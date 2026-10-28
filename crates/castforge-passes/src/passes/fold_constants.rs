@@ -2,7 +2,7 @@ use crate::{DeadCodeEliminationPass, Pass, PassResult};
 use anyhow::Result;
 use castforge_dialect_stablehlo::StableHloOp;
 use castforge_ir::{
-    Attribute, BlockId, Module, OpName, ValueDef, ValueId, format_dense_f32_literal,
+    Attribute, BlockId, Dim, Module, OpName, ValueDef, ValueId, format_dense_f32_literal,
 };
 use indexmap::IndexMap;
 
@@ -232,9 +232,21 @@ impl Pass for FoldConstantsPass {
                         Self::const_f32_vec(module, operand).map(|v| (result, v))
                     }
                     StableHloOp::Transpose {
-                        operand, result, ..
+                        operand,
+                        permutation,
+                        result,
+                    } => {
+                        let in_ty = module.values[operand].ty.as_tensor().cloned();
+                        let out_ty = module.values[result].ty.as_tensor().cloned();
+                        match (in_ty, out_ty, Self::const_f32_vec(module, operand)) {
+                            (Some(in_t), Some(out_t), Some(in_vals)) => {
+                                transpose_f32_nd(&in_vals, &in_t.shape, &out_t.shape, &permutation)
+                                    .map(|vals| (result, vals))
+                            }
+                            _ => None,
+                        }
                     }
-                    | StableHloOp::BroadcastInDim {
+                    StableHloOp::BroadcastInDim {
                         operand, result, ..
                     } => Self::const_splat(module, operand).map(|v| {
                         let n = module.values[result]
@@ -282,4 +294,60 @@ impl Pass for FoldConstantsPass {
             ops_created: 0,
         })
     }
+}
+
+fn transpose_f32_nd(
+    in_vals: &[f32],
+    in_shape: &[Dim],
+    out_shape: &[Dim],
+    perm: &[i64],
+) -> Option<Vec<f32>> {
+    let rank = in_shape.len();
+    if rank == 0 || out_shape.len() != rank || perm.len() != rank {
+        return None;
+    }
+    let mut in_dims = Vec::with_capacity(rank);
+    let mut out_dims = Vec::with_capacity(rank);
+    for d in in_shape {
+        if let Dim::Static(v) = d {
+            in_dims.push(*v as usize);
+        } else {
+            return None;
+        }
+    }
+    for d in out_shape {
+        if let Dim::Static(v) = d {
+            out_dims.push(*v as usize);
+        } else {
+            return None;
+        }
+    }
+    let total: usize = in_dims.iter().product();
+    if in_vals.len() != total {
+        return None;
+    }
+    let mut in_strides = vec![1usize; rank];
+    for i in (0..rank.saturating_sub(1)).rev() {
+        in_strides[i] = in_strides[i + 1] * in_dims[i + 1];
+    }
+    let mut out = vec![0.0_f32; total];
+    for (out_flat, out_elem) in out.iter_mut().enumerate() {
+        let mut rem = out_flat;
+        let mut out_coord = vec![0usize; rank];
+        for i in (0..rank).rev() {
+            let d = out_dims[i].max(1);
+            out_coord[i] = rem % d;
+            rem /= d;
+        }
+        let mut in_flat = 0usize;
+        for (out_axis, &in_axis) in perm.iter().enumerate() {
+            let ia = in_axis as usize;
+            if ia >= rank {
+                return None;
+            }
+            in_flat += out_coord[out_axis] * in_strides[ia];
+        }
+        *out_elem = in_vals[in_flat];
+    }
+    Some(out)
 }

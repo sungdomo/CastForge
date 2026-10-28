@@ -276,6 +276,54 @@ fn emit_rust_func(module: &Module, fn_op_id: OpId, out: &mut String) -> Result<(
                             "        {res_name}[i] = ({a}[i] + {b}[i]).max({c}[i]);"
                         )?;
                         writeln!(out, "    }}")?;
+                    } else if name == "castforge.fused_matmul_epilogue" && inputs.len() >= 3 {
+                        let a = value_ident(module, inputs[0], &mut names, &mut counter);
+                        let b = value_ident(module, inputs[1], &mut names, &mut counter);
+                        let bias = value_ident(module, inputs[2], &mut names, &mut counter);
+                        let lhs_dims = module.values[inputs[0]]
+                            .ty
+                            .as_tensor()
+                            .map(tensor_shape_dims)
+                            .unwrap_or_else(|| vec![1, 1]);
+                        let rhs_dims = module.values[inputs[1]]
+                            .ty
+                            .as_tensor()
+                            .map(tensor_shape_dims)
+                            .unwrap_or_else(|| vec![1, 1]);
+                        let m = *lhs_dims.first().unwrap_or(&1);
+                        let k = *lhs_dims.get(1).unwrap_or(&1);
+                        let n = *rhs_dims.get(1).unwrap_or(&1);
+                        let epilogue = op
+                            .attributes
+                            .get("epilogue")
+                            .and_then(|attr| attr.as_str())
+                            .unwrap_or("bias");
+                        writeln!(out, "    let mut {res_name} = [0.0_f32; {res_len}];")?;
+                        writeln!(out, "    for m in 0..{m} {{")?;
+                        writeln!(out, "        for n in 0..{n} {{")?;
+                        writeln!(out, "            let mut acc = 0.0_f32;")?;
+                        writeln!(out, "            for k in 0..{k} {{")?;
+                        writeln!(
+                            out,
+                            "                acc += {a}[m * {k} + k] * {b}[k * {n} + n];"
+                        )?;
+                        writeln!(out, "            }}")?;
+                        writeln!(out, "            let idx = m * {n} + n;")?;
+                        writeln!(out, "            let val = acc + {bias}[idx];")?;
+                        match epilogue {
+                            "bias_relu" if inputs.len() >= 4 => {
+                                let z = value_ident(module, inputs[3], &mut names, &mut counter);
+                                writeln!(out, "            {res_name}[idx] = val.max({z}[idx]);")?;
+                            }
+                            "bias_tanh" => {
+                                writeln!(out, "            {res_name}[idx] = val.tanh();")?;
+                            }
+                            _ => {
+                                writeln!(out, "            {res_name}[idx] = val;")?;
+                            }
+                        }
+                        writeln!(out, "        }}")?;
+                        writeln!(out, "    }}")?;
                     } else {
                         let a = value_ident(module, inputs[0], &mut names, &mut counter);
                         writeln!(out, "    let mut {res_name} = [0.0_f32; {res_len}];")?;

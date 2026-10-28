@@ -225,6 +225,21 @@ impl PassRegistry {
                 }))
             },
         );
+        reg.register(
+            "sink-transpose",
+            "Sinks stablehlo.transpose through elementwise ops toward constants and producers",
+            |_opts| Ok(Box::new(SinkTransposePass)),
+        );
+        reg.register(
+            "fuse-matmul-epilogue",
+            "Fuses dot_general + bias add (+ optional relu/tanh) into stablehlo.composite",
+            |_opts| Ok(Box::new(FuseMatmulEpiloguePass)),
+        );
+        reg.register(
+            "fold-norm-weights",
+            "Absorbs constant RMSNorm/LayerNorm scale multiply into adjacent dot_general weights",
+            |_opts| Ok(Box::new(FoldNormWeightsPass)),
+        );
         reg
     }
 

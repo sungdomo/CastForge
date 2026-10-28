@@ -103,6 +103,67 @@ pub fn emit_c_module(module: &Module) -> Result<String> {
                 writeln!(out, "            {res_name}[m * {n} + n] = acc;")?;
                 writeln!(out, "        }}")?;
                 writeln!(out, "    }}")?;
+            } else if op.is_op("stablehlo", "composite") && op.operands.len() >= 3 {
+                let comp_name = op
+                    .attributes
+                    .get("name")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("");
+                if comp_name == "castforge.fused_matmul_epilogue" {
+                    let a = value_ident(module, op.operands[0], &mut names, &mut counter);
+                    let b = value_ident(module, op.operands[1], &mut names, &mut counter);
+                    let bias = value_ident(module, op.operands[2], &mut names, &mut counter);
+                    let lhs_dims = module.values[op.operands[0]]
+                        .ty
+                        .as_tensor()
+                        .map(tensor_shape_dims)
+                        .unwrap_or_else(|| vec![1, 1]);
+                    let rhs_dims = module.values[op.operands[1]]
+                        .ty
+                        .as_tensor()
+                        .map(tensor_shape_dims)
+                        .unwrap_or_else(|| vec![1, 1]);
+                    let m = *lhs_dims.first().unwrap_or(&1);
+                    let k = *lhs_dims.get(1).unwrap_or(&1);
+                    let n = *rhs_dims.get(1).unwrap_or(&1);
+                    let epilogue = op
+                        .attributes
+                        .get("epilogue")
+                        .and_then(|attr| attr.as_str())
+                        .unwrap_or("bias");
+                    writeln!(out, "    float {res_name}[{res_len}];")?;
+                    writeln!(out, "    for (int m = 0; m < {m}; ++m) {{")?;
+                    writeln!(out, "        for (int n = 0; n < {n}; ++n) {{")?;
+                    writeln!(out, "            float acc = 0.0f;")?;
+                    writeln!(
+                        out,
+                        "            for (int k = 0; k < {k}; ++k) \
+                         acc += {a}[m * {k} + k] * {b}[k * {n} + n];"
+                    )?;
+                    writeln!(out, "            int idx = m * {n} + n;")?;
+                    writeln!(out, "            float val = acc + {bias}[idx];")?;
+                    match epilogue {
+                        "bias_relu" if op.operands.len() >= 4 => {
+                            let z = value_ident(module, op.operands[3], &mut names, &mut counter);
+                            writeln!(out, "            {res_name}[idx] = fmaxf(val, {z}[idx]);")?;
+                        }
+                        "bias_tanh" => {
+                            writeln!(out, "            {res_name}[idx] = tanhf(val);")?;
+                        }
+                        _ => {
+                            writeln!(out, "            {res_name}[idx] = val;")?;
+                        }
+                    }
+                    writeln!(out, "        }}")?;
+                    writeln!(out, "    }}")?;
+                } else {
+                    let src = value_ident(module, op.operands[0], &mut names, &mut counter);
+                    writeln!(out, "    float {res_name}[{res_len}];")?;
+                    writeln!(
+                        out,
+                        "    for (int i = 0; i < {res_len}; ++i) {res_name}[i] = {src}[i];"
+                    )?;
+                }
             } else {
                 let src = op
                     .operands
