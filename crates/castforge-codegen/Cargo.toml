@@ -1,0 +1,16 @@
+[package]
+name = "castforge-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Static buffer planner and multi-target code generator (Rust, C99, WebGPU WGSL) for CastForge IR"
+
+[dependencies]
+castforge-ir.workspace = true
+castforge-dialect-stablehlo.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+castforge-mlir.workspace = true
+castforge-passes.workspace = true

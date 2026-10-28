@@ -1,0 +1,20 @@
+[package]
+name = "castforge-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command-line interface for the CastForge AI Model IR Transformation Suite"
+
+[[bin]]
+name = "castforge"
+path = "src/main.rs"
+
+[dependencies]
+castforge-ir.workspace = true
+castforge-dialect-stablehlo.workspace = true
+castforge-mlir.workspace = true
+castforge-passes.workspace = true
+castforge-viz.workspace = true
+castforge-codegen.workspace = true
+clap.workspace = true
+anyhow.workspace = true

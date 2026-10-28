@@ -1,0 +1,13 @@
+[package]
+name = "castforge-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core MLIR-compatible Dual-Plane IR (Compute Graph + TensorStore) for CastForge"
+
+[dependencies]
+slotmap.workspace = true
+indexmap.workspace = true
+smallvec.workspace = true
+serde.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,20 @@
+# Declarative Pass Pipeline Configuration for CastForge
+[settings]
+verify_after_each_pass = true
+max_iterations = 2
+
+[[pipeline]]
+pass = "fold-transpose"
+options = { eliminate_identity = "true" }
+
+[[pipeline]]
+pass = "fold-reshape"
+
+[[pipeline]]
+pass = "cse"
+
+[[pipeline]]
+pass = "dce"
+
+[[pipeline]]
+pass = "fuse-elementwise"

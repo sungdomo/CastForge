@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>CastForge — Interactive Pass Timeline & Graph Debugger</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --panel: #1e293b;
+    --border: #334155;
+    --text: #f8fafc;
+    --muted: #94a3b8;
+    --accent: #38bdf8;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  header {
+    background: #020617;
+    border-bottom: 1px solid var(--border);
+    padding: 12px 20px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  header h1 { font-size: 16px; font-weight: 700; letter-spacing: 0.4px; color: var(--accent); }
+  .controls { display: flex; align-items: center; gap: 12px; }
+  button {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 6px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  button:hover { border-color: var(--accent); }
+  .workspace {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 270px 1fr 460px;
+    min-height: 0;
+  }
+  .sidebar {
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
+    padding: 12px;
+  }
+  .step-item {
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid transparent;
+    margin-bottom: 8px;
+    cursor: pointer;
+    transition: 0.15s;
+  }
+  .step-item:hover { background: rgba(255,255,255,0.04); }
+  .step-item.active {
+    background: rgba(56, 189, 248, 0.12);
+    border-color: var(--accent);
+  }
+  .step-title { font-size: 13px; font-weight: 600; display: flex; justify-content: space-between; }
+  .badges { display: flex; gap: 6px; margin-top: 6px; font-size: 11px; color: var(--muted); }
+  .badge { padding: 2px 6px; border-radius: 4px; background: #0f172a; }
+  .badge.changed { color: #4ade80; }
+  .canvas-pane {
+    position: relative;
+    overflow: auto;
+    background: radial-gradient(#1e293b 1px, transparent 1px);
+    background-size: 20px 20px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 24px;
+  }
+  .code-pane {
+    background: #0b1120;
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .pane-header {
+    padding: 10px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: var(--muted);
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  pre {
+    flex: 1;
+    padding: 14px;
+    overflow: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 12.5px;
+    line-height: 1.55;
+  }
+  .inspector {
+    border-top: 1px solid var(--border);
+    padding: 12px 14px;
+    font-size: 12.5px;
+    background: var(--panel);
+    min-height: 135px;
+  }
+  .node-card {
+    width: 280px;
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin: 6px 0;
+    border: 1.5px solid var(--border);
+    background: #1e293b;
+    cursor: pointer;
+    text-align: center;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+  }
+  .node-card:hover { border-color: var(--accent); }
+  .node-card.cat-arg { border-color: #38bdf8; background: #0c2a40; }
+  .node-card.cat-constant { border-color: #a855f7; background: #2a1442; }
+  .node-card.cat-shape { border-color: #f59e0b; background: #382509; }
+  .node-card.cat-quant { border-color: #ec4899; background: #3d122b; }
+  .node-card.cat-composite { border-color: #10b981; background: #093527; }
+  .node-card.cat-return { border-color: #64748b; background: #1e293b; }
+  .node-op { font-family: monospace; font-weight: 700; font-size: 13px; }
+  .node-ty { font-family: monospace; font-size: 11px; color: var(--muted); margin-top: 4px; word-break: break-all; }
+  .edge-arrow { color: #64748b; font-size: 11px; font-family: monospace; margin: 2px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CastForge Pass Timeline & IR Debugger</h1>
+  <div class="controls">
+    <button id="prevBtn">&#8592; Prev Pass</button>
+    <span id="stepIndicator" style="font-size:13px; color:var(--muted);">Step 0</span>
+    <button id="nextBtn">Next Pass &#8594;</button>
+  </div>
+</header>
+<div class="workspace">
+  <div class="sidebar" id="sidebar"></div>
+  <div class="canvas-pane" id="canvasPane"></div>
+  <div class="code-pane">
+    <div class="pane-header">MLIR IR Snapshot</div>
+    <pre id="mlirCode"></pre>
+    <div class="pane-header">Selected Operation Inspector</div>
+    <div class="inspector" id="inspector">Click any node in the graph to inspect its tensor types and attributes.</div>
+  </div>
+</div>
+<script>
+const FRAMES = [{"step_index":0,"pass_name":"Initial IR","changed":false,"ops_removed":0,"ops_modified":0,"ops_created":0,"mlir_text":"module @weight_surgery_demo {\n  func.func @forward(%x: tensor<2x3xf32>) -> tensor<2x4xf32> {\n    %w_expert_a = stablehlo.constant dense<[[1.0, 0.05, 2.0, -0.02], [0.8, -0.01, 1.5, 0.03], [1.2, 0.02, 2.5, -0.01]]> : tensor<3x4xf32>\n    %w_expert_b = stablehlo.constant dense<[[1.4, -0.03, 1.8, 0.01], [1.0, 0.02, 1.7, -0.02], [0.9, 0.01, 2.1, 0.04]]> : tensor<3x4xf32>\n    %w_merged = stablehlo.custom_call %w_expert_a, %w_expert_b {call_target_name = \"castforge.merge\"} : (tensor<3x4xf32>, tensor<3x4xf32>) -> tensor<3x4xf32>\n    %out = stablehlo.dot_general %x, %w_merged {lhs_contracting_dimensions = array<i64: 1>, rhs_contracting_dimensions = array<i64: 0>} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>\n    return %out : tensor<2x4xf32>\n  }\n}\n","graph":{"module_name":"weight_surgery_demo","nodes":[{"id":"n1","label":"%x","op_name":"input_arg","category":"arg","result_type":"tensor<2x3xf32>","attributes":{}},{"id":"n2","label":"stablehlo.constant","op_name":"stablehlo.constant","category":"constant","result_type":"tensor<3x4xf32>","attributes":{"value":"dense<[[1.0, 0.05, 2.0, -0.02], [0.8, -0.01, 1.5, 0.03], [1.2, 0.02, 2.5, -0.01]]> : tensor<3x4xf32>"}},{"id":"n3","label":"stablehlo.constant","op_name":"stablehlo.constant","category":"constant","result_type":"tensor<3x4xf32>","attributes":{"value":"dense<[[1.4, -0.03, 1.8, 0.01], [1.0, 0.02, 1.7, -0.02], [0.9, 0.01, 2.1, 0.04]]> : tensor<3x4xf32>"}},{"id":"n4","label":"stablehlo.custom_call","op_name":"stablehlo.custom_call","category":"compute","result_type":"tensor<3x4xf32>","attributes":{"call_target_name":"\"castforge.merge\""}},{"id":"n5","label":"stablehlo.dot_general","op_name":"stablehlo.dot_general","category":"compute","result_type":"tensor<2x4xf32>","attributes":{"rhs_contracting_dimensions":"array<i64: 0>","lhs_contracting_dimensions":"array<i64: 1>"}},{"id":"n6","label":"func.return","op_name":"func.return","category":"return","result_type":"()","attributes":{}}],"edges":[{"from":"n2","to":"n4","ssa_name":"w_expert_a","tensor_type":"tensor<3x4xf32>"},{"from":"n3","to":"n4","ssa_name":"w_expert_b","tensor_type":"tensor<3x4xf32>"},{"from":"n1","to":"n5","ssa_name":"x","tensor_type":"tensor<2x3xf32>"},{"from":"n4","to":"n5","ssa_name":"w_merged","tensor_type":"tensor<3x4xf32>"},{"from":"n5","to":"n6","ssa_name":"out","tensor_type":"tensor<2x4xf32>"}]}},{"step_index":1,"pass_name":"merge-weights","changed":true,"ops_removed":2,"ops_modified":1,"ops_created":0,"mlir_text":"module @weight_surgery_demo {\n  func.func @forward(%x: tensor<2x3xf32>) -> tensor<2x4xf32> {\n    %w_merged = stablehlo.constant dense<[[1.2052188, 0.010043491, 1.9082631, -0.005021745], [0.9039141, 0.005021745, 1.6069584, 0.0050217444], [1.0545664, 0.015065234, 2.3100026, 0.015065234]]> : tensor<3x4xf32>\n    %out = stablehlo.dot_general %x, %w_merged {lhs_contracting_dimensions = array<i64: 1>, rhs_contracting_dimensions = array<i64: 0>} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>\n    return %out : tensor<2x4xf32>\n  }\n}\n","graph":{"module_name":"weight_surgery_demo","nodes":[{"id":"n1","label":"%x","op_name":"input_arg","category":"arg","result_type":"tensor<2x3xf32>","attributes":{}},{"id":"n2","label":"stablehlo.constant","op_name":"stablehlo.constant","category":"constant","result_type":"tensor<3x4xf32>","attributes":{"value":"dense<[[1.2052188, 0.010043491, 1.9082631, -0.005021745], [0.9039141, 0.005021745, 1.6069584, 0.0050217444], [1.0545664, 0.015065234, 2.3100026, 0.015065234]]> : tensor<3x4xf32>"}},{"id":"n3","label":"stablehlo.dot_general","op_name":"stablehlo.dot_general","category":"compute","result_type":"tensor<2x4xf32>","attributes":{"rhs_contracting_dimensions":"array<i64: 0>","lhs_contracting_dimensions":"array<i64: 1>"}},{"id":"n4","label":"func.return","op_name":"func.return","category":"return","result_type":"()","attributes":{}}],"edges":[{"from":"n1","to":"n3","ssa_name":"x","tensor_type":"tensor<2x3xf32>"},{"from":"n2","to":"n3","ssa_name":"w_merged","tensor_type":"tensor<3x4xf32>"},{"from":"n3","to":"n4","ssa_name":"out","tensor_type":"tensor<2x4xf32>"}]}},{"step_index":2,"pass_name":"prune-structured","changed":true,"ops_removed":0,"ops_modified":1,"ops_created":0,"mlir_text":"module @weight_surgery_demo {\n  func.func @forward(%x: tensor<2x3xf32>) -> tensor<2x2xf32> {\n    %w_merged = stablehlo.constant dense<[[1.2052188, 1.9082631], [0.9039141, 1.6069584], [1.0545664, 2.3100026]]> : tensor<3x2xf32>\n    %out = stablehlo.dot_general %x, %w_merged {lhs_contracting_dimensions = array<i64: 1>, rhs_contracting_dimensions = array<i64: 0>} : (tensor<2x3xf32>, tensor<3x2xf32>) -> tensor<2x2xf32>\n    return %out : tensor<2x2xf32>\n  }\n}\n","graph":{"module_name":"weight_surgery_demo","nodes":[{"id":"n1","label":"%x","op_name":"input_arg","category":"arg","result_type":"tensor<2x3xf32>","attributes":{}},{"id":"n2","label":"stablehlo.constant","op_name":"stablehlo.constant","category":"constant","result_type":"tensor<3x2xf32>","attributes":{"value":"dense<[[1.2052188, 1.9082631], [0.9039141, 1.6069584], [1.0545664, 2.3100026]]> : tensor<3x2xf32>"}},{"id":"n3","label":"stablehlo.dot_general","op_name":"stablehlo.dot_general","category":"compute","result_type":"tensor<2x2xf32>","attributes":{"lhs_contracting_dimensions":"array<i64: 1>","rhs_contracting_dimensions":"array<i64: 0>"}},{"id":"n4","label":"func.return","op_name":"func.return","category":"return","result_type":"()","attributes":{}}],"edges":[{"from":"n1","to":"n3","ssa_name":"x","tensor_type":"tensor<2x3xf32>"},{"from":"n2","to":"n3","ssa_name":"w_merged","tensor_type":"tensor<3x2xf32>"},{"from":"n3","to":"n4","ssa_name":"out","tensor_type":"tensor<2x2xf32>"}]}},{"step_index":3,"pass_name":"quantize-weights","changed":true,"ops_removed":0,"ops_modified":1,"ops_created":1,"mlir_text":"module @weight_surgery_demo {\n  func.func @forward(%x: tensor<2x3xf32>) -> tensor<2x2xf32> {\n    %w_merged = stablehlo.constant dense<[[66, 105], [50, 88], [58, 127]]> : tensor<3x2x!quant.uniform<i8:f32,0.018189:0>>\n    %w_merged_deq = stablehlo.uniform_dequantize %w_merged : (tensor<3x2x!quant.uniform<i8:f32,0.018189:0>>) -> tensor<3x2xf32>\n    %out = stablehlo.dot_general %x, %w_merged_deq {lhs_contracting_dimensions = array<i64: 1>, rhs_contracting_dimensions = array<i64: 0>} : (tensor<2x3xf32>, tensor<3x2xf32>) -> tensor<2x2xf32>\n    return %out : tensor<2x2xf32>\n  }\n}\n","graph":{"module_name":"weight_surgery_demo","nodes":[{"id":"n1","label":"%x","op_name":"input_arg","category":"arg","result_type":"tensor<2x3xf32>","attributes":{}},{"id":"n2","label":"stablehlo.constant","op_name":"stablehlo.constant","category":"constant","result_type":"tensor<3x2x!quant.uniform<i8:f32,0.018189:0>>","attributes":{"value":"dense<[[66, 105], [50, 88], [58, 127]]> : tensor<3x2x!quant.uniform<i8:f32,0.018189:0>>"}},{"id":"n3","label":"stablehlo.uniform_dequantize","op_name":"stablehlo.uniform_dequantize","category":"quant","result_type":"tensor<3x2xf32>","attributes":{}},{"id":"n4","label":"stablehlo.dot_general","op_name":"stablehlo.dot_general","category":"compute","result_type":"tensor<2x2xf32>","attributes":{"rhs_contracting_dimensions":"array<i64: 0>","lhs_contracting_dimensions":"array<i64: 1>"}},{"id":"n5","label":"func.return","op_name":"func.return","category":"return","result_type":"()","attributes":{}}],"edges":[{"from":"n2","to":"n3","ssa_name":"w_merged","tensor_type":"tensor<3x2x!quant.uniform<i8:f32,0.018189:0>>"},{"from":"n1","to":"n4","ssa_name":"x","tensor_type":"tensor<2x3xf32>"},{"from":"n3","to":"n4","ssa_name":"w_merged_deq","tensor_type":"tensor<3x2xf32>"},{"from":"n4","to":"n5","ssa_name":"out","tensor_type":"tensor<2x2xf32>"}]}}];
+let currentIdx = FRAMES.length - 1;
+
+function selectStep(idx) {
+  currentIdx = Math.max(0, Math.min(FRAMES.length - 1, idx));
+  renderSidebar();
+  renderMain();
+}
+
+function renderSidebar() {
+  const sb = document.getElementById('sidebar');
+  sb.innerHTML = '';
+  FRAMES.forEach((f, idx) => {
+    const div = document.createElement('div');
+    div.className = 'step-item' + (idx === currentIdx ? ' active' : '');
+    div.onclick = () => selectStep(idx);
+    div.innerHTML = `
+      <div class="step-title">
+        <span>#${f.step_index} ${f.pass_name}</span>
+        <span>${f.graph.nodes.length} nodes</span>
+      </div>
+      <div class="badges">
+        <span class="badge ${f.changed ? 'changed' : ''}">${f.changed ? 'CHANGED' : 'NO-OP'}</span>
+        <span class="badge">-${f.ops_removed}</span>
+        <span class="badge">~${f.ops_modified}</span>
+        <span class="badge">+${f.ops_created}</span>
+      </div>
+    `;
+    sb.appendChild(div);
+  });
+}
+
+function renderMain() {
+  const f = FRAMES[currentIdx];
+  document.getElementById('stepIndicator').textContent = `Step ${f.step_index} / ${FRAMES.length - 1}: ${f.pass_name}`;
+  document.getElementById('mlirCode').textContent = f.mlir_text;
+
+  const canvas = document.getElementById('canvasPane');
+  canvas.innerHTML = '';
+  f.graph.nodes.forEach((n, i) => {
+    if (i > 0) {
+      const incoming = f.graph.edges.filter(e => e.to === n.id);
+      const edgeLabel = incoming.map(e => (e.ssa_name ? '%' + e.ssa_name + ' : ' : '') + e.tensor_type).join(' | ');
+      const arrow = document.createElement('div');
+      arrow.className = 'edge-arrow';
+      arrow.textContent = '↓ ' + edgeLabel;
+      canvas.appendChild(arrow);
+    }
+    const card = document.createElement('div');
+    card.className = `node-card cat-${n.category}`;
+    card.innerHTML = `
+      <div class="node-op">${n.label}</div>
+      <div class="node-ty">${n.result_type}</div>
+    `;
+    card.onclick = () => {
+      const attrs = Object.entries(n.attributes).map(([k, v]) => `<div><b>${k}</b>: <code>${v}</code></div>`).join('');
+      document.getElementById('inspector').innerHTML = `
+        <div style="margin-bottom:6px;"><b>Op:</b> <code>${n.op_name}</code> (${n.category})</div>
+        <div style="margin-bottom:6px;"><b>Result Type:</b> <code>${n.result_type}</code></div>
+        ${attrs || '<div style="color:var(--muted)">No attributes</div>'}
+      `;
+    };
+    canvas.appendChild(card);
+  });
+}
+
+document.getElementById('prevBtn').onclick = () => selectStep(currentIdx - 1);
+document.getElementById('nextBtn').onclick = () => selectStep(currentIdx + 1);
+window.addEventListener('keydown', e => {
+  if (e.key === 'ArrowLeft') selectStep(currentIdx - 1);
+  if (e.key === 'ArrowRight') selectStep(currentIdx + 1);
+});
+
+selectStep(FRAMES.length - 1);
+</script>
+</body>
+</html>

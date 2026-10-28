@@ -1,0 +1,12 @@
+[package]
+name = "castforge-mlir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure-Rust MLIR (Generic + StableHLO/Func) parser and printer for CastForge"
+
+[dependencies]
+castforge-ir.workspace = true
+indexmap.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true

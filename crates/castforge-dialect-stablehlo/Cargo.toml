@@ -1,0 +1,12 @@
+[package]
+name = "castforge-dialect-stablehlo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Strongly-typed StableHLO and Func dialect views and builders for CastForge IR"
+
+[dependencies]
+castforge-ir.workspace = true
+indexmap.workspace = true
+smallvec.workspace = true
+serde.workspace = true

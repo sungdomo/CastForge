@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/castforge-ir",
+    "crates/castforge-dialect-stablehlo",
+    "crates/castforge-mlir",
+    "crates/castforge-passes",
+    "crates/castforge-viz",
+    "crates/castforge-codegen",
+    "crates/castforge-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+slotmap = { version = "1.0", features = ["serde"] }
+indexmap = { version = "2.7", features = ["serde"] }
+smallvec = { version = "1.13", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+thiserror = "2.0"
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+
+castforge-ir = { path = "crates/castforge-ir" }
+castforge-dialect-stablehlo = { path = "crates/castforge-dialect-stablehlo" }
+castforge-mlir = { path = "crates/castforge-mlir" }
+castforge-passes = { path = "crates/castforge-passes" }
+castforge-viz = { path = "crates/castforge-viz" }
+castforge-codegen = { path = "crates/castforge-codegen" }
