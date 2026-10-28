@@ -1,13 +1,16 @@
+pub mod liveness;
+pub mod memory_plan;
 pub mod target_c;
 pub mod target_rust;
 pub mod target_wgsl;
 
+pub use crate::liveness::{LiveInterval, compute_block_liveness, compute_module_liveness};
+pub use crate::memory_plan::{BufferAllocation, MemoryPlan, build_memory_plan};
 use crate::target_c::emit_c_module;
 use crate::target_rust::emit_rust_module;
 use crate::target_wgsl::emit_wgsl_module;
 use anyhow::Result;
-use castforge_ir::{Dim, Module, TensorType, ValueDef, ValueId};
-use serde::Serialize;
+use castforge_ir::{Dim, Module, TensorType, ValueId};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,56 +18,6 @@ pub enum CodegenTarget {
     Rust,
     C,
     Wgsl,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct BufferAllocation {
-    pub name: String,
-    pub num_elements: usize,
-    pub byte_size: usize,
-    pub is_constant: bool,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct MemoryPlan {
-    pub allocations: Vec<BufferAllocation>,
-    pub total_constant_bytes: usize,
-    pub total_activation_bytes: usize,
-}
-
-/// Computes a static memory and buffer allocation plan for `module`.
-pub fn build_memory_plan(module: &Module) -> MemoryPlan {
-    let mut plan = MemoryPlan::default();
-    for (val_id, val) in &module.values {
-        let Some(t_ty) = val.ty.as_tensor() else {
-            continue;
-        };
-        let elems = t_ty.num_elements().unwrap_or(1).max(1) as usize;
-        let bytes = (elems * t_ty.dtype.bit_width()).div_ceil(8);
-        let is_const = match val.def {
-            ValueDef::OpResult { op, .. } => module
-                .ops
-                .get(op)
-                .is_some_and(|o| o.is_op("stablehlo", "constant")),
-            _ => false,
-        };
-        let name = val
-            .ssa_name
-            .clone()
-            .unwrap_or_else(|| format!("v_{:?}", val_id));
-        if is_const {
-            plan.total_constant_bytes += bytes;
-        } else {
-            plan.total_activation_bytes += bytes;
-        }
-        plan.allocations.push(BufferAllocation {
-            name,
-            num_elements: elems,
-            byte_size: bytes,
-            is_constant: is_const,
-        });
-    }
-    plan
 }
 
 /// Generate executable source code from a CastForge `Module` for the requested `CodegenTarget`.

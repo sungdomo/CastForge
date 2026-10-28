@@ -14,8 +14,13 @@ pub fn emit_c_module(module: &Module) -> Result<String> {
     )?;
     writeln!(
         out,
-        "/* Constant Weights: {} B | Activation Workspace: {} B */",
-        plan.total_constant_bytes, plan.total_activation_bytes
+        "/* Constant Weights: {} B | Activation Workspace: {} B \
+         (Naive: {} B, Saved: {} B across {} arena slots) */",
+        plan.total_constant_bytes,
+        plan.total_activation_bytes,
+        plan.naive_activation_bytes,
+        plan.saved_activation_bytes(),
+        plan.reusable_slot_count
     )?;
     writeln!(out, "#include <stdint.h>\n#include <math.h>\n")?;
 
@@ -62,6 +67,16 @@ pub fn emit_c_module(module: &Module) -> Result<String> {
             };
             let res_name = value_ident(module, res_val, &mut names, &mut counter);
             let res_len = tensor_len(module, res_val);
+            if let Some(alloc) = plan.allocation_for(res_val) {
+                if let (Some(slot), Some(off)) = (alloc.arena_slot, alloc.arena_offset) {
+                    writeln!(
+                        out,
+                        "    /* [arena] {res_name}: slot #{slot} @ offset {off} B \
+                         (live steps {}..={}) */",
+                        alloc.first_def, alloc.last_use
+                    )?;
+                }
+            }
 
             if op.is_op("stablehlo", "constant") {
                 let vals = op

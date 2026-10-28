@@ -50,3 +50,33 @@ module @weight_surgery_demo {
     let wgsl_code = generate_code(&module, CodegenTarget::Wgsl).expect("wgsl codegen failed");
     assert!(wgsl_code.contains("@compute @workgroup_size(64)"));
 }
+
+#[test]
+fn test_liveness_and_arena_buffer_reuse_savings() {
+    let mlir = r#"
+module @arena_reuse_demo {
+  func.func @chain(%x: tensor<4x4xf32>) -> tensor<4x4xf32> {
+    %t1 = stablehlo.exponential %x : tensor<4x4xf32>
+    %t2 = stablehlo.tanh %t1 : tensor<4x4xf32>
+    %t3 = stablehlo.rsqrt %t2 : tensor<4x4xf32>
+    %t4 = stablehlo.exponential %t3 : tensor<4x4xf32>
+    func.return %t4 : tensor<4x4xf32>
+  }
+}
+"#;
+    let module = parse_mlir(mlir).expect("parse chain mlir");
+    let plan = build_memory_plan(&module);
+
+    // 1 input arg (64 B) + 4 intermediate 4x4xf32 activations (4 * 64 B = 256 B) = 320 B naive
+    assert_eq!(plan.naive_activation_bytes, 320);
+    // With liveness-guided ping-pong reuse, only 2 arena slots (2 * 64 B = 128 B) are needed
+    // for the 4 sequential temporaries (%t3 reuses %t1's slot; %t4 reuses %t2's slot)!
+    assert_eq!(plan.reusable_slot_count, 2);
+    assert_eq!(plan.total_activation_bytes, 192);
+    assert_eq!(plan.saved_activation_bytes(), 128);
+
+    let rust_code = generate_code(&module, CodegenTarget::Rust).expect("rust codegen");
+    assert!(rust_code.contains("Saved: 128 B across 2 arena slots"));
+    assert!(rust_code.contains("// [arena] t1: slot #0 @ offset 0 B"));
+    assert!(rust_code.contains("// [arena] t3: slot #0 @ offset 0 B"));
+}

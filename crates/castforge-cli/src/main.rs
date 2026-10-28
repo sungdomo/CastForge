@@ -309,11 +309,13 @@ fn main() -> Result<()> {
             let plan = build_memory_plan(&module);
             eprintln!(
                 "[castforge:codegen] Target: {:?} | Constant Weights: {} B | \
-                 Activation Workspace: {} B ({} buffers)",
+                 Activation Workspace: {} B (Naive: {} B, Saved: {} B across {} slots)",
                 tgt,
                 plan.total_constant_bytes,
                 plan.total_activation_bytes,
-                plan.allocations.len()
+                plan.naive_activation_bytes,
+                plan.saved_activation_bytes(),
+                plan.reusable_slot_count
             );
 
             let code = generate_code(&module, tgt)?;
