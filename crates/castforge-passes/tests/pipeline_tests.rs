@@ -73,8 +73,12 @@ module @rmsnorm_test {
     %x_conv = stablehlo.convert %x_mul_1 : (tensor<4x128xf32>) -> tensor<4x128xf32>
     %scaled = stablehlo.multiply %x_conv, %c5 : tensor<4x128xf32>
     %init = stablehlo.constant dense<0.0> : tensor<f32>
-    %red = stablehlo.reduce(%scaled init: %init) applies stablehlo.add across dimensions = [1] : (tensor<4x128xf32>, tensor<f32>) -> tensor<4xf32>
-    %out = stablehlo.dot_general %scaled, %w {lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [0]} : (tensor<4x128xf32>, tensor<128x64xf32>) -> tensor<4x64xf32>
+    %red = stablehlo.reduce(%scaled init: %init)
+      applies stablehlo.add across dimensions = [1]
+      : (tensor<4x128xf32>, tensor<f32>) -> tensor<4xf32>
+    %out = stablehlo.dot_general %scaled, %w
+      {lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [0]}
+      : (tensor<4x128xf32>, tensor<128x64xf32>) -> tensor<4x64xf32>
     return %out : tensor<4x64xf32>
   }
 }
@@ -100,10 +104,21 @@ fn test_merge_prune_and_quantize_pipeline() {
     let mlir = r#"
 module @weight_surgery {
   func.func @forward(%x: tensor<2x3xf32>) -> tensor<2x4xf32> {
-    %w_a = stablehlo.constant dense<[[1.0, 0.05, 2.0, -0.02], [0.8, -0.01, 1.5, 0.03], [1.2, 0.02, 2.5, -0.01]]> : tensor<3x4xf32>
-    %w_b = stablehlo.constant dense<[[1.4, -0.03, 1.8, 0.01], [1.0, 0.02, 1.7, -0.02], [0.9, 0.01, 2.1, 0.04]]> : tensor<3x4xf32>
-    %w_merged = stablehlo.custom_call %w_a, %w_b {call_target_name = "castforge.merge"} : (tensor<3x4xf32>, tensor<3x4xf32>) -> tensor<3x4xf32>
-    %out = stablehlo.dot_general %x, %w_merged {lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [0]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
+    %w_a = stablehlo.constant dense<[
+      [1.0, 0.05, 2.0, -0.02],
+      [0.8, -0.01, 1.5, 0.03],
+      [1.2, 0.02, 2.5, -0.01]
+    ]> : tensor<3x4xf32>
+    %w_b = stablehlo.constant dense<[
+      [1.4, -0.03, 1.8, 0.01],
+      [1.0, 0.02, 1.7, -0.02],
+      [0.9, 0.01, 2.1, 0.04]
+    ]> : tensor<3x4xf32>
+    %w_merged = stablehlo.custom_call %w_a, %w_b {call_target_name = "castforge.merge"}
+      : (tensor<3x4xf32>, tensor<3x4xf32>) -> tensor<3x4xf32>
+    %out = stablehlo.dot_general %x, %w_merged
+      {lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [0]}
+      : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
     return %out : tensor<2x4xf32>
   }
 }
@@ -123,9 +138,9 @@ module @weight_surgery {
     let printed = print_mlir(&module);
     // 1. Donor constants w_a and w_b were merged into w_merged and DCE'd
     assert!(!printed.contains("castforge.merge"));
-    // 2. Structured pruning reduced columns from 4 -> 2 (tensor<3x2x...> and output tensor<2x2xf32>)
+    // 2. Structured pruning reduced columns from 4 -> 2 (output tensor<2x2xf32>)
     assert!(printed.contains("-> tensor<2x2xf32>"));
-    // 3. Quantization converted the 3x2 weight matrix into !quant.uniform<i8:f32, ...> + uniform_dequantize
+    // 3. Quantization converted the 3x2 weight matrix into !quant.uniform + uniform_dequantize
     assert!(printed.contains("!quant.uniform<i8:f32,"));
     assert!(printed.contains("stablehlo.uniform_dequantize"));
 

@@ -3,7 +3,7 @@ name = "castforge-viz"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Graph visualization exporter (Mermaid, Graphviz DOT, JSON, Interactive HTML Pass Debugger) for CastForge IR"
+description = "Graph visualization exporter (Mermaid, DOT, JSON, HTML Debugger) for CastForge"
 
 [dependencies]
 castforge-ir.workspace = true

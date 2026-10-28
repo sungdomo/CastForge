@@ -33,7 +33,7 @@ pub struct PassTraceStep {
 /// Key-value options passed to a Pass via CLI (`pass(k=v)`) or config file (`TOML`/`JSON`).
 pub type PassOptions = IndexMap<String, String>;
 
-/// Core trait implemented by all IR transformation, optimization, pruning, quantization, and editing passes.
+/// Core trait implemented by all IR transformation, optimization, and surgery passes.
 pub trait Pass: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
@@ -112,7 +112,7 @@ impl PassRegistry {
         );
         reg.register(
             "quantize-weights",
-            "Post-training symmetric weight quantization (bits=8|4, min_elements=2) with uniform_dequantize",
+            "Post-training symmetric weight quantization (bits=8|4) with uniform_dequantize",
             |opts| {
                 let bits = opts
                     .get("bits")
@@ -138,7 +138,7 @@ impl PassRegistry {
         );
         reg.register(
             "merge-weights",
-            "Merges paired constant weight tensors using linear, slerp, or ties (method=slerp, t=0.5)",
+            "Merges paired constant weight tensors (method=linear|slerp|ties, t=0.5)",
             |opts| {
                 let method = match opts.get("method").map(|s| s.to_lowercase()).as_deref() {
                     Some("slerp") => MergeMethod::Slerp,
@@ -154,7 +154,7 @@ impl PassRegistry {
         );
         reg.register(
             "fuse-elementwise",
-            "Fuses eligible elementwise producer-consumer pairs (e.g., add + maximum) into stablehlo.composite",
+            "Fuses eligible elementwise producer-consumer pairs into stablehlo.composite",
             |_opts| Ok(Box::new(FuseElementwisePass)),
         );
         reg.register(
@@ -192,17 +192,14 @@ impl PassRegistry {
     }
 
     pub fn create_pass(&self, name: &str, opts: &PassOptions) -> Result<Box<dyn Pass>> {
-        let desc = self
-            .passes
-            .get(name)
-            .ok_or_else(|| anyhow!("Unknown pass `{name}`. Run `castforge list-passes` to see available passes."))?;
+        let desc = self.passes.get(name).ok_or_else(|| {
+            anyhow!("Unknown pass `{name}`. Run `castforge list-passes` to see available passes.")
+        })?;
         (desc.factory)(opts)
     }
 
     pub fn list(&self) -> impl Iterator<Item = (&'static str, &'static str)> + '_ {
-        self.passes
-            .values()
-            .map(|d| (d.name, d.description))
+        self.passes.values().map(|d| (d.name, d.description))
     }
 }
 
@@ -333,7 +330,7 @@ impl PassManager {
         Ok(history)
     }
 
-    /// Execute the pipeline and capture a full step-by-step IR trace (initial state + after each pass)
+    /// Execute the pipeline and capture a full step-by-step IR trace
     /// for interactive visualization and pass diffing.
     pub fn run_with_trace(&mut self, module: &mut Module) -> Result<Vec<PassTraceStep>> {
         let mut steps = Vec::new();
@@ -521,7 +518,7 @@ impl Pass for CommonSubexpressionEliminationPass {
     }
 }
 
-/// 3. Fold Transpose Pass (`transpose(transpose(x, p1), p2)` -> `transpose(x, p1[p2])` & identity removal)
+/// 3. Fold Transpose Pass (`transpose(transpose(x, p1), p2)` -> `transpose(x, p1[p2])`)
 pub struct FoldTransposePass {
     pub eliminate_identity: bool,
 }
@@ -601,10 +598,7 @@ impl Pass for FoldTransposePass {
                 // Check if the resulting permutation is an identity `[0, 1, 2, ...]`
                 let is_identity = self.eliminate_identity
                     && !current_perm.is_empty()
-                    && current_perm
-                        .iter()
-                        .enumerate()
-                        .all(|(i, &p)| p == i as i64);
+                    && current_perm.iter().enumerate().all(|(i, &p)| p == i as i64);
 
                 if is_identity {
                     module.replace_all_uses(result, current_operand);
@@ -708,7 +702,7 @@ impl Pass for FuseElementwisePass {
     }
 
     fn description(&self) -> &'static str {
-        "Fuses eligible elementwise producer-consumer pairs (e.g., add + maximum) into stablehlo.composite"
+        "Fuses eligible elementwise producer-consumer pairs into stablehlo.composite"
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
@@ -732,8 +726,7 @@ impl Pass for FuseElementwisePass {
                 };
 
                 // Check if `lhs` is produced by `stablehlo.add` with a single use
-                let castforge_ir::ValueDef::OpResult { op: add_op_id, .. } =
-                    module.values[lhs].def
+                let castforge_ir::ValueDef::OpResult { op: add_op_id, .. } = module.values[lhs].def
                 else {
                     continue;
                 };
@@ -854,7 +847,7 @@ impl Pass for CanonicalizePass {
     }
 
     fn description(&self) -> &'static str {
-        "Composite canonicalization pass (fold-constants + simplify-algebraic + fold-transpose + fold-reshape + cse + dce)"
+        "Composite canonicalization pass (constants, algebraic, transpose, reshape, cse, dce)"
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
@@ -895,7 +888,7 @@ impl Pass for CanonicalizePass {
     }
 }
 
-/// 8. Algebraic Simplification Pass (`x + 0 -> x`, `x * 1 -> x`, `x * 0 -> 0`, identity `convert`/`slice`)
+/// 8. Algebraic Simplification Pass (`x + 0 -> x`, `x * 1 -> x`, `x * 0 -> 0`)
 pub struct SimplifyAlgebraicPass;
 
 impl SimplifyAlgebraicPass {
@@ -980,16 +973,13 @@ impl Pass for SimplifyAlgebraicPass {
                         let is_full = module.values[operand].ty == module.values[result].ty
                             && start_indices.iter().all(|&s| s == 0)
                             && strides.iter().all(|&s| s == 1)
-                            && module.values[operand]
-                                .ty
-                                .as_tensor()
-                                .is_some_and(|t| {
-                                    t.shape.len() == limit_indices.len()
-                                        && t.shape
-                                            .iter()
-                                            .zip(limit_indices.iter())
-                                            .all(|(d, &lim)| *d == Dim::Static(lim))
-                                });
+                            && module.values[operand].ty.as_tensor().is_some_and(|t| {
+                                t.shape.len() == limit_indices.len()
+                                    && t.shape
+                                        .iter()
+                                        .zip(limit_indices.iter())
+                                        .all(|(d, &lim)| *d == Dim::Static(lim))
+                            });
                         if is_full {
                             Some((result, operand))
                         } else {
@@ -1066,19 +1056,28 @@ impl Pass for FoldConstantsPass {
 
                 let folded: Option<(ValueId, f64)> = match hlo {
                     StableHloOp::Add { lhs, rhs, result } => {
-                        match (Self::const_splat(module, lhs), Self::const_splat(module, rhs)) {
+                        match (
+                            Self::const_splat(module, lhs),
+                            Self::const_splat(module, rhs),
+                        ) {
                             (Some(a), Some(b)) => Some((result, a + b)),
                             _ => None,
                         }
                     }
                     StableHloOp::Subtract { lhs, rhs, result } => {
-                        match (Self::const_splat(module, lhs), Self::const_splat(module, rhs)) {
+                        match (
+                            Self::const_splat(module, lhs),
+                            Self::const_splat(module, rhs),
+                        ) {
                             (Some(a), Some(b)) => Some((result, a - b)),
                             _ => None,
                         }
                     }
                     StableHloOp::Multiply { lhs, rhs, result } => {
-                        match (Self::const_splat(module, lhs), Self::const_splat(module, rhs)) {
+                        match (
+                            Self::const_splat(module, lhs),
+                            Self::const_splat(module, rhs),
+                        ) {
                             (Some(a), Some(b)) => Some((result, a * b)),
                             _ => None,
                         }
@@ -1180,7 +1179,7 @@ impl Pass for QuantizeWeightsPass {
     }
 
     fn description(&self) -> &'static str {
-        "Post-training symmetric weight quantization (bits=8|4, min_elements=2) with uniform_dequantize"
+        "Post-training symmetric weight quantization (bits=8|4) with uniform_dequantize"
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
@@ -1255,7 +1254,7 @@ impl Pass for QuantizeWeightsPass {
                 );
                 modified += 1;
 
-                // Create `stablehlo.uniform_dequantize` op and splice it right after the constant op
+                // Create `stablehlo.uniform_dequantize` op right after the constant op
                 let deq_ssa = module.values[const_val_id]
                     .ssa_name
                     .as_ref()
@@ -1282,7 +1281,7 @@ impl Pass for QuantizeWeightsPass {
                     }
                 }
 
-                // Redirect all downstream uses of `const_val_id` (except `deq_op_id` itself) to `deq_val_id`
+                // Redirect all downstream uses of `const_val_id` to `deq_val_id`
                 for (other_op_id, other_op) in &mut module.ops {
                     if other_op_id == deq_op_id {
                         continue;
@@ -1378,8 +1377,8 @@ impl Pass for StructuredPruningPass {
                     continue;
                 }
 
-                let keep_cols = ((cols as f32) * (1.0 - self.sparsity.clamp(0.0, 0.9))).round()
-                    as usize;
+                let keep_cols =
+                    ((cols as f32) * (1.0 - self.sparsity.clamp(0.0, 0.9))).round() as usize;
                 let keep_cols = keep_cols.clamp(1, cols);
                 if keep_cols == cols {
                     continue;
@@ -1421,7 +1420,7 @@ impl Pass for StructuredPruningPass {
                     .tensor_store
                     .insert(TensorEntry::from_f32(store_key, new_w_ty, pruned_vals));
 
-                // Update dot_general output shape and propagate to downstream single-input/return consumers
+                // Update dot_general output shape and propagate to downstream consumers
                 if let Some(mut dot_out_ty) = module.values[dot_res].ty.as_tensor().cloned() {
                     if let Some(last_dim) = dot_out_ty.shape.last_mut() {
                         *last_dim = Dim::Static(keep_cols as i64);
@@ -1431,8 +1430,11 @@ impl Pass for StructuredPruningPass {
 
                     // Also update parent func.func return type if dot_res is returned
                     for fn_op_id in module.functions() {
-                        if let Some(Attribute::Type(Type::Function { inputs, results })) =
-                            module.ops[fn_op_id].attributes.get("function_type").cloned()
+                        if let Some(Attribute::Type(Type::Function { inputs, results })) = module
+                            .ops[fn_op_id]
+                            .attributes
+                            .get("function_type")
+                            .cloned()
                         {
                             if results.len() == 1 {
                                 module.ops[fn_op_id].attributes.insert(
@@ -1462,7 +1464,7 @@ impl Pass for StructuredPruningPass {
 }
 
 /// 13. Weight Merging Pass (`merge-weights`)
-/// Fuses `stablehlo.add(w_a, w_b)` on two constant weight tensors using Linear, SLERP, or TIES merging.
+/// Fuses paired constant weight tensors using Linear, SLERP, or TIES merging.
 pub struct MergeWeightsPass {
     pub method: MergeMethod,
     pub t: f32,
@@ -1517,8 +1519,7 @@ impl Pass for MergeWeightsPass {
                 else {
                     continue;
                 };
-                if !lhs_op.is_op("stablehlo", "constant")
-                    || !rhs_op.is_op("stablehlo", "constant")
+                if !lhs_op.is_op("stablehlo", "constant") || !rhs_op.is_op("stablehlo", "constant")
                 {
                     continue;
                 }

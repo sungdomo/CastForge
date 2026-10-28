@@ -58,7 +58,7 @@ enum Commands {
         generic: bool,
     },
 
-    /// Export the IR computation graph or interactive Pass Timeline Debugger (mermaid, dot, json, html)
+    /// Export the IR computation graph or interactive Pass Timeline Debugger
     Viz {
         /// Input MLIR file path
         input: PathBuf,
@@ -134,7 +134,8 @@ fn main() -> Result<()> {
             if stats {
                 for r in &results {
                     eprintln!(
-                        "[castforge:pass] {:<18} | changed: {:<5} | removed: {:<3} | modified: {:<3} | created: {:<3}",
+                        "[castforge:pass] {:<18} | changed: {:<5} | \
+                         removed: {:<3} | modified: {:<3} | created: {:<3}",
                         r.pass_name, r.changed, r.ops_removed, r.ops_modified, r.ops_created
                     );
                 }
@@ -259,7 +260,8 @@ fn main() -> Result<()> {
 
             let plan = build_memory_plan(&module);
             eprintln!(
-                "[castforge:codegen] Target: {:?} | Constant Weights: {} B | Activation Workspace: {} B ({} buffers)",
+                "[castforge:codegen] Target: {:?} | Constant Weights: {} B | \
+                 Activation Workspace: {} B ({} buffers)",
                 tgt,
                 plan.total_constant_bytes,
                 plan.total_activation_bytes,
@@ -295,7 +297,8 @@ fn main() -> Result<()> {
             let results = pm.run(&mut module)?;
             for r in &results {
                 eprintln!(
-                    "[castforge:pass] {:<18} | changed: {:<5} | removed: {:<3} | modified: {:<3} | created: {:<3}",
+                    "[castforge:pass] {:<18} | changed: {:<5} | \
+                     removed: {:<3} | modified: {:<3} | created: {:<3}",
                     r.pass_name, r.changed, r.ops_removed, r.ops_modified, r.ops_created
                 );
             }

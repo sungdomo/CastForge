@@ -43,7 +43,7 @@ impl Attribute {
         }
     }
 
-    /// If this attribute is a scalar/splat `DenseElements` constant (e.g., `dense<0.0>` or `dense<1>`),
+    /// If this attribute is a scalar/splat `DenseElements` constant (e.g., `dense<0.0>`),
     /// parses and returns its scalar `f64` value.
     pub fn as_splat_f64(&self) -> Option<f64> {
         match self {
@@ -65,7 +65,9 @@ impl Attribute {
     }
 
     pub fn is_splat_one(&self) -> bool {
-        self.as_splat_f64().map(|v| (v - 1.0).abs() < f64::EPSILON).unwrap_or(false)
+        self.as_splat_f64()
+            .map(|v| (v - 1.0).abs() < f64::EPSILON)
+            .unwrap_or(false)
     }
 }
 

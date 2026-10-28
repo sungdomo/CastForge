@@ -37,9 +37,9 @@ impl MlirParser {
         let mut current_block: BlockId = module.body_block();
         let mut in_func = false;
 
+        let mut logical_lines: Vec<(usize, String)> = Vec::new();
         for (idx, raw_line) in input.lines().enumerate() {
             let line_no = idx + 1;
-            // Strip comments
             let line = match raw_line.find("//") {
                 Some(pos) => raw_line[..pos].trim(),
                 None => raw_line.trim(),
@@ -47,6 +47,32 @@ impl MlirParser {
             if line.is_empty() {
                 continue;
             }
+            let prev_incomplete = logical_lines.last().is_some_and(|(_, prev)| {
+                let open_p = prev.chars().filter(|&c| c == '(').count();
+                let close_p = prev.chars().filter(|&c| c == ')').count();
+                let open_b = prev.chars().filter(|&c| c == '[').count();
+                let close_b = prev.chars().filter(|&c| c == ']').count();
+                open_p > close_p || open_b > close_b
+            });
+            let is_continuation = prev_incomplete
+                || line.starts_with(':')
+                || line.starts_with("->")
+                || line.starts_with("applies ")
+                || line.starts_with("across ")
+                || line.starts_with('{')
+                || line.starts_with('[');
+            if is_continuation {
+                if let Some((_prev_ln, prev_text)) = logical_lines.last_mut() {
+                    prev_text.push(' ');
+                    prev_text.push_str(line);
+                    continue;
+                }
+            }
+            logical_lines.push((line_no, line.to_string()));
+        }
+
+        for (line_no, line_buf) in logical_lines {
+            let line = line_buf.as_str();
 
             if let Some(rest) = line.strip_prefix("module") {
                 let rest = rest.trim();
@@ -99,12 +125,11 @@ impl MlirParser {
 
         // Find matching close paren for argument list
         let args_part = &after_at[open_paren + 1..];
-        let close_paren = find_matching_delim(args_part, '(', ')').ok_or_else(|| {
-            ParseError::Syntax {
+        let close_paren =
+            find_matching_delim(args_part, '(', ')').ok_or_else(|| ParseError::Syntax {
                 line: line_no,
                 message: "Unclosed argument list in `func.func`".to_string(),
-            }
-        })?;
+            })?;
         let args_str = &args_part[..close_paren];
         let after_args = args_part[close_paren + 1..].trim();
 
@@ -117,11 +142,10 @@ impl MlirParser {
             if arg_item.is_empty() {
                 continue;
             }
-            let (val_str, ty_str) =
-                arg_item.split_once(':').ok_or_else(|| ParseError::Syntax {
-                    line: line_no,
-                    message: format!("Invalid function argument `{arg_item}`"),
-                })?;
+            let (val_str, ty_str) = arg_item.split_once(':').ok_or_else(|| ParseError::Syntax {
+                line: line_no,
+                message: format!("Invalid function argument `{arg_item}`"),
+            })?;
             let ssa = val_str.trim().trim_start_matches('%').to_string();
             let ty = parse_type(ty_str.trim(), line_no)?;
             input_types.push(ty.clone());
@@ -208,12 +232,14 @@ impl MlirParser {
                 for op_tok in split_top_level(ops_part, ',') {
                     let ssa = op_tok.trim().trim_start_matches('%');
                     if !ssa.is_empty() {
-                        let val_id = *self.value_map.get(ssa).ok_or_else(|| {
-                            ParseError::UndefinedValue {
-                                line: line_no,
-                                name: ssa.to_string(),
-                            }
-                        })?;
+                        let val_id =
+                            *self
+                                .value_map
+                                .get(ssa)
+                                .ok_or_else(|| ParseError::UndefinedValue {
+                                    line: line_no,
+                                    name: ssa.to_string(),
+                                })?;
                         operands.push(val_id);
                     }
                 }
@@ -238,7 +264,7 @@ impl MlirParser {
         let op_name = OpName::parse(&rhs[..op_end]);
         let rest = rhs[op_end..].trim();
 
-        // Special case: `stablehlo.reduce(%in init: %init) applies <op> across dimensions = [...] : ...`
+        // Special case: `stablehlo.reduce(%in init: %init) applies <op> across dimensions = [...]`
         if op_name.dialect == "stablehlo" && op_name.name == "reduce" && rest.starts_with('(') {
             return self.parse_reduce_short_op(module, block, lhs_names, rest, location, line_no);
         }
@@ -284,9 +310,10 @@ impl MlirParser {
             })?;
             let literal_part = rest[..colon_idx].trim();
             let ty = parse_type(rest[colon_idx + 1..].trim(), line_no)?;
-            let tensor_ty = ty.as_tensor().cloned().unwrap_or_else(|| {
-                TensorType::new(Vec::new(), DType::F32)
-            });
+            let tensor_ty = ty
+                .as_tensor()
+                .cloned()
+                .unwrap_or_else(|| TensorType::new(Vec::new(), DType::F32));
 
             let val_attr = if let Some(inner) = literal_part
                 .strip_prefix("dense<")
@@ -297,14 +324,14 @@ impl MlirParser {
                     .cloned()
                     .unwrap_or_else(|| format!("const_{}", module.tensor_store.len()));
                 let num_elems = tensor_ty.num_elements().unwrap_or(1) as usize;
-                if let Some(f32_vals) =
-                    castforge_ir::parse_dense_f32_literal(inner, num_elems)
-                {
-                    module.tensor_store.insert(castforge_ir::TensorEntry::from_f32(
-                        res_key,
-                        tensor_ty.clone(),
-                        f32_vals,
-                    ));
+                if let Some(f32_vals) = castforge_ir::parse_dense_f32_literal(inner, num_elems) {
+                    module
+                        .tensor_store
+                        .insert(castforge_ir::TensorEntry::from_f32(
+                            res_key,
+                            tensor_ty.clone(),
+                            f32_vals,
+                        ));
                 }
                 Attribute::DenseElements {
                     ty: tensor_ty,
@@ -421,12 +448,11 @@ impl MlirParser {
         location: Location,
         line_no: usize,
     ) -> Result<(), ParseError> {
-        let close_paren = find_matching_delim(&rest[1..], '(', ')').ok_or_else(|| {
-            ParseError::Syntax {
+        let close_paren =
+            find_matching_delim(&rest[1..], '(', ')').ok_or_else(|| ParseError::Syntax {
                 line: line_no,
                 message: "Unclosed `(` in `stablehlo.reduce`".to_string(),
-            }
-        })? + 1;
+            })? + 1;
         let inside_parens = &rest[1..close_paren];
         let (in_part, init_part) =
             inside_parens
@@ -439,21 +465,21 @@ impl MlirParser {
         let mut operands = SmallVec::new();
         for tok in [in_part.trim(), init_part.trim()] {
             let ssa = tok.trim_start_matches('%').trim();
-            let val_id = *self.value_map.get(ssa).ok_or_else(|| {
-                ParseError::UndefinedValue {
+            let val_id = *self
+                .value_map
+                .get(ssa)
+                .ok_or_else(|| ParseError::UndefinedValue {
                     line: line_no,
                     name: ssa.to_string(),
-                }
-            })?;
+                })?;
             operands.push(val_id);
         }
 
         let after_parens = rest[close_paren + 1..].trim();
-        let colon_idx =
-            find_top_level_colon(after_parens).ok_or_else(|| ParseError::Syntax {
-                line: line_no,
-                message: "Expected `:` type signature in `stablehlo.reduce`".to_string(),
-            })?;
+        let colon_idx = find_top_level_colon(after_parens).ok_or_else(|| ParseError::Syntax {
+            line: line_no,
+            message: "Expected `:` type signature in `stablehlo.reduce`".to_string(),
+        })?;
         let spec_part = after_parens[..colon_idx].trim();
         let ty_part = after_parens[colon_idx + 1..].trim();
 
@@ -538,12 +564,13 @@ impl MlirParser {
                 continue;
             }
             let ssa = tok.trim_start_matches('%');
-            let val_id = *self.value_map.get(ssa).ok_or_else(|| {
-                ParseError::UndefinedValue {
+            let val_id = *self
+                .value_map
+                .get(ssa)
+                .ok_or_else(|| ParseError::UndefinedValue {
                     line: line_no,
                     name: ssa.to_string(),
-                }
-            })?;
+                })?;
             operands.push(val_id);
         }
 

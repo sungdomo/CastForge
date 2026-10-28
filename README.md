@@ -1,15 +1,29 @@
 # CastForge
 
-**CastForge** is a pure-Rust AI Model IR Transformation, Optimization, Weight Surgery, Visualization, and Code Generation toolset built around an MLIR-compatible Dual-Plane Intermediate Representation (**Compute Graph + TensorStore**) with first-class **StableHLO** support.
+**CastForge** is a pure-Rust AI Model IR Transformation, Optimization, Weight Surgery,
+Visualization, and Code Generation toolset built around an MLIR-compatible Dual-Plane
+Intermediate Representation (**Compute Graph + TensorStore**) with first-class **StableHLO**
+support.
 
 ## Workspace Architecture
 
-- [`crates/castforge-ir`](crates/castforge-ir): Arena-allocated MLIR-compatible IR (`Module`, `Operation`, `Value`, `Block`, `Region`, `Type`, `Attribute`, `Location`), structural verifier, and the `TensorStore` weight plane (Linear/SLERP/TIES merging, L1 structured pruning, symmetric `i8`/`i4` quantization).
-- [`crates/castforge-dialect-stablehlo`](crates/castforge-dialect-stablehlo): Strongly-typed `stablehlo` and `func` dialect views (`StableHloOp`, `DotDimensionNumbers`, `FuncView`) and shape verifiers.
-- [`crates/castforge-mlir`](crates/castforge-mlir): Zero-C++ MLIR parser & printer supporting both **MLIR Generic Form** (`"stablehlo.add"(...)`) and **Pretty/Custom Syntax** (`stablehlo.add %0, %1 : tensor<...>`), including `!quant.uniform` quantized tensor types.
-- [`crates/castforge-passes`](crates/castforge-passes): Unified `Pass`, `PassRegistry`, and `PassManager` supporting static Rust construction, CLI pipeline strings (`-p`), direct subcommand invocation, declarative TOML config files (`--config`), and step-by-step pass tracing (`run_with_trace`).
-- [`crates/castforge-viz`](crates/castforge-viz): Computation graph exporter for **Mermaid**, **Graphviz DOT**, **JSON**, and a self-contained **Interactive HTML Pass Timeline Debugger** (`--format html`).
-- [`crates/castforge-codegen`](crates/castforge-codegen): Static memory/buffer planner (`MemoryPlan`) and multi-target source code generator for **Rust**, **C99**, and **WebGPU (WGSL)**.
+- [`crates/castforge-ir`](crates/castforge-ir): Arena-allocated MLIR-compatible IR (`Module`,
+  `Operation`, `Value`, `Block`, `Region`, `Type`, `Attribute`, `Location`), structural verifier,
+  and the `TensorStore` weight plane (Linear/SLERP/TIES merging, L1 structured pruning, symmetric
+  `i8`/`i4` quantization).
+- [`crates/castforge-dialect-stablehlo`](crates/castforge-dialect-stablehlo): Strongly-typed
+  `stablehlo` and `func` dialect views (`StableHloOp`, `DotDimensionNumbers`, `FuncView`) and
+  shape verifiers.
+- [`crates/castforge-mlir`](crates/castforge-mlir): Zero-C++ MLIR parser & printer supporting both
+  **MLIR Generic Form** (`"stablehlo.add"(...)`) and **Pretty/Custom Syntax**
+  (`stablehlo.add %0, %1 : tensor<...>`), including `!quant.uniform` quantized tensor types.
+- [`crates/castforge-passes`](crates/castforge-passes): Unified `Pass`, `PassRegistry`, and
+  `PassManager` supporting static Rust construction, CLI pipeline strings (`-p`), direct
+  subcommand invocation, declarative TOML config files (`--config`), and step-by-step pass tracing.
+- [`crates/castforge-viz`](crates/castforge-viz): Computation graph exporter for **Mermaid**,
+  **Graphviz DOT**, **JSON**, and a self-contained **Interactive HTML Pass Timeline Debugger**.
+- [`crates/castforge-codegen`](crates/castforge-codegen): Static memory/buffer planner
+  (`MemoryPlan`) and multi-target source code generator for **Rust**, **C99**, and **WebGPU WGSL**.
 - [`crates/castforge-cli`](crates/castforge-cli): The `castforge` command-line tool.
 
 ## Built-in Transformation Passes
@@ -20,15 +34,15 @@
 | `cse` | Common Subexpression Elimination (deduplicates identical pure operations) |
 | `fold-transpose` | Folds chained `stablehlo.transpose` ops and eliminates identity transposes |
 | `fold-reshape` | Folds chained `stablehlo.reshape` ops and eliminates identity reshapes |
-| `simplify-algebraic` | Algebraic identity simplification (`x+0->x`, `x*1->x`, `x*0->0`, identity `convert`/`slice`) |
+| `simplify-algebraic` | Algebraic identity simplification (`x+0->x`, `x*1->x`, `x*0->0`) |
 | `fold-constants` | Constant folding for arithmetic and shape ops on constant splat tensors |
 | `verify-shapes` | Verifies StableHLO tensor shapes and rank consistency across all ops |
-| `fuse-elementwise` | Fuses eligible elementwise producer-consumer pairs into `stablehlo.composite` |
+| `fuse-elementwise` | Fuses elementwise producer-consumer pairs into `stablehlo.composite` |
 | `ir-edit` | Surgical IR editing pass (`rename_op=from:to`, `annotate_op=op:key:val`) |
-| `merge-weights` | Merges paired constant weight tensors using `linear`, `slerp`, or `ties` (`method=slerp,t=0.5`) |
-| `prune-structured` | Structured L1 channel pruning on 2D weight matrices in `dot_general` (`sparsity=0.5`) |
-| `quantize-weights` | Post-training symmetric weight quantization (`bits=8\|4`) with `stablehlo.uniform_dequantize` |
-| `canonicalize` | Composite fixed-point pass (`fold-constants` + `simplify-algebraic` + `fold-transpose` + `fold-reshape` + `cse` + `dce`) |
+| `merge-weights` | Merges constant weight tensors (`method=linear\|slerp\|ties,t=0.5`) |
+| `prune-structured` | Structured L1 channel pruning on 2D weights (`sparsity=0.5`) |
+| `quantize-weights` | Symmetric weight quantization (`bits=8\|4`) + `uniform_dequantize` |
+| `canonicalize` | Fixed-point algebraic, constant, transpose, reshape, CSE, and DCE pass |
 
 ## Quick Start
 

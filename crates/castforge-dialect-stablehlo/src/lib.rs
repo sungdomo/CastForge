@@ -439,7 +439,7 @@ pub fn verify_stablehlo_shapes(module: &Module, op_id: OpId) -> Result<(), Strin
                 if let (Dim::Static(a), Dim::Static(b)) = (in_dim, out_dim) {
                     if a != b {
                         return Err(format!(
-                            "stablehlo.transpose dimension mismatch at axis {out_idx}: expected {a}, got {b}"
+                            "stablehlo.transpose dim mismatch at axis {out_idx}: {a} vs {b}"
                         ));
                     }
                 }
@@ -452,13 +452,11 @@ pub fn verify_stablehlo_shapes(module: &Module, op_id: OpId) -> Result<(), Strin
             let Some(out_ty) = module.values[result].ty.as_tensor() else {
                 return Ok(());
             };
-            if let (Some(in_elems), Some(out_elems)) =
-                (in_ty.num_elements(), out_ty.num_elements())
+            if let (Some(in_elems), Some(out_elems)) = (in_ty.num_elements(), out_ty.num_elements())
             {
                 if in_elems != out_elems {
                     return Err(format!(
-                        "stablehlo.reshape element count mismatch: {} ({in_elems}) vs {} ({out_elems})",
-                        in_ty, out_ty
+                        "stablehlo.reshape count mismatch: {in_ty} ({in_elems}) vs {out_ty}"
                     ));
                 }
             }

@@ -108,8 +108,7 @@ impl<'a> MlirPrinter<'a> {
             if operand_names.is_empty() {
                 write!(out, "return")?;
             } else {
-                let types_str: Vec<String> =
-                    operand_types.iter().map(|t| t.to_string()).collect();
+                let types_str: Vec<String> = operand_types.iter().map(|t| t.to_string()).collect();
                 write!(
                     out,
                     "return {} : {}",
@@ -180,11 +179,7 @@ impl<'a> MlirPrinter<'a> {
                 Some(Attribute::Int(d)) => *d,
                 _ => 0,
             };
-            write!(
-                out,
-                "stablehlo.iota dim = {} : {}",
-                dim, result_types[0]
-            )?;
+            write!(out, "stablehlo.iota dim = {} : {}", dim, result_types[0])?;
         } else if op.is_op("stablehlo", "reduce")
             && op.operands.len() == 2
             && op.results.len() == 1
@@ -206,16 +201,15 @@ impl<'a> MlirPrinter<'a> {
                         .join(", ")
                 })
                 .unwrap_or_default();
+            let lhs = &operand_names[0];
+            let init = &operand_names[1];
+            let in0 = &operand_types[0];
+            let in1 = &operand_types[1];
+            let res0 = &result_types[0];
             write!(
                 out,
-                "stablehlo.reduce({} init: {}) applies {} across dimensions = [{}] : ({}, {}) -> {}",
-                operand_names[0],
-                operand_names[1],
-                reducer,
-                dims,
-                operand_types[0],
-                operand_types[1],
-                result_types[0]
+                "stablehlo.reduce({lhs} init: {init}) applies {reducer} \
+                 across dimensions = [{dims}] : ({in0}, {in1}) -> {res0}"
             )?;
         } else if op.is_op("stablehlo", "broadcast_in_dim") && op.results.len() == 1 {
             let in_ty = &operand_types[0];

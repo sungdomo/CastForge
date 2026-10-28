@@ -149,14 +149,8 @@ pub fn quantize_symmetric_f32(
     let qmax = if bits == 4 { 7.0f32 } else { 127.0f32 };
     let qmin = if bits == 4 { -8.0f32 } else { -128.0f32 };
 
-    let max_abs = values
-        .iter()
-        .fold(0.0f32, |acc, &v| acc.max(v.abs()));
-    let scale = if max_abs < 1e-12 {
-        1.0
-    } else {
-        max_abs / qmax
-    };
+    let max_abs = values.iter().fold(0.0f32, |acc, &v| acc.max(v.abs()));
+    let scale = if max_abs < 1e-12 { 1.0 } else { max_abs / qmax };
 
     let q_data: Vec<i8> = values
         .iter()
@@ -236,9 +230,7 @@ pub enum MergeMethod {
 pub fn merge_f32_tensors(a: &[f32], b: &[f32], method: MergeMethod, t: f32) -> Vec<f32> {
     let len = a.len().min(b.len());
     match method {
-        MergeMethod::Linear => (0..len)
-            .map(|i| (1.0 - t) * a[i] + t * b[i])
-            .collect(),
+        MergeMethod::Linear => (0..len).map(|i| (1.0 - t) * a[i] + t * b[i]).collect(),
         MergeMethod::Slerp => {
             let norm_a: f32 = a.iter().take(len).map(|x| x * x).sum::<f32>().sqrt();
             let norm_b: f32 = b.iter().take(len).map(|x| x * x).sum::<f32>().sqrt();

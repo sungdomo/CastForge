@@ -233,7 +233,8 @@ pub fn render_dot(module: &Module) -> String {
     let _ = writeln!(out, "  rankdir=TB;");
     let _ = writeln!(
         out,
-        "  node [shape=box, style=\"rounded,filled\", fillcolor=\"#f8fafc\", fontname=\"monospace\"];"
+        "  node [shape=box, style=\"rounded,filled\", \
+         fillcolor=\"#f8fafc\", fontname=\"monospace\"];"
     );
     let _ = writeln!(out, "  edge [fontname=\"monospace\", fontsize=10];");
 
@@ -302,7 +303,32 @@ pub fn render_json(module: &Module) -> String {
 /// Renders a self-contained, zero-dependency interactive HTML Pass Debugger
 /// allowing users to scrub through each pass step, inspect the DAG, and diff MLIR code.
 pub fn render_timeline_html(frames: &[TimelineFrame]) -> String {
-    let frames_json = serde_json::to_string(frames).unwrap_or_else(|_| "[]".to_string());
+    let raw_json = serde_json::to_string(frames).unwrap_or_else(|_| "[]".to_string());
+    // Escape backslashes and quotes so we can wrap the JSON across <=80-col JS string lines
+    let escaped: String = raw_json
+        .chars()
+        .flat_map(|c| match c {
+            '\\' => vec!['\\', '\\'],
+            '"' => vec!['\\', '"'],
+            '\n' => vec!['\\', 'n'],
+            '\r' => vec![],
+            other => vec![other],
+        })
+        .collect();
+    let chars: Vec<char> = escaped.chars().collect();
+    let mut chunk_lines = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let mut end = (i + 72).min(chars.len());
+        while end > i && chars[end - 1] == '\\' {
+            end -= 1;
+        }
+        let s: String = chars[i..end].iter().collect();
+        chunk_lines.push(format!("  \"{s}\""));
+        i = end;
+    }
+    let frames_expr = format!("JSON.parse([\n{}\n].join(''))", chunk_lines.join(",\n"));
+
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -373,7 +399,12 @@ pub fn render_timeline_html(frames: &[TimelineFrame]) -> String {
     background: rgba(56, 189, 248, 0.12);
     border-color: var(--accent);
   }}
-  .step-title {{ font-size: 13px; font-weight: 600; display: flex; justify-content: space-between; }}
+  .step-title {{
+    font-size: 13px;
+    font-weight: 600;
+    display: flex;
+    justify-content: space-between;
+  }}
   .badges {{ display: flex; gap: 6px; margin-top: 6px; font-size: 11px; color: var(--muted); }}
   .badge {{ padding: 2px 6px; border-radius: 4px; background: #0f172a; }}
   .badge.changed {{ color: #4ade80; }}
@@ -437,7 +468,13 @@ pub fn render_timeline_html(frames: &[TimelineFrame]) -> String {
   .node-card.cat-composite {{ border-color: #10b981; background: #093527; }}
   .node-card.cat-return {{ border-color: #64748b; background: #1e293b; }}
   .node-op {{ font-family: monospace; font-weight: 700; font-size: 13px; }}
-  .node-ty {{ font-family: monospace; font-size: 11px; color: var(--muted); margin-top: 4px; word-break: break-all; }}
+  .node-ty {{
+    font-family: monospace;
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 4px;
+    word-break: break-all;
+  }}
   .edge-arrow {{ color: #64748b; font-size: 11px; font-family: monospace; margin: 2px 0; }}
 </style>
 </head>
@@ -457,11 +494,13 @@ pub fn render_timeline_html(frames: &[TimelineFrame]) -> String {
     <div class="pane-header">MLIR IR Snapshot</div>
     <pre id="mlirCode"></pre>
     <div class="pane-header">Selected Operation Inspector</div>
-    <div class="inspector" id="inspector">Click any node in the graph to inspect its tensor types and attributes.</div>
+    <div class="inspector" id="inspector">
+      Click any node in the graph to inspect its tensor types and attributes.
+    </div>
   </div>
 </div>
 <script>
-const FRAMES = {frames_json};
+const FRAMES = {frames_expr};
 let currentIdx = FRAMES.length - 1;
 
 function selectStep(idx) {{
@@ -477,13 +516,15 @@ function renderSidebar() {{
     const div = document.createElement('div');
     div.className = 'step-item' + (idx === currentIdx ? ' active' : '');
     div.onclick = () => selectStep(idx);
+    const statusCls = f.changed ? 'changed' : '';
+    const statusTxt = f.changed ? 'CHANGED' : 'NO-OP';
     div.innerHTML = `
       <div class="step-title">
         <span>#${{f.step_index}} ${{f.pass_name}}</span>
         <span>${{f.graph.nodes.length}} nodes</span>
       </div>
       <div class="badges">
-        <span class="badge ${{f.changed ? 'changed' : ''}}">${{f.changed ? 'CHANGED' : 'NO-OP'}}</span>
+        <span class="badge ${{statusCls}}">${{statusTxt}}</span>
         <span class="badge">-${{f.ops_removed}}</span>
         <span class="badge">~${{f.ops_modified}}</span>
         <span class="badge">+${{f.ops_created}}</span>
@@ -495,7 +536,9 @@ function renderSidebar() {{
 
 function renderMain() {{
   const f = FRAMES[currentIdx];
-  document.getElementById('stepIndicator').textContent = `Step ${{f.step_index}} / ${{FRAMES.length - 1}}: ${{f.pass_name}}`;
+  const total = FRAMES.length - 1;
+  const ind = document.getElementById('stepIndicator');
+  ind.textContent = `Step ${{f.step_index}} / ${{total}}: ${{f.pass_name}}`;
   document.getElementById('mlirCode').textContent = f.mlir_text;
 
   const canvas = document.getElementById('canvasPane');
@@ -503,7 +546,9 @@ function renderMain() {{
   f.graph.nodes.forEach((n, i) => {{
     if (i > 0) {{
       const incoming = f.graph.edges.filter(e => e.to === n.id);
-      const edgeLabel = incoming.map(e => (e.ssa_name ? '%' + e.ssa_name + ' : ' : '') + e.tensor_type).join(' | ');
+      const edgeLabel = incoming
+        .map(e => (e.ssa_name ? '%' + e.ssa_name + ' : ' : '') + e.tensor_type)
+        .join(' | ');
       const arrow = document.createElement('div');
       arrow.className = 'edge-arrow';
       arrow.textContent = '↓ ' + edgeLabel;
@@ -516,11 +561,16 @@ function renderMain() {{
       <div class="node-ty">${{n.result_type}}</div>
     `;
     card.onclick = () => {{
-      const attrs = Object.entries(n.attributes).map(([k, v]) => `<div><b>${{k}}</b>: <code>${{v}}</code></div>`).join('');
+      const attrs = Object.entries(n.attributes)
+        .map(([k, v]) => `<div><b>${{k}}</b>: <code>${{v}}</code></div>`)
+        .join('');
+      const fallback = '<div style="color:var(--muted)">No attributes</div>';
       document.getElementById('inspector').innerHTML = `
-        <div style="margin-bottom:6px;"><b>Op:</b> <code>${{n.op_name}}</code> (${{n.category}})</div>
+        <div style="margin-bottom:6px;">
+          <b>Op:</b> <code>${{n.op_name}}</code> (${{n.category}})
+        </div>
         <div style="margin-bottom:6px;"><b>Result Type:</b> <code>${{n.result_type}}</code></div>
-        ${{attrs || '<div style="color:var(--muted)">No attributes</div>'}}
+        ${{attrs || fallback}}
       `;
     }};
     canvas.appendChild(card);
