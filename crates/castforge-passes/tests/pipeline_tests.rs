@@ -166,3 +166,62 @@ fn test_run_with_trace_captures_every_pass_step() {
     assert_eq!(steps[1].label, "fold-transpose");
     assert_eq!(steps[5].label, "fuse-elementwise");
 }
+
+#[test]
+fn test_mlir_general_passes_inliner_symbol_dce_sccp_toposort_and_debuginfo() {
+    let mlir = r#"
+module @general_passes {
+  func.func private @helper(%a: tensor<4x8xf32>, %b: tensor<4x8xf32>) -> tensor<4x8xf32> {
+    %sum = stablehlo.add %a, %b : tensor<4x8xf32> loc("helper_add")
+    return %sum : tensor<4x8xf32>
+  }
+
+  func.func private @unused_fn(%x: tensor<4x8xf32>) -> tensor<4x8xf32> {
+    return %x : tensor<4x8xf32>
+  }
+
+  func.func @main(%arg0: tensor<4x8xf32>, %bias: tensor<4x8xf32>) -> tensor<4x8xf32> {
+    %call_res = func.call @helper(%arg0, %bias)
+      : (tensor<4x8xf32>, tensor<4x8xf32>) -> tensor<4x8xf32> loc("call_op")
+    %c10 = stablehlo.constant dense<10.0> : tensor<4x8xf32>
+    %c5 = stablehlo.constant dense<5.0> : tensor<4x8xf32>
+    %cmp = stablehlo.compare %c10, %c5, GT
+      : (tensor<4x8xf32>, tensor<4x8xf32>) -> tensor<4x8xi1>
+    %sel = stablehlo.select %cmp, %call_res, %arg0
+      : (tensor<4x8xi1>, tensor<4x8xf32>, tensor<4x8xf32>) -> tensor<4x8xf32>
+    return %sel : tensor<4x8xf32>
+  }
+}
+"#;
+
+    let registry = PassRegistry::with_builtin_passes();
+    let mut module = parse_mlir(mlir).expect("parse failed");
+    assert_eq!(module.functions().len(), 3);
+
+    let mut pm = PassManager::from_pipeline_str(
+        &registry,
+        "inliner,symbol-dce,sccp,topological-sort,strip-debuginfo,print-op-stats",
+    )
+    .expect("pipeline build failed");
+
+    pm.run(&mut module).expect("pipeline execution failed");
+
+    // Both private functions (@helper and @unused_fn) should be eliminated by symbol-dce!
+    assert_eq!(module.functions().len(), 1);
+
+    let printed = print_mlir_with_options(
+        &module,
+        PrintOptions {
+            generic_form: false,
+            print_locations: true,
+        },
+    );
+    // func.call was inlined into stablehlo.add
+    assert!(!printed.contains("func.call"));
+    assert!(printed.contains("stablehlo.add"));
+    // SCCP folded compare(10 > 5) -> true and select(true, %call_res, %arg0) -> %call_res
+    assert!(!printed.contains("stablehlo.compare"));
+    assert!(!printed.contains("stablehlo.select"));
+    // strip-debuginfo reset all named locations to loc(unknown)
+    assert!(!printed.contains("helper_add"));
+}

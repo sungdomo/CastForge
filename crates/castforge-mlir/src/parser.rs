@@ -112,6 +112,8 @@ impl MlirParser {
         line_no: usize,
     ) -> Result<BlockId, ParseError> {
         self.value_map.clear();
+        let after_kw = line.trim_start_matches("func.func").trim();
+        let is_private = after_kw.starts_with("private ");
         let at_idx = line.find('@').ok_or_else(|| ParseError::Syntax {
             line: line_no,
             message: "Expected `@func_name` in `func.func`".to_string(),
@@ -170,6 +172,12 @@ impl MlirParser {
 
         let mut attrs = IndexMap::new();
         attrs.insert("sym_name".to_string(), Attribute::String(sym_name));
+        if is_private {
+            attrs.insert(
+                "sym_visibility".to_string(),
+                Attribute::String("private".to_string()),
+            );
+        }
         attrs.insert(
             "function_type".to_string(),
             Attribute::Type(Type::Function {
@@ -302,6 +310,75 @@ impl MlirParser {
             return Ok(());
         }
 
+        // Special case: `func.call @callee(%a, %b) : (...) -> ...`
+        if op_name.dialect == "func" && op_name.name == "call" {
+            let colon_idx = find_top_level_colon(rest).ok_or_else(|| ParseError::Syntax {
+                line: line_no,
+                message: "Expected `:` type signature in `func.call`".to_string(),
+            })?;
+            let call_part = rest[..colon_idx].trim();
+            let ty_part = rest[colon_idx + 1..].trim();
+            let open_paren = call_part.find('(').ok_or_else(|| ParseError::Syntax {
+                line: line_no,
+                message: "Expected `(` in `func.call`".to_string(),
+            })?;
+            let callee = call_part[..open_paren]
+                .trim()
+                .trim_start_matches('@')
+                .to_string();
+            let close_paren = find_matching_delim(&call_part[open_paren + 1..], '(', ')')
+                .ok_or_else(|| ParseError::Syntax {
+                    line: line_no,
+                    message: "Unclosed `(` in `func.call`".to_string(),
+                })?
+                + open_paren
+                + 1;
+            let args_inner = &call_part[open_paren + 1..close_paren];
+            let mut operands = SmallVec::new();
+            for tok in split_top_level(args_inner, ',') {
+                let ssa = tok.trim().trim_start_matches('%');
+                if !ssa.is_empty() {
+                    let val_id =
+                        *self
+                            .value_map
+                            .get(ssa)
+                            .ok_or_else(|| ParseError::UndefinedValue {
+                                line: line_no,
+                                name: ssa.to_string(),
+                            })?;
+                    operands.push(val_id);
+                }
+            }
+            let parsed_ty = parse_type(ty_part, line_no)?;
+            let result_types = match parsed_ty {
+                Type::Function { results, .. } => results,
+                other => vec![other],
+            };
+            let named_results: Vec<(Option<String>, Type)> = result_types
+                .into_iter()
+                .enumerate()
+                .map(|(i, t)| (lhs_names.get(i).cloned(), t))
+                .collect();
+            let mut attrs = IndexMap::new();
+            attrs.insert("callee".to_string(), Attribute::SymbolRef(callee));
+            let op_id = module.add_operation(
+                block,
+                op_name,
+                operands,
+                named_results,
+                attrs,
+                Vec::new(),
+                true,
+                location,
+            );
+            for (i, name) in lhs_names.into_iter().enumerate() {
+                if let Some(&val_id) = module.ops[op_id].results.get(i) {
+                    self.value_map.insert(name, val_id);
+                }
+            }
+            return Ok(());
+        }
+
         // Special case: `stablehlo.constant dense<...> : tensor<...>`
         if op_name.dialect == "stablehlo" && op_name.name == "constant" {
             let colon_idx = find_top_level_colon(rest).ok_or_else(|| ParseError::Syntax {
@@ -404,6 +481,13 @@ impl MlirParser {
                             name: ssa.trim().to_string(),
                         })?;
                 operands.push(val_id);
+            } else if op_name.name == "compare"
+                && matches!(item, "EQ" | "NE" | "LT" | "LE" | "GT" | "GE")
+            {
+                attrs.insert(
+                    "comparison_direction".to_string(),
+                    Attribute::String(item.to_string()),
+                );
             }
         }
 

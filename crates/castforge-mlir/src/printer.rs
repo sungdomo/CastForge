@@ -116,6 +116,21 @@ impl<'a> MlirPrinter<'a> {
                     types_str.join(", ")
                 )?;
             }
+        } else if op.is_op("func", "call") {
+            let callee = op
+                .attributes
+                .get("callee")
+                .and_then(|a| a.as_str())
+                .unwrap_or("callee");
+            let fn_ty = Type::Function {
+                inputs: operand_types,
+                results: result_types,
+            };
+            write!(
+                out,
+                "func.call @{callee}({}) : {fn_ty}",
+                operand_names.join(", ")
+            )?;
         } else if op.is_op("stablehlo", "constant") {
             if let Some(val_attr) = op.attributes.get("value") {
                 write!(out, "stablehlo.constant {val_attr}")?;
@@ -302,9 +317,14 @@ impl<'a> MlirPrinter<'a> {
             _ => String::new(),
         };
 
+        let vis_str = match op.attributes.get("sym_visibility").and_then(|a| a.as_str()) {
+            Some("private") => "private ",
+            _ => "",
+        };
+
         writeln!(
             out,
-            "{pad}func.func @{sym_name}({}){ret_str} {{",
+            "{pad}func.func {vis_str}@{sym_name}({}){ret_str} {{",
             arg_strs.join(", ")
         )?;
 

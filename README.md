@@ -43,6 +43,12 @@ support.
 | `prune-structured` | Structured L1 channel pruning on 2D weights (`sparsity=0.5`) |
 | `quantize-weights` | Symmetric weight quantization (`bits=8\|4`) + `uniform_dequantize` |
 | `canonicalize` | Fixed-point algebraic, constant, transpose, reshape, CSE, and DCE pass |
+| `inliner` | Inlines `func.call` operations by splicing callee bodies into caller blocks |
+| `symbol-dce` | Removes unreachable `private` `func.func` symbols from the module |
+| `sccp` | Sparse Conditional Constant Propagation (`compare`/`select` + constants) |
+| `topological-sort` | Reorders operations inside blocks to satisfy SSA def-before-use ordering |
+| `strip-debuginfo` | Strips source location metadata (`loc(...)`) from all operations |
+| `print-op-stats` | Prints operation counts, parameter sizes, and MatMul FLOP estimates |
 
 ## Quick Start
 

@@ -174,6 +174,36 @@ impl PassRegistry {
             "Composite canonicalization pass (fold-transpose + fold-reshape + cse + dce)",
             |_opts| Ok(Box::new(CanonicalizePass)),
         );
+        reg.register(
+            "inliner",
+            "Inlines func.call operations by splicing callee bodies into caller blocks",
+            |_opts| Ok(Box::new(InlinerPass)),
+        );
+        reg.register(
+            "symbol-dce",
+            "Symbol Dead Code Elimination (removes unreachable private func.func symbols)",
+            |_opts| Ok(Box::new(SymbolDcePass)),
+        );
+        reg.register(
+            "sccp",
+            "Sparse Conditional Constant Propagation (evaluates compare/select and constants)",
+            |_opts| Ok(Box::new(SccpPass)),
+        );
+        reg.register(
+            "topological-sort",
+            "Reorders operations inside blocks to satisfy SSA def-before-use ordering",
+            |_opts| Ok(Box::new(TopologicalSortPass)),
+        );
+        reg.register(
+            "strip-debuginfo",
+            "Strips source location metadata (loc(...)) from all operations in the module",
+            |_opts| Ok(Box::new(StripDebugInfoPass)),
+        );
+        reg.register(
+            "print-op-stats",
+            "Computes and prints operation counts, parameter sizes, and FLOP estimates",
+            |_opts| Ok(Box::new(PrintOpStatsPass)),
+        );
         reg
     }
 
@@ -1591,6 +1621,491 @@ impl Pass for MergeWeightsPass {
             changed: modified > 0 || removed > 0,
             ops_removed: removed,
             ops_modified: modified,
+            ops_created: 0,
+        })
+    }
+}
+
+/// 14. Function Call Inliner Pass (`inliner`)
+/// Inlines `func.call @callee(...)` operations into their caller blocks.
+pub struct InlinerPass;
+
+impl Pass for InlinerPass {
+    fn name(&self) -> &'static str {
+        "inliner"
+    }
+
+    fn description(&self) -> &'static str {
+        "Inlines func.call operations by splicing callee bodies into caller blocks"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let mut removed = 0usize;
+        let mut created = 0usize;
+
+        let mut func_map: HashMap<String, OpId> = HashMap::new();
+        for fn_op_id in module.functions() {
+            if let Some(name) = module.ops[fn_op_id]
+                .attributes
+                .get("sym_name")
+                .and_then(|a| a.as_str())
+            {
+                func_map.insert(name.to_string(), fn_op_id);
+            }
+        }
+
+        let blocks: Vec<BlockId> = module.blocks.keys().collect();
+        for block_id in blocks {
+            let ops = module.block_ops(block_id);
+            for call_op_id in ops {
+                let Some(call_op) = module.ops.get(call_op_id).cloned() else {
+                    continue;
+                };
+                if !call_op.is_op("func", "call") {
+                    continue;
+                }
+                let Some(callee_name) = call_op.attributes.get("callee").and_then(|a| a.as_str())
+                else {
+                    continue;
+                };
+                let Some(&callee_fn_id) = func_map.get(callee_name) else {
+                    continue;
+                };
+                let callee_reg = module.ops[callee_fn_id].regions[0];
+                let callee_block = module.regions[callee_reg].blocks[0];
+                if callee_block == block_id {
+                    continue;
+                }
+
+                let callee_args = module.blocks[callee_block].arguments.clone();
+                if callee_args.len() != call_op.operands.len() {
+                    continue;
+                }
+
+                let mut val_map: HashMap<ValueId, ValueId> = HashMap::new();
+                for (&arg_val, &caller_val) in callee_args.iter().zip(call_op.operands.iter()) {
+                    val_map.insert(arg_val, caller_val);
+                }
+
+                let callee_ops = module.blocks[callee_block].ops.clone();
+                let mut new_op_ids = Vec::new();
+                let mut return_values = Vec::new();
+
+                for src_op_id in callee_ops {
+                    let src_op = module.ops[src_op_id].clone();
+                    if src_op.is_op("func", "return") {
+                        for &ret_opnd in &src_op.operands {
+                            let mapped = val_map.get(&ret_opnd).copied().unwrap_or(ret_opnd);
+                            return_values.push(mapped);
+                        }
+                        continue;
+                    }
+
+                    let mapped_operands: SmallVec<[ValueId; 4]> = src_op
+                        .operands
+                        .iter()
+                        .map(|&v| val_map.get(&v).copied().unwrap_or(v))
+                        .collect();
+
+                    let res_types: Vec<(Option<String>, Type)> = src_op
+                        .results
+                        .iter()
+                        .map(|&r| {
+                            let v = &module.values[r];
+                            let inlined_name = v
+                                .ssa_name
+                                .as_ref()
+                                .map(|n| format!("inl_{callee_name}_{n}"));
+                            (inlined_name, v.ty.clone())
+                        })
+                        .collect();
+
+                    let cloned_id = module.add_operation(
+                        block_id,
+                        src_op.name.clone(),
+                        mapped_operands,
+                        res_types,
+                        src_op.attributes.clone(),
+                        Vec::new(),
+                        src_op.custom_syntax,
+                        src_op.location.clone(),
+                    );
+                    module.blocks[block_id].ops.pop();
+                    for (&old_res, &new_res) in src_op
+                        .results
+                        .iter()
+                        .zip(module.ops[cloned_id].results.iter())
+                    {
+                        val_map.insert(old_res, new_res);
+                    }
+                    new_op_ids.push(cloned_id);
+                    created += 1;
+                }
+
+                for (&call_res, &ret_val) in call_op.results.iter().zip(return_values.iter()) {
+                    module.replace_all_uses(call_res, ret_val);
+                }
+
+                if let Some(pos) = module.blocks[block_id]
+                    .ops
+                    .iter()
+                    .position(|&id| id == call_op_id)
+                {
+                    module.blocks[block_id].ops.splice(pos..pos, new_op_ids);
+                }
+                module.remove_op(block_id, call_op_id);
+                removed += 1;
+            }
+        }
+
+        Ok(PassResult {
+            pass_name: self.name().to_string(),
+            changed: removed > 0,
+            ops_removed: removed,
+            ops_modified: 0,
+            ops_created: created,
+        })
+    }
+}
+
+/// 15. Symbol Dead Code Elimination Pass (`symbol-dce`)
+/// Eliminates unreachable `private` functions from the module.
+pub struct SymbolDcePass;
+
+impl Pass for SymbolDcePass {
+    fn name(&self) -> &'static str {
+        "symbol-dce"
+    }
+
+    fn description(&self) -> &'static str {
+        "Symbol Dead Code Elimination (removes unreachable private func.func symbols)"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let mut referenced_symbols = std::collections::HashSet::new();
+        for (_, op) in &module.ops {
+            if op.is_op("func", "call") {
+                if let Some(callee) = op.attributes.get("callee").and_then(|a| a.as_str()) {
+                    referenced_symbols.insert(callee.to_string());
+                }
+            }
+            if op.is_op("stablehlo", "composite") {
+                if let Some(decomp) = op.attributes.get("decomposition").and_then(|a| a.as_str()) {
+                    referenced_symbols.insert(decomp.to_string());
+                }
+            }
+        }
+
+        let root_block = module.body_block();
+        let mut removed = 0usize;
+        for fn_op_id in module.functions() {
+            let op = &module.ops[fn_op_id];
+            let is_private =
+                op.attributes.get("sym_visibility").and_then(|a| a.as_str()) == Some("private");
+            let sym_name = op
+                .attributes
+                .get("sym_name")
+                .and_then(|a| a.as_str())
+                .unwrap_or("");
+            if is_private && !referenced_symbols.contains(sym_name) {
+                let regions = op.regions.clone();
+                for reg_id in regions {
+                    let blocks = module.regions[reg_id].blocks.clone();
+                    for blk_id in blocks {
+                        let inner_ops = module.block_ops(blk_id);
+                        for inner_op in inner_ops {
+                            module.remove_op(blk_id, inner_op);
+                        }
+                    }
+                }
+                module.remove_op(root_block, fn_op_id);
+                removed += 1;
+            }
+        }
+
+        Ok(PassResult {
+            pass_name: self.name().to_string(),
+            changed: removed > 0,
+            ops_removed: removed,
+            ops_modified: 0,
+            ops_created: 0,
+        })
+    }
+}
+
+/// 16. Sparse Conditional Constant Propagation (`sccp`)
+/// Evaluates `stablehlo.compare` on constants and folds `stablehlo.select` predicates.
+pub struct SccpPass;
+
+impl Pass for SccpPass {
+    fn name(&self) -> &'static str {
+        "sccp"
+    }
+
+    fn description(&self) -> &'static str {
+        "Sparse Conditional Constant Propagation (evaluates compare/select and constants)"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let mut modified = 0usize;
+        let mut removed = 0usize;
+
+        let fold_res = FoldConstantsPass.run(module)?;
+        modified += fold_res.ops_modified;
+        removed += fold_res.ops_removed;
+
+        let blocks: Vec<BlockId> = module.blocks.keys().collect();
+        for block_id in blocks {
+            let ops = module.block_ops(block_id);
+            for op_id in ops {
+                let Some(op) = module.ops.get(op_id) else {
+                    continue;
+                };
+                let Some(hlo) = StableHloOp::from_op(op) else {
+                    continue;
+                };
+
+                match hlo {
+                    StableHloOp::Compare {
+                        lhs,
+                        rhs,
+                        direction,
+                        result,
+                    } => {
+                        let (Some(a), Some(b)) = (
+                            FoldConstantsPass::const_splat(module, lhs),
+                            FoldConstantsPass::const_splat(module, rhs),
+                        ) else {
+                            continue;
+                        };
+                        let cond = match direction.as_str() {
+                            "EQ" => (a - b).abs() < 1e-7,
+                            "NE" => (a - b).abs() >= 1e-7,
+                            "LT" => a < b,
+                            "LE" => a <= b,
+                            "GT" => a > b,
+                            "GE" => a >= b,
+                            _ => continue,
+                        };
+                        let Some(res_ty) = module.values[result].ty.as_tensor().cloned() else {
+                            continue;
+                        };
+                        let lit = if cond { "1" } else { "0" };
+                        let mut attrs = IndexMap::new();
+                        attrs.insert(
+                            "value".to_string(),
+                            Attribute::DenseElements {
+                                ty: res_ty,
+                                raw_literal: lit.to_string(),
+                            },
+                        );
+                        let op_mut = &mut module.ops[op_id];
+                        op_mut.name = OpName::new("stablehlo", "constant");
+                        op_mut.operands.clear();
+                        op_mut.attributes = attrs;
+                        modified += 1;
+                    }
+                    StableHloOp::Select {
+                        pred,
+                        on_true,
+                        on_false,
+                        result,
+                    } => {
+                        let chosen = if on_true == on_false {
+                            Some(on_true)
+                        } else {
+                            FoldConstantsPass::const_splat(module, pred)
+                                .map(|v| if v != 0.0 { on_true } else { on_false })
+                        };
+                        if let Some(winner) = chosen {
+                            module.replace_all_uses(result, winner);
+                            module.remove_op(block_id, op_id);
+                            removed += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if modified > 0 || removed > 0 {
+            let dce_res = DeadCodeEliminationPass.run(module)?;
+            removed += dce_res.ops_removed;
+        }
+
+        Ok(PassResult {
+            pass_name: self.name().to_string(),
+            changed: modified > 0 || removed > 0,
+            ops_removed: removed,
+            ops_modified: modified,
+            ops_created: 0,
+        })
+    }
+}
+
+/// 17. Topological Sort Pass (`topological-sort`)
+/// Reorders operations inside each block so all SSA definitions precede their uses.
+pub struct TopologicalSortPass;
+
+impl Pass for TopologicalSortPass {
+    fn name(&self) -> &'static str {
+        "topological-sort"
+    }
+
+    fn description(&self) -> &'static str {
+        "Reorders operations inside blocks to satisfy SSA def-before-use ordering"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let mut modified = 0usize;
+        let blocks: Vec<BlockId> = module.blocks.keys().collect();
+
+        for block_id in blocks {
+            let orig_ops = module.block_ops(block_id);
+            if orig_ops.len() <= 1 {
+                continue;
+            }
+            let block_op_set: std::collections::HashSet<OpId> = orig_ops.iter().copied().collect();
+            let mut visited: std::collections::HashSet<OpId> = std::collections::HashSet::new();
+            let mut sorted: Vec<OpId> = Vec::with_capacity(orig_ops.len());
+            let mut terminators: Vec<OpId> = Vec::new();
+
+            fn visit(
+                op_id: OpId,
+                module: &Module,
+                block_op_set: &std::collections::HashSet<OpId>,
+                visited: &mut std::collections::HashSet<OpId>,
+                sorted: &mut Vec<OpId>,
+            ) {
+                if !visited.insert(op_id) {
+                    return;
+                }
+                if let Some(op) = module.ops.get(op_id) {
+                    for &operand in &op.operands {
+                        if let ValueDef::OpResult { op: prod_op, .. } = module.values[operand].def {
+                            if block_op_set.contains(&prod_op) {
+                                visit(prod_op, module, block_op_set, visited, sorted);
+                            }
+                        }
+                    }
+                }
+                sorted.push(op_id);
+            }
+
+            for &op_id in &orig_ops {
+                let is_term = module
+                    .ops
+                    .get(op_id)
+                    .is_some_and(|o| o.is_op("func", "return") || o.is_op("stablehlo", "return"));
+                if is_term {
+                    terminators.push(op_id);
+                } else {
+                    visit(op_id, module, &block_op_set, &mut visited, &mut sorted);
+                }
+            }
+            sorted.extend(terminators);
+
+            if sorted != orig_ops {
+                module.blocks[block_id].ops = sorted;
+                modified += 1;
+            }
+        }
+
+        Ok(PassResult {
+            pass_name: self.name().to_string(),
+            changed: modified > 0,
+            ops_removed: 0,
+            ops_modified: modified,
+            ops_created: 0,
+        })
+    }
+}
+
+/// 18. Strip DebugInfo Pass (`strip-debuginfo`)
+/// Resets all operation `Location` annotations to `Location::Unknown`.
+pub struct StripDebugInfoPass;
+
+impl Pass for StripDebugInfoPass {
+    fn name(&self) -> &'static str {
+        "strip-debuginfo"
+    }
+
+    fn description(&self) -> &'static str {
+        "Strips source location metadata (loc(...)) from all operations in the module"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let mut modified = 0usize;
+        for (_, op) in &mut module.ops {
+            if op.location != Location::Unknown {
+                op.location = Location::Unknown;
+                modified += 1;
+            }
+        }
+        Ok(PassResult {
+            pass_name: self.name().to_string(),
+            changed: modified > 0,
+            ops_removed: 0,
+            ops_modified: modified,
+            ops_created: 0,
+        })
+    }
+}
+
+/// 19. Print Op Stats Pass (`print-op-stats`)
+/// Computes operation frequency, parameter counts, and FLOP estimates across the module.
+pub struct PrintOpStatsPass;
+
+impl Pass for PrintOpStatsPass {
+    fn name(&self) -> &'static str {
+        "print-op-stats"
+    }
+
+    fn description(&self) -> &'static str {
+        "Computes and prints operation counts, parameter sizes, and FLOP estimates"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let mut counts: IndexMap<String, usize> = IndexMap::new();
+        let mut total_params = 0i64;
+        let mut est_flops = 0i64;
+
+        for (_, op) in &module.ops {
+            *counts.entry(op.name.to_string()).or_insert(0) += 1;
+            if op.is_op("stablehlo", "constant") {
+                if let Some(&res) = op.results.first() {
+                    if let Some(t) = module.values[res].ty.as_tensor() {
+                        total_params += t.num_elements().unwrap_or(0);
+                    }
+                }
+            } else if op.is_op("stablehlo", "dot_general") && op.operands.len() == 2 {
+                let lhs_ty = module.values[op.operands[0]].ty.as_tensor();
+                let rhs_ty = module.values[op.operands[1]].ty.as_tensor();
+                if let (Some(l), Some(r)) = (lhs_ty, rhs_ty) {
+                    if let (Some(Dim::Static(m)), Some(Dim::Static(k)), Some(Dim::Static(n))) =
+                        (l.shape.first(), l.shape.get(1), r.shape.get(1))
+                    {
+                        est_flops += 2 * m * k * n;
+                    }
+                }
+            }
+        }
+
+        eprintln!(
+            "[castforge:stats] Total Ops: {} | Constant Params: {} | Est. MatMul FLOPs: {}",
+            module.ops.len(),
+            total_params,
+            est_flops
+        );
+        for (op_name, count) in &counts {
+            eprintln!("  - {:<28} : {}", op_name, count);
+        }
+
+        Ok(PassResult {
+            pass_name: self.name().to_string(),
+            changed: false,
+            ops_removed: 0,
+            ops_modified: 0,
             ops_created: 0,
         })
     }
