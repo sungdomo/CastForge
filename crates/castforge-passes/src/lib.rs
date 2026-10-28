@@ -1,19 +1,5 @@
-pub mod cleanup;
-pub mod constants;
-pub mod fusion_inliner;
-pub mod shape_algebraic;
-pub mod surgery;
-
-pub use cleanup::{
-    CanonicalizePass, CommonSubexpressionEliminationPass, DeadCodeEliminationPass,
-    PrintOpStatsPass, StripDebugInfoPass, SymbolDcePass, TopologicalSortPass,
-};
-pub use constants::{FoldConstantsPass, SccpPass};
-pub use fusion_inliner::{FuseElementwisePass, InlinerPass, IrEditPass};
-pub use shape_algebraic::{
-    FoldReshapePass, FoldTransposePass, SimplifyAlgebraicPass, VerifyShapesPass,
-};
-pub use surgery::{MergeWeightsPass, QuantizeWeightsPass, StructuredPruningPass};
+pub mod passes;
+pub use passes::*;
 
 use anyhow::{Result, anyhow};
 use castforge_ir::{MergeMethod, Module};
