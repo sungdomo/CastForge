@@ -3,7 +3,6 @@ use anyhow::Result;
 use castforge_dialect_stablehlo::StableHloOp;
 use castforge_ir::{
     Attribute, BlockId, Module, OpName, ValueDef, ValueId, format_dense_f32_literal,
-    parse_dense_f32_literal,
 };
 use indexmap::IndexMap;
 
@@ -25,7 +24,20 @@ impl FoldConstantsPass {
         if let ValueDef::OpResult { op, .. } = module.values[val_id].def {
             let op_node = module.ops.get(op)?;
             if op_node.is_op("stablehlo", "constant") {
-                return op_node.attributes.get("value")?.as_splat_f64();
+                let attr = op_node.attributes.get("value")?;
+                if let Some(v) = attr.as_splat_f64() {
+                    return Some(v);
+                }
+                let n = module.values[val_id]
+                    .ty
+                    .as_tensor()
+                    .and_then(|t| t.num_elements())
+                    .unwrap_or(1) as usize;
+                let vals = module.tensor_store.resolve_f32_attr(attr, n)?;
+                let first = *vals.first()?;
+                if vals.iter().all(|&x| (x - first).abs() < 1e-7) {
+                    return Some(first as f64);
+                }
             }
         }
         None
@@ -40,11 +52,8 @@ impl FoldConstantsPass {
                     .as_tensor()
                     .and_then(|t| t.num_elements())
                     .unwrap_or(1) as usize;
-                if let Some(Attribute::DenseElements { raw_literal, .. }) =
-                    op_node.attributes.get("value")
-                {
-                    return parse_dense_f32_literal(raw_literal, n);
-                }
+                let attr = op_node.attributes.get("value")?;
+                return module.tensor_store.resolve_f32_attr(attr, n);
             }
         }
         None

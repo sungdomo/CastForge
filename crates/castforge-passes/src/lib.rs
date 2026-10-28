@@ -210,6 +210,21 @@ impl PassRegistry {
             "Computes and prints operation counts, parameter sizes, and FLOP estimates",
             |_opts| Ok(Box::new(PrintOpStatsPass)),
         );
+        reg.register(
+            "externalize-weights",
+            "Converts inline dense<...> weights to dense_resource<key> in TensorStore",
+            |opts| {
+                let min_elements = opts
+                    .get("min_elements")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(2);
+                let inline = opts.get("inline").is_some_and(|v| v == "true");
+                Ok(Box::new(ExternalizeWeightsPass {
+                    min_elements,
+                    inline,
+                }))
+            },
+        );
         reg
     }
 

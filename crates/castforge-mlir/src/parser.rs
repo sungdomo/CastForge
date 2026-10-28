@@ -320,6 +320,14 @@ impl MlirParser {
                     ty: tensor_ty,
                     raw_literal: inner.to_string(),
                 }
+            } else if let Some(key) = literal_part
+                .strip_prefix("dense_resource<")
+                .and_then(|s| s.strip_suffix('>'))
+            {
+                Attribute::TensorRef {
+                    key: key.trim().to_string(),
+                    ty: tensor_ty,
+                }
             } else {
                 Attribute::Opaque(literal_part.to_string())
             };

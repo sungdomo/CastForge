@@ -2,7 +2,7 @@ use crate::{Pass, PassResult};
 use anyhow::Result;
 use castforge_ir::{
     Attribute, BlockId, DType, Location, Module, OpName, TensorBacking, TensorEntry, TensorType,
-    Type, format_dense_i8_literal, parse_dense_f32_literal, quantize_symmetric_f32,
+    Type, format_dense_i8_literal, quantize_symmetric_f32,
 };
 use indexmap::IndexMap;
 use smallvec::SmallVec;
@@ -60,12 +60,15 @@ impl Pass for QuantizeWeightsPass {
                     continue;
                 }
 
-                let Some(Attribute::DenseElements { raw_literal, .. }) =
-                    op.attributes.get("value").cloned()
-                else {
+                let Some(val_attr) = op.attributes.get("value").cloned() else {
                     continue;
                 };
-                let Some(f32_vals) = parse_dense_f32_literal(&raw_literal, num_elems) else {
+                let resource_key = match &val_attr {
+                    Attribute::TensorRef { key, .. } => Some(key.clone()),
+                    _ => None,
+                };
+                let Some(f32_vals) = module.tensor_store.resolve_f32_attr(&val_attr, num_elems)
+                else {
                     continue;
                 };
 
@@ -79,10 +82,12 @@ impl Pass for QuantizeWeightsPass {
                 let q_literal = format_dense_i8_literal(&q_data, &tensor_ty.shape);
 
                 // Update TensorStore entry
-                let store_key = module.values[const_val_id]
-                    .ssa_name
-                    .clone()
-                    .unwrap_or_else(|| format!("q_weight_{modified}"));
+                let store_key = resource_key.clone().unwrap_or_else(|| {
+                    module.values[const_val_id]
+                        .ssa_name
+                        .clone()
+                        .unwrap_or_else(|| format!("q_weight_{modified}"))
+                });
                 module.tensor_store.insert(TensorEntry {
                     name: store_key,
                     ty: q_tensor_ty.clone(),
@@ -96,13 +101,20 @@ impl Pass for QuantizeWeightsPass {
                 // Update the constant op to produce the quantized tensor type
                 let q_ty = Type::Tensor(q_tensor_ty.clone());
                 module.values[const_val_id].ty = q_ty;
-                module.ops[op_id].attributes.insert(
-                    "value".to_string(),
+                let updated_attr = if let Some(key) = resource_key {
+                    Attribute::TensorRef {
+                        key,
+                        ty: q_tensor_ty,
+                    }
+                } else {
                     Attribute::DenseElements {
                         ty: q_tensor_ty,
                         raw_literal: q_literal,
-                    },
-                );
+                    }
+                };
+                module.ops[op_id]
+                    .attributes
+                    .insert("value".to_string(), updated_attr);
                 modified += 1;
 
                 // Create `stablehlo.uniform_dequantize` op right after the constant op

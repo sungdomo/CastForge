@@ -3,7 +3,7 @@ use anyhow::Result;
 use castforge_dialect_stablehlo::StableHloOp;
 use castforge_ir::{
     Attribute, BlockId, Dim, Module, TensorEntry, TensorType, Type, ValueDef,
-    format_dense_f32_literal, parse_dense_f32_literal, prune_2d_columns_by_l1,
+    format_dense_f32_literal, prune_2d_columns_by_l1,
 };
 
 /// 12. Structured Channel Pruning Pass (`prune-structured`)
@@ -84,12 +84,15 @@ impl Pass for StructuredPruningPass {
                     continue;
                 }
 
-                let Some(Attribute::DenseElements { raw_literal, .. }) =
-                    weight_op.attributes.get("value").cloned()
-                else {
+                let Some(val_attr) = weight_op.attributes.get("value").cloned() else {
                     continue;
                 };
-                let Some(f32_vals) = parse_dense_f32_literal(&raw_literal, rows * cols) else {
+                let resource_key = match &val_attr {
+                    Attribute::TensorRef { key, .. } => Some(key.clone()),
+                    _ => None,
+                };
+                let Some(f32_vals) = module.tensor_store.resolve_f32_attr(&val_attr, rows * cols)
+                else {
                     continue;
                 };
 
@@ -103,19 +106,29 @@ impl Pass for StructuredPruningPass {
                 };
                 let new_literal = format_dense_f32_literal(&pruned_vals, &new_w_ty.shape);
 
-                // Update weight constant type, literal, and TensorStore
+                let store_key = resource_key.clone().unwrap_or_else(|| {
+                    module.values[rhs]
+                        .ssa_name
+                        .clone()
+                        .unwrap_or_else(|| "pruned_weight".to_string())
+                });
+
+                // Update weight constant type, literal/resource, and TensorStore
                 module.values[rhs].ty = Type::Tensor(new_w_ty.clone());
-                module.ops[weight_op_id].attributes.insert(
-                    "value".to_string(),
+                let updated_attr = if let Some(key) = resource_key {
+                    Attribute::TensorRef {
+                        key,
+                        ty: new_w_ty.clone(),
+                    }
+                } else {
                     Attribute::DenseElements {
                         ty: new_w_ty.clone(),
                         raw_literal: new_literal,
-                    },
-                );
-                let store_key = module.values[rhs]
-                    .ssa_name
-                    .clone()
-                    .unwrap_or_else(|| "pruned_weight".to_string());
+                    }
+                };
+                module.ops[weight_op_id]
+                    .attributes
+                    .insert("value".to_string(), updated_attr);
                 module
                     .tensor_store
                     .insert(TensorEntry::from_f32(store_key, new_w_ty, pruned_vals));

@@ -1,7 +1,7 @@
 use crate::{build_memory_plan, sanitize_ident, tensor_len, tensor_shape_dims, value_ident};
 use anyhow::{Result, anyhow};
 use castforge_dialect_stablehlo::StableHloOp;
-use castforge_ir::{Attribute, DType, Module, OpId, ValueId, parse_dense_f32_literal};
+use castforge_ir::{DType, Module, OpId, ValueId};
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -91,21 +91,22 @@ fn emit_rust_func(module: &Module, fn_op_id: OpId, out: &mut String) -> Result<(
                 .ty
                 .as_tensor()
                 .ok_or_else(|| anyhow!("constant without tensor type"))?;
-            let raw_lit = match op.attributes.get("value") {
-                Some(Attribute::DenseElements { raw_literal, .. }) => raw_literal.as_str(),
-                _ => "0.0",
-            };
-            let vals =
-                parse_dense_f32_literal(raw_lit, res_len).unwrap_or_else(|| vec![0.0; res_len]);
+            let val_attr = op.attributes.get("value");
 
             if let DType::QuantUniform { .. } = &t_ty.dtype {
-                let elems: Vec<String> = vals.iter().map(|&v| format!("{}", v as i8)).collect();
+                let q_vals = val_attr
+                    .and_then(|a| module.tensor_store.resolve_i8_attr(a, res_len))
+                    .unwrap_or_else(|| vec![0; res_len]);
+                let elems: Vec<String> = q_vals.iter().map(|v| v.to_string()).collect();
                 writeln!(
                     out,
                     "    let {res_name}: [i8; {res_len}] = [{}];",
                     elems.join(", ")
                 )?;
             } else {
+                let vals = val_attr
+                    .and_then(|a| module.tensor_store.resolve_f32_attr(a, res_len))
+                    .unwrap_or_else(|| vec![0.0; res_len]);
                 let elems: Vec<String> = vals.iter().map(|v| format!("{v:?}_f32")).collect();
                 writeln!(
                     out,

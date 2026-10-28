@@ -2,7 +2,7 @@ use crate::{DeadCodeEliminationPass, Pass, PassResult};
 use anyhow::Result;
 use castforge_ir::{
     Attribute, BlockId, MergeMethod, Module, OpName, TensorEntry, ValueDef,
-    format_dense_f32_literal, merge_f32_tensors, parse_dense_f32_literal,
+    format_dense_f32_literal, merge_f32_tensors,
 };
 use indexmap::IndexMap;
 
@@ -72,24 +72,19 @@ impl Pass for MergeWeightsPass {
                 };
                 let num_elems = tensor_ty.num_elements().unwrap_or(1) as usize;
 
-                let (
-                    Some(Attribute::DenseElements {
-                        raw_literal: lit_a, ..
-                    }),
-                    Some(Attribute::DenseElements {
-                        raw_literal: lit_b, ..
-                    }),
-                ) = (
+                let (Some(attr_a), Some(attr_b)) = (
                     lhs_op.attributes.get("value").cloned(),
                     rhs_op.attributes.get("value").cloned(),
-                )
-                else {
+                ) else {
                     continue;
                 };
 
+                let is_resource = matches!(attr_a, Attribute::TensorRef { .. })
+                    || matches!(attr_b, Attribute::TensorRef { .. });
+
                 let (Some(vals_a), Some(vals_b)) = (
-                    parse_dense_f32_literal(&lit_a, num_elems),
-                    parse_dense_f32_literal(&lit_b, num_elems),
+                    module.tensor_store.resolve_f32_attr(&attr_a, num_elems),
+                    module.tensor_store.resolve_f32_attr(&attr_b, num_elems),
                 ) else {
                     continue;
                 };
@@ -102,19 +97,24 @@ impl Pass for MergeWeightsPass {
                     .clone()
                     .unwrap_or_else(|| "merged_weight".to_string());
                 module.tensor_store.insert(TensorEntry::from_f32(
-                    store_key,
+                    store_key.clone(),
                     tensor_ty.clone(),
                     merged,
                 ));
 
                 let mut attrs = IndexMap::new();
-                attrs.insert(
-                    "value".to_string(),
+                let new_val_attr = if is_resource {
+                    Attribute::TensorRef {
+                        key: store_key,
+                        ty: tensor_ty,
+                    }
+                } else {
                     Attribute::DenseElements {
                         ty: tensor_ty,
                         raw_literal: merged_lit,
-                    },
-                );
+                    }
+                };
+                attrs.insert("value".to_string(), new_val_attr);
 
                 let op_mut = &mut module.ops[op_id];
                 op_mut.name = OpName::new("stablehlo", "constant");

@@ -1,4 +1,5 @@
 pub mod attr;
+pub mod safetensors_io;
 pub mod tensor_store;
 pub mod types;
 pub mod verify;

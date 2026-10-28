@@ -39,6 +39,14 @@ enum Commands {
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
 
+        /// Optional input `.safetensors` file to load into TensorStore before passes
+        #[arg(short = 'w', long = "weights")]
+        weights: Option<PathBuf>,
+
+        /// Optional output `.safetensors` file to save TensorStore weights after passes
+        #[arg(long = "save-weights")]
+        save_weights: Option<PathBuf>,
+
         /// Emit canonical MLIR Generic Form ("dialect.op"(...) : ...)
         #[arg(long)]
         generic: bool,
@@ -89,6 +97,10 @@ enum Commands {
         #[arg(short = 'p', long = "passes")]
         passes: Option<String>,
 
+        /// Optional input `.safetensors` file to load into TensorStore before passes/codegen
+        #[arg(short = 'w', long = "weights")]
+        weights: Option<PathBuf>,
+
         /// Optional output file path
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
@@ -113,12 +125,27 @@ fn main() -> Result<()> {
             passes,
             config,
             output,
+            weights,
+            save_weights,
             generic,
             stats,
         } => {
             let src = fs::read_to_string(&input)
                 .with_context(|| format!("Failed to read {}", input.display()))?;
             let mut module = parse_mlir(&src)?;
+            if let Some(w_path) = weights {
+                let count = module
+                    .tensor_store
+                    .load_safetensors_file(&w_path)
+                    .with_context(|| format!("Failed to load weights {}", w_path.display()))?;
+                if stats {
+                    eprintln!(
+                        "[castforge:weights] Loaded {} tensors from {}",
+                        count,
+                        w_path.display()
+                    );
+                }
+            }
 
             let mut pm = if let Some(cfg_path) = config {
                 let toml_str = fs::read_to_string(&cfg_path)
@@ -137,6 +164,20 @@ fn main() -> Result<()> {
                         "[castforge:pass] {:<18} | changed: {:<5} | \
                          removed: {:<3} | modified: {:<3} | created: {:<3}",
                         r.pass_name, r.changed, r.ops_removed, r.ops_modified, r.ops_created
+                    );
+                }
+            }
+
+            if let Some(sw_path) = save_weights {
+                module
+                    .tensor_store
+                    .save_safetensors_file(&sw_path)
+                    .with_context(|| format!("Failed to save weights {}", sw_path.display()))?;
+                if stats {
+                    eprintln!(
+                        "[castforge:weights] Saved {} tensors to {}",
+                        module.tensor_store.len(),
+                        sw_path.display()
                     );
                 }
             }
@@ -241,11 +282,18 @@ fn main() -> Result<()> {
             input,
             target,
             passes,
+            weights,
             output,
         } => {
             let src = fs::read_to_string(&input)
                 .with_context(|| format!("Failed to read {}", input.display()))?;
             let mut module = parse_mlir(&src)?;
+            if let Some(w_path) = weights {
+                module
+                    .tensor_store
+                    .load_safetensors_file(&w_path)
+                    .with_context(|| format!("Failed to load weights {}", w_path.display()))?;
+            }
 
             if let Some(spec) = passes {
                 let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;

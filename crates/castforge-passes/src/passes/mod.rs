@@ -1,6 +1,7 @@
 pub mod canonicalize;
 pub mod cse;
 pub mod dce;
+pub mod externalize_weights;
 pub mod fold_constants;
 pub mod fold_reshape;
 pub mod fold_transpose;
@@ -21,6 +22,7 @@ pub mod verify_shapes;
 pub use canonicalize::CanonicalizePass;
 pub use cse::CommonSubexpressionEliminationPass;
 pub use dce::DeadCodeEliminationPass;
+pub use externalize_weights::ExternalizeWeightsPass;
 pub use fold_constants::FoldConstantsPass;
 pub use fold_reshape::FoldReshapePass;
 pub use fold_transpose::FoldTransposePass;

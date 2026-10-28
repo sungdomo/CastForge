@@ -280,7 +280,7 @@ pub fn merge_f32_tensors(a: &[f32], b: &[f32], method: MergeMethod, t: f32) -> V
 /// Holds weight buffers or lazy external file references alongside the SSA Compute Graph.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TensorStore {
-    entries: IndexMap<String, TensorEntry>,
+    pub(crate) entries: IndexMap<String, TensorEntry>,
 }
 
 impl TensorStore {

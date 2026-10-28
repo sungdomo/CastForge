@@ -1,6 +1,6 @@
 use crate::{build_memory_plan, sanitize_ident, tensor_len, tensor_shape_dims, value_ident};
 use anyhow::Result;
-use castforge_ir::{Attribute, Module, ValueId, parse_dense_f32_literal};
+use castforge_ir::{Module, ValueId};
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -64,12 +64,11 @@ pub fn emit_c_module(module: &Module) -> Result<String> {
             let res_len = tensor_len(module, res_val);
 
             if op.is_op("stablehlo", "constant") {
-                let raw_lit = match op.attributes.get("value") {
-                    Some(Attribute::DenseElements { raw_literal, .. }) => raw_literal.as_str(),
-                    _ => "0.0",
-                };
-                let vals =
-                    parse_dense_f32_literal(raw_lit, res_len).unwrap_or_else(|| vec![0.0; res_len]);
+                let vals = op
+                    .attributes
+                    .get("value")
+                    .and_then(|a| module.tensor_store.resolve_f32_attr(a, res_len))
+                    .unwrap_or_else(|| vec![0.0; res_len]);
                 let elems: Vec<String> = vals.iter().map(|v| format!("{v:.6}f")).collect();
                 writeln!(
                     out,

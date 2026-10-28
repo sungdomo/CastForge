@@ -150,6 +150,39 @@ pub(crate) fn parse_attribute_value(val_str: &str) -> Attribute {
     } else if val_str.starts_with('[') && val_str.ends_with(']') {
         let nums = parse_int_list(val_str);
         Attribute::DenseIntArray(nums)
+    } else if let Some(rest) = val_str.strip_prefix("dense_resource<") {
+        if let Some((key_part, ty_part)) = rest.split_once('>') {
+            let ty_str = ty_part.trim().trim_start_matches(':').trim();
+            let ty = parse_type(ty_str, 0)
+                .ok()
+                .and_then(|t| t.as_tensor().cloned())
+                .unwrap_or_else(|| TensorType::new(Vec::new(), DType::F32));
+            return Attribute::TensorRef {
+                key: key_part.trim().to_string(),
+                ty,
+            };
+        }
+        Attribute::Opaque(val_str.to_string())
+    } else if let Some(rest) = val_str.strip_prefix("dense<") {
+        if let Some(colon_idx) = find_top_level_colon(val_str) {
+            let lit_part = val_str[..colon_idx].trim();
+            let ty_part = val_str[colon_idx + 1..].trim();
+            if let Some(inner) = lit_part
+                .strip_prefix("dense<")
+                .and_then(|s| s.strip_suffix('>'))
+            {
+                let ty = parse_type(ty_part, 0)
+                    .ok()
+                    .and_then(|t| t.as_tensor().cloned())
+                    .unwrap_or_else(|| TensorType::new(Vec::new(), DType::F32));
+                return Attribute::DenseElements {
+                    ty,
+                    raw_literal: inner.to_string(),
+                };
+            }
+        }
+        let _ = rest;
+        Attribute::Opaque(val_str.to_string())
     } else if let Ok(i) = val_str.parse::<i64>() {
         Attribute::Int(i)
     } else if let Ok(f) = val_str.parse::<f64>() {
