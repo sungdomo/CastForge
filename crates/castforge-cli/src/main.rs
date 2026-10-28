@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
-use castforge_codegen::{CodegenTarget, build_memory_plan, generate_code};
+use castforge_codegen::{
+    CodegenTarget, build_memory_plan, evaluate_module, generate_code, generate_synthetic_inputs,
+    verify_module_numerics,
+};
 use castforge_mlir::{PrintOptions, parse_mlir, print_mlir, print_mlir_with_options};
 use castforge_passes::{PassManager, PassRegistry};
 use castforge_viz::{
@@ -54,6 +57,32 @@ enum Commands {
         /// Print pass execution statistics to stderr
         #[arg(long, default_value_t = true)]
         stats: bool,
+
+        /// Verify numerical equivalence before vs. after optimization passes
+        #[arg(long = "verify-numerics")]
+        verify_numerics: bool,
+
+        /// Maximum allowed absolute difference when --verify-numerics is enabled
+        #[arg(long = "tolerance", default_value_t = 1e-4)]
+        tolerance: f32,
+    },
+
+    /// Execute an MLIR module directly in the reference interpreter and verify/print outputs
+    Run {
+        /// Input MLIR file path
+        input: PathBuf,
+
+        /// Optional pass pipeline to run and numerically verify against the unoptimized module
+        #[arg(short = 'p', long = "passes")]
+        passes: Option<String>,
+
+        /// Optional input `.safetensors` file to load into TensorStore before execution
+        #[arg(short = 'w', long = "weights")]
+        weights: Option<PathBuf>,
+
+        /// Numerical verification tolerance when -p/--passes is used
+        #[arg(long = "tolerance", default_value_t = 1e-4)]
+        tolerance: f32,
     },
 
     /// Parse and round-trip an MLIR file (pretty or --generic form)
@@ -129,6 +158,8 @@ fn main() -> Result<()> {
             save_weights,
             generic,
             stats,
+            verify_numerics,
+            tolerance,
         } => {
             let src = fs::read_to_string(&input)
                 .with_context(|| format!("Failed to read {}", input.display()))?;
@@ -146,6 +177,7 @@ fn main() -> Result<()> {
                     );
                 }
             }
+            let before_snapshot = verify_numerics.then(|| module.clone());
 
             let mut pm = if let Some(cfg_path) = config {
                 let toml_str = fs::read_to_string(&cfg_path)
@@ -164,6 +196,21 @@ fn main() -> Result<()> {
                         "[castforge:pass] {:<18} | changed: {:<5} | \
                          removed: {:<3} | modified: {:<3} | created: {:<3}",
                         r.pass_name, r.changed, r.ops_removed, r.ops_modified, r.ops_created
+                    );
+                }
+            }
+            if let Some(before_mod) = &before_snapshot {
+                let rep = verify_module_numerics(before_mod, &module, tolerance)?;
+                eprintln!(
+                    "[castforge:verify] passed: {} | max_abs_diff: {:.6e} (tol: {:.2e}, \
+                     checked {} elements)",
+                    rep.passed, rep.max_abs_diff, rep.tolerance, rep.num_outputs_checked
+                );
+                if !rep.passed {
+                    anyhow::bail!(
+                        "Numerical verification failed: max_abs_diff {:.6e} > tolerance {:.2e}",
+                        rep.max_abs_diff,
+                        rep.tolerance
                     );
                 }
             }
@@ -194,6 +241,38 @@ fn main() -> Result<()> {
                 fs::write(&out_path, formatted)?;
             } else {
                 print!("{formatted}");
+            }
+        }
+
+        Commands::Run {
+            input,
+            passes,
+            weights,
+            tolerance,
+        } => {
+            let src = fs::read_to_string(&input)
+                .with_context(|| format!("Failed to read {}", input.display()))?;
+            let mut module = parse_mlir(&src)?;
+            if let Some(w_path) = weights {
+                module.tensor_store.load_safetensors_file(&w_path)?;
+            }
+            let inputs = generate_synthetic_inputs(&module, None)?;
+            let baseline = evaluate_module(&module, &inputs)?;
+            if let Some(spec) = passes {
+                let before_mod = module.clone();
+                let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
+                pm.run(&mut module)?;
+                let rep = verify_module_numerics(&before_mod, &module, tolerance)?;
+                println!(
+                    "Numerical verification: {} (max_abs_diff = {:.6e}, tol = {:.2e})",
+                    if rep.passed { "PASSED" } else { "FAILED" },
+                    rep.max_abs_diff,
+                    rep.tolerance
+                );
+                let optimized_out = evaluate_module(&module, &inputs)?;
+                println!("Outputs: {optimized_out:?}");
+            } else {
+                println!("Outputs: {baseline:?}");
             }
         }
 

@@ -1,6 +1,7 @@
 use crate::{build_memory_plan, sanitize_ident, tensor_len, tensor_shape_dims, value_ident};
-use anyhow::Result;
-use castforge_ir::{Module, ValueId};
+use anyhow::{Result, anyhow};
+use castforge_dialect_stablehlo::StableHloOp;
+use castforge_ir::{DType, Module, OpId, ValueId};
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -25,63 +26,89 @@ pub fn emit_c_module(module: &Module) -> Result<String> {
     writeln!(out, "#include <stdint.h>\n#include <math.h>\n")?;
 
     for fn_op_id in module.functions() {
-        let fn_op = &module.ops[fn_op_id];
-        let fn_name = sanitize_ident(
-            fn_op
-                .attributes
-                .get("sym_name")
-                .and_then(|a| a.as_str())
-                .unwrap_or("forward"),
-        );
-        let region_id = fn_op.regions[0];
-        let block_id = module.regions[region_id].blocks[0];
-        let block = &module.blocks[block_id];
+        emit_c_func(module, fn_op_id, &plan, &mut out)?;
+    }
 
-        let mut names: HashMap<ValueId, String> = HashMap::new();
-        let mut counter = 0usize;
+    Ok(out)
+}
 
-        let mut params = Vec::new();
-        for &arg_id in &block.arguments {
-            let name = value_ident(module, arg_id, &mut names, &mut counter);
-            params.push(format!("const float* restrict {name}"));
+fn emit_c_func(
+    module: &Module,
+    fn_op_id: OpId,
+    plan: &crate::MemoryPlan,
+    out: &mut String,
+) -> Result<()> {
+    let fn_op = &module.ops[fn_op_id];
+    let fn_name = sanitize_ident(
+        fn_op
+            .attributes
+            .get("sym_name")
+            .and_then(|a| a.as_str())
+            .unwrap_or("forward"),
+    );
+    let region_id = fn_op.regions[0];
+    let block_id = module.regions[region_id].blocks[0];
+    let block = &module.blocks[block_id];
+
+    let mut names: HashMap<ValueId, String> = HashMap::new();
+    let mut counter = 0usize;
+
+    let mut params = Vec::new();
+    for &arg_id in &block.arguments {
+        let name = value_ident(module, arg_id, &mut names, &mut counter);
+        params.push(format!("const float* restrict {name}"));
+    }
+    params.push("float* restrict out_buf".to_string());
+
+    writeln!(out, "void {fn_name}({}) {{", params.join(", "))?;
+
+    for &op_id in &block.ops {
+        let op = &module.ops[op_id];
+        if op.is_op("func", "return") {
+            if let Some(&ret_val) = op.operands.first() {
+                let r_name = value_ident(module, ret_val, &mut names, &mut counter);
+                let r_len = tensor_len(module, ret_val);
+                writeln!(
+                    out,
+                    "    for (int i = 0; i < {r_len}; ++i) out_buf[i] = {r_name}[i];"
+                )?;
+            }
+            continue;
         }
-        params.push("float* restrict out_buf".to_string());
-
-        writeln!(out, "void {fn_name}({}) {{", params.join(", "))?;
-
-        for &op_id in &block.ops {
-            let op = &module.ops[op_id];
-            if op.is_op("func", "return") {
-                if let Some(&ret_val) = op.operands.first() {
-                    let r_name = value_ident(module, ret_val, &mut names, &mut counter);
-                    let r_len = tensor_len(module, ret_val);
-                    writeln!(
-                        out,
-                        "    for (int i = 0; i < {r_len}; ++i) out_buf[i] = {r_name}[i];"
-                    )?;
-                }
-                continue;
+        let Some(&res_val) = op.results.first() else {
+            continue;
+        };
+        let res_name = value_ident(module, res_val, &mut names, &mut counter);
+        let res_len = tensor_len(module, res_val);
+        if let Some(alloc) = plan.allocation_for(res_val) {
+            if let (Some(slot), Some(off)) = (alloc.arena_slot, alloc.arena_offset) {
+                writeln!(
+                    out,
+                    "    /* [arena] {res_name}: slot #{slot} @ offset {off} B \
+                     (live steps {}..={}) */",
+                    alloc.first_def, alloc.last_use
+                )?;
             }
-            let Some(&res_val) = op.results.first() else {
-                continue;
-            };
-            let res_name = value_ident(module, res_val, &mut names, &mut counter);
-            let res_len = tensor_len(module, res_val);
-            if let Some(alloc) = plan.allocation_for(res_val) {
-                if let (Some(slot), Some(off)) = (alloc.arena_slot, alloc.arena_offset) {
-                    writeln!(
-                        out,
-                        "    /* [arena] {res_name}: slot #{slot} @ offset {off} B \
-                         (live steps {}..={}) */",
-                        alloc.first_def, alloc.last_use
-                    )?;
-                }
-            }
+        }
 
-            if op.is_op("stablehlo", "constant") {
-                let vals = op
-                    .attributes
-                    .get("value")
+        if op.is_op("stablehlo", "constant") {
+            let t_ty = module.values[res_val]
+                .ty
+                .as_tensor()
+                .ok_or_else(|| anyhow!("constant without tensor type"))?;
+            let val_attr = op.attributes.get("value");
+            if let DType::QuantUniform { .. } = &t_ty.dtype {
+                let q_vals = val_attr
+                    .and_then(|a| module.tensor_store.resolve_i8_attr(a, res_len))
+                    .unwrap_or_else(|| vec![0; res_len]);
+                let elems: Vec<String> = q_vals.iter().map(|v| v.to_string()).collect();
+                writeln!(
+                    out,
+                    "    static const int8_t {res_name}[{res_len}] = {{ {} }};",
+                    elems.join(", ")
+                )?;
+            } else {
+                let vals = val_attr
                     .and_then(|a| module.tensor_store.resolve_f32_attr(a, res_len))
                     .unwrap_or_else(|| vec![0.0; res_len]);
                 let elems: Vec<String> = vals.iter().map(|v| format!("{v:.6}f")).collect();
@@ -90,50 +117,139 @@ pub fn emit_c_module(module: &Module) -> Result<String> {
                     "    static const float {res_name}[{res_len}] = {{ {} }};",
                     elems.join(", ")
                 )?;
-            } else if op.is_op("stablehlo", "dot_general") {
-                let a = value_ident(module, op.operands[0], &mut names, &mut counter);
-                let b = value_ident(module, op.operands[1], &mut names, &mut counter);
-                let lhs_dims = module.values[op.operands[0]]
-                    .ty
-                    .as_tensor()
-                    .map(tensor_shape_dims)
-                    .unwrap_or_else(|| vec![1, 1]);
-                let rhs_dims = module.values[op.operands[1]]
-                    .ty
-                    .as_tensor()
-                    .map(tensor_shape_dims)
-                    .unwrap_or_else(|| vec![1, 1]);
-                let m = *lhs_dims.first().unwrap_or(&1);
-                let k = *lhs_dims.get(1).unwrap_or(&1);
-                let n = *rhs_dims.get(1).unwrap_or(&1);
-                writeln!(out, "    float {res_name}[{res_len}];")?;
-                writeln!(out, "    for (int m = 0; m < {m}; ++m) {{")?;
-                writeln!(out, "        for (int n = 0; n < {n}; ++n) {{")?;
-                writeln!(out, "            float acc = 0.0f;")?;
-                writeln!(
-                    out,
-                    "            for (int k = 0; k < {k}; ++k) \
-                     acc += {a}[m * {k} + k] * {b}[k * {n} + n];"
-                )?;
-                writeln!(out, "            {res_name}[m * {n} + n] = acc;")?;
-                writeln!(out, "        }}")?;
-                writeln!(out, "    }}")?;
-            } else if op.is_op("stablehlo", "composite") && op.operands.len() >= 3 {
-                let comp_name = op
-                    .attributes
-                    .get("name")
-                    .and_then(|a| a.as_str())
-                    .unwrap_or("");
-                if comp_name == "castforge.fused_matmul_epilogue" {
-                    let a = value_ident(module, op.operands[0], &mut names, &mut counter);
-                    let b = value_ident(module, op.operands[1], &mut names, &mut counter);
-                    let bias = value_ident(module, op.operands[2], &mut names, &mut counter);
-                    let lhs_dims = module.values[op.operands[0]]
+            }
+            continue;
+        }
+
+        if op.is_op("stablehlo", "uniform_dequantize") {
+            let src_val = op.operands[0];
+            let src_name = value_ident(module, src_val, &mut names, &mut counter);
+            let (scale, zp) = match module.values[src_val].ty.as_tensor().map(|t| &t.dtype) {
+                Some(DType::QuantUniform {
+                    scale, zero_point, ..
+                }) => (scale.parse::<f32>().unwrap_or(1.0), *zero_point),
+                _ => (1.0, 0),
+            };
+            writeln!(out, "    float {res_name}[{res_len}];")?;
+            writeln!(out, "    for (int i = 0; i < {res_len}; ++i) {{")?;
+            writeln!(
+                out,
+                "        {res_name}[i] = ((float)((int32_t){src_name}[i] - {zp})) * {scale:.6}f;"
+            )?;
+            writeln!(out, "    }}")?;
+            continue;
+        }
+
+        if let Some(hlo) = StableHloOp::from_op(op) {
+            match hlo {
+                StableHloOp::Add { lhs, rhs, .. }
+                | StableHloOp::Subtract { lhs, rhs, .. }
+                | StableHloOp::Multiply { lhs, rhs, .. }
+                | StableHloOp::Divide { lhs, rhs, .. }
+                | StableHloOp::Maximum { lhs, rhs, .. }
+                | StableHloOp::Minimum { lhs, rhs, .. } => {
+                    let a = value_ident(module, lhs, &mut names, &mut counter);
+                    let b = value_ident(module, rhs, &mut names, &mut counter);
+                    let expr = match op.name.name.as_str() {
+                        "add" => format!("{a}[i] + {b}[i]"),
+                        "subtract" => format!("{a}[i] - {b}[i]"),
+                        "multiply" => format!("{a}[i] * {b}[i]"),
+                        "divide" => format!("{a}[i] / {b}[i]"),
+                        "maximum" => format!("fmaxf({a}[i], {b}[i])"),
+                        _ => format!("fminf({a}[i], {b}[i])"),
+                    };
+                    writeln!(out, "    float {res_name}[{res_len}];")?;
+                    writeln!(
+                        out,
+                        "    for (int i = 0; i < {res_len}; ++i) {res_name}[i] = {expr};"
+                    )?;
+                }
+                StableHloOp::Exp { operand, .. }
+                | StableHloOp::Tanh { operand, .. }
+                | StableHloOp::Rsqrt { operand, .. }
+                | StableHloOp::Convert { operand, .. }
+                | StableHloOp::Reshape { operand, .. } => {
+                    let x = value_ident(module, operand, &mut names, &mut counter);
+                    let expr = match op.name.name.as_str() {
+                        "exponential" => format!("expf({x}[i])"),
+                        "tanh" => format!("tanhf({x}[i])"),
+                        "rsqrt" => format!("1.0f / sqrtf({x}[i])"),
+                        _ => format!("{x}[i]"),
+                    };
+                    writeln!(out, "    float {res_name}[{res_len}];")?;
+                    writeln!(
+                        out,
+                        "    for (int i = 0; i < {res_len}; ++i) {res_name}[i] = {expr};"
+                    )?;
+                }
+                StableHloOp::Transpose {
+                    operand,
+                    permutation,
+                    ..
+                } => {
+                    let x = value_ident(module, operand, &mut names, &mut counter);
+                    let in_dims = module.values[operand]
+                        .ty
+                        .as_tensor()
+                        .map(tensor_shape_dims)
+                        .unwrap_or_else(|| vec![res_len]);
+                    writeln!(out, "    float {res_name}[{res_len}];")?;
+                    if in_dims.len() == 2 && permutation == vec![1, 0] {
+                        let (r, c) = (in_dims[0], in_dims[1]);
+                        writeln!(out, "    for (int r = 0; r < {r}; ++r) {{")?;
+                        writeln!(
+                            out,
+                            "        for (int c = 0; c < {c}; ++c) \
+                             {res_name}[c * {r} + r] = {x}[r * {c} + c];"
+                        )?;
+                        writeln!(out, "    }}")?;
+                    } else {
+                        writeln!(
+                            out,
+                            "    for (int i = 0; i < {res_len}; ++i) {res_name}[i] = {x}[i];"
+                        )?;
+                    }
+                }
+                StableHloOp::BroadcastInDim { operand, .. } => {
+                    let x = value_ident(module, operand, &mut names, &mut counter);
+                    let in_len = tensor_len(module, operand).max(1);
+                    let stride = (res_len / in_len).max(1);
+                    writeln!(out, "    float {res_name}[{res_len}];")?;
+                    writeln!(
+                        out,
+                        "    for (int i = 0; i < {res_len}; ++i) \
+                         {res_name}[i] = {x}[(i / {stride}) % {in_len}];"
+                    )?;
+                }
+                StableHloOp::Reduce {
+                    inputs,
+                    init_values,
+                    ..
+                } => {
+                    let inp = value_ident(module, inputs[0], &mut names, &mut counter);
+                    let init = value_ident(module, init_values[0], &mut names, &mut counter);
+                    let in_len = tensor_len(module, inputs[0]);
+                    let inner = (in_len / res_len.max(1)).max(1);
+                    writeln!(out, "    float {res_name}[{res_len}];")?;
+                    writeln!(out, "    for (int o = 0; o < {res_len}; ++o) {{")?;
+                    writeln!(out, "        float acc = {init}[0];")?;
+                    writeln!(
+                        out,
+                        "        for (int k = 0; k < {inner}; ++k) \
+                         acc += {inp}[o * {inner} + k];"
+                    )?;
+                    writeln!(out, "        {res_name}[o] = acc;")?;
+                    writeln!(out, "    }}")?;
+                }
+                StableHloOp::DotGeneral { lhs, rhs, .. } => {
+                    let a = value_ident(module, lhs, &mut names, &mut counter);
+                    let b = value_ident(module, rhs, &mut names, &mut counter);
+                    let lhs_dims = module.values[lhs]
                         .ty
                         .as_tensor()
                         .map(tensor_shape_dims)
                         .unwrap_or_else(|| vec![1, 1]);
-                    let rhs_dims = module.values[op.operands[1]]
+                    let rhs_dims = module.values[rhs]
                         .ty
                         .as_tensor()
                         .map(tensor_shape_dims)
@@ -141,11 +257,6 @@ pub fn emit_c_module(module: &Module) -> Result<String> {
                     let m = *lhs_dims.first().unwrap_or(&1);
                     let k = *lhs_dims.get(1).unwrap_or(&1);
                     let n = *rhs_dims.get(1).unwrap_or(&1);
-                    let epilogue = op
-                        .attributes
-                        .get("epilogue")
-                        .and_then(|attr| attr.as_str())
-                        .unwrap_or("bias");
                     writeln!(out, "    float {res_name}[{res_len}];")?;
                     writeln!(out, "    for (int m = 0; m < {m}; ++m) {{")?;
                     writeln!(out, "        for (int n = 0; n < {n}; ++n) {{")?;
@@ -155,45 +266,86 @@ pub fn emit_c_module(module: &Module) -> Result<String> {
                         "            for (int k = 0; k < {k}; ++k) \
                          acc += {a}[m * {k} + k] * {b}[k * {n} + n];"
                     )?;
-                    writeln!(out, "            int idx = m * {n} + n;")?;
-                    writeln!(out, "            float val = acc + {bias}[idx];")?;
-                    match epilogue {
-                        "bias_relu" if op.operands.len() >= 4 => {
-                            let z = value_ident(module, op.operands[3], &mut names, &mut counter);
-                            writeln!(out, "            {res_name}[idx] = fmaxf(val, {z}[idx]);")?;
-                        }
-                        "bias_tanh" => {
-                            writeln!(out, "            {res_name}[idx] = tanhf(val);")?;
-                        }
-                        _ => {
-                            writeln!(out, "            {res_name}[idx] = val;")?;
-                        }
-                    }
+                    writeln!(out, "            {res_name}[m * {n} + n] = acc;")?;
                     writeln!(out, "        }}")?;
                     writeln!(out, "    }}")?;
-                } else {
-                    let src = value_ident(module, op.operands[0], &mut names, &mut counter);
-                    writeln!(out, "    float {res_name}[{res_len}];")?;
-                    writeln!(
-                        out,
-                        "    for (int i = 0; i < {res_len}; ++i) {res_name}[i] = {src}[i];"
-                    )?;
                 }
-            } else {
-                let src = op
-                    .operands
-                    .first()
-                    .map(|&v| value_ident(module, v, &mut names, &mut counter))
-                    .unwrap_or_else(|| "0.0f".to_string());
-                writeln!(out, "    float {res_name}[{res_len}];")?;
-                writeln!(
-                    out,
-                    "    for (int i = 0; i < {res_len}; ++i) {res_name}[i] = {src}[i];"
-                )?;
+                StableHloOp::Composite { name, inputs, .. } => {
+                    if name == "castforge.fused_add_max" && inputs.len() == 3 {
+                        let a = value_ident(module, inputs[0], &mut names, &mut counter);
+                        let b = value_ident(module, inputs[1], &mut names, &mut counter);
+                        let c = value_ident(module, inputs[2], &mut names, &mut counter);
+                        writeln!(out, "    float {res_name}[{res_len}];")?;
+                        writeln!(
+                            out,
+                            "    for (int i = 0; i < {res_len}; ++i) \
+                             {res_name}[i] = fmaxf({a}[i] + {b}[i], {c}[i]);"
+                        )?;
+                    } else if name == "castforge.fused_matmul_epilogue" && inputs.len() >= 3 {
+                        let a = value_ident(module, inputs[0], &mut names, &mut counter);
+                        let b = value_ident(module, inputs[1], &mut names, &mut counter);
+                        let bias = value_ident(module, inputs[2], &mut names, &mut counter);
+                        let lhs_dims = module.values[inputs[0]]
+                            .ty
+                            .as_tensor()
+                            .map(tensor_shape_dims)
+                            .unwrap_or_else(|| vec![1, 1]);
+                        let rhs_dims = module.values[inputs[1]]
+                            .ty
+                            .as_tensor()
+                            .map(tensor_shape_dims)
+                            .unwrap_or_else(|| vec![1, 1]);
+                        let m = *lhs_dims.first().unwrap_or(&1);
+                        let k = *lhs_dims.get(1).unwrap_or(&1);
+                        let n = *rhs_dims.get(1).unwrap_or(&1);
+                        let epilogue = op
+                            .attributes
+                            .get("epilogue")
+                            .and_then(|attr| attr.as_str())
+                            .unwrap_or("bias");
+                        writeln!(out, "    float {res_name}[{res_len}];")?;
+                        writeln!(out, "    for (int m = 0; m < {m}; ++m) {{")?;
+                        writeln!(out, "        for (int n = 0; n < {n}; ++n) {{")?;
+                        writeln!(out, "            float acc = 0.0f;")?;
+                        writeln!(
+                            out,
+                            "            for (int k = 0; k < {k}; ++k) \
+                             acc += {a}[m * {k} + k] * {b}[k * {n} + n];"
+                        )?;
+                        writeln!(out, "            int idx = m * {n} + n;")?;
+                        writeln!(out, "            float val = acc + {bias}[idx];")?;
+                        match epilogue {
+                            "bias_relu" if inputs.len() >= 4 => {
+                                let z = value_ident(module, inputs[3], &mut names, &mut counter);
+                                writeln!(
+                                    out,
+                                    "            {res_name}[idx] = fmaxf(val, {z}[idx]);"
+                                )?;
+                            }
+                            "bias_tanh" => {
+                                writeln!(out, "            {res_name}[idx] = tanhf(val);")?;
+                            }
+                            _ => {
+                                writeln!(out, "            {res_name}[idx] = val;")?;
+                            }
+                        }
+                        writeln!(out, "        }}")?;
+                        writeln!(out, "    }}")?;
+                    } else {
+                        let src = value_ident(module, inputs[0], &mut names, &mut counter);
+                        writeln!(out, "    float {res_name}[{res_len}];")?;
+                        writeln!(
+                            out,
+                            "    for (int i = 0; i < {res_len}; ++i) {res_name}[i] = {src}[i];"
+                        )?;
+                    }
+                }
+                _ => {
+                    writeln!(out, "    float {res_name}[{res_len}];")?;
+                }
             }
         }
-        writeln!(out, "}}")?;
     }
-
-    Ok(out)
+    writeln!(out, "}}")?;
+    Ok(())
 }

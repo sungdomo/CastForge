@@ -1,9 +1,14 @@
+pub mod eval;
 pub mod liveness;
 pub mod memory_plan;
 pub mod target_c;
 pub mod target_rust;
 pub mod target_wgsl;
 
+pub use crate::eval::{
+    NumericVerificationReport, evaluate_function, evaluate_module, generate_synthetic_inputs,
+    verify_module_numerics,
+};
 pub use crate::liveness::{LiveInterval, compute_block_liveness, compute_module_liveness};
 pub use crate::memory_plan::{BufferAllocation, MemoryPlan, build_memory_plan};
 use crate::target_c::emit_c_module;

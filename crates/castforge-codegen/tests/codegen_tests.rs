@@ -1,4 +1,6 @@
-use castforge_codegen::{CodegenTarget, build_memory_plan, generate_code};
+use castforge_codegen::{
+    CodegenTarget, build_memory_plan, evaluate_module, generate_code, verify_module_numerics,
+};
 use castforge_mlir::parse_mlir;
 use castforge_passes::{PassManager, PassRegistry};
 
@@ -79,4 +81,47 @@ module @arena_reuse_demo {
     assert!(rust_code.contains("Saved: 128 B across 2 arena slots"));
     assert!(rust_code.contains("// [arena] t1: slot #0 @ offset 0 B"));
     assert!(rust_code.contains("// [arena] t3: slot #0 @ offset 0 B"));
+}
+
+#[test]
+fn test_ir_interpreter_and_numeric_verification_across_ai_optimizations() {
+    let mlir = r#"
+module @numeric_verify_demo {
+  func.func @norm_linear_relu(
+    %x: tensor<2x2xf32>,
+    %bias: tensor<2x2xf32>
+  ) -> tensor<2x2xf32> {
+    %scale = stablehlo.constant dense<[[2.0, 0.5], [2.0, 0.5]]> : tensor<2x2xf32>
+    %w = stablehlo.constant dense<[[1.0, -1.0], [2.0, 4.0]]> : tensor<2x2xf32>
+    %zero = stablehlo.constant dense<0.0> : tensor<2x2xf32>
+    %normed = stablehlo.multiply %x, %scale : tensor<2x2xf32>
+    %mm = stablehlo.dot_general %normed, %w, contracting_dims = [1] x [0]
+      : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+    %added = stablehlo.add %mm, %bias : tensor<2x2xf32>
+    %act = stablehlo.maximum %added, %zero : tensor<2x2xf32>
+    func.return %act : tensor<2x2xf32>
+  }
+}
+"#;
+    let before = parse_mlir(mlir).expect("parse mlir");
+    let mut after = before.clone();
+
+    let registry = PassRegistry::with_builtin_passes();
+    let mut pm = PassManager::from_pipeline_str(
+        &registry,
+        "fold-norm-weights,fuse-matmul-epilogue,fold-constants,dce",
+    )
+    .expect("build pipeline");
+    pm.run(&mut after).expect("run pipeline");
+
+    let rep = verify_module_numerics(&before, &after, 1e-5).expect("verify numerics");
+    assert!(rep.passed, "max_abs_diff = {}", rep.max_abs_diff);
+    assert!(rep.max_abs_diff < 1e-6);
+
+    // Check explicit evaluation on known inputs
+    let x = vec![1.0_f32, 2.0, 3.0, 4.0];
+    let bias = vec![0.5_f32, -10.0, 0.0, 1.0];
+    let out = evaluate_module(&after, &[x, bias]).expect("eval module");
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0], vec![4.5_f32, 0.0, 10.0, 3.0]);
 }
