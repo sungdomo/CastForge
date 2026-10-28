@@ -25,12 +25,26 @@ pub struct MemoryPlan {
     pub naive_activation_bytes: usize,
     /// Number of reusable arena slots allocated.
     pub reusable_slot_count: usize,
+    /// Total contiguous arena bytes allocated strictly for reusable intermediate slots.
+    pub arena_workspace_bytes: usize,
 }
 
 impl MemoryPlan {
     /// Lookup the allocation record for `val_id`.
     pub fn allocation_for(&self, val_id: ValueId) -> Option<&BufferAllocation> {
         self.allocations.iter().find(|a| a.value_id == Some(val_id))
+    }
+
+    /// Returns the `f32` element index (`arena_offset / 4`) in the shared `arena` workspace
+    /// if `val_id` is allocated in the reusable activation arena.
+    pub fn arena_f32_offset(&self, val_id: ValueId) -> Option<usize> {
+        let alloc = self.allocation_for(val_id)?;
+        alloc.arena_offset.map(|bytes| bytes / 4)
+    }
+
+    /// Total number of `f32` elements required by the shared `arena` workspace array.
+    pub fn arena_f32_len(&self) -> usize {
+        self.arena_workspace_bytes.div_ceil(4)
     }
 
     /// Bytes saved by liveness-based arena buffer reuse compared to naive allocation.
@@ -47,6 +61,9 @@ struct ArenaSlot {
 }
 
 impl ArenaSlot {
+    /// Two values conflict if their live ranges overlap, OR if one is defined at the exact
+    /// step `s == e` where the other has its last use (because loops read operands while
+    /// writing the result buffer). Thus reuse requires `first_def > e || s > last_use`.
     fn conflicts_with(&self, first_def: usize, last_use: usize) -> bool {
         self.intervals
             .iter()
@@ -181,6 +198,7 @@ pub fn build_memory_plan(module: &Module) -> MemoryPlan {
     }
 
     plan.reusable_slot_count = slots.len();
+    plan.arena_workspace_bytes = current_offset;
     plan.total_activation_bytes = current_offset + arg_bytes;
     plan
 }

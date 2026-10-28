@@ -79,8 +79,18 @@ module @arena_reuse_demo {
 
     let rust_code = generate_code(&module, CodegenTarget::Rust).expect("rust codegen");
     assert!(rust_code.contains("Saved: 128 B across 2 arena slots"));
+    assert!(rust_code.contains("let mut arena = [0.0_f32; 32];"));
     assert!(rust_code.contains("// [arena] t1: slot #0 @ offset 0 B"));
     assert!(rust_code.contains("// [arena] t3: slot #0 @ offset 0 B"));
+    assert!(rust_code.contains("arena[16 + i] = (arena[i]).tanh();"));
+    assert!(rust_code.contains("arena[i] = 1.0_f32 / (arena[16 + i]).sqrt();"));
+
+    let c_code = generate_code(&module, CodegenTarget::C).expect("c codegen");
+    assert!(c_code.contains("float arena[32];"));
+    assert!(c_code.contains("float* const t1 = &arena[0];"));
+    assert!(c_code.contains("float* const t2 = &arena[16];"));
+    assert!(c_code.contains("float* const t3 = &arena[0];"));
+    assert!(c_code.contains("float* const t4 = &arena[16];"));
 }
 
 #[test]
