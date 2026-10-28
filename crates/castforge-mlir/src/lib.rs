@@ -1,7 +1,10 @@
 pub mod parser;
+pub mod parser_special;
+pub mod parser_types;
 pub mod printer;
 
 pub use parser::{MlirParser, ParseError};
+pub use parser_types::parse_type;
 pub use printer::{MlirPrinter, PrintOptions};
 
 use castforge_ir::Module;
