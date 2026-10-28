@@ -225,3 +225,52 @@ module @general_passes {
     // strip-debuginfo reset all named locations to loc(unknown)
     assert!(!printed.contains("helper_add"));
 }
+
+#[test]
+fn test_unified_dce_and_fold_constants() {
+    let mlir = r#"
+module @unified_passes {
+  func.func private @add_vec(%a: tensor<4xf32>, %b: tensor<4xf32>) -> tensor<4xf32> {
+    %sum = stablehlo.add %a, %b : tensor<4xf32>
+    return %sum : tensor<4xf32>
+  }
+
+  func.func private @dead_private(%x: tensor<4xf32>) -> tensor<4xf32> {
+    return %x : tensor<4xf32>
+  }
+
+  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+    %v1 = stablehlo.constant dense<[1.0, 2.0, 3.0, 4.0]> : tensor<4xf32>
+    %v2 = stablehlo.constant dense<[10.0, 20.0, 30.0, 40.0]> : tensor<4xf32>
+    %vsum = func.call @add_vec(%v1, %v2) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+    %c1 = stablehlo.constant dense<2.0> : tensor<4xf32>
+    %c2 = stablehlo.constant dense<1.0> : tensor<4xf32>
+    %cmp = stablehlo.compare %c1, %c2, GT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+    %sel = stablehlo.select %cmp, %vsum, %arg0
+      : (tensor<4xi1>, tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+    return %sel : tensor<4xf32>
+  }
+}
+"#;
+
+    let registry = PassRegistry::with_builtin_passes();
+    let mut module = parse_mlir(mlir).expect("parse failed");
+    assert_eq!(module.functions().len(), 3);
+
+    // Running just `inliner,fold-constants,dce` (or `inliner,canonicalize`) should:
+    // 1. Inline @add_vec
+    // 2. Fold dense<[1,2,3,4]> + dense<[10,20,30,40]> -> dense<[11,22,33,44]>
+    // 3. Fold compare(2.0 > 1.0) and select -> %vsum
+    // 4. Eliminate both dead private functions (@add_vec and @dead_private) via unified `dce`
+    let mut pm = PassManager::from_pipeline_str(&registry, "inliner,fold-constants,dce")
+        .expect("pipeline build failed");
+    pm.run(&mut module).expect("pipeline execution failed");
+
+    assert_eq!(module.functions().len(), 1);
+    let printed = print_mlir(&module);
+    assert!(!printed.contains("func.call"));
+    assert!(!printed.contains("stablehlo.add"));
+    assert!(!printed.contains("stablehlo.compare"));
+    assert!(!printed.contains("stablehlo.select"));
+    assert!(printed.contains("dense<[11.0, 22.0, 33.0, 44.0]>"));
+}

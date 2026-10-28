@@ -71,8 +71,11 @@ impl PassRegistry {
         let mut reg = Self::new();
         reg.register(
             "dce",
-            "Dead Code Elimination (removes unused pure operations)",
-            |_opts| Ok(Box::new(DeadCodeEliminationPass)),
+            "Dead Code Elimination (removes unused pure SSA ops and dead private symbols)",
+            |opts| {
+                let include_symbols = opts.get("symbols").map(|v| v != "false").unwrap_or(true);
+                Ok(Box::new(DeadCodeEliminationPass { include_symbols }))
+            },
         );
         reg.register(
             "cse",
@@ -102,8 +105,16 @@ impl PassRegistry {
         );
         reg.register(
             "fold-constants",
-            "Constant folding for arithmetic and shape ops on constant splat tensors",
-            |_opts| Ok(Box::new(FoldConstantsPass)),
+            "Constant folding & conditional propagation (arithmetic, shape, compare/select)",
+            |opts| {
+                let include_conditional = opts
+                    .get("conditional")
+                    .map(|v| v != "false")
+                    .unwrap_or(true);
+                Ok(Box::new(FoldConstantsPass {
+                    include_conditional,
+                }))
+            },
         );
         reg.register(
             "verify-shapes",
@@ -443,8 +454,26 @@ fn parse_pass_spec_item(item: &str) -> Result<(String, PassOptions)> {
 // Built-in Transformation & Optimization Passes
 // ============================================================================
 
-/// 1. Dead Code Elimination (DCE)
-pub struct DeadCodeEliminationPass;
+/// 1. Dead Code Elimination (DCE — SSA values + optional Symbol DCE)
+pub struct DeadCodeEliminationPass {
+    pub include_symbols: bool,
+}
+
+impl Default for DeadCodeEliminationPass {
+    fn default() -> Self {
+        Self {
+            include_symbols: true,
+        }
+    }
+}
+
+impl DeadCodeEliminationPass {
+    pub fn ssa_only() -> Self {
+        Self {
+            include_symbols: false,
+        }
+    }
+}
 
 impl Pass for DeadCodeEliminationPass {
     fn name(&self) -> &'static str {
@@ -452,7 +481,7 @@ impl Pass for DeadCodeEliminationPass {
     }
 
     fn description(&self) -> &'static str {
-        "Dead Code Elimination (removes unused pure operations)"
+        "Dead Code Elimination (removes unused pure SSA ops and dead private symbols)"
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
@@ -482,6 +511,11 @@ impl Pass for DeadCodeEliminationPass {
             if pass_removed == 0 {
                 break;
             }
+        }
+
+        if self.include_symbols {
+            let sym_res = SymbolDcePass.run(module)?;
+            removed += sym_res.ops_removed;
         }
 
         Ok(PassResult {
@@ -640,7 +674,7 @@ impl Pass for FoldTransposePass {
 
         // Clean up any producer transpose that became dead
         if modified > 0 || removed > 0 {
-            let dce_res = DeadCodeEliminationPass.run(module)?;
+            let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
             removed += dce_res.ops_removed;
         }
 
@@ -709,7 +743,7 @@ impl Pass for FoldReshapePass {
         }
 
         if modified > 0 || removed > 0 {
-            let dce_res = DeadCodeEliminationPass.run(module)?;
+            let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
             removed += dce_res.ops_removed;
         }
 
@@ -887,12 +921,12 @@ impl Pass for CanonicalizePass {
         };
 
         for _ in 0..8 {
-            let r0 = FoldConstantsPass.run(module)?;
+            let r0 = FoldConstantsPass::default().run(module)?;
             let r_alg = SimplifyAlgebraicPass.run(module)?;
             let r1 = FoldTransposePass::default().run(module)?;
             let r2 = FoldReshapePass.run(module)?;
             let r3 = CommonSubexpressionEliminationPass.run(module)?;
-            let r4 = DeadCodeEliminationPass.run(module)?;
+            let r4 = DeadCodeEliminationPass::default().run(module)?;
 
             let iter_changed =
                 r0.changed || r_alg.changed || r1.changed || r2.changed || r3.changed || r4.changed;
@@ -1031,7 +1065,7 @@ impl Pass for SimplifyAlgebraicPass {
         }
 
         if removed > 0 {
-            let dce_res = DeadCodeEliminationPass.run(module)?;
+            let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
             removed += dce_res.ops_removed;
         }
 
@@ -1045,15 +1079,44 @@ impl Pass for SimplifyAlgebraicPass {
     }
 }
 
-/// 9. Constant Folding Pass (`fold-constants`)
-pub struct FoldConstantsPass;
+/// 9. Unified Constant Folding & Conditional Propagation Pass (`fold-constants`)
+pub struct FoldConstantsPass {
+    pub include_conditional: bool,
+}
+
+impl Default for FoldConstantsPass {
+    fn default() -> Self {
+        Self {
+            include_conditional: true,
+        }
+    }
+}
 
 impl FoldConstantsPass {
-    fn const_splat(module: &Module, val_id: ValueId) -> Option<f64> {
+    pub fn const_splat(module: &Module, val_id: ValueId) -> Option<f64> {
         if let castforge_ir::ValueDef::OpResult { op, .. } = module.values[val_id].def {
             let op_node = module.ops.get(op)?;
             if op_node.is_op("stablehlo", "constant") {
                 return op_node.attributes.get("value")?.as_splat_f64();
+            }
+        }
+        None
+    }
+
+    pub fn const_f32_vec(module: &Module, val_id: ValueId) -> Option<Vec<f32>> {
+        if let castforge_ir::ValueDef::OpResult { op, .. } = module.values[val_id].def {
+            let op_node = module.ops.get(op)?;
+            if op_node.is_op("stablehlo", "constant") {
+                let n = module.values[val_id]
+                    .ty
+                    .as_tensor()
+                    .and_then(|t| t.num_elements())
+                    .unwrap_or(1) as usize;
+                if let Some(Attribute::DenseElements { raw_literal, .. }) =
+                    op_node.attributes.get("value")
+                {
+                    return parse_dense_f32_literal(raw_literal, n);
+                }
             }
         }
         None
@@ -1066,7 +1129,7 @@ impl Pass for FoldConstantsPass {
     }
 
     fn description(&self) -> &'static str {
-        "Constant folding for arithmetic and shape ops on constant splat tensors"
+        "Constant folding & conditional propagation (arithmetic, shape, compare/select)"
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
@@ -1084,54 +1147,136 @@ impl Pass for FoldConstantsPass {
                     continue;
                 };
 
-                let folded: Option<(ValueId, f64)> = match hlo {
+                // 1. Conditional folding (`compare` & `select`) when enabled
+                if self.include_conditional {
+                    match &hlo {
+                        StableHloOp::Compare {
+                            lhs,
+                            rhs,
+                            direction,
+                            result,
+                        } => {
+                            if let (Some(a), Some(b)) = (
+                                Self::const_splat(module, *lhs),
+                                Self::const_splat(module, *rhs),
+                            ) {
+                                let cond = match direction.as_str() {
+                                    "EQ" => (a - b).abs() < 1e-7,
+                                    "NE" => (a - b).abs() >= 1e-7,
+                                    "LT" => a < b,
+                                    "LE" => a <= b,
+                                    "GT" => a > b,
+                                    "GE" => a >= b,
+                                    _ => false,
+                                };
+                                if let Some(res_ty) = module.values[*result].ty.as_tensor().cloned()
+                                {
+                                    let lit = if cond { "1" } else { "0" };
+                                    let mut attrs = IndexMap::new();
+                                    attrs.insert(
+                                        "value".to_string(),
+                                        Attribute::DenseElements {
+                                            ty: res_ty,
+                                            raw_literal: lit.to_string(),
+                                        },
+                                    );
+                                    let op_mut = &mut module.ops[op_id];
+                                    op_mut.name = OpName::new("stablehlo", "constant");
+                                    op_mut.operands.clear();
+                                    op_mut.attributes = attrs;
+                                    modified += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                        StableHloOp::Select {
+                            pred,
+                            on_true,
+                            on_false,
+                            result,
+                        } => {
+                            let chosen = if on_true == on_false {
+                                Some(*on_true)
+                            } else {
+                                Self::const_splat(module, *pred)
+                                    .map(|v| if v != 0.0 { *on_true } else { *on_false })
+                            };
+                            if let Some(winner) = chosen {
+                                module.replace_all_uses(*result, winner);
+                                module.remove_op(block_id, op_id);
+                                removed += 1;
+                                continue;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // 2. General tensor & splat constant folding
+                let folded_vec: Option<(ValueId, Vec<f32>)> = match hlo {
                     StableHloOp::Add { lhs, rhs, result } => {
                         match (
-                            Self::const_splat(module, lhs),
-                            Self::const_splat(module, rhs),
+                            Self::const_f32_vec(module, lhs),
+                            Self::const_f32_vec(module, rhs),
                         ) {
-                            (Some(a), Some(b)) => Some((result, a + b)),
+                            (Some(a), Some(b)) if a.len() == b.len() => {
+                                Some((result, a.iter().zip(b.iter()).map(|(x, y)| x + y).collect()))
+                            }
                             _ => None,
                         }
                     }
                     StableHloOp::Subtract { lhs, rhs, result } => {
                         match (
-                            Self::const_splat(module, lhs),
-                            Self::const_splat(module, rhs),
+                            Self::const_f32_vec(module, lhs),
+                            Self::const_f32_vec(module, rhs),
                         ) {
-                            (Some(a), Some(b)) => Some((result, a - b)),
+                            (Some(a), Some(b)) if a.len() == b.len() => {
+                                Some((result, a.iter().zip(b.iter()).map(|(x, y)| x - y).collect()))
+                            }
                             _ => None,
                         }
                     }
                     StableHloOp::Multiply { lhs, rhs, result } => {
                         match (
-                            Self::const_splat(module, lhs),
-                            Self::const_splat(module, rhs),
+                            Self::const_f32_vec(module, lhs),
+                            Self::const_f32_vec(module, rhs),
                         ) {
-                            (Some(a), Some(b)) => Some((result, a * b)),
+                            (Some(a), Some(b)) if a.len() == b.len() => {
+                                Some((result, a.iter().zip(b.iter()).map(|(x, y)| x * y).collect()))
+                            }
                             _ => None,
                         }
                     }
-                    StableHloOp::Reshape { operand, result }
-                    | StableHloOp::Transpose {
+                    StableHloOp::Reshape { operand, result } => {
+                        Self::const_f32_vec(module, operand).map(|v| (result, v))
+                    }
+                    StableHloOp::Transpose {
                         operand, result, ..
                     }
                     | StableHloOp::BroadcastInDim {
                         operand, result, ..
-                    } => Self::const_splat(module, operand).map(|v| (result, v)),
+                    } => Self::const_splat(module, operand).map(|v| {
+                        let n = module.values[result]
+                            .ty
+                            .as_tensor()
+                            .and_then(|t| t.num_elements())
+                            .unwrap_or(1) as usize;
+                        (result, vec![v as f32; n])
+                    }),
                     _ => None,
                 };
 
-                if let Some((res_val, scalar)) = folded {
+                if let Some((res_val, vals)) = folded_vec {
                     let Some(tensor_ty) = module.values[res_val].ty.as_tensor().cloned() else {
                         continue;
                     };
+                    let raw_literal = format_dense_f32_literal(&vals, &tensor_ty.shape);
                     let mut attrs = IndexMap::new();
                     attrs.insert(
                         "value".to_string(),
                         Attribute::DenseElements {
                             ty: tensor_ty,
-                            raw_literal: format!("{scalar:?}"),
+                            raw_literal,
                         },
                     );
                     let op_mut = &mut module.ops[op_id];
@@ -1143,8 +1288,8 @@ impl Pass for FoldConstantsPass {
             }
         }
 
-        if modified > 0 {
-            let dce_res = DeadCodeEliminationPass.run(module)?;
+        if modified > 0 || removed > 0 {
+            let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
             removed += dce_res.ops_removed;
         }
 
@@ -1612,7 +1757,7 @@ impl Pass for MergeWeightsPass {
         }
 
         if modified > 0 {
-            let dce_res = DeadCodeEliminationPass.run(module)?;
+            let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
             removed += dce_res.ops_removed;
         }
 
@@ -1835,6 +1980,8 @@ impl Pass for SymbolDcePass {
 
 /// 16. Sparse Conditional Constant Propagation (`sccp`)
 /// Evaluates `stablehlo.compare` on constants and folds `stablehlo.select` predicates.
+/// Note: `fold-constants` includes conditional constant propagation by default; `sccp` runs
+/// `FoldConstantsPass { include_conditional: true }` to a fixed point.
 pub struct SccpPass;
 
 impl Pass for SccpPass {
@@ -1850,87 +1997,16 @@ impl Pass for SccpPass {
         let mut modified = 0usize;
         let mut removed = 0usize;
 
-        let fold_res = FoldConstantsPass.run(module)?;
-        modified += fold_res.ops_modified;
-        removed += fold_res.ops_removed;
-
-        let blocks: Vec<BlockId> = module.blocks.keys().collect();
-        for block_id in blocks {
-            let ops = module.block_ops(block_id);
-            for op_id in ops {
-                let Some(op) = module.ops.get(op_id) else {
-                    continue;
-                };
-                let Some(hlo) = StableHloOp::from_op(op) else {
-                    continue;
-                };
-
-                match hlo {
-                    StableHloOp::Compare {
-                        lhs,
-                        rhs,
-                        direction,
-                        result,
-                    } => {
-                        let (Some(a), Some(b)) = (
-                            FoldConstantsPass::const_splat(module, lhs),
-                            FoldConstantsPass::const_splat(module, rhs),
-                        ) else {
-                            continue;
-                        };
-                        let cond = match direction.as_str() {
-                            "EQ" => (a - b).abs() < 1e-7,
-                            "NE" => (a - b).abs() >= 1e-7,
-                            "LT" => a < b,
-                            "LE" => a <= b,
-                            "GT" => a > b,
-                            "GE" => a >= b,
-                            _ => continue,
-                        };
-                        let Some(res_ty) = module.values[result].ty.as_tensor().cloned() else {
-                            continue;
-                        };
-                        let lit = if cond { "1" } else { "0" };
-                        let mut attrs = IndexMap::new();
-                        attrs.insert(
-                            "value".to_string(),
-                            Attribute::DenseElements {
-                                ty: res_ty,
-                                raw_literal: lit.to_string(),
-                            },
-                        );
-                        let op_mut = &mut module.ops[op_id];
-                        op_mut.name = OpName::new("stablehlo", "constant");
-                        op_mut.operands.clear();
-                        op_mut.attributes = attrs;
-                        modified += 1;
-                    }
-                    StableHloOp::Select {
-                        pred,
-                        on_true,
-                        on_false,
-                        result,
-                    } => {
-                        let chosen = if on_true == on_false {
-                            Some(on_true)
-                        } else {
-                            FoldConstantsPass::const_splat(module, pred)
-                                .map(|v| if v != 0.0 { on_true } else { on_false })
-                        };
-                        if let Some(winner) = chosen {
-                            module.replace_all_uses(result, winner);
-                            module.remove_op(block_id, op_id);
-                            removed += 1;
-                        }
-                    }
-                    _ => {}
-                }
+        for _ in 0..8 {
+            let fold_res = (FoldConstantsPass {
+                include_conditional: true,
+            })
+            .run(module)?;
+            modified += fold_res.ops_modified;
+            removed += fold_res.ops_removed;
+            if !fold_res.changed {
+                break;
             }
-        }
-
-        if modified > 0 || removed > 0 {
-            let dce_res = DeadCodeEliminationPass.run(module)?;
-            removed += dce_res.ops_removed;
         }
 
         Ok(PassResult {
