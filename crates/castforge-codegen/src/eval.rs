@@ -536,6 +536,47 @@ fn eval_stablehlo_op(
                 (0..res_len)
                     .map(|i| (g[i] / (1.0 + (-g[i]).exp())) * u[i])
                     .collect()
+            } else if name == "castforge.fused_rope" && inputs.len() >= 3 {
+                let (x, cos_v, sin_v) = (get_v(inputs[0]), get_v(inputs[1]), get_v(inputs[2]));
+                let dims = module.values[res_val]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_else(|| vec![1, res_len]);
+                let cols = *dims.last().unwrap_or(&res_len).max(&2);
+                let rows = (res_len / cols).max(1);
+                let half = cols / 2;
+                let mut out = vec![0.0_f32; res_len];
+                for r in 0..rows {
+                    for c in 0..cols {
+                        let idx = r * cols + c;
+                        let rot = if c < half {
+                            -x[r * cols + c + half]
+                        } else {
+                            x[r * cols + c - half]
+                        };
+                        out[idx] = x[idx] * cos_v[idx] + rot * sin_v[idx];
+                    }
+                }
+                out
+            } else if name == "castforge.fused_attention" && inputs.len() >= 3 {
+                let scale = match op.attributes.get("scale") {
+                    Some(castforge_ir::Attribute::Float(f)) => *f as f32,
+                    _ => 1.0_f32,
+                };
+                let k_transposed = op
+                    .attributes
+                    .get("k_transposed")
+                    .is_some_and(|a| matches!(a, castforge_ir::Attribute::Bool(true)));
+                eval_fused_attention_2d(
+                    module,
+                    inputs[0],
+                    inputs[1],
+                    inputs[2],
+                    scale,
+                    k_transposed,
+                    &get_v,
+                )
             } else {
                 get_v(inputs[0])
             }
@@ -586,6 +627,56 @@ fn eval_matmul_2d(
                 acc += a[row * k + kk] * b_val;
             }
             out[row * n + col] = acc;
+        }
+    }
+    out
+}
+
+fn eval_fused_attention_2d(
+    module: &Module,
+    q_id: ValueId,
+    k_id: ValueId,
+    v_id: ValueId,
+    scale: f32,
+    k_transposed: bool,
+    get_v: &dyn Fn(ValueId) -> Vec<f32>,
+) -> Vec<f32> {
+    let q_dims = module.values[q_id]
+        .ty
+        .as_tensor()
+        .map(tensor_shape_dims)
+        .unwrap_or_else(|| vec![1, 1]);
+    let v_dims = module.values[v_id]
+        .ty
+        .as_tensor()
+        .map(tensor_shape_dims)
+        .unwrap_or_else(|| vec![1, 1]);
+    let seq_q = *q_dims.first().unwrap_or(&1);
+    let seq_kv = *v_dims.first().unwrap_or(&1);
+    let d_v = *v_dims.get(1).unwrap_or(&1);
+
+    let qk = eval_matmul_2d(module, q_id, k_id, k_transposed, get_v);
+    let v = get_v(v_id);
+    let mut out = vec![0.0_f32; seq_q * d_v];
+
+    for r in 0..seq_q {
+        let row_scores = &qk[r * seq_kv..(r + 1) * seq_kv];
+        let max_s = row_scores
+            .iter()
+            .map(|&s| s * scale)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut probs = vec![0.0_f32; seq_kv];
+        let mut sum = 0.0_f32;
+        for (c, &s) in row_scores.iter().enumerate() {
+            let e = (s * scale - max_s).exp();
+            probs[c] = e;
+            sum += e;
+        }
+        for c in 0..seq_kv {
+            let p = probs[c] / sum;
+            for d in 0..d_v {
+                out[r * d_v + d] += p * v[c * d_v + d];
+            }
         }
     }
     out

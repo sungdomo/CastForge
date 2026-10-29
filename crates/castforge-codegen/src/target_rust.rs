@@ -624,6 +624,52 @@ fn emit_rust_hlo_op(
                     "        {dst} = (g / (1.0_f32 + (-g).exp())) * ({up});"
                 )?;
                 writeln!(out, "    }}")?;
+            } else if name == "castforge.fused_rope" && inputs.len() >= 3 {
+                let dims = module.values[res_val]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_else(|| vec![1, res_len]);
+                let cols = *dims.last().unwrap_or(&res_len).max(&2);
+                let rows = (res_len / cols).max(1);
+                let half = cols / 2;
+                let x_cur = r_idx(module, plan, inputs[0], "idx", names, counter);
+                let x_hi = r_idx(
+                    module,
+                    plan,
+                    inputs[0],
+                    &format!("idx + {half}"),
+                    names,
+                    counter,
+                );
+                let x_lo = r_idx(
+                    module,
+                    plan,
+                    inputs[0],
+                    &format!("idx - {half}"),
+                    names,
+                    counter,
+                );
+                let c_cur = r_idx(module, plan, inputs[1], "idx", names, counter);
+                let s_cur = r_idx(module, plan, inputs[2], "idx", names, counter);
+                let dst = r_idx(module, plan, res_val, "idx", names, counter);
+                writeln!(out, "    for r in 0..{rows} {{")?;
+                writeln!(out, "        for c in 0..{cols} {{")?;
+                writeln!(out, "            let idx = r * {cols} + c;")?;
+                writeln!(
+                    out,
+                    "            let rot = if c < {half} {{ -{x_hi} }} else {{ {x_lo} }};"
+                )?;
+                writeln!(
+                    out,
+                    "            {dst} = {x_cur} * {c_cur} + rot * {s_cur};"
+                )?;
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
+            } else if name == "castforge.fused_attention" && inputs.len() >= 3 {
+                emit_rust_fused_attention(
+                    module, plan, op, inputs[0], inputs[1], inputs[2], res_val, names, counter, out,
+                )?;
             } else {
                 let src = r_idx(module, plan, inputs[0], "i", names, counter);
                 let dst = r_idx(module, plan, res_val, "i", names, counter);
@@ -635,5 +681,100 @@ fn emit_rust_hlo_op(
         _ => {}
     }
 
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_rust_fused_attention(
+    module: &Module,
+    plan: &MemoryPlan,
+    op: &castforge_ir::Operation,
+    q_id: ValueId,
+    k_id: ValueId,
+    v_id: ValueId,
+    res_val: ValueId,
+    names: &mut HashMap<ValueId, String>,
+    counter: &mut usize,
+    out: &mut String,
+) -> Result<()> {
+    let q_dims = module.values[q_id]
+        .ty
+        .as_tensor()
+        .map(tensor_shape_dims)
+        .unwrap_or_else(|| vec![1, 1]);
+    let v_dims = module.values[v_id]
+        .ty
+        .as_tensor()
+        .map(tensor_shape_dims)
+        .unwrap_or_else(|| vec![1, 1]);
+    let seq_q = *q_dims.first().unwrap_or(&1);
+    let d_k = *q_dims.get(1).unwrap_or(&1);
+    let seq_kv = *v_dims.first().unwrap_or(&1);
+    let d_v = *v_dims.get(1).unwrap_or(&1);
+    let scale = match op.attributes.get("scale") {
+        Some(castforge_ir::Attribute::Float(f)) => *f as f32,
+        _ => 1.0_f32,
+    };
+    let k_transposed = op
+        .attributes
+        .get("k_transposed")
+        .is_some_and(|a| matches!(a, castforge_ir::Attribute::Bool(true)));
+    let q_idx = r_idx(
+        module,
+        plan,
+        q_id,
+        &format!("r * {d_k} + kd"),
+        names,
+        counter,
+    );
+    let k_idx_str = if k_transposed {
+        format!("c * {d_k} + kd")
+    } else {
+        format!("kd * {seq_kv} + c")
+    };
+    let k_idx = r_idx(module, plan, k_id, &k_idx_str, names, counter);
+    let v_idx = r_idx(
+        module,
+        plan,
+        v_id,
+        &format!("c * {d_v} + d"),
+        names,
+        counter,
+    );
+    let dst = r_idx(
+        module,
+        plan,
+        res_val,
+        &format!("r * {d_v} + d"),
+        names,
+        counter,
+    );
+    writeln!(out, "    for r in 0..{seq_q} {{")?;
+    writeln!(out, "        let mut scores = [0.0_f32; {seq_kv}];")?;
+    writeln!(out, "        let mut max_s = f32::NEG_INFINITY;")?;
+    writeln!(out, "        for c in 0..{seq_kv} {{")?;
+    writeln!(out, "            let mut acc = 0.0_f32;")?;
+    writeln!(
+        out,
+        "            for kd in 0..{d_k} {{ acc += {q_idx} * {k_idx}; }}"
+    )?;
+    writeln!(out, "            let s = acc * {scale:?}_f32;")?;
+    writeln!(out, "            scores[c] = s;")?;
+    writeln!(out, "            if s > max_s {{ max_s = s; }}")?;
+    writeln!(out, "        }}")?;
+    writeln!(out, "        let mut sum = 0.0_f32;")?;
+    writeln!(out, "        for c in 0..{seq_kv} {{")?;
+    writeln!(out, "            scores[c] = (scores[c] - max_s).exp();")?;
+    writeln!(out, "            sum += scores[c];")?;
+    writeln!(out, "        }}")?;
+    writeln!(out, "        for d in 0..{d_v} {{")?;
+    writeln!(out, "            let mut o_acc = 0.0_f32;")?;
+    writeln!(
+        out,
+        "            for c in 0..{seq_kv} {{ o_acc += (scores[c] / sum) * {v_idx}; }}"
+    )?;
+    writeln!(out, "            {dst} = o_acc;")?;
+    writeln!(out, "        }}")?;
+    writeln!(out, "    }}")?;
     Ok(())
 }

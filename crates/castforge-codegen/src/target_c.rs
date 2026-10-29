@@ -518,6 +518,35 @@ fn emit_c_hlo_op(
                     "    for (int i = 0; i < {res_len}; ++i) \
                      {res_name}[i] = ({g}[i] / (1.0f + expf(-{g}[i]))) * {u}[i];"
                 )?;
+            } else if name == "castforge.fused_rope" && inputs.len() >= 3 {
+                let x = value_ident(module, inputs[0], names, counter);
+                let c_arr = value_ident(module, inputs[1], names, counter);
+                let s_arr = value_ident(module, inputs[2], names, counter);
+                let dims = module.values[inputs[0]]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_else(|| vec![1, res_len]);
+                let cols = *dims.last().unwrap_or(&res_len).max(&2);
+                let rows = (res_len / cols).max(1);
+                let half = cols / 2;
+                writeln!(out, "    for (int r = 0; r < {rows}; ++r) {{")?;
+                writeln!(out, "        for (int c = 0; c < {cols}; ++c) {{")?;
+                writeln!(out, "            int idx = r * {cols} + c;")?;
+                writeln!(
+                    out,
+                    "            float rot = (c < {half}) ? -{x}[idx + {half}] : {x}[idx - {half}];"
+                )?;
+                writeln!(
+                    out,
+                    "            {res_name}[idx] = {x}[idx] * {c_arr}[idx] + rot * {s_arr}[idx];"
+                )?;
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
+            } else if name == "castforge.fused_attention" && inputs.len() >= 3 {
+                emit_c_fused_attention(
+                    module, op, inputs[0], inputs[1], inputs[2], res_name, names, counter, out,
+                )?;
             } else {
                 let src = value_ident(module, inputs[0], names, counter);
                 writeln!(
@@ -529,5 +558,77 @@ fn emit_c_hlo_op(
         _ => {}
     }
 
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_c_fused_attention(
+    module: &Module,
+    op: &castforge_ir::Operation,
+    q_id: ValueId,
+    k_id: ValueId,
+    v_id: ValueId,
+    res_name: &str,
+    names: &mut HashMap<ValueId, String>,
+    counter: &mut usize,
+    out: &mut String,
+) -> Result<()> {
+    let q = value_ident(module, q_id, names, counter);
+    let k = value_ident(module, k_id, names, counter);
+    let v = value_ident(module, v_id, names, counter);
+    let q_dims = module.values[q_id]
+        .ty
+        .as_tensor()
+        .map(tensor_shape_dims)
+        .unwrap_or_else(|| vec![1, 1]);
+    let v_dims = module.values[v_id]
+        .ty
+        .as_tensor()
+        .map(tensor_shape_dims)
+        .unwrap_or_else(|| vec![1, 1]);
+    let seq_q = *q_dims.first().unwrap_or(&1);
+    let d_k = *q_dims.get(1).unwrap_or(&1);
+    let seq_kv = *v_dims.first().unwrap_or(&1);
+    let d_v = *v_dims.get(1).unwrap_or(&1);
+    let scale = match op.attributes.get("scale") {
+        Some(castforge_ir::Attribute::Float(f)) => *f as f32,
+        _ => 1.0_f32,
+    };
+    let k_transposed = op
+        .attributes
+        .get("k_transposed")
+        .is_some_and(|a| matches!(a, castforge_ir::Attribute::Bool(true)));
+    let k_idx = if k_transposed {
+        format!("c * {d_k} + kd")
+    } else {
+        format!("kd * {seq_kv} + c")
+    };
+    writeln!(out, "    for (int r = 0; r < {seq_q}; ++r) {{")?;
+    writeln!(out, "        float scores[{seq_kv}];")?;
+    writeln!(out, "        float max_s = -1e30f;")?;
+    writeln!(out, "        for (int c = 0; c < {seq_kv}; ++c) {{")?;
+    writeln!(out, "            float acc = 0.0f;")?;
+    writeln!(
+        out,
+        "            for (int kd = 0; kd < {d_k}; ++kd) acc += {q}[r * {d_k} + kd] * {k}[{k_idx}];"
+    )?;
+    writeln!(out, "            scores[c] = acc * {scale:.6}f;")?;
+    writeln!(out, "            if (scores[c] > max_s) max_s = scores[c];")?;
+    writeln!(out, "        }}")?;
+    writeln!(out, "        float sum = 0.0f;")?;
+    writeln!(out, "        for (int c = 0; c < {seq_kv}; ++c) {{")?;
+    writeln!(out, "            scores[c] = expf(scores[c] - max_s);")?;
+    writeln!(out, "            sum += scores[c];")?;
+    writeln!(out, "        }}")?;
+    writeln!(out, "        for (int d = 0; d < {d_v}; ++d) {{")?;
+    writeln!(out, "            float o_acc = 0.0f;")?;
+    writeln!(
+        out,
+        "            for (int c = 0; c < {seq_kv}; ++c) \
+         o_acc += (scores[c] / sum) * {v}[c * {d_v} + d];"
+    )?;
+    writeln!(out, "            {res_name}[r * {d_v} + d] = o_acc;")?;
+    writeln!(out, "        }}")?;
+    writeln!(out, "    }}")?;
     Ok(())
 }

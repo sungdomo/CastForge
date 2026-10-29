@@ -368,7 +368,7 @@ fn profile_single_op(module: &Module, op_id: OpId, roofline: &HardwareRoofline) 
             let n = out_dims.last().copied().unwrap_or(1);
             2 * m * n * k + 2 * m * k * r + 2 * m * r * n + m * n
         }
-        "scaled_dot_product_attention" => {
+        "scaled_dot_product_attention" | "fused_attention" => {
             let q_dims = op
                 .operands
                 .first()
@@ -381,9 +381,10 @@ fn profile_single_op(module: &Module, op_id: OpId, roofline: &HardwareRoofline) 
             };
             4 * s * s * d + 5 * s * s
         }
-        "swiglu" | "layer_norm" => 6 * out_elems,
+        "swiglu" | "fused_swiglu" | "layer_norm" => 6 * out_elems,
+        "rope" | "fused_rope" => 3 * out_elems,
         "gelu" | "silu" | "sigmoid" | "logistic" | "tanh" | "exp" | "log" | "rsqrt" | "sqrt"
-        | "rms_norm" => 4 * out_elems,
+        | "rms_norm" | "fused_rmsnorm" | "fused_softmax" => 4 * out_elems,
         "fma" => 2 * out_elems,
         "add" | "subtract" | "multiply" | "divide" | "maximum" | "minimum" | "power" | "negate"
         | "abs" | "relu" | "clamp" | "dequantize_int8" => out_elems,

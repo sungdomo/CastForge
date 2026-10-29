@@ -249,6 +249,74 @@ impl Pass for DecomposeCompositesPass {
                         created += 4;
                         modified += 1;
                     }
+                    "castforge.fused_rope" if inputs.len() >= 3 => {
+                        let (x, cos_v, sin_v) = (inputs[0], inputs[1], inputs[2]);
+                        let (half_ty, rows, cols) = half_col_type(&out_ty);
+                        let half = cols / 2;
+                        let x_lo = insert_slice_2d_before(
+                            module,
+                            block_id,
+                            op_id,
+                            x,
+                            [0, 0],
+                            [rows, half],
+                            half_ty.clone(),
+                        );
+                        let x_hi = insert_slice_2d_before(
+                            module,
+                            block_id,
+                            op_id,
+                            x,
+                            [0, half],
+                            [rows, cols],
+                            half_ty.clone(),
+                        );
+                        let zero_hi = insert_zero_tensor_before(module, block_id, op_id, &half_ty);
+                        let neg_hi = insert_op_before(
+                            module,
+                            block_id,
+                            op_id,
+                            OpName::new("stablehlo", "subtract"),
+                            &[zero_hi, x_hi],
+                            IndexMap::new(),
+                            half_ty,
+                        );
+                        let mut cat_attrs = IndexMap::new();
+                        cat_attrs.insert("dimension".to_string(), Attribute::Int(1));
+                        let rot_x = insert_op_before(
+                            module,
+                            block_id,
+                            op_id,
+                            OpName::new("stablehlo", "concatenate"),
+                            &[neg_hi, x_lo],
+                            cat_attrs,
+                            out_ty.clone(),
+                        );
+                        let mul_cos = insert_op_before(
+                            module,
+                            block_id,
+                            op_id,
+                            OpName::new("stablehlo", "multiply"),
+                            &[x, cos_v],
+                            IndexMap::new(),
+                            out_ty.clone(),
+                        );
+                        let mul_sin = insert_op_before(
+                            module,
+                            block_id,
+                            op_id,
+                            OpName::new("stablehlo", "multiply"),
+                            &[rot_x, sin_v],
+                            IndexMap::new(),
+                            out_ty,
+                        );
+                        let op_mut = &mut module.ops[op_id];
+                        op_mut.name = OpName::new("stablehlo", "add");
+                        op_mut.operands = SmallVec::from_slice(&[mul_cos, mul_sin]);
+                        op_mut.attributes.clear();
+                        created += 7;
+                        modified += 1;
+                    }
                     _ => {}
                 }
             }
@@ -395,6 +463,91 @@ fn insert_scalar_const_before(
         &[],
         attrs,
         Type::Tensor(s_ty),
+    )
+}
+
+fn half_col_type(out_ty: &Type) -> (Type, i64, i64) {
+    if let Some(t) = out_ty.as_tensor()
+        && let [Dim::Static(r), Dim::Static(c)] = t.shape.as_slice()
+    {
+        return (
+            Type::Tensor(TensorType {
+                shape: vec![Dim::Static(*r), Dim::Static(*c / 2)],
+                dtype: t.dtype.clone(),
+                encoding: None,
+            }),
+            *r,
+            *c,
+        );
+    }
+    (
+        Type::Tensor(TensorType {
+            shape: vec![Dim::Static(1), Dim::Static(1)],
+            dtype: DType::F32,
+            encoding: None,
+        }),
+        1,
+        2,
+    )
+}
+
+fn insert_slice_2d_before(
+    module: &mut Module,
+    block_id: BlockId,
+    before_op: OpId,
+    operand: ValueId,
+    starts: [i64; 2],
+    limits: [i64; 2],
+    out_ty: Type,
+) -> ValueId {
+    let mut attrs = IndexMap::new();
+    attrs.insert(
+        "start_indices".to_string(),
+        Attribute::DenseIntArray(starts.to_vec()),
+    );
+    attrs.insert(
+        "limit_indices".to_string(),
+        Attribute::DenseIntArray(limits.to_vec()),
+    );
+    attrs.insert("strides".to_string(), Attribute::DenseIntArray(vec![1, 1]));
+    insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "slice"),
+        &[operand],
+        attrs,
+        out_ty,
+    )
+}
+
+fn insert_zero_tensor_before(
+    module: &mut Module,
+    block_id: BlockId,
+    before_op: OpId,
+    ty: &Type,
+) -> ValueId {
+    let t_ty = ty.as_tensor().cloned().unwrap_or(TensorType {
+        shape: Vec::new(),
+        dtype: DType::F32,
+        encoding: None,
+    });
+    let mut attrs = IndexMap::new();
+    attrs.insert(
+        "value".to_string(),
+        Attribute::DenseElements {
+            ty: t_ty,
+            raw_literal: "0.0".to_string(),
+        },
+    );
+    insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "constant"),
+        &[],
+        attrs,
+        ty.clone(),
     )
 }
 

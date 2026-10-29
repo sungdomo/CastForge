@@ -296,6 +296,34 @@ fn emit_wgsl_func(
                             "        {res_name}[i] = ({g}[i] / (1.0 + exp(-{g}[i]))) * {u}[i];"
                         )?;
                         writeln!(out, "    }}")?;
+                    } else if name == "castforge.fused_rope" && inputs.len() >= 3 {
+                        let x = value_ident(module, inputs[0], &mut names, &mut counter);
+                        let c_arr = value_ident(module, inputs[1], &mut names, &mut counter);
+                        let s_arr = value_ident(module, inputs[2], &mut names, &mut counter);
+                        let dims = module.values[res_val]
+                            .ty
+                            .as_tensor()
+                            .map(tensor_shape_dims)
+                            .unwrap_or_else(|| vec![1, res_len]);
+                        let cols = *dims.last().unwrap_or(&res_len).max(&2);
+                        let rows = (res_len / cols).max(1);
+                        let half = cols / 2;
+                        writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+                        writeln!(out, "    for (var r = 0u; r < {rows}u; r = r + 1u) {{")?;
+                        writeln!(out, "        for (var c = 0u; c < {cols}u; c = c + 1u) {{")?;
+                        writeln!(out, "            let idx = r * {cols}u + c;")?;
+                        writeln!(
+                            out,
+                            "            let rot = select(\
+                             {x}[idx - {half}u], -{x}[idx + {half}u], c < {half}u);"
+                        )?;
+                        writeln!(
+                            out,
+                            "            {res_name}[idx] = \
+                             {x}[idx] * {c_arr}[idx] + rot * {s_arr}[idx];"
+                        )?;
+                        writeln!(out, "        }}")?;
+                        writeln!(out, "    }}")?;
                     } else {
                         let a = value_ident(module, inputs[0], &mut names, &mut counter);
                         writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;

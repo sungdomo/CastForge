@@ -497,3 +497,87 @@ fn test_pack_weights_and_unit_stride_codegen() {
     let c_code = generate_code(&packed, CodegenTarget::C).expect("c codegen packed");
     assert!(c_code.contains("n * 3 + k"));
 }
+
+const ROPE_AND_GQA_MLIR: &str = r#"
+module @rope_gqa_demo {
+  func.func @forward(
+    %q_in: tensor<2x4xf32>,
+    %cos: tensor<2x4xf32>,
+    %sin: tensor<2x4xf32>,
+    %k_kv: tensor<4x1xf32>,
+    %v_kv: tensor<1x4xf32>
+  ) -> tensor<2x4xf32> {
+    %zero_half = stablehlo.constant dense<0.0> : tensor<2x2xf32>
+    %zero_init = stablehlo.constant dense<0.0> : tensor<f32>
+    %scale = stablehlo.constant dense<0.5> : tensor<2x2xf32>
+    %q_lo = stablehlo.slice %q_in
+      {start_indices = [0, 0], limit_indices = [2, 2], strides = [1, 1]}
+      : (tensor<2x4xf32>) -> tensor<2x2xf32>
+    %q_hi = stablehlo.slice %q_in
+      {start_indices = [0, 2], limit_indices = [2, 4], strides = [1, 1]}
+      : (tensor<2x4xf32>) -> tensor<2x2xf32>
+    %neg_hi = stablehlo.subtract %zero_half, %q_hi : tensor<2x2xf32>
+    %q_rot = stablehlo.concatenate %neg_hi, %q_lo {dimension = 1}
+      : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x4xf32>
+    %q_cos = stablehlo.multiply %q_in, %cos : tensor<2x4xf32>
+    %q_sin = stablehlo.multiply %q_rot, %sin : tensor<2x4xf32>
+    %q = stablehlo.add %q_cos, %q_sin : tensor<2x4xf32>
+
+    %k = stablehlo.broadcast_in_dim %k_kv, dims = [0, 1]
+      : (tensor<4x1xf32>) -> tensor<4x2xf32>
+    %v = stablehlo.broadcast_in_dim %v_kv, dims = [0, 1]
+      : (tensor<1x4xf32>) -> tensor<2x4xf32>
+
+    %qk = stablehlo.dot_general %q, %k, contracting_dims = [1] x [0]
+      : (tensor<2x4xf32>, tensor<4x2xf32>) -> tensor<2x2xf32>
+    %scores = stablehlo.multiply %qk, %scale : tensor<2x2xf32>
+    %exp = stablehlo.exponential %scores : tensor<2x2xf32>
+    %sum = stablehlo.reduce %exp, %zero_init
+      {dimensions = [1], reducer = "stablehlo.add"}
+      : (tensor<2x2xf32>, tensor<f32>) -> tensor<2xf32>
+    %denom = stablehlo.broadcast_in_dim %sum, dims = [0]
+      : (tensor<2xf32>) -> tensor<2x2xf32>
+    %probs = stablehlo.divide %exp, %denom : tensor<2x2xf32>
+    %out = stablehlo.dot_general %probs, %v, contracting_dims = [1] x [0]
+      : (tensor<2x2xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+    func.return %out : tensor<2x4xf32>
+  }
+}
+"#;
+
+#[test]
+fn test_fuse_rope_and_gqa_attention() {
+    let before = parse_mlir(ROPE_AND_GQA_MLIR).expect("parse rope+gqa mlir");
+    let mut fused = before.clone();
+    let registry = PassRegistry::with_builtin_passes();
+
+    let mut pm = PassManager::from_pipeline_str(&registry, "fuse-rope,fuse-attention")
+        .expect("fuse-rope,fuse-attention pipeline");
+    let res = pm.run(&mut fused).expect("run fuse-rope,fuse-attention");
+    assert!(res[0].changed);
+    assert!(res[1].changed);
+
+    let printed = print_mlir(&fused);
+    assert!(printed.contains("castforge.fused_rope"));
+    assert!(printed.contains("castforge.fused_attention"));
+    assert!(printed.contains("gqa = true"));
+
+    let rep = verify_module_numerics(&before, &fused, 1e-5).expect("verify rope+gqa numerics");
+    assert!(rep.passed, "max_abs_diff = {}", rep.max_abs_diff);
+
+    let rust_code = generate_code(&fused, CodegenTarget::Rust).expect("rust codegen");
+    assert!(rust_code.contains("let rot = if c < 2"));
+    assert!(rust_code.contains("let mut scores = [0.0_f32; 2];"));
+
+    let c_code = generate_code(&fused, CodegenTarget::C).expect("c codegen");
+    assert!(c_code.contains("float scores[2];"));
+
+    // Also verify decompose-composites restores primitive RoPE ops
+    let mut decomposed = fused.clone();
+    let mut dec_pm = PassManager::from_pipeline_str(&registry, "decompose-composites")
+        .expect("decompose pipeline");
+    dec_pm.run(&mut decomposed).expect("run decompose");
+    let dec_printed = print_mlir(&decomposed);
+    assert!(!dec_printed.contains("castforge.fused_rope"));
+    assert!(dec_printed.contains("stablehlo.concatenate"));
+}

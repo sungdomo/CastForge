@@ -2,12 +2,12 @@ use crate::{
     BakeLoraPass, CanonicalizePass, CommonSubexpressionEliminationPass, DeadCodeEliminationPass,
     DecomposeCompositesPass, ExternalizeWeightsPass, FoldBroadcastPass, FoldConstantsPass,
     FoldConvertPass, FoldNormWeightsPass, FoldReshapePass, FoldSliceConcatPass, FoldTransposePass,
-    FuseElementwisePass, FuseHorizontalDotPass, FuseMatmulEpiloguePass, FuseRmsNormPass,
-    FuseSoftmaxPass, FuseSwiGluPass, HoistConstantsPass, InlinerPass, IrEditPass, LicmPass,
-    MergeWeightsPass, PackWeightsPass, Pass, PassOptions, PrintOpStatsPass, QuantizeWeightsPass,
-    SccpPass, SimplifyAlgebraicPass, SinkTransposePass, SpecializeShapesPass, StripDebugInfoPass,
-    StructuredPruningPass, SymbolDcePass, TaskArithmeticPass, TopologicalSortPass,
-    VerifyShapesPass,
+    FuseAttentionPass, FuseElementwisePass, FuseHorizontalDotPass, FuseMatmulEpiloguePass,
+    FuseRmsNormPass, FuseRopePass, FuseSoftmaxPass, FuseSwiGluPass, HoistConstantsPass,
+    InlinerPass, IrEditPass, LicmPass, MergeWeightsPass, PackWeightsPass, Pass, PassOptions,
+    PrintOpStatsPass, QuantizeWeightsPass, SccpPass, SimplifyAlgebraicPass, SinkTransposePass,
+    SpecializeShapesPass, StripDebugInfoPass, StructuredPruningPass, SymbolDcePass,
+    TaskArithmeticPass, TopologicalSortPass, VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
 use castforge_ir::MergeMethod;
@@ -327,6 +327,16 @@ impl PassRegistry {
             "pack-weights",
             "Pre-packs 2D constant RHS weights from [K, N] to [N, K] for unit-stride SIMD MatMul",
             |_opts| Ok(Box::new(PackWeightsPass)),
+        );
+        reg.register(
+            "fuse-rope",
+            "Fuses decomposed Rotary Position Embedding (RoPE) subgraphs into stablehlo.composite",
+            |_opts| Ok(Box::new(FuseRopePass)),
+        );
+        reg.register(
+            "fuse-attention",
+            "Fuses Q*K^T + scale + softmax + P*V (with GQA support) into stablehlo.composite",
+            |_opts| Ok(Box::new(FuseAttentionPass)),
         );
         reg
     }
