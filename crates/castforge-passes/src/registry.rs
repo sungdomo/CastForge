@@ -5,8 +5,9 @@ use crate::{
     FuseElementwisePass, FuseHorizontalDotPass, FuseMatmulEpiloguePass, FuseRmsNormPass,
     FuseSoftmaxPass, FuseSwiGluPass, HoistConstantsPass, InlinerPass, IrEditPass, LicmPass,
     MergeWeightsPass, Pass, PassOptions, PrintOpStatsPass, QuantizeWeightsPass, SccpPass,
-    SimplifyAlgebraicPass, SinkTransposePass, StripDebugInfoPass, StructuredPruningPass,
-    SymbolDcePass, TaskArithmeticPass, TopologicalSortPass, VerifyShapesPass,
+    SimplifyAlgebraicPass, SinkTransposePass, SpecializeShapesPass, StripDebugInfoPass,
+    StructuredPruningPass, SymbolDcePass, TaskArithmeticPass, TopologicalSortPass,
+    VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
 use castforge_ir::MergeMethod;
@@ -300,6 +301,27 @@ impl PassRegistry {
             "fuse-swiglu",
             "Fuses SwiGLU (gate / (1 + exp(-gate)) * up) into stablehlo.composite (fused_swiglu)",
             |_opts| Ok(Box::new(FuseSwiGluPass)),
+        );
+        reg.register(
+            "specialize-shapes",
+            "Binds dynamic/symbolic dimensions (?, B, S) and propagates static shapes across IR",
+            |opts| {
+                let mut default_dim = 1i64;
+                let mut bindings = IndexMap::new();
+                for (k, v) in opts {
+                    if let Ok(n) = v.parse::<i64>() {
+                        if k == "default" || k == "?" {
+                            default_dim = n;
+                        } else {
+                            bindings.insert(k.clone(), n);
+                        }
+                    }
+                }
+                Ok(Box::new(SpecializeShapesPass {
+                    default_dim,
+                    bindings,
+                }))
+            },
         );
         reg
     }

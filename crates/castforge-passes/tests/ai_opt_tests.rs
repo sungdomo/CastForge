@@ -436,3 +436,35 @@ fn test_fuse_swiglu_and_generalized_matmul_epilogue() {
         verify_module_numerics(&before, &silu_epilogue_mod, 1e-5).expect("verify bias_silu");
     assert!(rep_e.passed, "max_abs_diff = {}", rep_e.max_abs_diff);
 }
+
+const SYMBOLIC_DYNAMIC_SHAPES_MLIR: &str = r#"
+module @symbolic_dynamic_demo {
+  func.func @forward(%x: tensor<Bx6xf32>) -> tensor<?x2xf32> {
+    %w = stablehlo.constant dense<[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]> : tensor<3x2xf32>
+    %reshaped = stablehlo.reshape %x : (tensor<Bx6xf32>) -> tensor<?x3xf32>
+    %out = stablehlo.dot_general %reshaped, %w
+      : (tensor<?x3xf32>, tensor<3x2xf32>) -> tensor<?x2xf32>
+    func.return %out : tensor<?x2xf32>
+  }
+}
+"#;
+
+#[test]
+fn test_specialize_symbolic_and_dynamic_shapes() {
+    let mut module = parse_mlir(SYMBOLIC_DYNAMIC_SHAPES_MLIR).expect("parse symbolic/dynamic MLIR");
+    let registry = PassRegistry::with_builtin_passes();
+
+    // Bind B=4: `%x` becomes `tensor<4x6xf32>` (24 elements), `%reshaped` (`tensor<?x3xf32>`)
+    // infers `? = 24 / 3 = 8` (`tensor<8x3xf32>`), and `%out` becomes `tensor<8x2xf32>`!
+    let mut pm = PassManager::from_pipeline_str(&registry, "specialize-shapes(B=4),verify-shapes")
+        .expect("specialize-shapes pipeline");
+    let res = pm.run(&mut module).expect("run specialize-shapes");
+    assert!(res[0].changed);
+
+    let printed = print_mlir(&module);
+    assert!(!printed.contains('?'));
+    assert!(!printed.contains("Bx6"));
+    assert!(printed.contains("tensor<4x6xf32>"));
+    assert!(printed.contains("tensor<8x3xf32>"));
+    assert!(printed.contains("-> tensor<8x2xf32>"));
+}
