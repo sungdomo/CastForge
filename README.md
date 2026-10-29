@@ -98,6 +98,12 @@ support.
 | `bisect-passes` | IR Debugging | Verifies invariants & stamps bisection step checkpoints |
 | `sanitize-numerics` | IR Sanitizer | Injects `castforge.nan_guard` finite clamps on ops |
 | `compose-funcs` | IR Linker | Chains two module functions `f2(f1(x))` into entry func |
+| `freeze-inputs` | IR Surgery | Binds `func.func` arguments to in-body constants |
+| `parameterize-constants` | IR Surgery | Hoists in-body weight constants to `func.func` args |
+| `tap-intermediates` | IR Probe | Appends intermediate SSA values to `func.return` |
+| `resize-batch` | IR Resizer | Rewrites leading batch dim while preserving 2D weights |
+| `dedup-functions` | IR Dedup | Merges structurally identical `func.func` definitions |
+| `normalize-ssa` | IR Canonical | Renames SSA values (`%arg0`, `%v0`) & sorts attributes |
 | `decompose-composites` | Lowering | Expands `stablehlo.composite` ops to primitive StableHLO |
 | `bufferize-inplace` | Lowering | Annotates elementwise ops for in-place arena buffer reuse |
 | `fold-norm-weights` | Weight Surgery | Absorbs RMSNorm/LayerNorm scale weights into MatMuls |

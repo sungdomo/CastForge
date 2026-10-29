@@ -1,20 +1,21 @@
 use crate::{
     AutodiffPass, BakeLoraPass, BisectPassesPass, BufferizeInplacePass, CalibrateQuantizePass,
     CanonicalizePass, CommonSubexpressionEliminationPass, ComposeFuncsPass,
-    DeadCodeEliminationPass, DecomposeCompositesPass, EgraphSimplifyPass, ExternalizeWeightsPass,
-    ExtractSubgraphPass, FissionLoopsPass, FoldBroadcastPass, FoldConstantsPass, FoldConvertPass,
-    FoldNormWeightsPass, FoldReshapePass, FoldSliceConcatPass, FoldTransposePass,
-    FuseAttentionPass, FuseDequantMatmulPass, FuseElementwisePass, FuseGatedMlpPass, FuseGeluPass,
-    FuseHorizontalDotPass, FuseLayerNormPass, FuseLogSoftmaxPass, FuseLoopsPass, FuseMapReducePass,
-    FuseMatmulEpiloguePass, FuseMoePass, FuseResidualNormPass, FuseRmsNormPass, FuseRopePass,
-    FuseSoftmaxPass, FuseSwiGluPass, HoistConstantsPass, InjectKvCachePass, InlinerPass,
-    IrEditPass, LicmPass, LowerConvToGemmPass, MergeWeightsPass, MixedPrecisionPass, OptO1Pass,
-    OptO2Pass, OptO3Pass, OutlineSubgraphsPass, PackWeightsPass, Pass, PassOptions,
+    DeadCodeEliminationPass, DecomposeCompositesPass, DedupFunctionsPass, EgraphSimplifyPass,
+    ExternalizeWeightsPass, ExtractSubgraphPass, FissionLoopsPass, FoldBroadcastPass,
+    FoldConstantsPass, FoldConvertPass, FoldNormWeightsPass, FoldReshapePass, FoldSliceConcatPass,
+    FoldTransposePass, FreezeInputsPass, FuseAttentionPass, FuseDequantMatmulPass,
+    FuseElementwisePass, FuseGatedMlpPass, FuseGeluPass, FuseHorizontalDotPass, FuseLayerNormPass,
+    FuseLogSoftmaxPass, FuseLoopsPass, FuseMapReducePass, FuseMatmulEpiloguePass, FuseMoePass,
+    FuseResidualNormPass, FuseRmsNormPass, FuseRopePass, FuseSoftmaxPass, FuseSwiGluPass,
+    HoistConstantsPass, InjectKvCachePass, InlinerPass, IrEditPass, LicmPass, LowerConvToGemmPass,
+    MergeWeightsPass, MixedPrecisionPass, NormalizeSsaPass, OptO1Pass, OptO2Pass, OptO3Pass,
+    OutlineSubgraphsPass, PackWeightsPass, ParameterizeConstantsPass, Pass, PassOptions,
     PermuteLoopsPass, PrintOpStatsPass, QuantizeWeightsPass, ReduceIrPass, RematerializePass,
-    SanitizeNumericsPass, SccpPass, ScheduleStreamsPass, ShardSpmdPass, SimplifyAlgebraicPass,
-    SinkTransposePass, SpecializeShapesPass, StripDebugInfoPass, StructuredPruningPass,
-    SymbolDcePass, TaskArithmeticPass, TileLoopsPass, TopologicalSortPass, UnrollLoopsPass,
-    VectorizeLoopsPass, VerifyShapesPass,
+    ResizeBatchPass, SanitizeNumericsPass, SccpPass, ScheduleStreamsPass, ShardSpmdPass,
+    SimplifyAlgebraicPass, SinkTransposePass, SpecializeShapesPass, StripDebugInfoPass,
+    StructuredPruningPass, SymbolDcePass, TapIntermediatesPass, TaskArithmeticPass, TileLoopsPass,
+    TopologicalSortPass, UnrollLoopsPass, VectorizeLoopsPass, VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
 use castforge_ir::{DType, MergeMethod};
@@ -719,6 +720,69 @@ impl PassRegistry {
                     second,
                     entry_name,
                 }))
+            },
+        );
+        reg.register(
+            "freeze-inputs",
+            "Binds func.func input arguments to in-body stablehlo.constant operations",
+            |opts| {
+                let args = opts.get("args").cloned().unwrap_or_default();
+                let value = opts
+                    .get("value")
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.5);
+                Ok(Box::new(FreezeInputsPass { args, value }))
+            },
+        );
+        reg.register(
+            "parameterize-constants",
+            "Hoists in-body stablehlo.constant weight tensors into explicit func.func arguments",
+            |opts| {
+                let min_elements = opts
+                    .get("min_elements")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(2);
+                Ok(Box::new(ParameterizeConstantsPass { min_elements }))
+            },
+        );
+        reg.register(
+            "tap-intermediates",
+            "Appends intermediate SSA activations to func.return for multi-output layer inspection",
+            |opts| {
+                let values = opts
+                    .get("values")
+                    .or_else(|| opts.get("targets"))
+                    .cloned()
+                    .unwrap_or_default();
+                Ok(Box::new(TapIntermediatesPass { values }))
+            },
+        );
+        reg.register(
+            "resize-batch",
+            "Rewrites leading batch dimension across activations while preserving 2D GEMM weights",
+            |opts| {
+                let batch = opts
+                    .get("batch")
+                    .or_else(|| opts.get("size"))
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(4);
+                Ok(Box::new(ResizeBatchPass { batch }))
+            },
+        );
+        reg.register(
+            "dedup-functions",
+            "Merges structurally identical func.func definitions and rewrites func.call sites",
+            |_opts| Ok(Box::new(DedupFunctionsPass)),
+        );
+        reg.register(
+            "normalize-ssa",
+            "Renames SSA values in canonical topological order and sorts operation attributes",
+            |opts| {
+                let prefix = opts
+                    .get("prefix")
+                    .cloned()
+                    .unwrap_or_else(|| "v".to_string());
+                Ok(Box::new(NormalizeSsaPass { prefix }))
             },
         );
         reg.register(

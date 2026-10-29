@@ -1351,3 +1351,93 @@ module @stage2_mod {
     assert!(comp_ir.contains("func.call @main("));
     assert!(comp_ir.contains("func.call @postprocess("));
 }
+
+#[test]
+fn test_freeze_parameterize_tap_resize_dedup_and_normalize_passes() {
+    let mlir = r#"
+module @two_layer_gemm {
+  func.func @main(
+    %x: tensor<2x4xf32>,
+    %w1: tensor<4x4xf32>,
+    %w2: tensor<4x4xf32>
+  ) -> tensor<2x4xf32> {
+    %h1 = stablehlo.dot_general %x, %w1, contracting_dims = [1] x [0]
+      : (tensor<2x4xf32>, tensor<4x4xf32>) -> tensor<2x4xf32>
+    %h2 = stablehlo.dot_general %h1, %w2, contracting_dims = [1] x [0]
+      : (tensor<2x4xf32>, tensor<4x4xf32>) -> tensor<2x4xf32>
+    func.return %h2 : tensor<2x4xf32>
+  }
+}
+"#;
+    let base = parse_mlir(mlir).expect("parse two_layer_gemm");
+    let registry = PassRegistry::with_builtin_passes();
+
+    // 1. Symmetric `freeze-inputs` <-> `parameterize-constants` round-trip
+    let mut frozen = base.clone();
+    let mut frz_pm = PassManager::from_pipeline_str(&registry, "freeze-inputs(args=w1;w2)")
+        .expect("freeze-inputs");
+    let frz_res = frz_pm.run(&mut frozen).expect("run freeze-inputs");
+    assert!(frz_res[0].changed);
+    let frz_ir = print_mlir(&frozen);
+    assert!(frz_ir.contains("func.func @main(%x: tensor<2x4xf32>) -> tensor<2x4xf32>"));
+    assert!(frz_ir.contains("stablehlo.constant dense<0.5000> : tensor<4x4xf32>"));
+
+    let mut re_param = frozen.clone();
+    let mut prm_pm =
+        PassManager::from_pipeline_str(&registry, "parameterize-constants(min_elements=2)")
+            .expect("parameterize-constants");
+    let prm_res = prm_pm
+        .run(&mut re_param)
+        .expect("run parameterize-constants");
+    assert!(prm_res[0].changed);
+    let prm_ir = print_mlir(&re_param);
+    assert!(!prm_ir.contains("stablehlo.constant"));
+    assert!(prm_ir.contains("%w1: tensor<4x4xf32>, %w2: tensor<4x4xf32>"));
+
+    // 2. Intermediate Activation Tapper (`tap-intermediates`)
+    let mut tapped = base.clone();
+    let mut tap_pm = PassManager::from_pipeline_str(&registry, "tap-intermediates(values=h1)")
+        .expect("tap-intermediates");
+    let tap_res = tap_pm.run(&mut tapped).expect("run tap-intermediates");
+    assert!(tap_res[0].changed);
+    let tap_ir = print_mlir(&tapped);
+    assert!(tap_ir.contains("-> (tensor<2x4xf32>, tensor<2x4xf32>)"));
+    assert!(tap_ir.contains("return %h2, %h1 : tensor<2x4xf32>, tensor<2x4xf32>"));
+
+    // 3. Static Batch Dimension Resizer (`resize-batch`)
+    let mut resized = base.clone();
+    let mut rsz_pm =
+        PassManager::from_pipeline_str(&registry, "resize-batch(batch=8)").expect("resize-batch");
+    let rsz_res = rsz_pm.run(&mut resized).expect("run resize-batch");
+    assert!(rsz_res[0].changed);
+    let rsz_ir = print_mlir(&resized);
+    assert!(rsz_ir.contains("%x: tensor<8x4xf32>"));
+    assert!(rsz_ir.contains("%w1: tensor<4x4xf32>"));
+    assert!(rsz_ir.contains("-> tensor<8x4xf32>"));
+
+    // 4. Outlining + Identical Function Deduplicator (`outline-subgraphs | dedup-functions`)
+    let mut deduped = base.clone();
+    let mut dedup_pm =
+        PassManager::from_pipeline_str(&registry, "outline-subgraphs(mode=gemm) | dedup-functions")
+            .expect("outline + dedup");
+    let dedup_res = dedup_pm.run(&mut deduped).expect("run outline + dedup");
+    assert!(dedup_res[0].changed);
+    assert!(dedup_res[1].changed);
+    assert_eq!(dedup_res[1].ops_removed, 1);
+    let dedup_ir = print_mlir(&deduped);
+    assert!(dedup_ir.contains("func.func private @outlined_kernel_0("));
+    assert!(!dedup_ir.contains("func.func private @outlined_kernel_1("));
+    let dedup_rep = verify_module_numerics(&base, &deduped, 1e-5).expect("verify deduped");
+    assert!(dedup_rep.passed);
+
+    // 5. Canonical SSA Renamer & Attribute Sorter (`normalize-ssa`)
+    let mut norm = base.clone();
+    let mut norm_pm = PassManager::from_pipeline_str(&registry, "normalize-ssa(prefix=t)")
+        .expect("normalize-ssa");
+    let norm_res = norm_pm.run(&mut norm).expect("run normalize-ssa");
+    assert!(norm_res[0].changed);
+    let norm_ir = print_mlir(&norm);
+    assert!(norm_ir.contains("%arg0: tensor<2x4xf32>"));
+    assert!(norm_ir.contains("%t0 = stablehlo.dot_general"));
+    assert!(norm_ir.contains("%t1 = stablehlo.dot_general"));
+}
