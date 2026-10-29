@@ -4,8 +4,8 @@ use crate::{
     FoldConvertPass, FoldNormWeightsPass, FoldReshapePass, FoldSliceConcatPass, FoldTransposePass,
     FuseElementwisePass, FuseHorizontalDotPass, FuseMatmulEpiloguePass, FuseRmsNormPass,
     FuseSoftmaxPass, FuseSwiGluPass, HoistConstantsPass, InlinerPass, IrEditPass, LicmPass,
-    MergeWeightsPass, Pass, PassOptions, PrintOpStatsPass, QuantizeWeightsPass, SccpPass,
-    SimplifyAlgebraicPass, SinkTransposePass, SpecializeShapesPass, StripDebugInfoPass,
+    MergeWeightsPass, PackWeightsPass, Pass, PassOptions, PrintOpStatsPass, QuantizeWeightsPass,
+    SccpPass, SimplifyAlgebraicPass, SinkTransposePass, SpecializeShapesPass, StripDebugInfoPass,
     StructuredPruningPass, SymbolDcePass, TaskArithmeticPass, TopologicalSortPass,
     VerifyShapesPass,
 };
@@ -322,6 +322,11 @@ impl PassRegistry {
                     bindings,
                 }))
             },
+        );
+        reg.register(
+            "pack-weights",
+            "Pre-packs 2D constant RHS weights from [K, N] to [N, K] for unit-stride SIMD MatMul",
+            |_opts| Ok(Box::new(PackWeightsPass)),
         );
         reg
     }

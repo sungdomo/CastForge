@@ -433,13 +433,25 @@ fn eval_stablehlo_op(
                 })
                 .collect()
         }
-        StableHloOp::DotGeneral { lhs, rhs, .. } => eval_matmul_2d(module, lhs, rhs, &get_v),
+        StableHloOp::DotGeneral {
+            lhs,
+            rhs,
+            dimension_numbers: dims,
+            ..
+        } => {
+            let packed = dims.rhs_contracting_dimensions == [1];
+            eval_matmul_2d(module, lhs, rhs, packed, &get_v)
+        }
         StableHloOp::Composite { name, inputs, .. } => {
             if name == "castforge.fused_add_max" && inputs.len() == 3 {
                 let (a, b, c) = (get_v(inputs[0]), get_v(inputs[1]), get_v(inputs[2]));
                 (0..res_len).map(|i| (a[i] + b[i]).max(c[i])).collect()
             } else if name == "castforge.fused_matmul_epilogue" && inputs.len() >= 3 {
-                let mm = eval_matmul_2d(module, inputs[0], inputs[1], &get_v);
+                let packed = op
+                    .attributes
+                    .get("packed_rhs")
+                    .is_some_and(|a| matches!(a, castforge_ir::Attribute::Bool(true)));
+                let mm = eval_matmul_2d(module, inputs[0], inputs[1], packed, &get_v);
                 let bias = get_v(inputs[2]);
                 let epilogue = op
                     .attributes
@@ -539,6 +551,7 @@ fn eval_matmul_2d(
     module: &Module,
     lhs: ValueId,
     rhs: ValueId,
+    packed_rhs: bool,
     get_v: &dyn Fn(ValueId) -> Vec<f32>,
 ) -> Vec<f32> {
     let a = get_v(lhs);
@@ -555,13 +568,22 @@ fn eval_matmul_2d(
         .unwrap_or_else(|| vec![1, 1]);
     let m = *lhs_dims.first().unwrap_or(&1);
     let k = *lhs_dims.get(1).unwrap_or(&1);
-    let n = *rhs_dims.get(1).unwrap_or(&1);
+    let n = if packed_rhs {
+        *rhs_dims.first().unwrap_or(&1)
+    } else {
+        *rhs_dims.get(1).unwrap_or(&1)
+    };
     let mut out = vec![0.0_f32; m * n];
     for row in 0..m {
         for col in 0..n {
             let mut acc = 0.0_f32;
             for kk in 0..k {
-                acc += a[row * k + kk] * b[kk * n + col];
+                let b_val = if packed_rhs {
+                    b[col * k + kk]
+                } else {
+                    b[kk * n + col]
+                };
+                acc += a[row * k + kk] * b_val;
             }
             out[row * n + col] = acc;
         }

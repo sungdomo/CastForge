@@ -353,7 +353,13 @@ fn emit_rust_hlo_op(
             writeln!(out, "        {dst} = acc;")?;
             writeln!(out, "    }}")?;
         }
-        StableHloOp::DotGeneral { lhs, rhs, .. } => {
+        StableHloOp::DotGeneral {
+            lhs,
+            rhs,
+            dimension_numbers: dims,
+            ..
+        } => {
+            let packed = dims.rhs_contracting_dimensions == [1];
             let lhs_dims = module.values[lhs]
                 .ty
                 .as_tensor()
@@ -366,9 +372,18 @@ fn emit_rust_hlo_op(
                 .unwrap_or_else(|| vec![1, 1]);
             let m = *lhs_dims.first().unwrap_or(&1);
             let k = *lhs_dims.get(1).unwrap_or(&1);
-            let n = *rhs_dims.get(1).unwrap_or(&1);
+            let n = if packed {
+                *rhs_dims.first().unwrap_or(&1)
+            } else {
+                *rhs_dims.get(1).unwrap_or(&1)
+            };
+            let b_idx = if packed {
+                format!("n * {k} + k")
+            } else {
+                format!("k * {n} + n")
+            };
             let a = r_idx(module, plan, lhs, &format!("m * {k} + k"), names, counter);
-            let b = r_idx(module, plan, rhs, &format!("k * {n} + n"), names, counter);
+            let b = r_idx(module, plan, rhs, &b_idx, names, counter);
             let dst = r_idx(
                 module,
                 plan,
@@ -397,6 +412,10 @@ fn emit_rust_hlo_op(
                 writeln!(out, "        {dst} = ({a} + {b}).max({c});")?;
                 writeln!(out, "    }}")?;
             } else if name == "castforge.fused_matmul_epilogue" && inputs.len() >= 3 {
+                let packed = op
+                    .attributes
+                    .get("packed_rhs")
+                    .is_some_and(|a| matches!(a, castforge_ir::Attribute::Bool(true)));
                 let lhs_dims = module.values[inputs[0]]
                     .ty
                     .as_tensor()
@@ -409,7 +428,16 @@ fn emit_rust_hlo_op(
                     .unwrap_or_else(|| vec![1, 1]);
                 let m = *lhs_dims.first().unwrap_or(&1);
                 let k = *lhs_dims.get(1).unwrap_or(&1);
-                let n = *rhs_dims.get(1).unwrap_or(&1);
+                let n = if packed {
+                    *rhs_dims.first().unwrap_or(&1)
+                } else {
+                    *rhs_dims.get(1).unwrap_or(&1)
+                };
+                let b_idx = if packed {
+                    format!("n * {k} + k")
+                } else {
+                    format!("k * {n} + n")
+                };
                 let a = r_idx(
                     module,
                     plan,
@@ -418,14 +446,7 @@ fn emit_rust_hlo_op(
                     names,
                     counter,
                 );
-                let b = r_idx(
-                    module,
-                    plan,
-                    inputs[1],
-                    &format!("k * {n} + n"),
-                    names,
-                    counter,
-                );
+                let b = r_idx(module, plan, inputs[1], &b_idx, names, counter);
                 let bias = r_idx(module, plan, inputs[2], "idx", names, counter);
                 let dst = r_idx(module, plan, res_val, "idx", names, counter);
                 let epilogue = op

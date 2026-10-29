@@ -468,3 +468,32 @@ fn test_specialize_symbolic_and_dynamic_shapes() {
     assert!(printed.contains("tensor<8x3xf32>"));
     assert!(printed.contains("-> tensor<8x2xf32>"));
 }
+
+#[test]
+fn test_pack_weights_and_unit_stride_codegen() {
+    let before = parse_mlir(BAKE_LORA_MLIR).expect("parse mlir for pack-weights");
+    let mut packed = before.clone();
+    let registry = PassRegistry::with_builtin_passes();
+
+    let mut pm = PassManager::from_pipeline_str(&registry, "bake-lora,pack-weights")
+        .expect("bake-lora,pack-weights pipeline");
+    let res = pm.run(&mut packed).expect("run bake-lora,pack-weights");
+    assert!(res[0].changed);
+    assert!(res[1].changed);
+
+    // Weight shape `[3, 2]` (`tensor<3x2xf32>`) is transposed at compile time to `[2, 3]`
+    // (`tensor<2x3xf32>`) and `rhs_contracting_dimensions = array<i64: 1>` (`packed_rhs = true`)
+    // is set on `dot_general`!
+    let printed = print_mlir(&packed);
+    assert!(printed.contains("packed_rhs = true"));
+    assert!(printed.contains("rhs_contracting_dimensions = array<i64: 1>"));
+
+    let rep = verify_module_numerics(&before, &packed, 1e-5).expect("verify packed numerics");
+    assert!(rep.passed, "max_abs_diff = {}", rep.max_abs_diff);
+
+    // Verify Rust & C99 codegen emit unit-stride `n * 3 + k` instead of column-strided `k * 2 + n`!
+    let rust_code = generate_code(&packed, CodegenTarget::Rust).expect("rust codegen packed");
+    assert!(rust_code.contains("n * 3 + k"));
+    let c_code = generate_code(&packed, CodegenTarget::C).expect("c codegen packed");
+    assert!(c_code.contains("n * 3 + k"));
+}

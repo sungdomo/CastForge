@@ -178,7 +178,13 @@ fn emit_wgsl_func(module: &Module, fn_op_id: OpId, out: &mut String) -> Result<(
                     writeln!(out, "        {res_name}[i] = {expr};")?;
                     writeln!(out, "    }}")?;
                 }
-                StableHloOp::DotGeneral { lhs, rhs, .. } => {
+                StableHloOp::DotGeneral {
+                    lhs,
+                    rhs,
+                    dimension_numbers: dims,
+                    ..
+                } => {
+                    let packed = dims.rhs_contracting_dimensions == [1];
                     let a = value_ident(module, lhs, &mut names, &mut counter);
                     let b = value_ident(module, rhs, &mut names, &mut counter);
                     let lhs_dims = module.values[lhs]
@@ -193,7 +199,16 @@ fn emit_wgsl_func(module: &Module, fn_op_id: OpId, out: &mut String) -> Result<(
                         .unwrap_or_else(|| vec![1, 1]);
                     let m = *lhs_dims.first().unwrap_or(&1);
                     let k = *lhs_dims.get(1).unwrap_or(&1);
-                    let n = *rhs_dims.get(1).unwrap_or(&1);
+                    let n = if packed {
+                        *rhs_dims.first().unwrap_or(&1)
+                    } else {
+                        *rhs_dims.get(1).unwrap_or(&1)
+                    };
+                    let b_idx = if packed {
+                        format!("n * {k}u + k")
+                    } else {
+                        format!("k * {n}u + n")
+                    };
                     writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
                     writeln!(out, "    for (var m = 0u; m < {m}u; m = m + 1u) {{")?;
                     writeln!(out, "        for (var n = 0u; n < {n}u; n = n + 1u) {{")?;
@@ -201,7 +216,7 @@ fn emit_wgsl_func(module: &Module, fn_op_id: OpId, out: &mut String) -> Result<(
                     writeln!(out, "            for (var k = 0u; k < {k}u; k = k + 1u) {{")?;
                     writeln!(
                         out,
-                        "                acc = acc + {a}[m * {k}u + k] * {b}[k * {n}u + n];"
+                        "                acc = acc + {a}[m * {k}u + k] * {b}[{b_idx}];"
                     )?;
                     writeln!(out, "            }}")?;
                     writeln!(out, "            {res_name}[m * {n}u + n] = acc;")?;

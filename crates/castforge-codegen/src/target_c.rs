@@ -275,7 +275,13 @@ fn emit_c_hlo_op(
             writeln!(out, "        {res_name}[o] = acc;")?;
             writeln!(out, "    }}")?;
         }
-        StableHloOp::DotGeneral { lhs, rhs, .. } => {
+        StableHloOp::DotGeneral {
+            lhs,
+            rhs,
+            dimension_numbers: dims,
+            ..
+        } => {
+            let packed = dims.rhs_contracting_dimensions == [1];
             let a = value_ident(module, lhs, names, counter);
             let b = value_ident(module, rhs, names, counter);
             let lhs_dims = module.values[lhs]
@@ -290,14 +296,23 @@ fn emit_c_hlo_op(
                 .unwrap_or_else(|| vec![1, 1]);
             let m = *lhs_dims.first().unwrap_or(&1);
             let k = *lhs_dims.get(1).unwrap_or(&1);
-            let n = *rhs_dims.get(1).unwrap_or(&1);
+            let n = if packed {
+                *rhs_dims.first().unwrap_or(&1)
+            } else {
+                *rhs_dims.get(1).unwrap_or(&1)
+            };
+            let b_idx = if packed {
+                format!("n * {k} + k")
+            } else {
+                format!("k * {n} + n")
+            };
             writeln!(out, "    for (int m = 0; m < {m}; ++m) {{")?;
             writeln!(out, "        for (int n = 0; n < {n}; ++n) {{")?;
             writeln!(out, "            float acc = 0.0f;")?;
             writeln!(
                 out,
                 "            for (int k = 0; k < {k}; ++k) \
-                 acc += {a}[m * {k} + k] * {b}[k * {n} + n];"
+                 acc += {a}[m * {k} + k] * {b}[{b_idx}];"
             )?;
             writeln!(out, "            {res_name}[m * {n} + n] = acc;")?;
             writeln!(out, "        }}")?;
@@ -314,6 +329,10 @@ fn emit_c_hlo_op(
                      {res_name}[i] = fmaxf({a}[i] + {b}[i], {c}[i]);"
                 )?;
             } else if name == "castforge.fused_matmul_epilogue" && inputs.len() >= 3 {
+                let packed = op
+                    .attributes
+                    .get("packed_rhs")
+                    .is_some_and(|a| matches!(a, castforge_ir::Attribute::Bool(true)));
                 let a = value_ident(module, inputs[0], names, counter);
                 let b = value_ident(module, inputs[1], names, counter);
                 let bias = value_ident(module, inputs[2], names, counter);
@@ -329,7 +348,16 @@ fn emit_c_hlo_op(
                     .unwrap_or_else(|| vec![1, 1]);
                 let m = *lhs_dims.first().unwrap_or(&1);
                 let k = *lhs_dims.get(1).unwrap_or(&1);
-                let n = *rhs_dims.get(1).unwrap_or(&1);
+                let n = if packed {
+                    *rhs_dims.first().unwrap_or(&1)
+                } else {
+                    *rhs_dims.get(1).unwrap_or(&1)
+                };
+                let b_idx = if packed {
+                    format!("n * {k} + k")
+                } else {
+                    format!("k * {n} + n")
+                };
                 let epilogue = op
                     .attributes
                     .get("epilogue")
@@ -341,7 +369,7 @@ fn emit_c_hlo_op(
                 writeln!(
                     out,
                     "            for (int k = 0; k < {k}; ++k) \
-                     acc += {a}[m * {k} + k] * {b}[k * {n} + n];"
+                     acc += {a}[m * {k} + k] * {b}[{b_idx}];"
                 )?;
                 writeln!(out, "            int idx = m * {n} + n;")?;
                 writeln!(out, "            float val = acc + {bias}[idx];")?;
