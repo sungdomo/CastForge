@@ -1,5 +1,5 @@
 use crate::liveness::{LiveInterval, compute_module_liveness};
-use castforge_ir::{Module, ValueId};
+use castforge_ir::{Attribute, Module, ValueDef, ValueId};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -13,6 +13,7 @@ pub struct BufferAllocation {
     pub last_use: usize,
     pub arena_offset: Option<usize>,
     pub arena_slot: Option<usize>,
+    pub inplace_from: Option<ValueId>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -27,6 +28,8 @@ pub struct MemoryPlan {
     pub reusable_slot_count: usize,
     /// Total contiguous arena bytes allocated strictly for reusable intermediate slots.
     pub arena_workspace_bytes: usize,
+    /// Number of operations that reused an operand buffer in-place (`inplace_operand`).
+    pub inplace_reuse_count: usize,
 }
 
 impl MemoryPlan {
@@ -109,6 +112,7 @@ pub fn build_memory_plan(module: &Module) -> MemoryPlan {
                 last_use: iv.last_use,
                 arena_offset: None,
                 arena_slot: None,
+                inplace_from: None,
             });
             continue;
         }
@@ -127,40 +131,66 @@ pub fn build_memory_plan(module: &Module) -> MemoryPlan {
                 last_use: iv.last_use,
                 arena_offset: None,
                 arena_slot: None,
+                inplace_from: None,
             });
             continue;
         }
 
-        // Greedy interval coloring: pick an existing non-overlapping slot (preferring one
-        // already large enough, or the one requiring minimal growth), else allocate a new slot.
-        let mut best_slot_idx: Option<usize> = None;
-        for (idx, slot) in slots.iter().enumerate() {
-            if !slot.conflicts_with(iv.first_def, iv.last_use) {
-                match best_slot_idx {
-                    None => best_slot_idx = Some(idx),
-                    Some(prev_idx) => {
-                        let prev_growth = bytes.saturating_sub(slots[prev_idx].max_bytes);
-                        let cur_growth = bytes.saturating_sub(slot.max_bytes);
-                        if cur_growth < prev_growth {
-                            best_slot_idx = Some(idx);
+        // Check if this value is defined by an op annotated with `inplace_operand = <idx>`.
+        let mut inplace_donor: Option<(ValueId, usize)> = None;
+        if let ValueDef::OpResult { op: op_id, .. } = val.def
+            && let Some(op) = module.ops.get(op_id)
+            && let Some(Attribute::Int(op_idx)) = op.attributes.get("inplace_operand")
+            && let Some(&donor_id) = op.operands.get(*op_idx as usize)
+            && let Some(donor_slot) = plan.allocation_for(donor_id).and_then(|a| a.arena_slot)
+        {
+            let can_extend = iv.last_use <= iv.first_def
+                || !slots[donor_slot].conflicts_with(iv.first_def + 1, iv.last_use);
+            if can_extend {
+                inplace_donor = Some((donor_id, donor_slot));
+            }
+        }
+
+        let (assigned_slot, inplace_from) = if let Some((donor_id, donor_slot)) = inplace_donor {
+            slots[donor_slot].max_bytes = slots[donor_slot].max_bytes.max(bytes);
+            slots[donor_slot]
+                .intervals
+                .push((iv.first_def, iv.last_use));
+            plan.inplace_reuse_count += 1;
+            (donor_slot, Some(donor_id))
+        } else {
+            // Greedy interval coloring: pick an existing non-overlapping slot (preferring one
+            // already large enough, or the one requiring minimal growth), else allocate a new slot.
+            let mut best_slot_idx: Option<usize> = None;
+            for (idx, slot) in slots.iter().enumerate() {
+                if !slot.conflicts_with(iv.first_def, iv.last_use) {
+                    match best_slot_idx {
+                        None => best_slot_idx = Some(idx),
+                        Some(prev_idx) => {
+                            let prev_growth = bytes.saturating_sub(slots[prev_idx].max_bytes);
+                            let cur_growth = bytes.saturating_sub(slot.max_bytes);
+                            if cur_growth < prev_growth {
+                                best_slot_idx = Some(idx);
+                            }
                         }
                     }
                 }
             }
-        }
 
-        let assigned_slot = if let Some(idx) = best_slot_idx {
-            slots[idx].max_bytes = slots[idx].max_bytes.max(bytes);
-            slots[idx].intervals.push((iv.first_def, iv.last_use));
-            idx
-        } else {
-            let idx = slots.len();
-            slots.push(ArenaSlot {
-                max_bytes: bytes,
-                intervals: vec![(iv.first_def, iv.last_use)],
-                offset: 0,
-            });
-            idx
+            let slot_idx = if let Some(idx) = best_slot_idx {
+                slots[idx].max_bytes = slots[idx].max_bytes.max(bytes);
+                slots[idx].intervals.push((iv.first_def, iv.last_use));
+                idx
+            } else {
+                let idx = slots.len();
+                slots.push(ArenaSlot {
+                    max_bytes: bytes,
+                    intervals: vec![(iv.first_def, iv.last_use)],
+                    offset: 0,
+                });
+                idx
+            };
+            (slot_idx, None)
         };
 
         plan.allocations.push(BufferAllocation {
@@ -173,6 +203,7 @@ pub fn build_memory_plan(module: &Module) -> MemoryPlan {
             last_use: iv.last_use,
             arena_offset: None,
             arena_slot: Some(assigned_slot),
+            inplace_from,
         });
     }
 

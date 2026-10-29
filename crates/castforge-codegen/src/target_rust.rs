@@ -154,9 +154,14 @@ fn emit_rust_func(
             && let (Some(slot), Some(off)) = (alloc.arena_slot, alloc.arena_offset)
         {
             let elem_off = off / 4;
+            let tag = if alloc.inplace_from.is_some() {
+                "arena:inplace"
+            } else {
+                "arena"
+            };
             writeln!(
                 out,
-                "    // [arena] {res_name}: slot #{slot} @ offset {off} B \
+                "    // [{tag}] {res_name}: slot #{slot} @ offset {off} B \
                      (arena[{elem_off}..{}], live steps {}..={})",
                 elem_off + res_len,
                 alloc.first_def,

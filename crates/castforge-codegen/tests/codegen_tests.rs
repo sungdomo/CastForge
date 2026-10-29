@@ -207,3 +207,43 @@ module @roofline_demo {
             .contains("castforge.fused_matmul_epilogue")
     );
 }
+
+#[test]
+fn test_bufferize_inplace_reduces_arena_to_single_slot() {
+    let mlir = r#"
+module @inplace_demo {
+  func.func @chain(%x: tensor<4x4xf32>) -> tensor<4x4xf32> {
+    %c = stablehlo.constant dense<1.0> : tensor<4x4xf32>
+    %t1 = stablehlo.add %x, %c : tensor<4x4xf32>
+    %t2 = stablehlo.multiply %t1, %c : tensor<4x4xf32>
+    %t3 = stablehlo.tanh %t2 : tensor<4x4xf32>
+    %t4 = stablehlo.maximum %t3, %c : tensor<4x4xf32>
+    func.return %t4 : tensor<4x4xf32>
+  }
+}
+"#;
+    let baseline = parse_mlir(mlir).expect("parse inplace mlir");
+    let baseline_plan = build_memory_plan(&baseline);
+    assert_eq!(baseline_plan.reusable_slot_count, 2);
+    assert_eq!(baseline_plan.arena_workspace_bytes, 128);
+
+    let mut inplace_mod = baseline.clone();
+    let registry = PassRegistry::with_builtin_passes();
+    let mut pm =
+        PassManager::from_pipeline_str(&registry, "bufferize-inplace").expect("inplace pipeline");
+    let res = pm.run(&mut inplace_mod).expect("run bufferize-inplace");
+    assert!(res[0].changed);
+
+    let inplace_plan = build_memory_plan(&inplace_mod);
+    assert_eq!(inplace_plan.inplace_reuse_count, 3);
+    assert_eq!(inplace_plan.reusable_slot_count, 1);
+    assert_eq!(inplace_plan.arena_workspace_bytes, 64);
+
+    let rust_code = generate_code(&inplace_mod, CodegenTarget::Rust).expect("rust inplace");
+    assert!(rust_code.contains("[arena:inplace]"));
+    assert!(rust_code.contains("let mut arena = [0.0_f32; 16]; // 64 B"));
+
+    let c_code = generate_code(&inplace_mod, CodegenTarget::C).expect("c inplace");
+    assert!(c_code.contains("[arena:inplace]"));
+    assert!(c_code.contains("float arena[16]; /* 64 B"));
+}

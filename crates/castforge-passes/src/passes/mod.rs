@@ -1,4 +1,5 @@
 pub mod bake_lora;
+pub mod bufferize_inplace;
 pub mod canonicalize;
 pub mod cse;
 pub mod dce;
@@ -39,6 +40,7 @@ pub mod topological_sort;
 pub mod verify_shapes;
 
 pub use bake_lora::BakeLoraPass;
+pub use bufferize_inplace::BufferizeInplacePass;
 pub use canonicalize::CanonicalizePass;
 pub use cse::CommonSubexpressionEliminationPass;
 pub use dce::DeadCodeEliminationPass;

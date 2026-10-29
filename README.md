@@ -32,7 +32,7 @@ support.
 - [`crates/castforge-cli`](crates/castforge-cli): The `castforge` command-line tool (`opt`, `viz`,
   `codegen`, `run`, `list-passes`, plus direct pass subcommands).
 
-## Built-in Transformation Passes (38 Passes)
+## Built-in Transformation Passes (39 Passes)
 
 | Pass Name | Category | Description |
 | :--- | :--- | :--- |
@@ -68,6 +68,7 @@ support.
 | `fuse-rope` | Fusion | Fuses Rotary Position Embedding (`RoPE`) into composite |
 | `fuse-attention` | Fusion | Fuses SDPA & GQA (`softmax(Q @ K^T * scale) @ V`) |
 | `decompose-composites` | Lowering | Expands `stablehlo.composite` ops to primitive StableHLO |
+| `bufferize-inplace` | Lowering | Annotates elementwise ops for in-place arena buffer reuse |
 | `fold-norm-weights` | Weight Surgery | Absorbs RMSNorm/LayerNorm scale weights into MatMuls |
 | `bake-lora` | Weight Surgery | Fuses LoRA branches `W + alpha * (A @ B)` into base weights |
 | `task-arithmetic` | Weight Surgery | Applies multi-checkpoint task vectors & DARE pruning |
@@ -79,7 +80,7 @@ support.
 ## Quick Start
 
 ```bash
-# 1. List all 38 registered passes
+# 1. List all 39 registered passes
 cargo run --bin castforge -- list-passes
 
 # 2. Run an optimization pipeline with automatic numerical verification

@@ -1,13 +1,13 @@
 use crate::{
-    BakeLoraPass, CanonicalizePass, CommonSubexpressionEliminationPass, DeadCodeEliminationPass,
-    DecomposeCompositesPass, ExternalizeWeightsPass, FoldBroadcastPass, FoldConstantsPass,
-    FoldConvertPass, FoldNormWeightsPass, FoldReshapePass, FoldSliceConcatPass, FoldTransposePass,
-    FuseAttentionPass, FuseElementwisePass, FuseHorizontalDotPass, FuseMatmulEpiloguePass,
-    FuseRmsNormPass, FuseRopePass, FuseSoftmaxPass, FuseSwiGluPass, HoistConstantsPass,
-    InlinerPass, IrEditPass, LicmPass, MergeWeightsPass, PackWeightsPass, Pass, PassOptions,
-    PrintOpStatsPass, QuantizeWeightsPass, SccpPass, SimplifyAlgebraicPass, SinkTransposePass,
-    SpecializeShapesPass, StripDebugInfoPass, StructuredPruningPass, SymbolDcePass,
-    TaskArithmeticPass, TopologicalSortPass, VerifyShapesPass,
+    BakeLoraPass, BufferizeInplacePass, CanonicalizePass, CommonSubexpressionEliminationPass,
+    DeadCodeEliminationPass, DecomposeCompositesPass, ExternalizeWeightsPass, FoldBroadcastPass,
+    FoldConstantsPass, FoldConvertPass, FoldNormWeightsPass, FoldReshapePass, FoldSliceConcatPass,
+    FoldTransposePass, FuseAttentionPass, FuseElementwisePass, FuseHorizontalDotPass,
+    FuseMatmulEpiloguePass, FuseRmsNormPass, FuseRopePass, FuseSoftmaxPass, FuseSwiGluPass,
+    HoistConstantsPass, InlinerPass, IrEditPass, LicmPass, MergeWeightsPass, PackWeightsPass, Pass,
+    PassOptions, PrintOpStatsPass, QuantizeWeightsPass, SccpPass, SimplifyAlgebraicPass,
+    SinkTransposePass, SpecializeShapesPass, StripDebugInfoPass, StructuredPruningPass,
+    SymbolDcePass, TaskArithmeticPass, TopologicalSortPass, VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
 use castforge_ir::MergeMethod;
@@ -337,6 +337,11 @@ impl PassRegistry {
             "fuse-attention",
             "Fuses Q*K^T + scale + softmax + P*V (with GQA support) into stablehlo.composite",
             |_opts| Ok(Box::new(FuseAttentionPass)),
+        );
+        reg.register(
+            "bufferize-inplace",
+            "Annotates elementwise ops whose input buffer dies at the op for in-place arena reuse",
+            |_opts| Ok(Box::new(BufferizeInplacePass)),
         );
         reg
     }

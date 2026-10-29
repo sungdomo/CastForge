@@ -139,9 +139,14 @@ fn emit_c_func(
         if let Some(alloc) = plan.allocation_for(res_val) {
             if let (Some(slot), Some(off)) = (alloc.arena_slot, alloc.arena_offset) {
                 let elem_off = off / 4;
+                let tag = if alloc.inplace_from.is_some() {
+                    "arena:inplace"
+                } else {
+                    "arena"
+                };
                 writeln!(
                     out,
-                    "    /* [arena] {res_name}: slot #{slot} @ offset {off} B \
+                    "    /* [{tag}] {res_name}: slot #{slot} @ offset {off} B \
                      (live steps {}..={}) */",
                     alloc.first_def, alloc.last_use
                 )?;
