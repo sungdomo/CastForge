@@ -270,3 +270,65 @@ fn test_task_arithmetic_and_dare_pruning() {
     assert!(roof.total_bytes_transferred > 0);
     assert!(roof.arithmetic_intensity > 0.0);
 }
+
+const HORIZONTAL_DOT_AND_CANON_MLIR: &str = r#"
+module @qkv_horizontal_and_canon {
+  func.func @forward(%x: tensor<2x2xf32>) -> tensor<2x2xf32> {
+    %wq = stablehlo.constant dense<[[1.0, 2.0], [3.0, 4.0]]> : tensor<2x2xf32>
+    %wk = stablehlo.constant dense<[[0.5, 1.5], [2.5, 3.5]]> : tensor<2x2xf32>
+    %c1 = stablehlo.constant dense<2.0> : tensor<2x2xf32>
+    %c2 = stablehlo.constant dense<3.0> : tensor<2x2xf32>
+    %q = stablehlo.dot_general %x, %wq, contracting_dims = [1] x [0]
+      : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+    %k = stablehlo.dot_general %x, %wk, contracting_dims = [1] x [0]
+      : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+    %cat = stablehlo.concatenate %q, %k {dimension = 1}
+      : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x4xf32>
+    %slice_q = stablehlo.slice %cat
+      {start_indices = [0, 0], limit_indices = [2, 2], strides = [1, 1]}
+      : (tensor<2x4xf32>) -> tensor<2x2xf32>
+    %bcast = stablehlo.broadcast_in_dim %slice_q, dims = [0, 1]
+      : (tensor<2x2xf32>) -> tensor<2x2xf32>
+    %add1 = stablehlo.add %c1, %bcast : tensor<2x2xf32>
+    %add2 = stablehlo.add %add1, %c2 : tensor<2x2xf32>
+    %max_id = stablehlo.maximum %add2, %add2 : tensor<2x2xf32>
+    func.return %max_id : tensor<2x2xf32>
+  }
+}
+"#;
+
+#[test]
+fn test_horizontal_dot_broadcast_slice_concat_and_reassociation() {
+    let before = parse_mlir(HORIZONTAL_DOT_AND_CANON_MLIR).expect("parse horizontal dot MLIR");
+
+    // 1. Test `fuse-horizontal-dot` in isolation: merges %q and %k into 1 `dot_general` + 2 slices
+    let mut horiz = before.clone();
+    let registry = PassRegistry::with_builtin_passes();
+    let mut pm_h = PassManager::from_pipeline_str(&registry, "fuse-horizontal-dot")
+        .expect("fuse-horizontal-dot pipeline");
+    let res_h = pm_h.run(&mut horiz).expect("run fuse-horizontal-dot");
+    assert!(res_h[0].changed);
+    let printed_h = print_mlir(&horiz);
+    assert_eq!(printed_h.matches("stablehlo.dot_general").count(), 1);
+    let rep_h =
+        verify_module_numerics(&before, &horiz, 1e-5).expect("verify horizontal dot numerics");
+    assert!(rep_h.passed, "max_abs_diff = {}", rep_h.max_abs_diff);
+
+    // 2. Test `canonicalize` (`fold-slice-concat`, `fold-broadcast`, `simplify-algebraic`, `dce`)
+    let mut canon = before.clone();
+    let mut pm_c =
+        PassManager::from_pipeline_str(&registry, "canonicalize").expect("canonicalize pipeline");
+    let res_c = pm_c.run(&mut canon).expect("run canonicalize");
+    assert!(res_c[0].changed);
+    let printed_c = print_mlir(&canon);
+    // `slice_q` folds through `concatenate(%q, %k)` directly to `%q` (killing `%k` and `%cat`),
+    // `bcast` is eliminated, `(c1 + q) + c2` reassociates to `q + 5.0`, and `max(x, x)` folds!
+    assert!(!printed_c.contains("stablehlo.concatenate"));
+    assert!(!printed_c.contains("stablehlo.broadcast_in_dim"));
+    assert!(!printed_c.contains("stablehlo.maximum"));
+    assert_eq!(printed_c.matches("stablehlo.add").count(), 1);
+    assert!(printed_c.contains("dense<5.0>"));
+
+    let rep_c = verify_module_numerics(&before, &canon, 1e-5).expect("verify canonicalize");
+    assert!(rep_c.passed, "max_abs_diff = {}", rep_c.max_abs_diff);
+}

@@ -305,6 +305,79 @@ fn eval_stablehlo_op(
                 .map(|i| x[i / (res_len / in_len).max(1) % in_len])
                 .collect()
         }
+        StableHloOp::Slice {
+            operand,
+            start_indices,
+            limit_indices,
+            strides,
+            ..
+        } => {
+            let x = get_v(operand);
+            let in_dims = module.values[operand]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![x.len()]);
+            if in_dims.len() == 2 && start_indices.len() == 2 {
+                let (s0, s1) = (start_indices[0] as usize, start_indices[1] as usize);
+                let (l0, l1) = (limit_indices[0] as usize, limit_indices[1] as usize);
+                let st0 = (strides.first().copied().unwrap_or(1) as usize).max(1);
+                let st1 = (strides.get(1).copied().unwrap_or(1) as usize).max(1);
+                let in_cols = in_dims[1];
+                let mut out_v = Vec::with_capacity(res_len);
+                for r in (s0..l0).step_by(st0) {
+                    for c in (s1..l1).step_by(st1) {
+                        out_v.push(*x.get(r * in_cols + c).unwrap_or(&0.0));
+                    }
+                }
+                out_v
+            } else {
+                let s0 = start_indices.first().copied().unwrap_or(0) as usize;
+                let st0 = (strides.first().copied().unwrap_or(1) as usize).max(1);
+                (0..res_len)
+                    .map(|i| *x.get(s0 + i * st0).unwrap_or(&0.0))
+                    .collect()
+            }
+        }
+        StableHloOp::Concatenate {
+            inputs, dimension, ..
+        } => {
+            let out_dims = module.values[res_val]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![res_len]);
+            if out_dims.len() == 2 && dimension == 1 {
+                let rows = out_dims[0];
+                let in_vecs: Vec<(Vec<f32>, usize)> = inputs
+                    .iter()
+                    .map(|&inp| {
+                        let v = get_v(inp);
+                        let c = module.values[inp]
+                            .ty
+                            .as_tensor()
+                            .and_then(|t| tensor_shape_dims(t).get(1).copied())
+                            .unwrap_or(1);
+                        (v, c)
+                    })
+                    .collect();
+                let mut out_v = Vec::with_capacity(res_len);
+                for r in 0..rows {
+                    for (v, cols) in &in_vecs {
+                        let start = r * cols;
+                        out_v.extend_from_slice(&v[start..start + cols]);
+                    }
+                }
+                out_v
+            } else {
+                let mut out_v = Vec::with_capacity(res_len);
+                for inp in inputs {
+                    out_v.extend(get_v(inp));
+                }
+                out_v.truncate(res_len);
+                out_v
+            }
+        }
         StableHloOp::Compare {
             lhs,
             rhs,

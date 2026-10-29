@@ -1,8 +1,9 @@
 use crate::{
     BakeLoraPass, CanonicalizePass, CommonSubexpressionEliminationPass, DeadCodeEliminationPass,
-    DecomposeCompositesPass, ExternalizeWeightsPass, FoldConstantsPass, FoldNormWeightsPass,
-    FoldReshapePass, FoldTransposePass, FuseElementwisePass, FuseMatmulEpiloguePass,
-    FuseRmsNormPass, FuseSoftmaxPass, InlinerPass, IrEditPass, MergeWeightsPass, Pass, PassOptions,
+    DecomposeCompositesPass, ExternalizeWeightsPass, FoldBroadcastPass, FoldConstantsPass,
+    FoldNormWeightsPass, FoldReshapePass, FoldSliceConcatPass, FoldTransposePass,
+    FuseElementwisePass, FuseHorizontalDotPass, FuseMatmulEpiloguePass, FuseRmsNormPass,
+    FuseSoftmaxPass, InlinerPass, IrEditPass, MergeWeightsPass, Pass, PassOptions,
     PrintOpStatsPass, QuantizeWeightsPass, SccpPass, SimplifyAlgebraicPass, SinkTransposePass,
     StripDebugInfoPass, StructuredPruningPass, SymbolDcePass, TaskArithmeticPass,
     TopologicalSortPass, VerifyShapesPass,
@@ -264,6 +265,21 @@ impl PassRegistry {
                     .unwrap_or(0.0);
                 Ok(Box::new(TaskArithmeticPass { lambda, drop_rate }))
             },
+        );
+        reg.register(
+            "fold-broadcast",
+            "Composes chained broadcast_in_dim ops, removes identity broadcasts, hoists unary ops",
+            |_opts| Ok(Box::new(FoldBroadcastPass)),
+        );
+        reg.register(
+            "fold-slice-concat",
+            "Composes nested slices and folds slices of concatenate ops directly to source inputs",
+            |_opts| Ok(Box::new(FoldSliceConcatPass)),
+        );
+        reg.register(
+            "fuse-horizontal-dot",
+            "Horizontally fuses parallel dot_general ops sharing an LHS input (e.g. Q/K/V)",
+            |_opts| Ok(Box::new(FuseHorizontalDotPass)),
         );
         reg
     }
