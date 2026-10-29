@@ -5,7 +5,7 @@ use crate::{
 use anyhow::Result;
 use castforge_ir::Module;
 
-/// 7. Composite Canonicalize Pass
+/// Composite Canonicalize Pass (`canonicalize`).
 pub struct CanonicalizePass;
 
 impl Pass for CanonicalizePass {

@@ -2,7 +2,8 @@ use crate::{Pass, PassResult};
 use anyhow::Result;
 use castforge_ir::{Location, Module};
 
-/// 18. Strip DebugInfo Pass (`strip-debuginfo`)
+/// Strip DebugInfo Pass (`strip-debuginfo`).
+///
 /// Resets all operation `Location` annotations to `Location::Unknown`.
 pub struct StripDebugInfoPass;
 

@@ -2,7 +2,8 @@ use crate::{FoldConstantsPass, Pass, PassResult};
 use anyhow::Result;
 use castforge_ir::Module;
 
-/// 16. Sparse Conditional Constant Propagation (`sccp`)
+/// Sparse Conditional Constant Propagation (`sccp`).
+///
 /// Evaluates `stablehlo.compare` on constants and folds `stablehlo.select` predicates.
 /// Note: `fold-constants` includes conditional constant propagation by default; `sccp` runs
 /// `FoldConstantsPass { include_conditional: true }` to a fixed point.

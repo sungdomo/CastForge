@@ -194,11 +194,12 @@ pub(crate) fn parse_attribute_value(val_str: &str) -> Attribute {
 
 pub fn parse_type(s: &str, line_no: usize) -> Result<Type, ParseError> {
     let s = s.trim();
-    if s.starts_with('(') {
-        let close = find_matching_delim(&s[1..], '(', ')').ok_or_else(|| ParseError::Syntax {
-            line: line_no,
-            message: format!("Unclosed `(` in function type `{s}`"),
-        })? + 1;
+    if let Some(after_open) = s.strip_prefix('(') {
+        let close =
+            find_matching_delim(after_open, '(', ')').ok_or_else(|| ParseError::Syntax {
+                line: line_no,
+                message: format!("Unclosed `(` in function type `{s}`"),
+            })? + 1;
         let args_inner = &s[1..close];
         let mut inputs = Vec::new();
         for item in split_top_level(args_inner, ',') {
@@ -285,17 +286,16 @@ pub(crate) fn parse_dtype(s: &str) -> DType {
     if let Some(q_inner) = s
         .strip_prefix("!quant.uniform<")
         .and_then(|x| x.strip_suffix('>'))
+        && let Some((types_part, scale_part)) = q_inner.split_once(',')
     {
-        if let Some((types_part, scale_part)) = q_inner.split_once(',') {
-            let (st_str, ex_str) = types_part.split_once(':').unwrap_or(("i8", "f32"));
-            let (sc_str, zp_str) = scale_part.trim().split_once(':').unwrap_or(("1.0", "0"));
-            return DType::QuantUniform {
-                storage_type: Box::new(parse_dtype(st_str.trim())),
-                expressed_type: Box::new(parse_dtype(ex_str.trim())),
-                scale: sc_str.trim().to_string(),
-                zero_point: zp_str.trim().parse::<i64>().unwrap_or(0),
-            };
-        }
+        let (st_str, ex_str) = types_part.split_once(':').unwrap_or(("i8", "f32"));
+        let (sc_str, zp_str) = scale_part.trim().split_once(':').unwrap_or(("1.0", "0"));
+        return DType::QuantUniform {
+            storage_type: Box::new(parse_dtype(st_str.trim())),
+            expressed_type: Box::new(parse_dtype(ex_str.trim())),
+            scale: sc_str.trim().to_string(),
+            zero_point: zp_str.trim().parse::<i64>().unwrap_or(0),
+        };
     }
     match s {
         "i1" => DType::I1,

@@ -107,13 +107,12 @@ fn match_broadcast_reduce_of_exp(
     let mut cur_val = denom_val;
     let mut bcast_id = None;
 
-    if let ValueDef::OpResult { op: b_op_id, .. } = module.values[cur_val].def {
-        if let Some(b_op) = module.ops.get(b_op_id) {
-            if let Some(StableHloOp::BroadcastInDim { operand, .. }) = StableHloOp::from_op(b_op) {
-                cur_val = operand;
-                bcast_id = Some(b_op_id);
-            }
-        }
+    if let ValueDef::OpResult { op: b_op_id, .. } = module.values[cur_val].def
+        && let Some(b_op) = module.ops.get(b_op_id)
+        && let Some(StableHloOp::BroadcastInDim { operand, .. }) = StableHloOp::from_op(b_op)
+    {
+        cur_val = operand;
+        bcast_id = Some(b_op_id);
     }
 
     let ValueDef::OpResult { op: red_op_id, .. } = module.values[cur_val].def else {
@@ -144,21 +143,20 @@ fn unwrap_optional_max_sub(module: &Module, exp_in: ValueId) -> Option<ValueId> 
     };
 
     let mut cur = rhs;
-    if let ValueDef::OpResult { op: b_id, .. } = module.values[cur].def {
-        if let Some(b_op) = module.ops.get(b_id) {
-            if let Some(StableHloOp::BroadcastInDim { operand, .. }) = StableHloOp::from_op(b_op) {
-                cur = operand;
-            }
-        }
+    if let ValueDef::OpResult { op: b_id, .. } = module.values[cur].def
+        && let Some(b_op) = module.ops.get(b_id)
+        && let Some(StableHloOp::BroadcastInDim { operand, .. }) = StableHloOp::from_op(b_op)
+    {
+        cur = operand;
     }
     let ValueDef::OpResult { op: red_id, .. } = module.values[cur].def else {
         return None;
     };
     let red_op = module.ops.get(red_id)?;
-    if let Some(StableHloOp::Reduce { inputs, .. }) = StableHloOp::from_op(red_op) {
-        if inputs.first().copied() == Some(x) {
-            return Some(x);
-        }
+    if let Some(StableHloOp::Reduce { inputs, .. }) = StableHloOp::from_op(red_op)
+        && inputs.first().copied() == Some(x)
+    {
+        return Some(x);
     }
     None
 }

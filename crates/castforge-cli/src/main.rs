@@ -408,7 +408,7 @@ fn main() -> Result<()> {
 
         Commands::ListPasses => {
             println!("Available CastForge Passes:");
-            println!("{:<20} {}", "PASS NAME", "DESCRIPTION");
+            println!("{:<20} DESCRIPTION", "PASS NAME");
             println!("{}", "-".repeat(78));
             for (name, desc) in registry.list() {
                 println!("{:<20} {}", name, desc);

@@ -215,6 +215,7 @@ impl Module {
         val_id
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_operation(
         &mut self,
         block: BlockId,

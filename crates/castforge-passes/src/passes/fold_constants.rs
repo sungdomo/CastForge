@@ -6,7 +6,7 @@ use castforge_ir::{
 };
 use indexmap::IndexMap;
 
-/// 9. Unified Constant Folding & Conditional Propagation Pass (`fold-constants`)
+/// Unified Constant Folding & Conditional Propagation Pass (`fold-constants`).
 pub struct FoldConstantsPass {
     pub include_conditional: bool,
 }

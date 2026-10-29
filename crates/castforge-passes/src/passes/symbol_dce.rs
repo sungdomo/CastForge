@@ -3,7 +3,8 @@ use anyhow::Result;
 use castforge_ir::Module;
 use std::collections::HashSet;
 
-/// 15. Symbol Dead Code Elimination Pass (`symbol-dce`)
+/// Symbol Dead Code Elimination Pass (`symbol-dce`).
+///
 /// Eliminates unreachable `private` functions from the module.
 pub struct SymbolDcePass;
 
@@ -19,15 +20,15 @@ impl Pass for SymbolDcePass {
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let mut referenced_symbols = HashSet::new();
         for (_, op) in &module.ops {
-            if op.is_op("func", "call") {
-                if let Some(callee) = op.attributes.get("callee").and_then(|a| a.as_str()) {
-                    referenced_symbols.insert(callee.to_string());
-                }
+            if op.is_op("func", "call")
+                && let Some(callee) = op.attributes.get("callee").and_then(|a| a.as_str())
+            {
+                referenced_symbols.insert(callee.to_string());
             }
-            if op.is_op("stablehlo", "composite") {
-                if let Some(decomp) = op.attributes.get("decomposition").and_then(|a| a.as_str()) {
-                    referenced_symbols.insert(decomp.to_string());
-                }
+            if op.is_op("stablehlo", "composite")
+                && let Some(decomp) = op.attributes.get("decomposition").and_then(|a| a.as_str())
+            {
+                referenced_symbols.insert(decomp.to_string());
             }
         }
 

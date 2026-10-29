@@ -7,7 +7,8 @@ use castforge_ir::{
 use indexmap::IndexMap;
 use smallvec::SmallVec;
 
-/// 11. Weight Quantization Pass (`quantize-weights`)
+/// Weight Quantization Pass (`quantize-weights`).
+///
 /// Quantizes floating-point `stablehlo.constant` weights to `i8` or `i4` (`!quant.uniform<...>`)
 /// and inserts `stablehlo.uniform_dequantize` ops.
 pub struct QuantizeWeightsPass {

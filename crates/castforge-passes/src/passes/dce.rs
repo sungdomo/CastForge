@@ -2,7 +2,7 @@ use crate::{Pass, PassResult, SymbolDcePass};
 use anyhow::Result;
 use castforge_ir::{BlockId, Module};
 
-/// 1. Dead Code Elimination (DCE — SSA values + optional Symbol DCE)
+/// Dead Code Elimination Pass (`dce` — SSA values + optional Symbol DCE).
 pub struct DeadCodeEliminationPass {
     pub include_symbols: bool,
 }

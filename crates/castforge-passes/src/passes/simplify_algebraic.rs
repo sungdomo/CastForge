@@ -3,7 +3,7 @@ use anyhow::Result;
 use castforge_dialect_stablehlo::StableHloOp;
 use castforge_ir::{Attribute, BlockId, Dim, Module, ValueDef, ValueId};
 
-/// 8. Algebraic Simplification Pass (`x + 0 -> x`, `x * 1 -> x`, `x * 0 -> 0`)
+/// Algebraic Simplification Pass (`x + 0 -> x`, `x * 1 -> x`, `x * 0 -> 0`).
 pub struct SimplifyAlgebraicPass;
 
 impl SimplifyAlgebraicPass {
@@ -59,14 +59,14 @@ impl Pass for SimplifyAlgebraicPass {
                         }
                     }
                     StableHloOp::Multiply { lhs, rhs, result } => {
-                        if Self::const_attr(module, rhs).is_some_and(|a| a.is_splat_one()) {
+                        if Self::const_attr(module, rhs).is_some_and(|a| a.is_splat_one())
+                            || Self::const_attr(module, lhs).is_some_and(|a| a.is_splat_zero())
+                        {
                             Some((result, lhs))
-                        } else if Self::const_attr(module, lhs).is_some_and(|a| a.is_splat_one()) {
+                        } else if Self::const_attr(module, lhs).is_some_and(|a| a.is_splat_one())
+                            || Self::const_attr(module, rhs).is_some_and(|a| a.is_splat_zero())
+                        {
                             Some((result, rhs))
-                        } else if Self::const_attr(module, rhs).is_some_and(|a| a.is_splat_zero()) {
-                            Some((result, rhs))
-                        } else if Self::const_attr(module, lhs).is_some_and(|a| a.is_splat_zero()) {
-                            Some((result, lhs))
                         } else {
                             None
                         }

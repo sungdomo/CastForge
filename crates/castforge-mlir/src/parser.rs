@@ -63,12 +63,10 @@ impl MlirParser {
                 || line.starts_with("across ")
                 || line.starts_with('{')
                 || line.starts_with('[');
-            if is_continuation {
-                if let Some((_prev_ln, prev_text)) = logical_lines.last_mut() {
-                    prev_text.push(' ');
-                    prev_text.push_str(line);
-                    continue;
-                }
+            if is_continuation && let Some((_prev_ln, prev_text)) = logical_lines.last_mut() {
+                prev_text.push(' ');
+                prev_text.push_str(line);
+                continue;
             }
             logical_lines.push((line_no, line.to_string()));
         }

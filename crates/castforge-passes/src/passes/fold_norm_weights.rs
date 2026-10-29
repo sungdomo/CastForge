@@ -158,12 +158,11 @@ fn extract_x_and_scale(
 ) -> Option<(ValueId, Vec<f32>)> {
     // Allow `scale_cand` to be either a direct `stablehlo.constant` or a `broadcast_in_dim` of one
     let mut const_val = scale_cand;
-    if let ValueDef::OpResult { op: b_op_id, .. } = module.values[scale_cand].def {
-        if let Some(b_op) = module.ops.get(b_op_id) {
-            if let Some(StableHloOp::BroadcastInDim { operand, .. }) = StableHloOp::from_op(b_op) {
-                const_val = operand;
-            }
-        }
+    if let ValueDef::OpResult { op: b_op_id, .. } = module.values[scale_cand].def
+        && let Some(b_op) = module.ops.get(b_op_id)
+        && let Some(StableHloOp::BroadcastInDim { operand, .. }) = StableHloOp::from_op(b_op)
+    {
+        const_val = operand;
     }
 
     let ValueDef::OpResult { op: c_op_id, .. } = module.values[const_val].def else {

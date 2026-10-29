@@ -51,7 +51,16 @@ impl Pass for BakeLoraPass {
 
                 let matched = match_base_and_lora(module, lhs, rhs, self.alpha)
                     .or_else(|| match_base_and_lora(module, rhs, lhs, self.alpha));
-                let Some((base_dot_val, w_op_id, a_op_id, b_op_id, k, r, n, eff_alpha)) = matched
+                let Some(LoraMatch {
+                    base_dot_val,
+                    w_op_id,
+                    a_op_id,
+                    b_op_id,
+                    k,
+                    r,
+                    n,
+                    eff_alpha,
+                }) = matched
                 else {
                     continue;
                 };
@@ -130,21 +139,23 @@ impl Pass for BakeLoraPass {
     }
 }
 
+struct LoraMatch {
+    base_dot_val: ValueId,
+    w_op_id: castforge_ir::OpId,
+    a_op_id: castforge_ir::OpId,
+    b_op_id: castforge_ir::OpId,
+    k: usize,
+    r: usize,
+    n: usize,
+    eff_alpha: f32,
+}
+
 fn match_base_and_lora(
     module: &Module,
     base_cand: ValueId,
     lora_cand: ValueId,
     default_alpha: f32,
-) -> Option<(
-    ValueId,
-    castforge_ir::OpId,
-    castforge_ir::OpId,
-    castforge_ir::OpId,
-    usize,
-    usize,
-    usize,
-    f32,
-)> {
+) -> Option<LoraMatch> {
     // 1. `base_cand` must be `dot_general(x, W)` where `W` is a 2D constant `[K, N]`
     let ValueDef::OpResult { op: base_op_id, .. } = module.values[base_cand].def else {
         return None;
@@ -163,17 +174,16 @@ fn match_base_and_lora(
     // 2. `lora_cand` may be `multiply(dot_b, alpha_const)` or directly `dot_b`
     let mut dot_b_val = lora_cand;
     let mut eff_alpha = default_alpha;
-    if let ValueDef::OpResult { op: m_id, .. } = module.values[lora_cand].def {
-        if let Some(m_op) = module.ops.get(m_id) {
-            if let Some(StableHloOp::Multiply { lhs, rhs, .. }) = StableHloOp::from_op(m_op) {
-                if let Some(s) = FoldConstantsPass::const_splat(module, rhs) {
-                    dot_b_val = lhs;
-                    eff_alpha = s as f32;
-                } else if let Some(s) = FoldConstantsPass::const_splat(module, lhs) {
-                    dot_b_val = rhs;
-                    eff_alpha = s as f32;
-                }
-            }
+    if let ValueDef::OpResult { op: m_id, .. } = module.values[lora_cand].def
+        && let Some(m_op) = module.ops.get(m_id)
+        && let Some(StableHloOp::Multiply { lhs, rhs, .. }) = StableHloOp::from_op(m_op)
+    {
+        if let Some(s) = FoldConstantsPass::const_splat(module, rhs) {
+            dot_b_val = lhs;
+            eff_alpha = s as f32;
+        } else if let Some(s) = FoldConstantsPass::const_splat(module, lhs) {
+            dot_b_val = rhs;
+            eff_alpha = s as f32;
         }
     }
 
@@ -222,7 +232,16 @@ fn match_base_and_lora(
         return None;
     }
 
-    Some((base_cand, w_op_id, a_op_id, b_op_id, k, r_a, n, eff_alpha))
+    Some(LoraMatch {
+        base_dot_val: base_cand,
+        w_op_id,
+        a_op_id,
+        b_op_id,
+        k,
+        r: r_a,
+        n,
+        eff_alpha,
+    })
 }
 
 fn const_2d_dims(module: &Module, val_id: ValueId) -> Option<(castforge_ir::OpId, usize, usize)> {

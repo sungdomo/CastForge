@@ -2,7 +2,7 @@ use crate::{Pass, PassResult};
 use anyhow::Result;
 use castforge_ir::{Attribute, Location, Module, OpName};
 
-/// 6. Surgical IR Edit Pass (`ir-edit`)
+/// Surgical IR Edit Pass (`ir-edit`).
 pub struct IrEditPass {
     /// Format: `"old_dialect.old_op:new_dialect.new_op"`
     pub rename_op: Option<String>,
@@ -22,15 +22,15 @@ impl Pass for IrEditPass {
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let mut modified = 0usize;
 
-        if let Some(rule) = &self.rename_op {
-            if let Some((from, to)) = rule.split_once(':') {
-                let from_name = OpName::parse(from.trim());
-                let to_name = OpName::parse(to.trim());
-                for (_, op) in &mut module.ops {
-                    if op.name == from_name {
-                        op.name = to_name.clone();
-                        modified += 1;
-                    }
+        if let Some(rule) = &self.rename_op
+            && let Some((from, to)) = rule.split_once(':')
+        {
+            let from_name = OpName::parse(from.trim());
+            let to_name = OpName::parse(to.trim());
+            for (_, op) in &mut module.ops {
+                if op.name == from_name {
+                    op.name = to_name.clone();
+                    modified += 1;
                 }
             }
         }

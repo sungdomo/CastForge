@@ -5,7 +5,7 @@ use castforge_ir::{Attribute, BlockId, Module, OpName, ValueDef};
 use indexmap::IndexMap;
 use smallvec::SmallVec;
 
-/// 5. Fuse Elementwise Pass (`stablehlo.add` + `stablehlo.maximum` -> `stablehlo.composite`)
+/// Fuse Elementwise Pass (`stablehlo.add` + `stablehlo.maximum` -> `stablehlo.composite`).
 pub struct FuseElementwisePass;
 
 impl Pass for FuseElementwisePass {

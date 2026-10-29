@@ -37,12 +37,12 @@ pub fn verify_stablehlo_shapes(module: &Module, op_id: OpId) -> Result<(), Strin
                     ));
                 };
                 let out_dim = &out_ty.shape[out_idx];
-                if let (Dim::Static(a), Dim::Static(b)) = (in_dim, out_dim) {
-                    if a != b {
-                        return Err(format!(
-                            "stablehlo.transpose dim mismatch at axis {out_idx}: {a} vs {b}"
-                        ));
-                    }
+                if let (Dim::Static(a), Dim::Static(b)) = (in_dim, out_dim)
+                    && a != b
+                {
+                    return Err(format!(
+                        "stablehlo.transpose dim mismatch at axis {out_idx}: {a} vs {b}"
+                    ));
                 }
             }
         }
@@ -54,12 +54,11 @@ pub fn verify_stablehlo_shapes(module: &Module, op_id: OpId) -> Result<(), Strin
                 return Ok(());
             };
             if let (Some(in_elems), Some(out_elems)) = (in_ty.num_elements(), out_ty.num_elements())
+                && in_elems != out_elems
             {
-                if in_elems != out_elems {
-                    return Err(format!(
-                        "stablehlo.reshape count mismatch: {in_ty} ({in_elems}) vs {out_ty}"
-                    ));
-                }
+                return Err(format!(
+                    "stablehlo.reshape count mismatch: {in_ty} ({in_elems}) vs {out_ty}"
+                ));
             }
         }
         StableHloOp::Slice {
@@ -73,17 +72,16 @@ pub fn verify_stablehlo_shapes(module: &Module, op_id: OpId) -> Result<(), Strin
                 return Ok(());
             };
             let _ = operand;
-            for i in 0..start_indices.len() {
-                let start = start_indices[i];
+            for (i, &start) in start_indices.iter().enumerate() {
                 let limit = *limit_indices.get(i).unwrap_or(&start);
                 let stride = (*strides.get(i).unwrap_or(&1)).max(1);
                 let expected = (limit - start + stride - 1) / stride;
-                if let Some(Dim::Static(actual)) = out_ty.shape.get(i) {
-                    if *actual != expected {
-                        return Err(format!(
-                            "stablehlo.slice axis {i} expected dim {expected}, got {actual}"
-                        ));
-                    }
+                if let Some(Dim::Static(actual)) = out_ty.shape.get(i)
+                    && *actual != expected
+                {
+                    return Err(format!(
+                        "stablehlo.slice axis {i} expected dim {expected}, got {actual}"
+                    ));
                 }
             }
         }

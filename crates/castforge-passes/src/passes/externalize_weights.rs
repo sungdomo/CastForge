@@ -5,7 +5,8 @@ use castforge_ir::{
     format_dense_i8_literal, parse_dense_f32_literal,
 };
 
-/// 20. Externalize / Inline Weights Pass (`externalize-weights`)
+/// Externalize / Inline Weights Pass (`externalize-weights`).
+///
 /// Converts inline `dense<...>` constants into external `dense_resource<key>` references backed by
 /// `Module::tensor_store` (or inlines `dense_resource<key>` back into `dense<...>` when
 /// `inline=true`).

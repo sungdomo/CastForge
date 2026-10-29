@@ -134,12 +134,11 @@ fn match_x_and_rsqrt(
     rsqrt_cand: ValueId,
 ) -> Option<(ValueId, f64)> {
     let mut cur = rsqrt_cand;
-    if let ValueDef::OpResult { op: b_id, .. } = module.values[cur].def {
-        if let Some(b_op) = module.ops.get(b_id) {
-            if let Some(StableHloOp::BroadcastInDim { operand, .. }) = StableHloOp::from_op(b_op) {
-                cur = operand;
-            }
-        }
+    if let ValueDef::OpResult { op: b_id, .. } = module.values[cur].def
+        && let Some(b_op) = module.ops.get(b_id)
+        && let Some(StableHloOp::BroadcastInDim { operand, .. }) = StableHloOp::from_op(b_op)
+    {
+        cur = operand;
     }
 
     let ValueDef::OpResult {
@@ -159,35 +158,34 @@ fn match_x_and_rsqrt(
     // `rsqrt_in` may be `add(mean_or_red, eps)` or directly `mean_or_red`
     let mut eps = 1e-5_f64;
     let mut mean_val = rsqrt_in;
-    if let ValueDef::OpResult { op: add_id, .. } = module.values[rsqrt_in].def {
-        if let Some(add_op) = module.ops.get(add_id) {
-            if let Some(StableHloOp::Add { lhs, rhs, .. }) = StableHloOp::from_op(add_op) {
-                if let Some(c) = FoldConstantsPass::const_splat(module, rhs) {
-                    eps = c;
-                    mean_val = lhs;
-                } else if let Some(c) = FoldConstantsPass::const_splat(module, lhs) {
-                    eps = c;
-                    mean_val = rhs;
-                }
-            }
+    if let ValueDef::OpResult { op: add_id, .. } = module.values[rsqrt_in].def
+        && let Some(add_op) = module.ops.get(add_id)
+        && let Some(StableHloOp::Add { lhs, rhs, .. }) = StableHloOp::from_op(add_op)
+    {
+        if let Some(c) = FoldConstantsPass::const_splat(module, rhs) {
+            eps = c;
+            mean_val = lhs;
+        } else if let Some(c) = FoldConstantsPass::const_splat(module, lhs) {
+            eps = c;
+            mean_val = rhs;
         }
     }
 
     // `mean_val` may be `divide(reduce_val, N)` or `multiply(reduce_val, inv_N)` or `reduce_val`
     let mut red_val = mean_val;
-    if let ValueDef::OpResult { op: div_id, .. } = module.values[mean_val].def {
-        if let Some(div_op) = module.ops.get(div_id) {
-            match StableHloOp::from_op(div_op) {
-                Some(StableHloOp::Divide { lhs, .. }) => red_val = lhs,
-                Some(StableHloOp::Multiply { lhs, rhs, .. }) => {
-                    red_val = if FoldConstantsPass::const_splat(module, rhs).is_some() {
-                        lhs
-                    } else {
-                        rhs
-                    };
-                }
-                _ => {}
+    if let ValueDef::OpResult { op: div_id, .. } = module.values[mean_val].def
+        && let Some(div_op) = module.ops.get(div_id)
+    {
+        match StableHloOp::from_op(div_op) {
+            Some(StableHloOp::Divide { lhs, .. }) => red_val = lhs,
+            Some(StableHloOp::Multiply { lhs, rhs, .. }) => {
+                red_val = if FoldConstantsPass::const_splat(module, rhs).is_some() {
+                    lhs
+                } else {
+                    rhs
+                };
             }
+            _ => {}
         }
     }
 

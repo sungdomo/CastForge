@@ -3,7 +3,7 @@ use anyhow::{Result, anyhow};
 use castforge_dialect_stablehlo::verify_stablehlo_shapes;
 use castforge_ir::Module;
 
-/// 10. Shape Verification Pass (`verify-shapes`)
+/// Shape Verification Pass (`verify-shapes`).
 pub struct VerifyShapesPass;
 
 impl Pass for VerifyShapesPass {

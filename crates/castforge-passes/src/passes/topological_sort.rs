@@ -3,7 +3,8 @@ use anyhow::Result;
 use castforge_ir::{BlockId, Module, OpId, ValueDef};
 use std::collections::HashSet;
 
-/// 17. Topological Sort Pass (`topological-sort`)
+/// Topological Sort Pass (`topological-sort`).
+///
 /// Reorders operations inside each block so all SSA definitions precede their uses.
 pub struct TopologicalSortPass;
 
@@ -42,10 +43,10 @@ impl Pass for TopologicalSortPass {
                 }
                 if let Some(op) = module.ops.get(op_id) {
                     for &operand in &op.operands {
-                        if let ValueDef::OpResult { op: prod_op, .. } = module.values[operand].def {
-                            if block_op_set.contains(&prod_op) {
-                                visit(prod_op, module, block_op_set, visited, sorted);
-                            }
+                        if let ValueDef::OpResult { op: prod_op, .. } = module.values[operand].def
+                            && block_op_set.contains(&prod_op)
+                        {
+                            visit(prod_op, module, block_op_set, visited, sorted);
                         }
                     }
                 }

@@ -90,11 +90,11 @@ fn emit_rust_func(
     let mut ret_val_opt = None;
     for &op_id in &block.ops {
         let op = &module.ops[op_id];
-        if op.is_op("func", "return") {
-            if let Some(&ret_val) = op.operands.first() {
-                ret_len = tensor_len(module, ret_val);
-                ret_val_opt = Some(ret_val);
-            }
+        if op.is_op("func", "return")
+            && let Some(&ret_val) = op.operands.first()
+        {
+            ret_len = tensor_len(module, ret_val);
+            ret_val_opt = Some(ret_val);
         }
     }
 
@@ -136,18 +136,18 @@ fn emit_rust_func(
         };
         let res_name = value_ident(module, res_val, &mut names, &mut counter);
         let res_len = tensor_len(module, res_val);
-        if let Some(alloc) = plan.allocation_for(res_val) {
-            if let (Some(slot), Some(off)) = (alloc.arena_slot, alloc.arena_offset) {
-                let elem_off = off / 4;
-                writeln!(
-                    out,
-                    "    // [arena] {res_name}: slot #{slot} @ offset {off} B \
+        if let Some(alloc) = plan.allocation_for(res_val)
+            && let (Some(slot), Some(off)) = (alloc.arena_slot, alloc.arena_offset)
+        {
+            let elem_off = off / 4;
+            writeln!(
+                out,
+                "    // [arena] {res_name}: slot #{slot} @ offset {off} B \
                      (arena[{elem_off}..{}], live steps {}..={})",
-                    elem_off + res_len,
-                    alloc.first_def,
-                    alloc.last_use
-                )?;
-            }
+                elem_off + res_len,
+                alloc.first_def,
+                alloc.last_use
+            )?;
         }
 
         if op.is_op("stablehlo", "constant") {

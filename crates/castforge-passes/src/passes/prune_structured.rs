@@ -6,7 +6,8 @@ use castforge_ir::{
     format_dense_f32_literal, prune_2d_columns_by_l1,
 };
 
-/// 12. Structured Channel Pruning Pass (`prune-structured`)
+/// Structured Channel Pruning Pass (`prune-structured`).
+///
 /// Prunes low-L1-importance output columns of 2D weight constants in `stablehlo.dot_general`
 /// and propagates the reduced dimension downstream.
 pub struct StructuredPruningPass {
@@ -148,16 +149,15 @@ impl Pass for StructuredPruningPass {
                             .attributes
                             .get("function_type")
                             .cloned()
+                            && results.len() == 1
                         {
-                            if results.len() == 1 {
-                                module.ops[fn_op_id].attributes.insert(
-                                    "function_type".to_string(),
-                                    Attribute::Type(Type::Function {
-                                        inputs,
-                                        results: vec![updated_out_ty.clone()],
-                                    }),
-                                );
-                            }
+                            module.ops[fn_op_id].attributes.insert(
+                                "function_type".to_string(),
+                                Attribute::Type(Type::Function {
+                                    inputs,
+                                    results: vec![updated_out_ty.clone()],
+                                }),
+                            );
                         }
                     }
                 }

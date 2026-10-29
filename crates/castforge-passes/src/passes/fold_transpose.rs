@@ -3,7 +3,7 @@ use anyhow::Result;
 use castforge_dialect_stablehlo::StableHloOp;
 use castforge_ir::{Attribute, BlockId, Module, ValueDef};
 
-/// 3. Fold Transpose Pass (`transpose(transpose(x, p1), p2)` -> `transpose(x, p1[p2])`)
+/// Fold Transpose Pass (`transpose(transpose(x, p1), p2)` -> `transpose(x, p1[p2])`).
 pub struct FoldTransposePass {
     pub eliminate_identity: bool,
 }
@@ -49,33 +49,30 @@ impl Pass for FoldTransposePass {
                 let mut current_operand = operand;
                 let mut current_perm = perm2;
 
-                if let ValueDef::OpResult { op: prod_op_id, .. } = module.values[operand].def {
-                    if let Some(prod_op) = module.ops.get(prod_op_id) {
-                        if let Some(StableHloOp::Transpose {
-                            operand: base_input,
-                            permutation: perm1,
-                            ..
-                        }) = StableHloOp::from_op(prod_op)
-                        {
-                            if perm1.len() == current_perm.len() {
-                                // Compose permutations: composed[i] = perm1[perm2[i]]
-                                let composed: Vec<i64> = current_perm
-                                    .iter()
-                                    .map(|&idx| perm1[idx as usize])
-                                    .collect();
-                                current_operand = base_input;
-                                current_perm = composed;
+                if let ValueDef::OpResult { op: prod_op_id, .. } = module.values[operand].def
+                    && let Some(prod_op) = module.ops.get(prod_op_id)
+                    && let Some(StableHloOp::Transpose {
+                        operand: base_input,
+                        permutation: perm1,
+                        ..
+                    }) = StableHloOp::from_op(prod_op)
+                    && perm1.len() == current_perm.len()
+                {
+                    // Compose permutations: composed[i] = perm1[perm2[i]]
+                    let composed: Vec<i64> = current_perm
+                        .iter()
+                        .map(|&idx| perm1[idx as usize])
+                        .collect();
+                    current_operand = base_input;
+                    current_perm = composed;
 
-                                let op_mut = &mut module.ops[op_id];
-                                op_mut.operands[0] = current_operand;
-                                op_mut.attributes.insert(
-                                    "permutation".to_string(),
-                                    Attribute::DenseIntArray(current_perm.clone()),
-                                );
-                                modified += 1;
-                            }
-                        }
-                    }
+                    let op_mut = &mut module.ops[op_id];
+                    op_mut.operands[0] = current_operand;
+                    op_mut.attributes.insert(
+                        "permutation".to_string(),
+                        Attribute::DenseIntArray(current_perm.clone()),
+                    );
+                    modified += 1;
                 }
 
                 // Check if the resulting permutation is an identity `[0, 1, 2, ...]`

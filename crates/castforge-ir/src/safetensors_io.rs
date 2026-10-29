@@ -43,7 +43,9 @@ impl TensorStore {
                         if bytes.len() == expected_len * 4 {
                             Some(
                                 bytes
-                                    .chunks_exact(4)
+                                    .as_chunks::<4>()
+                                    .0
+                                    .iter()
                                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                                     .collect(),
                             )
@@ -211,7 +213,9 @@ impl TensorStore {
             match hdr.dtype.as_str() {
                 "F32" => {
                     let vals: Vec<f32> = slice
-                        .chunks_exact(4)
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
                         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                         .collect();
                     let ty = TensorType::new(shape, DType::F32);

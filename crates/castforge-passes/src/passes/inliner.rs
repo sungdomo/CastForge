@@ -4,7 +4,8 @@ use castforge_ir::{BlockId, Module, OpId, Type, ValueId};
 use smallvec::SmallVec;
 use std::collections::HashMap;
 
-/// 14. Function Call Inliner Pass (`inliner`)
+/// Function Call Inliner Pass (`inliner`).
+///
 /// Inlines `func.call @callee(...)` operations into their caller blocks.
 pub struct InlinerPass;
 

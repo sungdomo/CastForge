@@ -41,8 +41,14 @@ impl Pass for FuseMatmulEpiloguePass {
                         rhs: zero_val,
                         ..
                     } => {
-                        let Some((add_op_id, dot_op_id, lhs, rhs, bias, dot_attrs)) =
-                            match_add_of_dot(module, add_val)
+                        let Some(MatmulAddMatch {
+                            add_op_id,
+                            dot_op_id,
+                            lhs,
+                            rhs,
+                            bias,
+                            dot_attrs,
+                        }) = match_add_of_dot(module, add_val)
                         else {
                             continue;
                         };
@@ -73,8 +79,14 @@ impl Pass for FuseMatmulEpiloguePass {
                     StableHloOp::Tanh {
                         operand: add_val, ..
                     } => {
-                        let Some((add_op_id, dot_op_id, lhs, rhs, bias, dot_attrs)) =
-                            match_add_of_dot(module, add_val)
+                        let Some(MatmulAddMatch {
+                            add_op_id,
+                            dot_op_id,
+                            lhs,
+                            rhs,
+                            bias,
+                            dot_attrs,
+                        }) = match_add_of_dot(module, add_val)
                         else {
                             continue;
                         };
@@ -115,8 +127,14 @@ impl Pass for FuseMatmulEpiloguePass {
                 let Some(StableHloOp::Add { result, .. }) = StableHloOp::from_op(op) else {
                     continue;
                 };
-                let Some((_add_op_id, dot_op_id, lhs, rhs, bias, dot_attrs)) =
-                    match_add_of_dot_ignoring_uses(module, result)
+                let Some(MatmulAddMatch {
+                    dot_op_id,
+                    lhs,
+                    rhs,
+                    bias,
+                    dot_attrs,
+                    ..
+                }) = match_add_of_dot_ignoring_uses(module, result)
                 else {
                     continue;
                 };
@@ -161,17 +179,16 @@ impl Pass for FuseMatmulEpiloguePass {
     }
 }
 
-fn match_add_of_dot(
-    module: &Module,
-    add_val: castforge_ir::ValueId,
-) -> Option<(
-    castforge_ir::OpId,
-    castforge_ir::OpId,
-    castforge_ir::ValueId,
-    castforge_ir::ValueId,
-    castforge_ir::ValueId,
-    IndexMap<String, Attribute>,
-)> {
+struct MatmulAddMatch {
+    add_op_id: castforge_ir::OpId,
+    dot_op_id: castforge_ir::OpId,
+    lhs: castforge_ir::ValueId,
+    rhs: castforge_ir::ValueId,
+    bias: castforge_ir::ValueId,
+    dot_attrs: IndexMap<String, Attribute>,
+}
+
+fn match_add_of_dot(module: &Module, add_val: castforge_ir::ValueId) -> Option<MatmulAddMatch> {
     if module.use_count(add_val) != 1 {
         return None;
     }
@@ -181,14 +198,7 @@ fn match_add_of_dot(
 fn match_add_of_dot_ignoring_uses(
     module: &Module,
     add_val: castforge_ir::ValueId,
-) -> Option<(
-    castforge_ir::OpId,
-    castforge_ir::OpId,
-    castforge_ir::ValueId,
-    castforge_ir::ValueId,
-    castforge_ir::ValueId,
-    IndexMap<String, Attribute>,
-)> {
+) -> Option<MatmulAddMatch> {
     let ValueDef::OpResult { op: add_op_id, .. } = module.values[add_val].def else {
         return None;
     };
@@ -209,14 +219,14 @@ fn match_add_of_dot_ignoring_uses(
             continue;
         };
         if let Some(StableHloOp::DotGeneral { lhs, rhs, .. }) = StableHloOp::from_op(dot_op) {
-            return Some((
+            return Some(MatmulAddMatch {
                 add_op_id,
                 dot_op_id,
                 lhs,
                 rhs,
-                bias_cand,
-                dot_op.attributes.clone(),
-            ));
+                bias: bias_cand,
+                dot_attrs: dot_op.attributes.clone(),
+            });
         }
     }
     None

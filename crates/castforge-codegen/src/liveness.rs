@@ -86,11 +86,11 @@ pub fn compute_module_liveness(module: &Module) -> HashMap<ValueId, LiveInterval
     let mut all = HashMap::new();
     for fn_op_id in module.functions() {
         let fn_op = &module.ops[fn_op_id];
-        if let Some(&reg_id) = fn_op.regions.first() {
-            if let Some(&blk_id) = module.regions[reg_id].blocks.first() {
-                for iv in compute_block_liveness(module, blk_id) {
-                    all.insert(iv.value, iv);
-                }
+        if let Some(&reg_id) = fn_op.regions.first()
+            && let Some(&blk_id) = module.regions[reg_id].blocks.first()
+        {
+            for iv in compute_block_liveness(module, blk_id) {
+                all.insert(iv.value, iv);
             }
         }
     }

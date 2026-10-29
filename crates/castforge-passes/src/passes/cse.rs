@@ -3,7 +3,7 @@ use anyhow::Result;
 use castforge_ir::{BlockId, Module, OpId};
 use std::collections::HashMap;
 
-/// 2. Common Subexpression Elimination (CSE)
+/// Common Subexpression Elimination Pass (`cse`).
 pub struct CommonSubexpressionEliminationPass;
 
 impl Pass for CommonSubexpressionEliminationPass {

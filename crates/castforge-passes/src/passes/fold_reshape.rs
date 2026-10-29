@@ -3,7 +3,7 @@ use anyhow::Result;
 use castforge_dialect_stablehlo::StableHloOp;
 use castforge_ir::{BlockId, Module, ValueDef};
 
-/// 4. Fold Reshape Pass (`reshape(reshape(x))` -> `reshape(x)` & identity reshape removal)
+/// Fold Reshape Pass (`reshape(reshape(x))` -> `reshape(x)` & identity reshape removal).
 pub struct FoldReshapePass;
 
 impl Pass for FoldReshapePass {
@@ -32,18 +32,16 @@ impl Pass for FoldReshapePass {
                 };
 
                 let mut current_operand = operand;
-                if let ValueDef::OpResult { op: prod_op_id, .. } = module.values[operand].def {
-                    if let Some(prod_op) = module.ops.get(prod_op_id) {
-                        if let Some(StableHloOp::Reshape {
-                            operand: base_input,
-                            ..
-                        }) = StableHloOp::from_op(prod_op)
-                        {
-                            current_operand = base_input;
-                            module.ops[op_id].operands[0] = current_operand;
-                            modified += 1;
-                        }
-                    }
+                if let ValueDef::OpResult { op: prod_op_id, .. } = module.values[operand].def
+                    && let Some(prod_op) = module.ops.get(prod_op_id)
+                    && let Some(StableHloOp::Reshape {
+                        operand: base_input,
+                        ..
+                    }) = StableHloOp::from_op(prod_op)
+                {
+                    current_operand = base_input;
+                    module.ops[op_id].operands[0] = current_operand;
+                    modified += 1;
                 }
 
                 // If input type and output type of reshape are identical, eliminate it!

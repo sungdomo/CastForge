@@ -6,7 +6,8 @@ use castforge_ir::{
 };
 use indexmap::IndexMap;
 
-/// 13. Weight Merging Pass (`merge-weights`)
+/// Weight Merging Pass (`merge-weights`).
+///
 /// Fuses paired constant weight tensors using Linear, SLERP, or TIES merging.
 pub struct MergeWeightsPass {
     pub method: MergeMethod,

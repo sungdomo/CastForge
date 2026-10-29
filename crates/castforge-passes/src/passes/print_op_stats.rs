@@ -26,10 +26,10 @@ pub fn analyze_roofline(module: &Module, ridge_flops_per_byte: f64) -> RooflineS
             continue;
         }
         if op.is_op("stablehlo", "constant") {
-            if let Some(&res) = op.results.first() {
-                if let Some(t) = module.values[res].ty.as_tensor() {
-                    total_params += t.num_elements().unwrap_or(0);
-                }
+            if let Some(&res) = op.results.first()
+                && let Some(t) = module.values[res].ty.as_tensor()
+            {
+                total_params += t.num_elements().unwrap_or(0);
             }
             continue;
         }
@@ -85,12 +85,11 @@ fn op_flops_and_bytes(module: &Module, op: &Operation) -> (i64, i64) {
     if op.is_op("stablehlo", "dot_general") && op.operands.len() >= 2 {
         let lhs_ty = module.values[op.operands[0]].ty.as_tensor();
         let rhs_ty = module.values[op.operands[1]].ty.as_tensor();
-        if let (Some(l), Some(r)) = (lhs_ty, rhs_ty) {
-            if let (Some(Dim::Static(m)), Some(Dim::Static(k)), Some(Dim::Static(n))) =
+        if let (Some(l), Some(r)) = (lhs_ty, rhs_ty)
+            && let (Some(Dim::Static(m)), Some(Dim::Static(k)), Some(Dim::Static(n))) =
                 (l.shape.first(), l.shape.get(1), r.shape.get(1))
-            {
-                return (2 * m * k * n, bytes);
-            }
+        {
+            return (2 * m * k * n, bytes);
         }
     }
 
@@ -103,12 +102,11 @@ fn op_flops_and_bytes(module: &Module, op: &Operation) -> (i64, i64) {
         if name == "castforge.fused_matmul_epilogue" && op.operands.len() >= 2 {
             let lhs_ty = module.values[op.operands[0]].ty.as_tensor();
             let rhs_ty = module.values[op.operands[1]].ty.as_tensor();
-            if let (Some(l), Some(r)) = (lhs_ty, rhs_ty) {
-                if let (Some(Dim::Static(m)), Some(Dim::Static(k)), Some(Dim::Static(n))) =
+            if let (Some(l), Some(r)) = (lhs_ty, rhs_ty)
+                && let (Some(Dim::Static(m)), Some(Dim::Static(k)), Some(Dim::Static(n))) =
                     (l.shape.first(), l.shape.get(1), r.shape.get(1))
-                {
-                    return (2 * m * k * n + 2 * m * n, bytes);
-                }
+            {
+                return (2 * m * k * n + 2 * m * n, bytes);
             }
         } else if name == "castforge.fused_softmax" || name == "castforge.fused_rmsnorm" {
             return (out_elems * 5, bytes);
@@ -118,7 +116,7 @@ fn op_flops_and_bytes(module: &Module, op: &Operation) -> (i64, i64) {
     (out_elems, bytes)
 }
 
-/// 19. Print Op Stats & Roofline Pass (`print-op-stats`)
+/// Print Op Stats & Roofline Pass (`print-op-stats`).
 pub struct PrintOpStatsPass {
     pub ridge_flops_per_byte: f64,
 }
