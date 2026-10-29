@@ -32,7 +32,7 @@ support.
 - [`crates/castforge-cli`](crates/castforge-cli): The `castforge` command-line tool (`opt`, `viz`,
   `codegen`, `run`, `list-passes`, plus direct pass subcommands).
 
-## Built-in Transformation Passes (39 Passes)
+## Built-in Transformation Passes & Presets (43 Passes)
 
 | Pass Name | Category | Description |
 | :--- | :--- | :--- |
@@ -76,11 +76,14 @@ support.
 | `prune-structured` | Weight Surgery | Structured L1 channel pruning on weights (`sparsity=0.5`) |
 | `quantize-weights` | Weight Surgery | Symmetric `i8`/`i4` quantization + `uniform_dequantize` |
 | `externalize-weights` | Weight I/O | Moves inline `dense<...>` to `dense_resource<key>` |
+| `O1` | Preset | Inlining, SCCP, LICM, canonicalization, symbol-dce, toposort |
+| `O2` | Preset | `O1` + LoRA/Norm folding + Transformer/MatMul operator fusions |
+| `O3` / `llm-opt` | Preset | Shape specialization + `O2` + weight packing + inplace arena |
 
 ## Quick Start
 
 ```bash
-# 1. List all 39 registered passes
+# 1. List all 43 registered passes and pipeline presets
 cargo run --bin castforge -- list-passes
 
 # 2. Run an optimization pipeline with automatic numerical verification

@@ -4,10 +4,11 @@ use crate::{
     FoldConstantsPass, FoldConvertPass, FoldNormWeightsPass, FoldReshapePass, FoldSliceConcatPass,
     FoldTransposePass, FuseAttentionPass, FuseElementwisePass, FuseHorizontalDotPass,
     FuseMatmulEpiloguePass, FuseRmsNormPass, FuseRopePass, FuseSoftmaxPass, FuseSwiGluPass,
-    HoistConstantsPass, InlinerPass, IrEditPass, LicmPass, MergeWeightsPass, PackWeightsPass, Pass,
-    PassOptions, PrintOpStatsPass, QuantizeWeightsPass, SccpPass, SimplifyAlgebraicPass,
-    SinkTransposePass, SpecializeShapesPass, StripDebugInfoPass, StructuredPruningPass,
-    SymbolDcePass, TaskArithmeticPass, TopologicalSortPass, VerifyShapesPass,
+    HoistConstantsPass, InlinerPass, IrEditPass, LicmPass, MergeWeightsPass, OptO1Pass, OptO2Pass,
+    OptO3Pass, PackWeightsPass, Pass, PassOptions, PrintOpStatsPass, QuantizeWeightsPass, SccpPass,
+    SimplifyAlgebraicPass, SinkTransposePass, SpecializeShapesPass, StripDebugInfoPass,
+    StructuredPruningPass, SymbolDcePass, TaskArithmeticPass, TopologicalSortPass,
+    VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
 use castforge_ir::MergeMethod;
@@ -343,6 +344,26 @@ impl PassRegistry {
             "Annotates elementwise ops whose input buffer dies at the op for in-place arena reuse",
             |_opts| Ok(Box::new(BufferizeInplacePass)),
         );
+        reg.register(
+            "O1",
+            "Preset O1: Inlining, SCCP, LICM, fixed-point canonicalization, symbol-dce, toposort",
+            |_opts| Ok(Box::new(OptO1Pass)),
+        );
+        reg.register(
+            "O2",
+            "Preset O2: O1 + LoRA/Norm weight folding + Transformer/MatMul operator fusions",
+            |_opts| Ok(Box::new(OptO2Pass)),
+        );
+        reg.register(
+            "O3",
+            "Preset O3: Shape specialization + O2 fusions + weight packing + inplace arena",
+            |opts| Ok(Box::new(build_o3_preset("O3", opts))),
+        );
+        reg.register(
+            "llm-opt",
+            "Preset llm-opt: Full LLM shape specialization, fusion, weight packing & inplace arena",
+            |opts| Ok(Box::new(build_o3_preset("llm-opt", opts))),
+        );
         reg
     }
 
@@ -369,5 +390,24 @@ impl PassRegistry {
 
     pub fn list(&self) -> impl Iterator<Item = (&'static str, &'static str)> + '_ {
         self.passes.values().map(|d| (d.name, d.description))
+    }
+}
+
+fn build_o3_preset(preset_name: &'static str, opts: &PassOptions) -> OptO3Pass {
+    let mut default_dim = 1i64;
+    let mut bindings = IndexMap::new();
+    for (k, v) in opts {
+        if let Ok(n) = v.parse::<i64>() {
+            if k == "default" || k == "?" {
+                default_dim = n;
+            } else {
+                bindings.insert(k.clone(), n);
+            }
+        }
+    }
+    OptO3Pass {
+        preset_name,
+        default_dim,
+        bindings,
     }
 }

@@ -581,3 +581,47 @@ fn test_fuse_rope_and_gqa_attention() {
     assert!(!dec_printed.contains("castforge.fused_rope"));
     assert!(dec_printed.contains("stablehlo.concatenate"));
 }
+
+#[test]
+fn test_o1_o2_o3_and_llm_opt_presets() {
+    let registry = PassRegistry::with_builtin_passes();
+
+    // 1. Test O1 preset on redundant convert/constant/identity graph
+    let mut mod_o1 = parse_mlir(CONVERT_AND_HOIST_MLIR).expect("parse o1 mlir");
+    let mut pm_o1 = PassManager::from_pipeline_str(&registry, "O1").expect("O1 pipeline");
+    let res_o1 = pm_o1.run(&mut mod_o1).expect("run O1");
+    assert!(res_o1[0].changed);
+    assert!(!print_mlir(&mod_o1).contains("stablehlo.convert"));
+
+    // 2. Test O2 preset on SwiGLU + MatMul epilogue graph
+    let before_o2 = parse_mlir(SWIGLU_AND_EPILOGUE_MLIR).expect("parse o2 mlir");
+    let mut mod_o2 = before_o2.clone();
+    let mut pm_o2 = PassManager::from_pipeline_str(&registry, "O2").expect("O2 pipeline");
+    let res_o2 = pm_o2.run(&mut mod_o2).expect("run O2");
+    assert!(res_o2[0].changed);
+    let printed_o2 = print_mlir(&mod_o2);
+    assert!(printed_o2.contains("castforge.fused_swiglu"));
+    assert!(printed_o2.contains("castforge.fused_matmul_epilogue"));
+    let rep_o2 = verify_module_numerics(&before_o2, &mod_o2, 1e-5).expect("verify O2");
+    assert!(rep_o2.passed);
+
+    // 3. Test O3 / llm-opt preset on LoRA + MatMul + weight packing
+    let before_o3 = parse_mlir(BAKE_LORA_MLIR).expect("parse o3 mlir");
+    let mut mod_o3 = before_o3.clone();
+    let mut pm_o3 = PassManager::from_pipeline_str(&registry, "llm-opt").expect("llm-opt pipeline");
+    let res_o3 = pm_o3.run(&mut mod_o3).expect("run llm-opt");
+    assert!(res_o3[0].changed);
+    let printed_o3 = print_mlir(&mod_o3);
+    assert!(printed_o3.contains("packed_rhs = true"));
+    let rep_o3 = verify_module_numerics(&before_o3, &mod_o3, 1e-5).expect("verify llm-opt");
+    assert!(rep_o3.passed);
+
+    // 4. Test O3(B=4) with symbolic shape specialization
+    let mut mod_sym = parse_mlir(SYMBOLIC_DYNAMIC_SHAPES_MLIR).expect("parse sym mlir");
+    let mut pm_sym = PassManager::from_pipeline_str(&registry, "O3(B=4)").expect("O3(B=4)");
+    let res_sym = pm_sym.run(&mut mod_sym).expect("run O3(B=4)");
+    assert!(res_sym[0].changed);
+    let printed_sym = print_mlir(&mod_sym);
+    assert!(!printed_sym.contains('?'));
+    assert!(printed_sym.contains("packed_rhs = true"));
+}
