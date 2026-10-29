@@ -126,7 +126,7 @@ module @weight_surgery {
 
     let mut pm = PassManager::from_pipeline_str(
         &registry,
-        "merge-weights(method=slerp,t=0.5),prune-structured(sparsity=0.5),quantize-weights(bits=8)",
+        "merge-weights(method=slerp,t=0.5),prune-weights(sparsity=0.5),quantize(bits=8)",
     )
     .expect("pipeline build failed");
 
@@ -194,7 +194,7 @@ module @general_passes {
 
     let mut pm = PassManager::from_pipeline_str(
         &registry,
-        "inliner,symbol-dce,fold-constants,topological-sort,strip-metadata,print-op-stats",
+        "inliner,dce,fold-constants,topological-sort,strip-metadata,print-op-stats",
     )
     .expect("pipeline build failed");
 

@@ -7,6 +7,7 @@ pub mod mixed_precision;
 pub mod ops;
 pub mod pack_weights;
 pub mod prune_structured;
+pub mod quantize;
 pub mod quantize_weights;
 pub mod sparsify_2to4;
 pub mod task_arithmetic;
@@ -20,6 +21,10 @@ pub use mixed_precision::MixedPrecisionPass;
 pub use ops::{MergeMethod, merge_f32_tensors, prune_2d_columns_by_l1, quantize_symmetric_f32};
 pub use pack_weights::PackWeightsPass;
 pub use prune_structured::StructuredPruningPass;
+pub use quantize::{
+    FoldBatchNormPass, HadamardQuantRotationPass, PruneWeightsPass, QuantizeFp8Pass,
+    QuantizeGroupwisePass, QuantizePass, UnifiedMergeWeightsPass,
+};
 pub use quantize_weights::QuantizeWeightsPass;
 pub use sparsify_2to4::{Sparsify2To4Pass, apply_2to4_mask};
 pub use task_arithmetic::TaskArithmeticPass;

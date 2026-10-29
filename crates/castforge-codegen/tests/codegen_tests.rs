@@ -35,7 +35,7 @@ module @weight_surgery_demo {
     let mut module = parse_mlir(mlir).expect("parse failed");
     let mut pm = PassManager::from_pipeline_str(
         &registry,
-        "merge-weights(method=slerp,t=0.5),prune-structured(sparsity=0.5),quantize-weights(bits=8)",
+        "merge-weights(method=slerp,t=0.5),prune-weights(sparsity=0.5),quantize(bits=8)",
     )
     .expect("pipeline build failed");
     pm.run(&mut module).expect("passes failed");
@@ -270,7 +270,8 @@ module @loop_transforms_demo {
     let before = parse_mlir(mlir).expect("parse loop mlir");
     let mut fused = before.clone();
     let registry = PassRegistry::with_builtin_passes();
-    let mut pm = PassManager::from_pipeline_str(&registry, "fuse-loops").expect("fuse-loops");
+    let mut pm = PassManager::from_pipeline_str(&registry, "fuse-elementwise(mode=loops)")
+        .expect("fuse-elementwise(mode=loops)");
     let res = pm.run(&mut fused).expect("run fuse-loops");
     assert!(res[0].changed);
 
@@ -349,7 +350,7 @@ module @advanced_loops_demo {
     let registry = PassRegistry::with_builtin_passes();
     let mut pm = PassManager::from_pipeline_str(
         &registry,
-        "fuse-rope,fuse-loops,fission-loops(max_steps=2)",
+        "fuse-rope,fuse-elementwise(mode=loops),fuse-elementwise(mode=loops,max_steps=2)",
     )
     .expect("fission pipeline");
     let res = pm.run(&mut transformed).expect("run pipeline");
@@ -757,7 +758,12 @@ module @advanced_compiler_frontiers {
     let registry = PassRegistry::with_builtin_passes();
     let mut pm = PassManager::from_pipeline_str(
         &registry,
-        "inject-kv-cache(max_seq_len=4096),shard-spmd(devices=4),egraph-simplify,rematerialize",
+        concat!(
+            "optimize-attention(mode=kv_cache,max_seq_len=4096),",
+            "shard-distributed(mode=tp,devices=4,coalesce=false),",
+            "simplify-algebraic(egraph=true),",
+            "rematerialize"
+        ),
     )
     .expect("frontiers pipeline");
     let res = pm.run(&mut after).expect("run frontiers pipeline");
@@ -909,7 +915,7 @@ module @parallel_branches {
     let registry = PassRegistry::with_builtin_passes();
     let mut pm = PassManager::from_pipeline_str(
         &registry,
-        "calibrate-quantize(bits=8,samples=4),schedule-streams(streams=2)",
+        "quantize(scheme=w8a8,bits=8,samples=4),schedule-streams(streams=2)",
     )
     .expect("calibrate + streams pipeline");
     let res = pm.run(&mut after).expect("run calibrate + streams");
@@ -1264,8 +1270,7 @@ module @ir_tools_demo {
     assert!(out_rep.passed);
 
     let mut re_inlined = outlined.clone();
-    let mut inl_pm =
-        PassManager::from_pipeline_str(&registry, "inliner | symbol-dce").expect("inliner");
+    let mut inl_pm = PassManager::from_pipeline_str(&registry, "inliner | dce").expect("inliner");
     inl_pm.run(&mut re_inlined).expect("run inliner");
     let inl_ir = print_mlir(&re_inlined);
     assert!(!inl_ir.contains("func.call"));
@@ -1382,11 +1387,11 @@ module @two_layer_gemm {
 
     let mut re_param = frozen.clone();
     let mut prm_pm =
-        PassManager::from_pipeline_str(&registry, "parameterize-constants(min_elements=2)")
-            .expect("parameterize-constants");
+        PassManager::from_pipeline_str(&registry, "freeze-inputs(unfreeze=true,min_elements=2)")
+            .expect("freeze-inputs(unfreeze=true)");
     let prm_res = prm_pm
         .run(&mut re_param)
-        .expect("run parameterize-constants");
+        .expect("run freeze-inputs(unfreeze=true)");
     assert!(prm_res[0].changed);
     let prm_ir = print_mlir(&re_param);
     assert!(!prm_ir.contains("stablehlo.constant"));
@@ -1402,10 +1407,10 @@ module @two_layer_gemm {
     assert!(tap_ir.contains("-> (tensor<2x4xf32>, tensor<2x4xf32>)"));
     assert!(tap_ir.contains("return %h2, %h1 : tensor<2x4xf32>, tensor<2x4xf32>"));
 
-    // 3. Static Batch Dimension Resizer (`resize-batch`)
+    // 3. Static Batch Dimension Resizer (`specialize-shapes(batch=8)`)
     let mut resized = base.clone();
-    let mut rsz_pm =
-        PassManager::from_pipeline_str(&registry, "resize-batch(batch=8)").expect("resize-batch");
+    let mut rsz_pm = PassManager::from_pipeline_str(&registry, "specialize-shapes(batch=8)")
+        .expect("specialize-shapes(batch=8)");
     let rsz_res = rsz_pm.run(&mut resized).expect("run resize-batch");
     assert!(rsz_res[0].changed);
     let rsz_ir = print_mlir(&resized);
@@ -1474,19 +1479,21 @@ module @advanced_ir_tools {
     assert!(hash_ir.contains("castforge.structural_hash"));
     assert!(hash_ir.contains("castforge.verified_tol"));
 
-    // 2. NVIDIA Ampere/Hopper 2:4 Structured Sparsity (`sparsify-2to4`)
+    // 2. NVIDIA Ampere/Hopper 2:4 Structured Sparsity (`prune-weights(mode=2to4)`)
     let mut sparse = base.clone();
-    let mut sp_pm =
-        PassManager::from_pipeline_str(&registry, "sparsify-2to4").expect("sparsify-2to4");
-    let sp_res = sp_pm.run(&mut sparse).expect("run sparsify-2to4");
+    let mut sp_pm = PassManager::from_pipeline_str(&registry, "prune-weights(mode=2to4)")
+        .expect("prune-weights(mode=2to4)");
+    let sp_res = sp_pm
+        .run(&mut sparse)
+        .expect("run prune-weights(mode=2to4)");
     assert!(sp_res[0].changed);
     let sp_ir = print_mlir(&sparse);
     assert!(sp_ir.contains("sparsity = \"2:4\""));
 
-    // 3. Multi-Bucket Dynamic Shape Dispatcher (`bucket-shapes`)
+    // 3. Multi-Bucket Dynamic Shape Dispatcher (`specialize-shapes(buckets=1;4)`)
     let mut bucketed = base.clone();
-    let mut bkt_pm = PassManager::from_pipeline_str(&registry, "bucket-shapes(buckets=1;4)")
-        .expect("bucket-shapes");
+    let mut bkt_pm = PassManager::from_pipeline_str(&registry, "specialize-shapes(buckets=1;4)")
+        .expect("specialize-shapes(buckets=1;4)");
     let bkt_res = bkt_pm.run(&mut bucketed).expect("run bucket-shapes");
     assert!(bkt_res[0].changed);
     assert_eq!(bkt_res[0].ops_created, 2);
@@ -1525,7 +1532,7 @@ module @advanced_ir_tools {
 #[test]
 fn test_pad_for_tiling_split_gemm_unroll_calls_hoist_all_reduce_instrument_and_strip() {
     let registry = PassRegistry::with_builtin_passes();
-    assert_eq!(registry.list().count(), 82);
+    assert_eq!(registry.list().count(), 67);
 
     let mlir = r#"
 module @final_ninety_suite {
@@ -1595,14 +1602,15 @@ module @square_block {
     assert!(unroll_ir.contains("%call_u1 = func.call @outlined_kernel_0("));
     assert!(unroll_ir.contains("%call_u2 = func.call @outlined_kernel_0("));
 
-    // 4. Collective Communication Coalescer (`shard-spmd | hoist-all-reduce`)
+    // 4. Collective Communication Coalescer (`shard-distributed(mode=tp,devices=4,coalesce=true)`)
     let mut spmd_mod = base.clone();
-    let mut spmd_pm =
-        PassManager::from_pipeline_str(&registry, "shard-spmd(devices=4) | hoist-all-reduce")
-            .expect("shard-spmd + hoist-all-reduce");
-    let spmd_res = spmd_pm.run(&mut spmd_mod).expect("run hoist-all-reduce");
+    let mut spmd_pm = PassManager::from_pipeline_str(
+        &registry,
+        "shard-distributed(mode=tp,devices=4,coalesce=true)",
+    )
+    .expect("shard-distributed");
+    let spmd_res = spmd_pm.run(&mut spmd_mod).expect("run shard-distributed");
     assert!(spmd_res[0].changed);
-    assert!(spmd_res[1].changed);
     let spmd_ir = print_mlir(&spmd_mod);
     assert!(spmd_ir.contains("async_overlap = true"));
 
@@ -1802,27 +1810,29 @@ fn test_consolidated_and_sota_passes_groupwise_batchnorm_concat_paged_gvn() {
     let baseline = module.clone();
 
     let mut pm_bn =
-        PassManager::from_pipeline_str(&registry, "fold-batchnorm,gvn,eliminate-concat-copies")
+        PassManager::from_pipeline_str(&registry, "fold-batchnorm,cse,eliminate-concat-copies")
             .expect("build sota pipeline");
     let res = pm_bn.run(&mut module).expect("run sota pipeline");
     assert!(res[0].changed, "fold-batchnorm absorbed scale into weight");
-    assert_eq!(res[1].ops_removed, 1, "gvn deduplicated commutative add");
+    assert_eq!(res[1].ops_removed, 1, "cse deduplicated commutative add");
     assert!(res[2].changed, "eliminate-concat-copies routed producer");
 
     let rep = verify_module_numerics(&baseline, &module, 1e-4).expect("verify numerics");
-    assert!(rep.passed, "fold-batchnorm + gvn numerically equivalent");
+    assert!(rep.passed, "fold-batchnorm + cse numerically equivalent");
 
     let printed = print_mlir(&module);
     assert!(printed.contains("castforge.batchnorm_folded = true"));
     assert!(printed.contains("castforge.zero_copy_concat = true"));
 
-    // 2. Test quantize-groupwise (AWQ/GPTQ style) + strip-metadata
+    // 2. Test quantize(scheme=groupwise) + strip-metadata
     let mut pm_gw = PassManager::from_pipeline_str(
         &registry,
-        "quantize-groupwise(bits=4,group_size=2,awq_salient=true)",
+        "quantize(scheme=groupwise,bits=4,group_size=2,awq_salient=true)",
     )
-    .expect("build quantize-groupwise");
-    let gw_res = pm_gw.run(&mut module).expect("run quantize-groupwise");
+    .expect("build quantize(scheme=groupwise)");
+    let gw_res = pm_gw
+        .run(&mut module)
+        .expect("run quantize(scheme=groupwise)");
     assert!(gw_res[0].changed);
     assert!(print_mlir(&module).contains("awq_groupwise"));
 
@@ -1831,7 +1841,7 @@ fn test_consolidated_and_sota_passes_groupwise_batchnorm_concat_paged_gvn() {
     pm_strip.run(&mut module).expect("run strip-metadata");
     assert!(!print_mlir(&module).contains("castforge.batchnorm_folded"));
 
-    // 3. Test fuse-norm, fuse-activations, and lower-paged-attention
+    // 3. Test fuse-norm, fuse-activations, and optimize-attention(mode=paged)
     let attn_mlir = concat!(
         "module @paged_attn_demo {\n",
         "  func.func @main(%q: tensor<2x2xf32>, %k: tensor<2x2xf32>, %v: tensor<2x2xf32>) ",
@@ -1846,7 +1856,10 @@ fn test_consolidated_and_sota_passes_groupwise_batchnorm_concat_paged_gvn() {
     let mut attn_mod = parse_mlir(attn_mlir).expect("parse attn_mlir");
     let mut pm_paged = PassManager::from_pipeline_str(
         &registry,
-        "fuse-norm,fuse-activations,lower-paged-attention(page_block_size=16,max_blocks=64)",
+        concat!(
+            "fuse-norm,fuse-activations,",
+            "optimize-attention(mode=paged,page_block_size=16,max_blocks=64)"
+        ),
     )
     .expect("build paged-attention pipeline");
     let paged_res = pm_paged.run(&mut attn_mod).expect("run paged-attention");
@@ -1856,16 +1869,16 @@ fn test_consolidated_and_sota_passes_groupwise_batchnorm_concat_paged_gvn() {
             .expect("emit cuda for paged attention");
     assert!(cuda_src.contains("PagedAttention KV block-table addressing (page_block_size=16)"));
 
-    // 4. Test flash-decoding, shard-ring-attention, speculative-tree-attention,
-    //    quantize-fp8, and fuse-megakernel
+    // 4. Test optimize-attention(mode=all), shard-distributed(mode=ring_cp),
+    //    quantize(scheme=fp8), and fuse-megakernel
     let mut sota5_mod = parse_mlir(attn_mlir).expect("parse attn_mlir for sota5");
     let mut pm_sota5 = PassManager::from_pipeline_str(
         &registry,
         concat!(
-            "flash-decoding(kv_splits=8),",
-            "shard-ring-attention(ring_size=4),",
-            "speculative-tree-attention(tree_depth=5,tree_width=4),",
-            "fuse-megakernel(min_ops=1)"
+            "optimize-attention(mode=flash_decoding,split_kv=8),",
+            "shard-distributed(mode=ring_cp,ring_size=4),",
+            "optimize-attention(mode=tree,tree_depth=5,draft_tokens=4),",
+            "fuse-megakernel"
         ),
     )
     .expect("build sota5 pipeline");
@@ -1878,9 +1891,32 @@ fn test_consolidated_and_sota_passes_groupwise_batchnorm_concat_paged_gvn() {
     assert!(sota5_printed.contains("castforge.megakernel = true"));
 
     let mut fp8_mod = parse_mlir(mlir).expect("parse mlir for fp8");
-    let mut pm_fp8 = PassManager::from_pipeline_str(&registry, "quantize-fp8(format=e4m3)")
-        .expect("build quantize-fp8");
-    let fp8_res = pm_fp8.run(&mut fp8_mod).expect("run quantize-fp8");
+    let mut pm_fp8 = PassManager::from_pipeline_str(&registry, "quantize(scheme=fp8,format=e4m3)")
+        .expect("build quantize(scheme=fp8)");
+    let fp8_res = pm_fp8.run(&mut fp8_mod).expect("run quantize(scheme=fp8)");
     assert!(fp8_res[0].changed);
     assert!(print_mlir(&fp8_mod).contains("fp8_e4m3"));
+
+    // 5. Test the 5 new SOTA passes: fuse-mla, hadamard-quant-rotation,
+    //    fuse-linear-cross-entropy, shard-pipeline-parallel, lower-tensor-cores
+    let mut new5_mod = parse_mlir(mlir).expect("parse mlir for new5");
+    let mut pm_new5 = PassManager::from_pipeline_str(
+        &registry,
+        concat!(
+            "fuse-mla(kv_lora_rank=512),",
+            "hadamard-quant-rotation(block_size=64),",
+            "fuse-linear-cross-entropy(chunk_size=4096),",
+            "shard-pipeline-parallel(stages=2,microbatches=4,schedule=1f1b),",
+            "lower-tensor-cores(arch=wgmma,tile=64x128x16)"
+        ),
+    )
+    .expect("build new5 pipeline");
+    let new5_res = pm_new5.run(&mut new5_mod).expect("run new5 pipeline");
+    assert!(new5_res.iter().all(|r| r.changed));
+    let new5_printed = print_mlir(&new5_mod);
+    assert!(new5_printed.contains("castforge.mla_compressed_kv = true"));
+    assert!(new5_printed.contains("castforge.hadamard_rotated = true"));
+    assert!(new5_printed.contains("castforge.fused_linear_cross_entropy = true"));
+    assert!(new5_printed.contains("castforge.pp_schedule = \"1f1b\""));
+    assert!(new5_printed.contains("castforge.tensor_core_arch = \"wgmma\""));
 }

@@ -217,8 +217,8 @@ fn test_bake_lora_and_numeric_verification() {
     let mut baked = before.clone();
     let registry = PassRegistry::with_builtin_passes();
 
-    let mut pm =
-        PassManager::from_pipeline_str(&registry, "bake-lora").expect("bake-lora pipeline");
+    let mut pm = PassManager::from_pipeline_str(&registry, "merge-weights(method=lora)")
+        .expect("merge-weights(method=lora) pipeline");
     let res = pm.run(&mut baked).expect("run bake-lora");
     assert!(res[0].changed);
 
@@ -251,9 +251,11 @@ module @task_arithmetic_demo {
 fn test_task_arithmetic_and_dare_pruning() {
     let mut module = parse_mlir(TASK_ARITHMETIC_MLIR).expect("parse task arithmetic MLIR");
     let registry = PassRegistry::with_builtin_passes();
-    let mut pm =
-        PassManager::from_pipeline_str(&registry, "task-arithmetic(lambda=0.5,drop_rate=0.5)")
-            .expect("task-arithmetic pipeline");
+    let mut pm = PassManager::from_pipeline_str(
+        &registry,
+        "merge-weights(method=dare,lambda=0.5,drop_rate=0.5)",
+    )
+    .expect("merge-weights(method=dare) pipeline");
     let res = pm.run(&mut module).expect("run task-arithmetic");
     assert!(res[0].changed);
 
@@ -351,8 +353,9 @@ module @convert_and_hoist {
 fn test_fold_convert_and_hoist_constants() {
     let mut module = parse_mlir(CONVERT_AND_HOIST_MLIR).expect("parse convert/hoist MLIR");
     let registry = PassRegistry::with_builtin_passes();
-    let mut pm = PassManager::from_pipeline_str(&registry, "fold-views,hoist-constants,licm")
-        .expect("fold-views/hoist-constants/licm pipeline");
+    let mut pm =
+        PassManager::from_pipeline_str(&registry, "fold-views,cse(hoist_constants=true),licm")
+            .expect("fold-views/cse/licm pipeline");
     let res = pm
         .run(&mut module)
         .expect("run fold-views/hoist-constants/licm");
@@ -478,8 +481,9 @@ fn test_pack_weights_and_unit_stride_codegen() {
     let mut packed = before.clone();
     let registry = PassRegistry::with_builtin_passes();
 
-    let mut pm = PassManager::from_pipeline_str(&registry, "bake-lora,pack-weights")
-        .expect("bake-lora,pack-weights pipeline");
+    let mut pm =
+        PassManager::from_pipeline_str(&registry, "merge-weights(method=lora),pack-weights")
+            .expect("merge-weights(method=lora),pack-weights pipeline");
     let res = pm.run(&mut packed).expect("run bake-lora,pack-weights");
     assert!(res[0].changed);
     assert!(res[1].changed);
@@ -720,10 +724,10 @@ module @layernorm_gelu_gated_mlp {
 fn test_fuse_dequant_matmul_residual_norm_layernorm_gelu_and_gated_mlp() {
     let registry = PassRegistry::with_builtin_passes();
 
-    // 1. Test `fuse-residual-norm,quantize-weights(bits=8,min_elements=4),fuse-dequant-matmul`
+    // 1. Test `fuse-norm(kind=residual_rmsnorm),quantize(bits=8,min_elements=4),fuse-gemm`
     let mut mod_q = parse_mlir(DEQUANT_MATMUL_AND_RESIDUAL_NORM_MLIR).expect("parse qmatmul mlir");
     let mut pm_q_only =
-        PassManager::from_pipeline_str(&registry, "quantize-weights(bits=8,min_elements=4)")
+        PassManager::from_pipeline_str(&registry, "quantize(bits=8,min_elements=4)")
             .expect("quant pipe");
     let mut ref_quantized = mod_q.clone();
     pm_q_only.run(&mut ref_quantized).expect("run quant");
@@ -732,11 +736,11 @@ fn test_fuse_dequant_matmul_residual_norm_layernorm_gelu_and_gated_mlp() {
         &registry,
         concat!(
             "fuse-norm(kind=residual_rmsnorm),",
-            "quantize-weights(bits=8,min_elements=4),",
+            "quantize(bits=8,min_elements=4),",
             "fuse-gemm(kind=dequant)"
         ),
     )
-    .expect("fuse-norm,quantize-weights,fuse-gemm");
+    .expect("fuse-norm,quantize,fuse-gemm");
     let res_fuse = pm_fuse.run(&mut mod_q).expect("run qmatmul+resnorm fusion");
     assert!(res_fuse[0].changed);
     assert!(res_fuse[2].changed);

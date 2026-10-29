@@ -1,22 +1,19 @@
 use crate::{
-    AutodiffPass, BakeLoraPass, BisectPassesPass, BucketShapesPass, BufferizeInplacePass,
-    CalibrateQuantizePass, CanonicalizePass, CommonSubexpressionEliminationPass, ComposeFuncsPass,
+    AutodiffPass, BisectPassesPass, BufferizeInplacePass, CanonicalizePass, ComposeFuncsPass,
     ConvertLayoutPass, DeadCodeEliminationPass, DecomposeCompositesPass, DedupFunctionsPass,
-    EgraphSimplifyPass, EliminateConcatCopiesPass, ExternalizeWeightsPass, ExtractSubgraphPass,
-    FissionLoopsPass, FlashDecodingPass, FoldBatchNormPass, FoldConstantsPass, FoldViewsPass,
-    FreezeInputsPass, FuseActivationsPass, FuseAttentionPass, FuseElementwisePass, FuseGemmPass,
-    FuseLoopsPass, FuseMapReducePass, FuseMegakernelPass, FuseMoePass, FuseNormPass, FuseRopePass,
-    FuseSoftmaxPass, GlobalValueNumberingPass, HashIrPass, HoistAllReducePass, HoistConstantsPass,
-    InjectKvCachePass, InlinerPass, InstrumentProfilingPass, IrEditPass, LicmPass,
-    LowerConvToGemmPass, LowerPagedAttentionPass, MergeMethod, MergeWeightsPass,
-    MixedPrecisionPass, NormalizeSsaPass, OffloadActivationsPass, OptO1Pass, OptO2Pass, OptO3Pass,
-    OutlineSubgraphsPass, PackWeightsPass, ParameterizeConstantsPass, Pass, PassOptions,
-    PrintOpStatsPass, QuantizeFp8Pass, QuantizeGroupwisePass, QuantizeWeightsPass, ReduceIrPass,
-    RematerializePass, ResizeBatchPass, SanitizeNumericsPass, ScheduleLoopsPass,
-    ScheduleStreamsPass, ShardRingAttentionPass, ShardSpmdPass, SimplifyAlgebraicPass,
-    Sparsify2To4Pass, SpecializeShapesPass, SpeculativeTreeAttentionPass, SplitLargeGemmPass,
-    StripMetadataPass, StructuredPruningPass, SymbolDcePass, TapIntermediatesPass,
-    TaskArithmeticPass, TopologicalSortPass, UnrollCallsPass, VerifyEquivPass, VerifyShapesPass,
+    EliminateConcatCopiesPass, ExternalizeWeightsPass, ExtractSubgraphPass, FoldBatchNormPass,
+    FoldConstantsPass, FoldViewsPass, FuseActivationsPass, FuseAttentionPass, FuseGemmPass,
+    FuseLinearCrossEntropyPass, FuseMapReducePass, FuseMegakernelPass, FuseMlaPass, FuseMoePass,
+    FuseNormPass, FuseRopePass, FuseSoftmaxPass, HadamardQuantRotationPass, HashIrPass,
+    InlinerPass, InstrumentProfilingPass, IrEditPass, LicmPass, LowerConvToGemmPass,
+    LowerTensorCoresPass, MixedPrecisionPass, NormalizeSsaPass, OffloadActivationsPass, OptO1Pass,
+    OptO2Pass, OptO3Pass, OptimizeAttentionPass, OutlineSubgraphsPass, PackWeightsPass, Pass,
+    PassOptions, PrintOpStatsPass, PruneWeightsPass, QuantizePass, ReduceIrPass, RematerializePass,
+    SanitizeNumericsPass, ScheduleLoopsPass, ScheduleStreamsPass, ShardDistributedPass,
+    ShardPipelineParallelPass, SplitLargeGemmPass, StripMetadataPass, TapIntermediatesPass,
+    TopologicalSortPass, UnifiedCsePass, UnifiedFreezeInputsPass, UnifiedFuseElementwisePass,
+    UnifiedMergeWeightsPass, UnifiedSimplifyAlgebraicPass, UnifiedSpecializeShapesPass,
+    UnrollCallsPass, VerifyEquivPass, VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
 use castforge_ir::DType;
@@ -61,13 +58,18 @@ impl PassRegistry {
         );
         reg.register(
             "cse",
-            "Common Subexpression Elimination (deduplicates identical pure operations)",
-            |_opts| Ok(Box::new(CommonSubexpressionEliminationPass)),
-        );
-        reg.register(
-            "gvn",
-            "Dominator-aware Global Value Numbering across nested regions and basic blocks",
-            |_opts| Ok(Box::new(GlobalValueNumberingPass)),
+            "Unified CSE, dominator-aware GVN, and entry constant hoisting",
+            |opts| {
+                let gvn = opts.get("gvn").map(|v| v != "false").unwrap_or(true);
+                let hoist_constants = opts
+                    .get("hoist_constants")
+                    .or_else(|| opts.get("hoist"))
+                    .is_some_and(|v| v == "true" || v == "1");
+                Ok(Box::new(UnifiedCsePass {
+                    gvn,
+                    hoist_constants,
+                }))
+            },
         );
         reg.register(
             "fold-views",
@@ -76,18 +78,17 @@ impl PassRegistry {
         );
         reg.register(
             "simplify-algebraic",
-            "Algebraic identity simplification (x+0->x, x*1->x, x*0->0, identity convert/slice)",
-            |_opts| Ok(Box::new(SimplifyAlgebraicPass)),
-        );
-        reg.register(
-            "egraph-simplify",
-            "Applies distributive algebraic factoring (a*b + a*c -> a*(b+c)) and FMA extraction",
+            "Unified algebraic identities (x+0->x, x*1->x, x*0->0) and e-graph FMA/factoring",
             |opts| {
+                let egraph = opts
+                    .get("egraph")
+                    .map(|v| v != "false" && v != "0")
+                    .unwrap_or(true);
                 let fuse_fma = opts
                     .get("fuse_fma")
                     .map(|s| s != "false" && s != "0")
                     .unwrap_or(true);
-                Ok(Box::new(EgraphSimplifyPass { fuse_fma }))
+                Ok(Box::new(UnifiedSimplifyAlgebraicPass { egraph, fuse_fma }))
             },
         );
         reg.register(
@@ -109,28 +110,33 @@ impl PassRegistry {
             |_opts| Ok(Box::new(VerifyShapesPass)),
         );
         reg.register(
-            "quantize-weights",
-            "Post-training symmetric weight quantization (bits=8|4) with uniform_dequantize",
+            "quantize",
+            "Unified quantization (scheme=weight|groupwise|fp8|w8a8, bits=8|4, format=e4m3|e5m2)",
             |opts| {
+                let scheme = opts
+                    .get("scheme")
+                    .or_else(|| opts.get("mode"))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        if opts.contains_key("group_size") || opts.contains_key("awq_salient") {
+                            "groupwise".to_string()
+                        } else if opts.contains_key("format") || opts.contains_key("mxfp8") {
+                            "fp8".to_string()
+                        } else if opts.contains_key("samples") || opts.contains_key("num_samples") {
+                            "w8a8".to_string()
+                        } else {
+                            "weight".to_string()
+                        }
+                    });
+                let default_bits = if scheme == "groupwise" { 4 } else { 8 };
                 let bits = opts
                     .get("bits")
                     .and_then(|s| s.parse::<u8>().ok())
-                    .unwrap_or(8);
+                    .unwrap_or(default_bits);
                 let min_elements = opts
                     .get("min_elements")
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(2);
-                Ok(Box::new(QuantizeWeightsPass { bits, min_elements }))
-            },
-        );
-        reg.register(
-            "quantize-groupwise",
-            "Group-wise AWQ/GPTQ weight quantization (bits=4|8, group_size=32, awq_salient=true)",
-            |opts| {
-                let bits = opts
-                    .get("bits")
-                    .and_then(|s| s.parse::<u8>().ok())
-                    .unwrap_or(4);
                 let group_size = opts
                     .get("group_size")
                     .or_else(|| opts.get("group"))
@@ -140,17 +146,6 @@ impl PassRegistry {
                     .get("awq_salient")
                     .map(|s| s != "false")
                     .unwrap_or(true);
-                Ok(Box::new(QuantizeGroupwisePass {
-                    bits,
-                    group_size,
-                    awq_salient,
-                }))
-            },
-        );
-        reg.register(
-            "quantize-fp8",
-            "Applies FP8 (E4M3/E5M2) and MXFP8 block-scaled quantization to weights and GEMMs",
-            |opts| {
                 let format = opts
                     .get("format")
                     .cloned()
@@ -160,27 +155,34 @@ impl PassRegistry {
                     .get("block_size")
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(32);
-                Ok(Box::new(QuantizeFp8Pass {
-                    format,
-                    mxfp8,
-                    block_size,
-                }))
-            },
-        );
-        reg.register(
-            "calibrate-quantize",
-            "Calibrates activation dynamic ranges and inserts static W8A8 quantization scales",
-            |opts| {
-                let bits = opts
-                    .get("bits")
-                    .and_then(|s| s.parse::<u8>().ok())
-                    .unwrap_or(8);
-                let num_samples = opts
+                let samples = opts
                     .get("samples")
                     .or_else(|| opts.get("num_samples"))
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(4);
-                Ok(Box::new(CalibrateQuantizePass { bits, num_samples }))
+                Ok(Box::new(QuantizePass {
+                    scheme,
+                    bits,
+                    min_elements,
+                    group_size,
+                    awq_salient,
+                    format,
+                    mxfp8,
+                    block_size,
+                    samples,
+                }))
+            },
+        );
+        reg.register(
+            "hadamard-quant-rotation",
+            "QuaRot/SpinQuant Hadamard orthogonal rotation to suppress activation outliers",
+            |opts| {
+                let block_size = opts
+                    .get("block_size")
+                    .or_else(|| opts.get("size"))
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(64);
+                Ok(Box::new(HadamardQuantRotationPass { block_size }))
             },
         );
         reg.register(
@@ -196,52 +198,41 @@ impl PassRegistry {
             },
         );
         reg.register(
-            "prune-structured",
-            "Structured L1 channel pruning on 2D weight matrices in dot_general (sparsity=0.5)",
+            "prune-weights",
+            "Unified weight pruning and sparsity (mode=structured|2to4, sparsity=0.5)",
             |opts| {
+                let mode = opts
+                    .get("mode")
+                    .cloned()
+                    .unwrap_or_else(|| "structured".to_string());
                 let sparsity = opts
                     .get("sparsity")
                     .and_then(|s| s.parse::<f32>().ok())
                     .unwrap_or(0.5);
-                Ok(Box::new(StructuredPruningPass { sparsity }))
+                Ok(Box::new(PruneWeightsPass { mode, sparsity }))
             },
         );
         reg.register(
-            "sparsify-2to4",
-            "Applies NVIDIA Ampere/Hopper 2:4 fine-grained structured sparsity to 2D GEMM weights",
-            |_opts| Ok(Box::new(Sparsify2To4Pass)),
-        );
-        reg.register(
             "merge-weights",
-            "Merges paired constant weight tensors (method=linear|slerp|ties, t=0.5)",
+            "Unified model merging & adapter baking (method=linear|slerp|ties|dare|lora)",
             |opts| {
-                let method = match opts.get("method").map(|s| s.to_lowercase()).as_deref() {
-                    Some("slerp") => MergeMethod::Slerp,
-                    Some("ties") => MergeMethod::Ties,
-                    _ => MergeMethod::Linear,
-                };
+                let method = opts.get("method").cloned().unwrap_or_else(|| {
+                    if opts.contains_key("alpha") {
+                        "lora".to_string()
+                    } else if opts.contains_key("lambda") || opts.contains_key("drop_rate") {
+                        "dare".to_string()
+                    } else {
+                        "linear".to_string()
+                    }
+                });
                 let t = opts
                     .get("t")
                     .and_then(|s| s.parse::<f32>().ok())
                     .unwrap_or(0.5);
-                Ok(Box::new(MergeWeightsPass { method, t }))
-            },
-        );
-        reg.register(
-            "bake-lora",
-            "Fuses LoRA adapter branches W + alpha * (A @ B) into base weight matrices",
-            |opts| {
                 let alpha = opts
                     .get("alpha")
                     .and_then(|s| s.parse::<f32>().ok())
                     .unwrap_or(1.0);
-                Ok(Box::new(BakeLoraPass { alpha }))
-            },
-        );
-        reg.register(
-            "task-arithmetic",
-            "Applies multi-checkpoint task vector arithmetic and DARE pruning (lambda, drop_rate)",
-            |opts| {
                 let lambda = opts
                     .get("lambda")
                     .and_then(|s| s.parse::<f32>().ok())
@@ -250,7 +241,13 @@ impl PassRegistry {
                     .get("drop_rate")
                     .and_then(|s| s.parse::<f32>().ok())
                     .unwrap_or(0.0);
-                Ok(Box::new(TaskArithmeticPass { lambda, drop_rate }))
+                Ok(Box::new(UnifiedMergeWeightsPass {
+                    method,
+                    t,
+                    alpha,
+                    lambda,
+                    drop_rate,
+                }))
             },
         );
         reg.register(
@@ -280,8 +277,21 @@ impl PassRegistry {
         );
         reg.register(
             "fuse-elementwise",
-            "Fuses eligible elementwise producer-consumer pairs into stablehlo.composite",
-            |_opts| Ok(Box::new(FuseElementwisePass)),
+            "Unified elementwise producer-consumer fusion and loop chain fusion/fission",
+            |opts| {
+                let mode = opts.get("mode").cloned().unwrap_or_else(|| {
+                    if opts.contains_key("max_steps") {
+                        "loops".to_string()
+                    } else {
+                        "pair".to_string()
+                    }
+                });
+                let max_steps = opts
+                    .get("max_steps")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
+                Ok(Box::new(UnifiedFuseElementwisePass { mode, max_steps }))
+            },
         );
         reg.register(
             "fuse-gemm",
@@ -332,9 +342,34 @@ impl PassRegistry {
             |_opts| Ok(Box::new(FuseAttentionPass)),
         );
         reg.register(
+            "fuse-mla",
+            "Fuses DeepSeek-V2/V3 Multi-head Latent Attention (MLA) low-rank KV compression",
+            |opts| {
+                let latent_rank = opts
+                    .get("kv_lora_rank")
+                    .or_else(|| opts.get("latent_rank"))
+                    .or_else(|| opts.get("rank"))
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(512);
+                Ok(Box::new(FuseMlaPass { latent_rank }))
+            },
+        );
+        reg.register(
             "fuse-moe",
             "Fuses routed Mixture-of-Experts (MoE) expert GEMMs and gate combine into fused_moe",
             |_opts| Ok(Box::new(FuseMoePass)),
+        );
+        reg.register(
+            "fuse-linear-cross-entropy",
+            "Fuses LM head projection and Softmax/Cross-Entropy into chunked Liger-style kernel",
+            |opts| {
+                let chunk_size = opts
+                    .get("chunk_size")
+                    .or_else(|| opts.get("chunk"))
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(4096);
+                Ok(Box::new(FuseLinearCrossEntropyPass { chunk_size }))
+            },
         );
         reg.register(
             "fuse-map-reduce",
@@ -362,19 +397,9 @@ impl PassRegistry {
             |_opts| Ok(Box::new(InlinerPass)),
         );
         reg.register(
-            "symbol-dce",
-            "Symbol Dead Code Elimination (removes unreachable private func.func symbols)",
-            |_opts| Ok(Box::new(SymbolDcePass)),
-        );
-        reg.register(
             "topological-sort",
             "Reorders operations inside blocks to satisfy SSA def-before-use ordering",
             |_opts| Ok(Box::new(TopologicalSortPass)),
-        );
-        reg.register(
-            "hoist-constants",
-            "Hoists stablehlo.constant ops to block entry and deduplicates identical constants",
-            |_opts| Ok(Box::new(HoistConstantsPass)),
         );
         reg.register(
             "licm",
@@ -383,11 +408,19 @@ impl PassRegistry {
         );
         reg.register(
             "specialize-shapes",
-            "Binds dynamic/symbolic dimensions (?, B, S) and propagates static shapes across IR",
+            "Unified symbolic shape specialization, static batch resizing, and bucket dispatch",
             |opts| {
                 let mut default_dim = 1i64;
                 let mut bindings = IndexMap::new();
+                let batch = opts
+                    .get("batch")
+                    .or_else(|| opts.get("size"))
+                    .and_then(|s| s.parse::<i64>().ok());
+                let buckets = opts.get("buckets").cloned();
                 for (k, v) in opts {
+                    if k == "batch" || k == "size" || k == "buckets" {
+                        continue;
+                    }
                     if let Ok(n) = v.parse::<i64>() {
                         if k == "default" || k == "?" {
                             default_dim = n;
@@ -396,33 +429,12 @@ impl PassRegistry {
                         }
                     }
                 }
-                Ok(Box::new(SpecializeShapesPass {
+                Ok(Box::new(UnifiedSpecializeShapesPass {
                     default_dim,
                     bindings,
+                    batch,
+                    buckets,
                 }))
-            },
-        );
-        reg.register(
-            "resize-batch",
-            "Rewrites leading batch dimension across activations while preserving 2D GEMM weights",
-            |opts| {
-                let batch = opts
-                    .get("batch")
-                    .or_else(|| opts.get("size"))
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or(4);
-                Ok(Box::new(ResizeBatchPass { batch }))
-            },
-        );
-        reg.register(
-            "bucket-shapes",
-            "Synthesizes multi-bucket shape-specialized functions (buckets=1;4;8) for dispatch",
-            |opts| {
-                let buckets = opts
-                    .get("buckets")
-                    .cloned()
-                    .unwrap_or_else(|| "1;4;8".to_string());
-                Ok(Box::new(BucketShapesPass { buckets }))
             },
         );
         reg.register(
@@ -488,33 +500,60 @@ impl PassRegistry {
             |_opts| Ok(Box::new(EliminateConcatCopiesPass)),
         );
         reg.register(
-            "shard-spmd",
-            "Partitions GEMM ops for Megatron-style SPMD tensor parallelism and inserts all_reduce",
+            "shard-distributed",
+            "Unified SPMD tensor parallelism, Ring Attention CP, and AllReduce coalescing",
             |opts| {
-                let num_devices = opts
+                let mode = opts.get("mode").cloned().unwrap_or_else(|| {
+                    if opts.contains_key("ring_size") {
+                        "ring_cp".to_string()
+                    } else {
+                        "tp".to_string()
+                    }
+                });
+                let devices = opts
                     .get("devices")
                     .or_else(|| opts.get("num_devices"))
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(2);
-                Ok(Box::new(ShardSpmdPass { num_devices }))
-            },
-        );
-        reg.register(
-            "shard-ring-attention",
-            "Shards sequence context across a device ring with overlapped P2P KV send/recv",
-            |opts| {
                 let ring_size = opts
                     .get("ring_size")
                     .or_else(|| opts.get("devices"))
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(4);
-                Ok(Box::new(ShardRingAttentionPass { ring_size }))
+                let coalesce = opts
+                    .get("coalesce")
+                    .map(|s| s != "false" && s != "0")
+                    .unwrap_or(true);
+                Ok(Box::new(ShardDistributedPass {
+                    mode,
+                    devices,
+                    ring_size,
+                    coalesce,
+                }))
             },
         );
         reg.register(
-            "hoist-all-reduce",
-            "Coalesces linear all_reduce sums, eliminates redundant collectives, and overlaps",
-            |_opts| Ok(Box::new(HoistAllReducePass)),
+            "shard-pipeline-parallel",
+            "Partitions model blocks across pipeline stages with 1F1B/ZeroBubble P2P schedules",
+            |opts| {
+                let stages = opts
+                    .get("stages")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(2);
+                let microbatches = opts
+                    .get("microbatches")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(4);
+                let schedule = opts
+                    .get("schedule")
+                    .cloned()
+                    .unwrap_or_else(|| "1f1b".to_string());
+                Ok(Box::new(ShardPipelineParallelPass {
+                    stages,
+                    microbatches,
+                    schedule,
+                }))
+            },
         );
         reg.register(
             "schedule-streams",
@@ -529,21 +568,34 @@ impl PassRegistry {
             },
         );
         reg.register(
-            "inject-kv-cache",
-            "Injects autoregressive KV-cache updates (castforge.kv_cache_update) before attention",
+            "optimize-attention",
+            "Unified LLM serving attention (mode=kv_cache|paged|flash_decoding|tree|all)",
             |opts| {
+                let mode = opts.get("mode").cloned().unwrap_or_else(|| {
+                    if opts.contains_key("page_block_size")
+                        || opts.contains_key("block_size")
+                        || opts.contains_key("max_blocks")
+                    {
+                        "paged".to_string()
+                    } else if opts.contains_key("split_kv") || opts.contains_key("splits") {
+                        "flash_decoding".to_string()
+                    } else if opts.contains_key("draft_tokens")
+                        || opts.contains_key("tokens")
+                        || opts.contains_key("tree_depth")
+                        || opts.contains_key("depth")
+                    {
+                        "tree".to_string()
+                    } else if opts.contains_key("max_seq_len") || opts.contains_key("seq_len") {
+                        "kv_cache".to_string()
+                    } else {
+                        "all".to_string()
+                    }
+                });
                 let max_seq_len = opts
                     .get("max_seq_len")
                     .or_else(|| opts.get("seq_len"))
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(2048);
-                Ok(Box::new(InjectKvCachePass { max_seq_len }))
-            },
-        );
-        reg.register(
-            "lower-paged-attention",
-            "Lowers fused_attention to vLLM-style PagedAttention with block-table KV addressing",
-            |opts| {
                 let page_block_size = opts
                     .get("page_block_size")
                     .or_else(|| opts.get("block_size"))
@@ -553,28 +605,11 @@ impl PassRegistry {
                     .get("max_blocks")
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(64);
-                Ok(Box::new(LowerPagedAttentionPass {
-                    page_block_size,
-                    max_blocks,
-                }))
-            },
-        );
-        reg.register(
-            "flash-decoding",
-            "Partitions KV sequence across parallel splits with LSE reduction for LLM decoding",
-            |opts| {
                 let split_kv = opts
                     .get("split_kv")
                     .or_else(|| opts.get("splits"))
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(4);
-                Ok(Box::new(FlashDecodingPass { split_kv }))
-            },
-        );
-        reg.register(
-            "speculative-tree-attention",
-            "Configures Medusa/EAGLE speculative decoding tree-attention verification masks",
-            |opts| {
                 let draft_tokens = opts
                     .get("draft_tokens")
                     .or_else(|| opts.get("tokens"))
@@ -585,7 +620,12 @@ impl PassRegistry {
                     .or_else(|| opts.get("depth"))
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(2);
-                Ok(Box::new(SpeculativeTreeAttentionPass {
+                Ok(Box::new(OptimizeAttentionPass {
+                    mode,
+                    max_seq_len,
+                    page_block_size,
+                    max_blocks,
+                    split_kv,
                     draft_tokens,
                     tree_depth,
                 }))
@@ -691,19 +731,31 @@ impl PassRegistry {
             },
         );
         reg.register(
-            "fuse-loops",
-            "Fuses multi-op elementwise loop chains into a single register-pipelined loop",
-            |_opts| Ok(Box::new(FuseLoopsPass)),
-        );
-        reg.register(
-            "fission-loops",
-            "Distributes long fused_loop_chain ops into balanced sub-loops (max_steps=2)",
+            "lower-tensor-cores",
+            "Lowers GEMM ops to hardware matrix-multiply-accumulate intrinsics (WMMA/WGMMA/AMX)",
             |opts| {
-                let max_steps = opts
-                    .get("max_steps")
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(2);
-                Ok(Box::new(FissionLoopsPass { max_steps }))
+                let arch = opts
+                    .get("arch")
+                    .cloned()
+                    .unwrap_or_else(|| "wgmma".to_string());
+                let (mma_m, mma_n, mma_k) = opts
+                    .get("tile")
+                    .map(|t| {
+                        let parts: Vec<i64> =
+                            t.split('x').filter_map(|p| p.parse::<i64>().ok()).collect();
+                        if parts.len() == 3 {
+                            (parts[0], parts[1], parts[2])
+                        } else {
+                            (16, 16, 16)
+                        }
+                    })
+                    .unwrap_or((16, 16, 16));
+                Ok(Box::new(LowerTensorCoresPass {
+                    arch,
+                    mma_m,
+                    mma_n,
+                    mma_k,
+                }))
             },
         );
         reg.register(
@@ -783,25 +835,28 @@ impl PassRegistry {
         );
         reg.register(
             "freeze-inputs",
-            "Binds func.func input arguments to in-body stablehlo.constant operations",
+            "Unified input freezing (args->constants) & parameterization (unfreeze=true)",
             |opts| {
+                let unfreeze = opts
+                    .get("unfreeze")
+                    .or_else(|| opts.get("parameterize"))
+                    .is_some_and(|v| v == "true" || v == "1")
+                    || opts.contains_key("min_elements");
                 let args = opts.get("args").cloned().unwrap_or_default();
                 let value = opts
                     .get("value")
                     .and_then(|s| s.parse::<f64>().ok())
                     .unwrap_or(0.5);
-                Ok(Box::new(FreezeInputsPass { args, value }))
-            },
-        );
-        reg.register(
-            "parameterize-constants",
-            "Hoists in-body stablehlo.constant weight tensors into explicit func.func arguments",
-            |opts| {
                 let min_elements = opts
                     .get("min_elements")
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(2);
-                Ok(Box::new(ParameterizeConstantsPass { min_elements }))
+                Ok(Box::new(UnifiedFreezeInputsPass {
+                    unfreeze,
+                    args,
+                    value,
+                    min_elements,
+                }))
             },
         );
         reg.register(
@@ -921,7 +976,7 @@ impl PassRegistry {
         );
         reg.register(
             "O1",
-            "Preset O1: Inlining, fold-constants, LICM, GVN, fold-views, canonicalize, symbol-dce",
+            "Preset O1: Inlining, fold-constants, LICM, GVN, fold-views, canonicalize, dce",
             |_opts| Ok(Box::new(OptO1Pass)),
         );
         reg.register(
@@ -936,7 +991,7 @@ impl PassRegistry {
         );
         reg.register(
             "llm-opt",
-            "Preset llm-opt: O3 + MoE fusion + egraph-simplify + hoist-all-reduce + zero-copy",
+            "Preset llm-opt: O3 + MoE fusion + simplify-algebraic + shard-distributed + zero-copy",
             |opts| Ok(Box::new(build_o3_preset("llm-opt", opts))),
         );
         reg

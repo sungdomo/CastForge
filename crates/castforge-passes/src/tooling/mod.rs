@@ -11,6 +11,7 @@ pub mod print_op_stats;
 pub mod reduce_ir;
 pub mod sanitize_numerics;
 pub mod strip_debuginfo;
+pub mod strip_metadata;
 pub mod tap_intermediates;
 
 pub use compose_funcs::{ComposeFuncsPass, link_modules};
@@ -26,4 +27,5 @@ pub use print_op_stats::{PrintOpStatsPass, RooflineSummary, analyze_roofline};
 pub use reduce_ir::{BisectPassesPass, ReduceIrPass};
 pub use sanitize_numerics::SanitizeNumericsPass;
 pub use strip_debuginfo::StripDebugInfoPass;
+pub use strip_metadata::{StripMetadataPass, UnifiedFreezeInputsPass};
 pub use tap_intermediates::TapIntermediatesPass;

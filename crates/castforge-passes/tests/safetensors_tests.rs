@@ -57,8 +57,8 @@ fn test_externalize_safetensors_roundtrip_and_weight_surgery() {
     let mut surgery_pm = PassManager::from_pipeline_str(
         &registry,
         "merge-weights(method=slerp,t=0.5),\
-         prune-structured(sparsity=0.5),\
-         quantize-weights(bits=8),\
+         prune-weights(mode=structured,sparsity=0.5),\
+         quantize(bits=8),\
          dce",
     )
     .expect("surgery pipeline build failed");

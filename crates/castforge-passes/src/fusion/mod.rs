@@ -6,7 +6,6 @@ pub mod fuse_gated_mlp;
 pub mod fuse_gelu;
 pub mod fuse_horizontal_dot;
 pub mod fuse_layernorm;
-pub mod fuse_log_softmax;
 pub mod fuse_map_reduce;
 pub mod fuse_matmul_epilogue;
 pub mod fuse_moe;
@@ -15,7 +14,7 @@ pub mod fuse_rmsnorm;
 pub mod fuse_rope;
 pub mod fuse_softmax;
 pub mod fuse_swiglu;
-pub mod sota_passes;
+pub mod sota_fusions;
 
 pub use decompose_composites::DecomposeCompositesPass;
 pub use fuse_attention::FuseAttentionPass;
@@ -25,7 +24,6 @@ pub use fuse_gated_mlp::FuseGatedMlpPass;
 pub use fuse_gelu::FuseGeluPass;
 pub use fuse_horizontal_dot::FuseHorizontalDotPass;
 pub use fuse_layernorm::FuseLayerNormPass;
-pub use fuse_log_softmax::FuseLogSoftmaxPass;
 pub use fuse_map_reduce::FuseMapReducePass;
 pub use fuse_matmul_epilogue::FuseMatmulEpiloguePass;
 pub use fuse_moe::FuseMoePass;
@@ -34,9 +32,8 @@ pub use fuse_rmsnorm::FuseRmsNormPass;
 pub use fuse_rope::FuseRopePass;
 pub use fuse_softmax::FuseSoftmaxPass;
 pub use fuse_swiglu::FuseSwiGluPass;
-pub use sota_passes::{
-    EliminateConcatCopiesPass, FlashDecodingPass, FoldBatchNormPass, FoldViewsPass,
-    FuseActivationsPass, FuseGemmPass, FuseMegakernelPass, FuseNormPass, GlobalValueNumberingPass,
-    LowerPagedAttentionPass, QuantizeFp8Pass, QuantizeGroupwisePass, ScheduleLoopsPass,
-    ShardRingAttentionPass, SpeculativeTreeAttentionPass, StripMetadataPass,
+pub use sota_fusions::{
+    FlashDecodingPass, FuseActivationsPass, FuseGemmPass, FuseLinearCrossEntropyPass,
+    FuseMegakernelPass, FuseMlaPass, FuseNormPass, LowerPagedAttentionPass, OptimizeAttentionPass,
+    SpeculativeTreeAttentionPass, UnifiedFuseElementwisePass,
 };
