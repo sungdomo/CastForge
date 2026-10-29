@@ -2,6 +2,7 @@ pub mod eval;
 pub mod liveness;
 pub mod memory_plan;
 pub mod target_c;
+pub mod target_config;
 pub mod target_rust;
 pub mod target_wgsl;
 
@@ -11,9 +12,10 @@ pub use crate::eval::{
 };
 pub use crate::liveness::{LiveInterval, compute_block_liveness, compute_module_liveness};
 pub use crate::memory_plan::{BufferAllocation, MemoryPlan, build_memory_plan};
-use crate::target_c::emit_c_module;
-use crate::target_rust::emit_rust_module;
-use crate::target_wgsl::emit_wgsl_module;
+use crate::target_c::emit_c_module_with_config;
+pub use crate::target_config::TargetConfig;
+use crate::target_rust::emit_rust_module_with_config;
+use crate::target_wgsl::emit_wgsl_module_with_config;
 use anyhow::Result;
 use castforge_ir::{Dim, Module, TensorType, ValueId};
 use std::collections::HashMap;
@@ -27,10 +29,19 @@ pub enum CodegenTarget {
 
 /// Generate executable source code from a CastForge `Module` for the requested `CodegenTarget`.
 pub fn generate_code(module: &Module, target: CodegenTarget) -> Result<String> {
+    generate_code_with_config(module, target, &TargetConfig::default())
+}
+
+/// Generate executable source code parameterized by hardware `TargetConfig` (tiling, SIMD, WGSL).
+pub fn generate_code_with_config(
+    module: &Module,
+    target: CodegenTarget,
+    config: &TargetConfig,
+) -> Result<String> {
     match target {
-        CodegenTarget::Rust => emit_rust_module(module),
-        CodegenTarget::C => emit_c_module(module),
-        CodegenTarget::Wgsl => emit_wgsl_module(module),
+        CodegenTarget::Rust => emit_rust_module_with_config(module, config),
+        CodegenTarget::C => emit_c_module_with_config(module, config),
+        CodegenTarget::Wgsl => emit_wgsl_module_with_config(module, config),
     }
 }
 

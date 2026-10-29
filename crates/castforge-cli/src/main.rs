@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use castforge_codegen::{
-    CodegenTarget, build_memory_plan, evaluate_module, generate_code, generate_synthetic_inputs,
-    verify_module_numerics,
+    CodegenTarget, TargetConfig, build_memory_plan, evaluate_module, generate_code_with_config,
+    generate_synthetic_inputs, verify_module_numerics,
 };
 use castforge_mlir::{PrintOptions, parse_mlir, print_mlir, print_mlir_with_options};
 use castforge_passes::{PassManager, PassRegistry};
@@ -133,6 +133,14 @@ enum Commands {
         /// Optional output file path
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
+
+        /// Optional cache/register tile size for GEMM loops (0 = untiled)
+        #[arg(long = "tile-size", default_value_t = 0)]
+        tile_size: usize,
+
+        /// WebGPU `@workgroup_size` thread count per workgroup
+        #[arg(long = "workgroup-size", default_value_t = 64)]
+        workgroup_size: u32,
     },
 
     /// List all registered transformation and optimization passes
@@ -364,6 +372,8 @@ fn main() -> Result<()> {
             passes,
             weights,
             output,
+            tile_size,
+            workgroup_size,
         } => {
             let src = fs::read_to_string(&input)
                 .with_context(|| format!("Failed to read {}", input.display()))?;
@@ -398,7 +408,14 @@ fn main() -> Result<()> {
                 plan.reusable_slot_count
             );
 
-            let code = generate_code(&module, tgt)?;
+            let cfg = TargetConfig {
+                tile_m: tile_size,
+                tile_n: tile_size,
+                tile_k: tile_size,
+                simd_width: 8,
+                wgsl_workgroup_size: workgroup_size,
+            };
+            let code = generate_code_with_config(&module, tgt, &cfg)?;
             if let Some(out_path) = output {
                 fs::write(&out_path, code)?;
             } else {

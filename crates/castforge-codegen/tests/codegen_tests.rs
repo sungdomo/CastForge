@@ -1,5 +1,6 @@
 use castforge_codegen::{
-    CodegenTarget, build_memory_plan, evaluate_module, generate_code, verify_module_numerics,
+    CodegenTarget, TargetConfig, build_memory_plan, evaluate_module, generate_code,
+    generate_code_with_config, verify_module_numerics,
 };
 use castforge_mlir::parse_mlir;
 use castforge_passes::{PassManager, PassRegistry};
@@ -134,4 +135,34 @@ module @numeric_verify_demo {
     let out = evaluate_module(&after, &[x, bias]).expect("eval module");
     assert_eq!(out.len(), 1);
     assert_eq!(out[0], vec![4.5_f32, 0.0, 10.0, 3.0]);
+}
+
+#[test]
+fn test_tiled_and_workgroup_parameterized_codegen() {
+    let mlir = r#"
+module @tiled_gemm_demo {
+  func.func @matmul(%x: tensor<4x4xf32>) -> tensor<4x4xf32> {
+    %w = stablehlo.constant dense<1.0> : tensor<4x4xf32>
+    %out = stablehlo.dot_general %x, %w : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xf32>
+    func.return %out : tensor<4x4xf32>
+  }
+}
+"#;
+    let module = parse_mlir(mlir).expect("parse tiled gemm mlir");
+    let cpu_cfg = TargetConfig::cpu_tiled(2);
+    let rust_tiled =
+        generate_code_with_config(&module, CodegenTarget::Rust, &cpu_cfg).expect("tiled rust");
+    assert!(rust_tiled.contains("// Hardware Config: Tiled GEMM (2x2x2)"));
+    assert!(rust_tiled.contains("for m0 in (0..4).step_by(2)"));
+    assert!(rust_tiled.contains("for k0 in (0..4).step_by(2)"));
+
+    let c_tiled = generate_code_with_config(&module, CodegenTarget::C, &cpu_cfg).expect("tiled c");
+    assert!(c_tiled.contains("for (int m0 = 0; m0 < 4; m0 += 2)"));
+    assert!(c_tiled.contains("for (int k0 = 0; k0 < 4; k0 += 2)"));
+
+    let gpu_cfg = TargetConfig::gpu_workgroup(4, 128);
+    let wgsl_tiled =
+        generate_code_with_config(&module, CodegenTarget::Wgsl, &gpu_cfg).expect("tiled wgsl");
+    assert!(wgsl_tiled.contains("var<workgroup> wg_tile_a: array<f32, 16>;"));
+    assert!(wgsl_tiled.contains("@compute @workgroup_size(128)"));
 }

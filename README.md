@@ -19,7 +19,7 @@ support.
   (`stablehlo.add %0, %1 : tensor<...>`), including `!quant.uniform` quantized tensor types and
   `dense_resource<key>` external weight references.
 - [`crates/castforge-passes`](crates/castforge-passes): Unified `Pass`, `PassRegistry`, and
-  `PassManager` with **33 built-in compiler passes** supporting static Rust construction, CLI
+  `PassManager` with **36 built-in compiler passes** supporting static Rust construction, CLI
   pipeline strings (`-p`), direct subcommand invocation, declarative TOML config files (`--config`),
   and step-by-step pass tracing.
 - [`crates/castforge-viz`](crates/castforge-viz): Computation graph exporter for **Mermaid**,
@@ -32,7 +32,7 @@ support.
 - [`crates/castforge-cli`](crates/castforge-cli): The `castforge` command-line tool (`opt`, `viz`,
   `codegen`, `run`, `list-passes`, plus direct pass subcommands).
 
-## Built-in Transformation Passes (33 Passes)
+## Built-in Transformation Passes (36 Passes)
 
 | Pass Name | Category | Description |
 | :--- | :--- | :--- |
@@ -47,6 +47,7 @@ support.
 | `topological-sort` | General IR | Reorders operations inside blocks for SSA def-before-use |
 | `strip-debuginfo` | General IR | Strips source location metadata (`loc(...)`) from all ops |
 | `ir-edit` | General IR | Surgical IR editing (`rename_op=from:to`, `annotate_op=k:v`) |
+| `specialize-shapes` | Shapes | Binds dynamic/symbolic dims (`?`, `B`, `S`) & infers shapes |
 | `verify-shapes` | Diagnostics | Verifies StableHLO tensor shapes and rank consistency |
 | `print-op-stats` | Diagnostics | Computes op counts, FLOPs, bytes, and Roofline intensity |
 | `fold-constants` | Folding | Constant folding for arithmetic, N-D transpose, and shape ops |
@@ -57,11 +58,13 @@ support.
 | `fold-broadcast` | Layout | Composes `broadcast_in_dim`, folds splats, hoists unary ops |
 | `fold-slice-concat` | Layout | Composes nested `slice` ops and folds `slice(concatenate)` |
 | `fold-convert` | Layout | Eliminates redundant/round-trip `convert` casts (`f16->f32->f16`) |
+| `pack-weights` | Layout | Pre-packs 2D RHS weights `[K,N]->[N,K]` for unit-stride SIMD |
 | `fuse-elementwise` | Fusion | Fuses `add` + `maximum` into `stablehlo.composite` |
-| `fuse-matmul-epilogue` | Fusion | Fuses `dot_general` + bias `add` (+ `relu`/`tanh`) |
+| `fuse-matmul-epilogue` | Fusion | Fuses `dot_general` + bias (`relu`/`tanh`/`silu`/`scale`) |
 | `fuse-horizontal-dot` | Fusion | Horizontally fuses parallel `dot_general` ops (e.g. Q/K/V) |
 | `fuse-softmax` | Fusion | Fuses `exp(x) / broadcast(reduce_sum(exp(x)))` into composite |
 | `fuse-rmsnorm` | Fusion | Fuses `x * rsqrt(mean(x^2) + eps) * weight` into composite |
+| `fuse-swiglu` | Fusion | Fuses SwiGLU (`gate / (1 + exp(-gate)) * up`) into composite |
 | `decompose-composites` | Lowering | Expands `stablehlo.composite` ops to primitive StableHLO |
 | `fold-norm-weights` | Weight Surgery | Absorbs RMSNorm/LayerNorm scale weights into MatMuls |
 | `bake-lora` | Weight Surgery | Fuses LoRA branches `W + alpha * (A @ B)` into base weights |

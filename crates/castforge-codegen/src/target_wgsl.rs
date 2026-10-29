@@ -1,4 +1,4 @@
-use crate::{build_memory_plan, tensor_len, tensor_shape_dims, value_ident};
+use crate::{TargetConfig, build_memory_plan, tensor_len, tensor_shape_dims, value_ident};
 use anyhow::Result;
 use castforge_dialect_stablehlo::StableHloOp;
 use castforge_ir::{DType, Module, OpId, ValueId};
@@ -7,6 +7,11 @@ use std::fmt::Write;
 
 /// WebGPU WGSL Compute Shader Generator (`CodegenTarget::Wgsl`)
 pub fn emit_wgsl_module(module: &Module) -> Result<String> {
+    emit_wgsl_module_with_config(module, &TargetConfig::default())
+}
+
+/// WebGPU WGSL Compute Shader Generator parameterized by `TargetConfig`.
+pub fn emit_wgsl_module_with_config(module: &Module, config: &TargetConfig) -> Result<String> {
     let mut out = String::new();
     let plan = build_memory_plan(module);
     writeln!(
@@ -25,13 +30,18 @@ pub fn emit_wgsl_module(module: &Module) -> Result<String> {
     )?;
 
     if let Some(&fn_op_id) = module.functions().first() {
-        emit_wgsl_func(module, fn_op_id, &mut out)?;
+        emit_wgsl_func(module, fn_op_id, config, &mut out)?;
     }
 
     Ok(out)
 }
 
-fn emit_wgsl_func(module: &Module, fn_op_id: OpId, out: &mut String) -> Result<()> {
+fn emit_wgsl_func(
+    module: &Module,
+    fn_op_id: OpId,
+    config: &TargetConfig,
+    out: &mut String,
+) -> Result<()> {
     let fn_op = &module.ops[fn_op_id];
     let region_id = fn_op.regions[0];
     let block_id = module.regions[region_id].blocks[0];
@@ -92,7 +102,13 @@ fn emit_wgsl_func(module: &Module, fn_op_id: OpId, out: &mut String) -> Result<(
         }
     }
 
-    writeln!(out, "\n@compute @workgroup_size(64)")?;
+    let wg_size = config.wgsl_workgroup_size.max(1);
+    if config.is_tiled() {
+        let tile_elems = (config.tile_m * config.tile_k).max(1);
+        writeln!(out, "var<workgroup> wg_tile_a: array<f32, {tile_elems}>;")?;
+        writeln!(out, "var<workgroup> wg_tile_b: array<f32, {tile_elems}>;")?;
+    }
+    writeln!(out, "\n@compute @workgroup_size({wg_size})")?;
     writeln!(
         out,
         "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{"

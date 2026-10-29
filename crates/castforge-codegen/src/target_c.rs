@@ -1,5 +1,6 @@
 use crate::{
-    MemoryPlan, build_memory_plan, sanitize_ident, tensor_len, tensor_shape_dims, value_ident,
+    MemoryPlan, TargetConfig, build_memory_plan, sanitize_ident, tensor_len, tensor_shape_dims,
+    value_ident,
 };
 use anyhow::{Result, anyhow};
 use castforge_dialect_stablehlo::StableHloOp;
@@ -9,6 +10,11 @@ use std::fmt::Write;
 
 /// Portable C99 Code Generator (`CodegenTarget::C`)
 pub fn emit_c_module(module: &Module) -> Result<String> {
+    emit_c_module_with_config(module, &TargetConfig::default())
+}
+
+/// Portable C99 Code Generator parameterized by `TargetConfig`.
+pub fn emit_c_module_with_config(module: &Module, config: &TargetConfig) -> Result<String> {
     let mut out = String::new();
     let plan = build_memory_plan(module);
     writeln!(
@@ -25,16 +31,29 @@ pub fn emit_c_module(module: &Module) -> Result<String> {
         plan.saved_activation_bytes(),
         plan.reusable_slot_count
     )?;
+    if config.is_tiled() {
+        writeln!(
+            out,
+            "/* Hardware Config: Tiled GEMM ({}x{}x{}), SIMD Width: {} lanes */",
+            config.tile_m, config.tile_n, config.tile_k, config.simd_width
+        )?;
+    }
     writeln!(out, "#include <stdint.h>\n#include <math.h>\n")?;
 
     for fn_op_id in module.functions() {
-        emit_c_func(module, fn_op_id, &plan, &mut out)?;
+        emit_c_func(module, fn_op_id, &plan, config, &mut out)?;
     }
 
     Ok(out)
 }
 
-fn emit_c_func(module: &Module, fn_op_id: OpId, plan: &MemoryPlan, out: &mut String) -> Result<()> {
+fn emit_c_func(
+    module: &Module,
+    fn_op_id: OpId,
+    plan: &MemoryPlan,
+    config: &TargetConfig,
+    out: &mut String,
+) -> Result<()> {
     let fn_op = &module.ops[fn_op_id];
     let fn_name = sanitize_ident(
         fn_op
@@ -154,6 +173,7 @@ fn emit_c_func(module: &Module, fn_op_id: OpId, plan: &MemoryPlan, out: &mut Str
 
         emit_c_hlo_op(
             module,
+            config,
             op_id,
             &res_name,
             res_len,
@@ -166,8 +186,10 @@ fn emit_c_func(module: &Module, fn_op_id: OpId, plan: &MemoryPlan, out: &mut Str
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_c_hlo_op(
     module: &Module,
+    config: &TargetConfig,
     op_id: OpId,
     res_name: &str,
     res_len: usize,
@@ -306,17 +328,47 @@ fn emit_c_hlo_op(
             } else {
                 format!("k * {n} + n")
             };
-            writeln!(out, "    for (int m = 0; m < {m}; ++m) {{")?;
-            writeln!(out, "        for (int n = 0; n < {n}; ++n) {{")?;
-            writeln!(out, "            float acc = 0.0f;")?;
-            writeln!(
-                out,
-                "            for (int k = 0; k < {k}; ++k) \
-                 acc += {a}[m * {k} + k] * {b}[{b_idx}];"
-            )?;
-            writeln!(out, "            {res_name}[m * {n} + n] = acc;")?;
-            writeln!(out, "        }}")?;
-            writeln!(out, "    }}")?;
+            if config.is_tiled() {
+                let (tm, tn, tk) = (config.tile_m, config.tile_n, config.tile_k);
+                writeln!(out, "    for (int m0 = 0; m0 < {m}; m0 += {tm}) {{")?;
+                writeln!(out, "        for (int n0 = 0; n0 < {n}; n0 += {tn}) {{")?;
+                writeln!(
+                    out,
+                    "            for (int m = m0; m < m0 + {tm} && m < {m}; ++m) {{"
+                )?;
+                writeln!(
+                    out,
+                    "                for (int n = n0; n < n0 + {tn} && n < {n}; ++n) {{"
+                )?;
+                writeln!(out, "                    float acc = 0.0f;")?;
+                writeln!(
+                    out,
+                    "                    for (int k0 = 0; k0 < {k}; k0 += {tk}) {{"
+                )?;
+                writeln!(
+                    out,
+                    "                        for (int k = k0; k < k0 + {tk} && k < {k}; ++k) \
+                     acc += {a}[m * {k} + k] * {b}[{b_idx}];"
+                )?;
+                writeln!(out, "                    }}")?;
+                writeln!(out, "                    {res_name}[m * {n} + n] = acc;")?;
+                writeln!(out, "                }}")?;
+                writeln!(out, "            }}")?;
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
+            } else {
+                writeln!(out, "    for (int m = 0; m < {m}; ++m) {{")?;
+                writeln!(out, "        for (int n = 0; n < {n}; ++n) {{")?;
+                writeln!(out, "            float acc = 0.0f;")?;
+                writeln!(
+                    out,
+                    "            for (int k = 0; k < {k}; ++k) \
+                     acc += {a}[m * {k} + k] * {b}[{b_idx}];"
+                )?;
+                writeln!(out, "            {res_name}[m * {n} + n] = acc;")?;
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
+            }
         }
         StableHloOp::Composite { name, inputs, .. } => {
             if name == "castforge.fused_add_max" && inputs.len() == 3 {

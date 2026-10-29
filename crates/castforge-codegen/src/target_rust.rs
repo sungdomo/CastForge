@@ -1,5 +1,6 @@
 use crate::{
-    MemoryPlan, build_memory_plan, sanitize_ident, tensor_len, tensor_shape_dims, value_ident,
+    MemoryPlan, TargetConfig, build_memory_plan, sanitize_ident, tensor_len, tensor_shape_dims,
+    value_ident,
 };
 use anyhow::{Result, anyhow};
 use castforge_dialect_stablehlo::StableHloOp;
@@ -9,6 +10,11 @@ use std::fmt::Write;
 
 /// Standalone Rust Code Generator (`CodegenTarget::Rust`)
 pub fn emit_rust_module(module: &Module) -> Result<String> {
+    emit_rust_module_with_config(module, &TargetConfig::default())
+}
+
+/// Standalone Rust Code Generator parameterized by `TargetConfig`.
+pub fn emit_rust_module_with_config(module: &Module, config: &TargetConfig) -> Result<String> {
     let mut out = String::new();
     let plan = build_memory_plan(module);
     let mod_name = module.name.as_deref().unwrap_or("castforge_model");
@@ -24,13 +30,20 @@ pub fn emit_rust_module(module: &Module) -> Result<String> {
         plan.saved_activation_bytes(),
         plan.reusable_slot_count
     )?;
+    if config.is_tiled() {
+        writeln!(
+            out,
+            "// Hardware Config: Tiled GEMM ({}x{}x{}), SIMD Width: {} lanes",
+            config.tile_m, config.tile_n, config.tile_k, config.simd_width
+        )?;
+    }
     writeln!(
         out,
         "#![allow(clippy::excessive_precision, unused_variables, clippy::identity_op)]\n"
     )?;
 
     for fn_op_id in module.functions() {
-        emit_rust_func(module, fn_op_id, &plan, &mut out)?;
+        emit_rust_func(module, fn_op_id, &plan, config, &mut out)?;
     }
 
     Ok(out)
@@ -60,6 +73,7 @@ fn emit_rust_func(
     module: &Module,
     fn_op_id: OpId,
     plan: &MemoryPlan,
+    config: &TargetConfig,
     out: &mut String,
 ) -> Result<()> {
     let fn_op = &module.ops[fn_op_id];
@@ -203,6 +217,7 @@ fn emit_rust_func(
         emit_rust_hlo_op(
             module,
             plan,
+            config,
             op_id,
             res_val,
             res_len,
@@ -220,6 +235,7 @@ fn emit_rust_func(
 fn emit_rust_hlo_op(
     module: &Module,
     plan: &MemoryPlan,
+    config: &TargetConfig,
     op_id: OpId,
     res_val: ValueId,
     res_len: usize,
@@ -392,15 +408,40 @@ fn emit_rust_hlo_op(
                 names,
                 counter,
             );
-            writeln!(out, "    for m in 0..{m} {{")?;
-            writeln!(out, "        for n in 0..{n} {{")?;
-            writeln!(out, "            let mut acc = 0.0_f32;")?;
-            writeln!(out, "            for k in 0..{k} {{")?;
-            writeln!(out, "                acc += {a} * {b};")?;
-            writeln!(out, "            }}")?;
-            writeln!(out, "            {dst} = acc;")?;
-            writeln!(out, "        }}")?;
-            writeln!(out, "    }}")?;
+            if config.is_tiled() {
+                let (tm, tn, tk) = (config.tile_m, config.tile_n, config.tile_k);
+                writeln!(out, "    for m0 in (0..{m}).step_by({tm}) {{")?;
+                writeln!(out, "        for n0 in (0..{n}).step_by({tn}) {{")?;
+                writeln!(out, "            for m in m0..(m0 + {tm}).min({m}) {{")?;
+                writeln!(out, "                for n in n0..(n0 + {tn}).min({n}) {{")?;
+                writeln!(out, "                    let mut acc = 0.0_f32;")?;
+                writeln!(
+                    out,
+                    "                    for k0 in (0..{k}).step_by({tk}) {{"
+                )?;
+                writeln!(
+                    out,
+                    "                        for k in k0..(k0 + {tk}).min({k}) {{"
+                )?;
+                writeln!(out, "                            acc += {a} * {b};")?;
+                writeln!(out, "                        }}")?;
+                writeln!(out, "                    }}")?;
+                writeln!(out, "                    {dst} = acc;")?;
+                writeln!(out, "                }}")?;
+                writeln!(out, "            }}")?;
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
+            } else {
+                writeln!(out, "    for m in 0..{m} {{")?;
+                writeln!(out, "        for n in 0..{n} {{")?;
+                writeln!(out, "            let mut acc = 0.0_f32;")?;
+                writeln!(out, "            for k in 0..{k} {{")?;
+                writeln!(out, "                acc += {a} * {b};")?;
+                writeln!(out, "            }}")?;
+                writeln!(out, "            {dst} = acc;")?;
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
+            }
         }
         StableHloOp::Composite { name, inputs, .. } => {
             if name == "castforge.fused_add_max" && inputs.len() == 3 {
