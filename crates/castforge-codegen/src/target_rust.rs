@@ -413,7 +413,53 @@ fn emit_rust_hlo_op(
                 names,
                 counter,
             );
-            if config.is_tiled() {
+            if config.parallel {
+                writeln!(out, "    // [loop:parallel(collapse=2, schedule=static)]")?;
+            }
+            if config.is_register_tiled() {
+                let (mr, nr) = (config.reg_tile_m, config.reg_tile_n);
+                let (m_main, n_main) = ((m / mr) * mr, (n / nr) * nr);
+                writeln!(out, "    // [loop:unroll_and_jam(mr={mr}, nr={nr})]")?;
+                writeln!(out, "    for m0 in (0..{m_main}).step_by({mr}) {{")?;
+                writeln!(out, "        for n0 in (0..{n_main}).step_by({nr}) {{")?;
+                writeln!(out, "            let mut acc = [[0.0_f32; {nr}]; {mr}];")?;
+                writeln!(out, "            for k in 0..{k} {{")?;
+                for mi in 0..mr {
+                    let a_mi = r_idx(
+                        module,
+                        plan,
+                        lhs,
+                        &format!("(m0 + {mi}) * {k} + k"),
+                        names,
+                        counter,
+                    );
+                    for nj in 0..nr {
+                        let b_nj_idx = if packed {
+                            format!("(n0 + {nj}) * {k} + k")
+                        } else {
+                            format!("k * {n} + n0 + {nj}")
+                        };
+                        let b_nj = r_idx(module, plan, rhs, &b_nj_idx, names, counter);
+                        writeln!(out, "                acc[{mi}][{nj}] += {a_mi} * {b_nj};")?;
+                    }
+                }
+                writeln!(out, "            }}")?;
+                for mi in 0..mr {
+                    for nj in 0..nr {
+                        let dst_ij = r_idx(
+                            module,
+                            plan,
+                            res_val,
+                            &format!("(m0 + {mi}) * {n} + n0 + {nj}"),
+                            names,
+                            counter,
+                        );
+                        writeln!(out, "            {dst_ij} = acc[{mi}][{nj}];")?;
+                    }
+                }
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
+            } else if config.is_tiled() {
                 let (tm, tn, tk) = (config.tile_m, config.tile_n, config.tile_k);
                 writeln!(out, "    for m0 in (0..{m}).step_by({tm}) {{")?;
                 writeln!(out, "        for n0 in (0..{n}).step_by({tn}) {{")?;
@@ -727,19 +773,31 @@ fn emit_rust_hlo_op(
                 let c_cur = r_idx(module, plan, inputs[1], "idx", names, counter);
                 let s_cur = r_idx(module, plan, inputs[2], "idx", names, counter);
                 let dst = r_idx(module, plan, res_val, "idx", names, counter);
-                writeln!(out, "    for r in 0..{rows} {{")?;
-                writeln!(out, "        for c in 0..{cols} {{")?;
-                writeln!(out, "            let idx = r * {cols} + c;")?;
-                writeln!(
-                    out,
-                    "            let rot = if c < {half} {{ -{x_hi} }} else {{ {x_lo} }};"
-                )?;
-                writeln!(
-                    out,
-                    "            {dst} = {x_cur} * {c_cur} + rot * {s_cur};"
-                )?;
-                writeln!(out, "        }}")?;
-                writeln!(out, "    }}")?;
+                if config.collapse_loops {
+                    writeln!(out, "    // [loop:coalesce(2D->1D, len={res_len})]")?;
+                    writeln!(out, "    for idx in 0..{res_len} {{")?;
+                    writeln!(out, "        let c = idx % {cols};")?;
+                    writeln!(
+                        out,
+                        "        let rot = if c < {half} {{ -{x_hi} }} else {{ {x_lo} }};"
+                    )?;
+                    writeln!(out, "        {dst} = {x_cur} * {c_cur} + rot * {s_cur};")?;
+                    writeln!(out, "    }}")?;
+                } else {
+                    writeln!(out, "    for r in 0..{rows} {{")?;
+                    writeln!(out, "        for c in 0..{cols} {{")?;
+                    writeln!(out, "            let idx = r * {cols} + c;")?;
+                    writeln!(
+                        out,
+                        "            let rot = if c < {half} {{ -{x_hi} }} else {{ {x_lo} }};"
+                    )?;
+                    writeln!(
+                        out,
+                        "            {dst} = {x_cur} * {c_cur} + rot * {s_cur};"
+                    )?;
+                    writeln!(out, "        }}")?;
+                    writeln!(out, "    }}")?;
+                }
             } else if name == "castforge.fused_attention" && inputs.len() >= 3 {
                 emit_rust_fused_attention(
                     module, plan, op, inputs[0], inputs[1], inputs[2], res_val, names, counter, out,

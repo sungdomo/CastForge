@@ -46,6 +46,14 @@ pub struct TargetConfig {
     pub unroll_factor: usize,
     /// Emit explicit SIMD vectorization loops/pragmas with tail-loop peeling.
     pub vectorize: bool,
+    /// Register micro-kernel row blocking factor (`mr` for Unroll-and-Jam; `0` or `1` = disabled).
+    pub reg_tile_m: usize,
+    /// Register micro-kernel col blocking factor (`nr` for Unroll-and-Jam; `0` or `1` = disabled).
+    pub reg_tile_n: usize,
+    /// Collapse/coalesce perfectly nested 2D loops into a single 1D loop.
+    pub collapse_loops: bool,
+    /// Emit multicore parallel outer-loop work-sharing (`#pragma omp parallel for`).
+    pub parallel: bool,
 }
 
 impl Default for TargetConfig {
@@ -59,6 +67,10 @@ impl Default for TargetConfig {
             loop_order: GemmLoopOrder::Mnk,
             unroll_factor: 1,
             vectorize: false,
+            reg_tile_m: 0,
+            reg_tile_n: 0,
+            collapse_loops: false,
+            parallel: false,
         }
     }
 }
@@ -103,8 +115,32 @@ impl TargetConfig {
         self
     }
 
+    /// Configure `(mr x nr)` outer-loop Unroll-and-Jam register micro-kernel blocking.
+    pub fn with_register_tile(mut self, mr: usize, nr: usize) -> Self {
+        self.reg_tile_m = mr;
+        self.reg_tile_n = nr;
+        self
+    }
+
+    /// Enable or disable 2D -> 1D loop coalescing / flattening.
+    pub fn with_collapse_loops(mut self, enabled: bool) -> Self {
+        self.collapse_loops = enabled;
+        self
+    }
+
+    /// Enable or disable multicore parallel outer-loop work-sharing.
+    pub fn with_parallel(mut self, enabled: bool) -> Self {
+        self.parallel = enabled;
+        self
+    }
+
     /// Returns `true` when 2D/3D loop tiling is enabled.
     pub fn is_tiled(&self) -> bool {
         self.tile_m > 0 && self.tile_n > 0 && self.tile_k > 0
+    }
+
+    /// Returns `true` when `(mr x nr)` register micro-kernel Unroll-and-Jam is enabled.
+    pub fn is_register_tiled(&self) -> bool {
+        self.reg_tile_m > 1 && self.reg_tile_n > 1
     }
 }

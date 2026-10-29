@@ -308,3 +308,73 @@ module @loop_transforms_demo {
     assert!(c_unroll.contains("for (int k_base = 0; k_base < 4; k_base += 2)"));
     assert!(c_unroll.contains("for (int k = 4; k < 5; ++k)"));
 }
+
+#[test]
+fn test_unroll_and_jam_register_microkernel_collapse_parallel_and_fission() {
+    let mlir = r#"
+module @advanced_loops_demo {
+  func.func @forward(
+    %x: tensor<4x4xf32>,
+    %cos: tensor<4x4xf32>,
+    %sin: tensor<4x4xf32>,
+    %w: tensor<4x4xf32>,
+    %bias: tensor<4x4xf32>
+  ) -> tensor<4x4xf32> {
+    %zero_half = stablehlo.constant dense<0.0> : tensor<4x2xf32>
+    %c = stablehlo.constant dense<0.5> : tensor<4x4xf32>
+    %x_lo = stablehlo.slice %x
+      {start_indices = [0, 0], limit_indices = [4, 2], strides = [1, 1]}
+      : (tensor<4x4xf32>) -> tensor<4x2xf32>
+    %x_hi = stablehlo.slice %x
+      {start_indices = [0, 2], limit_indices = [4, 4], strides = [1, 1]}
+      : (tensor<4x4xf32>) -> tensor<4x2xf32>
+    %neg_hi = stablehlo.subtract %zero_half, %x_hi : tensor<4x2xf32>
+    %x_rot = stablehlo.concatenate %neg_hi, %x_lo {dimension = 1}
+      : (tensor<4x2xf32>, tensor<4x2xf32>) -> tensor<4x4xf32>
+    %x_cos = stablehlo.multiply %x, %cos : tensor<4x4xf32>
+    %x_sin = stablehlo.multiply %x_rot, %sin : tensor<4x4xf32>
+    %rope = stablehlo.add %x_cos, %x_sin : tensor<4x4xf32>
+
+    %mm = stablehlo.dot_general %rope, %w : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xf32>
+    %s0 = stablehlo.add %mm, %bias : tensor<4x4xf32>
+    %s1 = stablehlo.multiply %s0, %c : tensor<4x4xf32>
+    %s2 = stablehlo.tanh %s1 : tensor<4x4xf32>
+    %s3 = stablehlo.subtract %s2, %c : tensor<4x4xf32>
+    func.return %s3 : tensor<4x4xf32>
+  }
+}
+"#;
+    let before = parse_mlir(mlir).expect("parse advanced loops mlir");
+    let mut transformed = before.clone();
+    let registry = PassRegistry::with_builtin_passes();
+    let mut pm = PassManager::from_pipeline_str(
+        &registry,
+        "fuse-rope,fuse-loops,fission-loops(max_steps=2)",
+    )
+    .expect("fission pipeline");
+    let res = pm.run(&mut transformed).expect("run pipeline");
+    assert!(res[0].changed);
+    assert!(res[1].changed);
+    assert!(res[2].changed);
+
+    let rep = verify_module_numerics(&before, &transformed, 1e-5).expect("verify fission");
+    assert!(rep.passed, "max_abs_diff = {}", rep.max_abs_diff);
+
+    let cfg = TargetConfig::default()
+        .with_register_tile(2, 2)
+        .with_collapse_loops(true)
+        .with_parallel(true);
+
+    let rust_code =
+        generate_code_with_config(&transformed, CodegenTarget::Rust, &cfg).expect("rust code");
+    assert!(rust_code.contains("[loop:parallel(collapse=2, schedule=static)]"));
+    assert!(rust_code.contains("[loop:unroll_and_jam(mr=2, nr=2)]"));
+    assert!(rust_code.contains("let mut acc = [[0.0_f32; 2]; 2];"));
+    assert!(rust_code.contains("[loop:coalesce(2D->1D, len=16)]"));
+
+    let c_code = generate_code_with_config(&transformed, CodegenTarget::C, &cfg).expect("c code");
+    assert!(c_code.contains("#pragma omp parallel for collapse(2) schedule(static)"));
+    assert!(c_code.contains("[loop:unroll_and_jam(mr=2, nr=2)]"));
+    assert!(c_code.contains("float acc[2][2] = {0};"));
+    assert!(c_code.contains("[loop:coalesce(2D->1D, len=16)]"));
+}

@@ -333,7 +333,50 @@ fn emit_c_hlo_op(
             } else {
                 format!("k * {n} + n")
             };
-            if config.is_tiled() {
+            if config.parallel {
+                writeln!(
+                    out,
+                    "    #pragma omp parallel for collapse(2) schedule(static)"
+                )?;
+            }
+            if config.is_register_tiled() {
+                let (mr, nr) = (config.reg_tile_m, config.reg_tile_n);
+                let (m_main, n_main) = ((m / mr) * mr, (n / nr) * nr);
+                writeln!(out, "    /* [loop:unroll_and_jam(mr={mr}, nr={nr})] */")?;
+                writeln!(out, "    for (int m0 = 0; m0 < {m_main}; m0 += {mr}) {{")?;
+                writeln!(
+                    out,
+                    "        for (int n0 = 0; n0 < {n_main}; n0 += {nr}) {{"
+                )?;
+                writeln!(out, "            float acc[{mr}][{nr}] = {{0}};")?;
+                writeln!(out, "            for (int k = 0; k < {k}; ++k) {{")?;
+                for mi in 0..mr {
+                    for nj in 0..nr {
+                        let b_nj_idx = if packed {
+                            format!("(n0 + {nj}) * {k} + k")
+                        } else {
+                            format!("k * {n} + n0 + {nj}")
+                        };
+                        writeln!(
+                            out,
+                            "                acc[{mi}][{nj}] += \
+                             {a}[(m0 + {mi}) * {k} + k] * {b}[{b_nj_idx}];"
+                        )?;
+                    }
+                }
+                writeln!(out, "            }}")?;
+                for mi in 0..mr {
+                    for nj in 0..nr {
+                        writeln!(
+                            out,
+                            "            {res_name}[(m0 + {mi}) * {n} + n0 + {nj}] = \
+                             acc[{mi}][{nj}];"
+                        )?;
+                    }
+                }
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
+            } else if config.is_tiled() {
                 let (tm, tn, tk) = (config.tile_m, config.tile_n, config.tile_k);
                 writeln!(out, "    for (int m0 = 0; m0 < {m}; m0 += {tm}) {{")?;
                 writeln!(out, "        for (int n0 = 0; n0 < {n}; n0 += {tn}) {{")?;
@@ -606,19 +649,36 @@ fn emit_c_hlo_op(
                 let cols = *dims.last().unwrap_or(&res_len).max(&2);
                 let rows = (res_len / cols).max(1);
                 let half = cols / 2;
-                writeln!(out, "    for (int r = 0; r < {rows}; ++r) {{")?;
-                writeln!(out, "        for (int c = 0; c < {cols}; ++c) {{")?;
-                writeln!(out, "            int idx = r * {cols} + c;")?;
-                writeln!(
-                    out,
-                    "            float rot = (c < {half}) ? -{x}[idx + {half}] : {x}[idx - {half}];"
-                )?;
-                writeln!(
-                    out,
-                    "            {res_name}[idx] = {x}[idx] * {c_arr}[idx] + rot * {s_arr}[idx];"
-                )?;
-                writeln!(out, "        }}")?;
-                writeln!(out, "    }}")?;
+                if config.collapse_loops {
+                    writeln!(out, "    /* [loop:coalesce(2D->1D, len={res_len})] */")?;
+                    writeln!(out, "    for (int idx = 0; idx < {res_len}; ++idx) {{")?;
+                    writeln!(out, "        int c = idx % {cols};")?;
+                    writeln!(
+                        out,
+                        "        float rot = (c < {half}) ? -{x}[idx + {half}] : {x}[idx - {half}];"
+                    )?;
+                    writeln!(
+                        out,
+                        "        {res_name}[idx] = {x}[idx] * {c_arr}[idx] + rot * {s_arr}[idx];"
+                    )?;
+                    writeln!(out, "    }}")?;
+                } else {
+                    writeln!(out, "    for (int r = 0; r < {rows}; ++r) {{")?;
+                    writeln!(out, "        for (int c = 0; c < {cols}; ++c) {{")?;
+                    writeln!(out, "            int idx = r * {cols} + c;")?;
+                    writeln!(
+                        out,
+                        "            float rot = (c < {half}) \
+                         ? -{x}[idx + {half}] : {x}[idx - {half}];"
+                    )?;
+                    writeln!(
+                        out,
+                        "            {res_name}[idx] = \
+                         {x}[idx] * {c_arr}[idx] + rot * {s_arr}[idx];"
+                    )?;
+                    writeln!(out, "        }}")?;
+                    writeln!(out, "    }}")?;
+                }
             } else if name == "castforge.fused_attention" && inputs.len() >= 3 {
                 emit_c_fused_attention(
                     module, op, inputs[0], inputs[1], inputs[2], res_name, names, counter, out,

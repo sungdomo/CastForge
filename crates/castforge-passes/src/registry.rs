@@ -1,14 +1,14 @@
 use crate::{
     BakeLoraPass, BufferizeInplacePass, CanonicalizePass, CommonSubexpressionEliminationPass,
-    DeadCodeEliminationPass, DecomposeCompositesPass, ExternalizeWeightsPass, FoldBroadcastPass,
-    FoldConstantsPass, FoldConvertPass, FoldNormWeightsPass, FoldReshapePass, FoldSliceConcatPass,
-    FoldTransposePass, FuseAttentionPass, FuseElementwisePass, FuseHorizontalDotPass,
-    FuseLoopsPass, FuseMatmulEpiloguePass, FuseRmsNormPass, FuseRopePass, FuseSoftmaxPass,
-    FuseSwiGluPass, HoistConstantsPass, InlinerPass, IrEditPass, LicmPass, MergeWeightsPass,
-    OptO1Pass, OptO2Pass, OptO3Pass, PackWeightsPass, Pass, PassOptions, PrintOpStatsPass,
-    QuantizeWeightsPass, SccpPass, SimplifyAlgebraicPass, SinkTransposePass, SpecializeShapesPass,
-    StripDebugInfoPass, StructuredPruningPass, SymbolDcePass, TaskArithmeticPass,
-    TopologicalSortPass, VerifyShapesPass,
+    DeadCodeEliminationPass, DecomposeCompositesPass, ExternalizeWeightsPass, FissionLoopsPass,
+    FoldBroadcastPass, FoldConstantsPass, FoldConvertPass, FoldNormWeightsPass, FoldReshapePass,
+    FoldSliceConcatPass, FoldTransposePass, FuseAttentionPass, FuseElementwisePass,
+    FuseHorizontalDotPass, FuseLoopsPass, FuseMatmulEpiloguePass, FuseRmsNormPass, FuseRopePass,
+    FuseSoftmaxPass, FuseSwiGluPass, HoistConstantsPass, InlinerPass, IrEditPass, LicmPass,
+    MergeWeightsPass, OptO1Pass, OptO2Pass, OptO3Pass, PackWeightsPass, Pass, PassOptions,
+    PrintOpStatsPass, QuantizeWeightsPass, SccpPass, SimplifyAlgebraicPass, SinkTransposePass,
+    SpecializeShapesPass, StripDebugInfoPass, StructuredPruningPass, SymbolDcePass,
+    TaskArithmeticPass, TopologicalSortPass, VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
 use castforge_ir::MergeMethod;
@@ -348,6 +348,17 @@ impl PassRegistry {
             "fuse-loops",
             "Fuses multi-op elementwise loop chains into a single register-pipelined loop",
             |_opts| Ok(Box::new(FuseLoopsPass)),
+        );
+        reg.register(
+            "fission-loops",
+            "Distributes long fused_loop_chain ops into balanced sub-loops (max_steps=2)",
+            |opts| {
+                let max_steps = opts
+                    .get("max_steps")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(2);
+                Ok(Box::new(FissionLoopsPass { max_steps }))
+            },
         );
         reg.register(
             "O1",

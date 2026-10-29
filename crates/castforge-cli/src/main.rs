@@ -154,6 +154,18 @@ enum Commands {
         /// Emit explicit SIMD vectorization pragmas/annotations
         #[arg(long = "vectorize")]
         vectorize: bool,
+
+        /// Register micro-kernel Unroll-and-Jam tile size (0 = disabled, e.g. 2 for 2x2)
+        #[arg(long = "reg-tile", default_value_t = 0)]
+        reg_tile: usize,
+
+        /// Collapse/coalesce nested 2D loops into 1D loops
+        #[arg(long = "collapse-loops")]
+        collapse_loops: bool,
+
+        /// Emit multicore parallel outer-loop work-sharing
+        #[arg(long = "parallel")]
+        parallel: bool,
     },
 
     /// Analyze FLOPs, memory bandwidth traffic, arithmetic intensity, and Roofline bottlenecks
@@ -408,6 +420,9 @@ fn main() -> Result<()> {
             loop_order,
             unroll,
             vectorize,
+            reg_tile,
+            collapse_loops,
+            parallel,
         } => {
             let src = fs::read_to_string(&input)
                 .with_context(|| format!("Failed to read {}", input.display()))?;
@@ -451,6 +466,10 @@ fn main() -> Result<()> {
                 loop_order: GemmLoopOrder::parse(&loop_order),
                 unroll_factor: unroll.max(1),
                 vectorize,
+                reg_tile_m: reg_tile,
+                reg_tile_n: reg_tile,
+                collapse_loops,
+                parallel,
             };
             let code = generate_code_with_config(&module, tgt, &cfg)?;
             if let Some(out_path) = output {
