@@ -457,6 +457,9 @@ fn eval_stablehlo_op(
             let packed = dims.rhs_contracting_dimensions == [1];
             eval_matmul_2d(module, lhs, rhs, packed, &get_v)
         }
+        StableHloOp::Convolution { lhs, rhs, .. } => {
+            eval_conv_2d(module, lhs, rhs, res_len, &get_v)
+        }
         StableHloOp::Composite { name, inputs, .. } => {
             if name == "castforge.fused_add_max" && inputs.len() == 3 {
                 let (a, b, c) = (get_v(inputs[0]), get_v(inputs[1]), get_v(inputs[2]));
@@ -799,6 +802,19 @@ fn eval_stablehlo_op(
                     }
                 }
                 out
+            } else if name == "castforge.im2col" && !inputs.is_empty() {
+                let get_i = |k: &str, def: usize| -> usize {
+                    match op.attributes.get(k) {
+                        Some(castforge_ir::Attribute::Int(v)) if *v > 0 => *v as usize,
+                        _ => def,
+                    }
+                };
+                let h_in = get_i("h_in", 1);
+                let w_in = get_i("w_in", 1);
+                let c_in = get_i("c_in", 1);
+                let kh = get_i("kh", 1);
+                let kw = get_i("kw", 1);
+                eval_im2col_raw(&get_v(inputs[0]), h_in, w_in, c_in, kh, kw, res_len)
             } else {
                 get_v(inputs[0])
             }
@@ -983,4 +999,89 @@ fn eval_fused_loop_chain(
 
 fn eval_gelu_scalar(x: f32) -> f32 {
     0.5 * x * (1.0 + (0.797_884_6_f32 * (x + 0.044715_f32 * x * x * x)).tanh())
+}
+
+fn eval_im2col_raw(
+    x: &[f32],
+    h_in: usize,
+    w_in: usize,
+    c_in: usize,
+    kh: usize,
+    kw: usize,
+    res_len: usize,
+) -> Vec<f32> {
+    let h_out = h_in.saturating_sub(kh).saturating_add(1).max(1);
+    let w_out = w_in.saturating_sub(kw).saturating_add(1).max(1);
+    let k_total = (kh * kw * c_in).max(1);
+    let mut out = vec![0.0_f32; res_len];
+    for oh in 0..h_out {
+        for ow in 0..w_out {
+            let p = oh * w_out + ow;
+            for r in 0..kh {
+                for s in 0..kw {
+                    for c in 0..c_in {
+                        let in_idx = ((oh + r) * w_in + (ow + s)) * c_in + c;
+                        let out_idx = p * k_total + (r * kw + s) * c_in + c;
+                        if out_idx < out.len() && in_idx < x.len() {
+                            out[out_idx] = x[in_idx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn eval_conv_2d(
+    module: &Module,
+    lhs: ValueId,
+    rhs: ValueId,
+    res_len: usize,
+    get_v: &dyn Fn(ValueId) -> Vec<f32>,
+) -> Vec<f32> {
+    let lhs_dims = module.values[lhs]
+        .ty
+        .as_tensor()
+        .map(tensor_shape_dims)
+        .unwrap_or_else(|| vec![1, 1]);
+    let rhs_dims = module.values[rhs]
+        .ty
+        .as_tensor()
+        .map(tensor_shape_dims)
+        .unwrap_or_else(|| vec![1, 1]);
+    if lhs_dims.len() == 2 && rhs_dims.len() == 2 && lhs_dims[1] == rhs_dims[0] {
+        return eval_matmul_2d(module, lhs, rhs, false, get_v);
+    }
+    let (h_in, w_in, c_in) = match lhs_dims.as_slice() {
+        [h, w, c] => (*h, *w, *c),
+        [_, h, w, c] => (*h, *w, *c),
+        [hw, c] => (*hw, 1, *c),
+        _ => (1, 1, 1),
+    };
+    let (kh, kw, k_total, c_out) = match rhs_dims.as_slice() {
+        [kh, kw, cin, cout] => (*kh, *kw, kh * kw * cin, *cout),
+        [kt, cout] => {
+            let spatial = (kt / c_in.max(1)).max(1);
+            let k_side = (spatial as f64).sqrt().round() as usize;
+            (k_side.max(1), (spatial / k_side.max(1)).max(1), *kt, *cout)
+        }
+        _ => (1, 1, c_in, 1),
+    };
+    let m_patches = (res_len / c_out.max(1)).max(1);
+    let patches = eval_im2col_raw(&get_v(lhs), h_in, w_in, c_in, kh, kw, m_patches * k_total);
+    let w = get_v(rhs);
+    let mut out = vec![0.0_f32; res_len];
+    for p in 0..m_patches {
+        for co in 0..c_out {
+            let mut acc = 0.0_f32;
+            for k in 0..k_total {
+                acc += patches[p * k_total + k] * w[k * c_out + co];
+            }
+            if p * c_out + co < out.len() {
+                out[p * c_out + co] = acc;
+            }
+        }
+    }
+    out
 }

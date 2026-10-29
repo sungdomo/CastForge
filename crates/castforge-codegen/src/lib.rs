@@ -1,3 +1,4 @@
+pub mod autotune;
 pub mod cost_model;
 pub mod eval;
 pub mod liveness;
@@ -7,6 +8,7 @@ pub mod target_config;
 pub mod target_rust;
 pub mod target_wgsl;
 
+pub use crate::autotune::{AutotuneCandidate, AutotuneReport, autotune_module};
 pub use crate::cost_model::{
     BottleneckKind, HardwareRoofline, ModuleCostReport, OpCostProfile, analyze_module_cost,
     analyze_module_cost_with_roofline,

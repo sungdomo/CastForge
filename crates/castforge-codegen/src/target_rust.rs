@@ -4,7 +4,7 @@ use crate::{
 };
 use anyhow::{Result, anyhow};
 use castforge_dialect_stablehlo::StableHloOp;
-use castforge_ir::{DType, Module, OpId, ValueId};
+use castforge_ir::{Attribute, DType, Module, OpId, ValueId};
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -969,6 +969,99 @@ fn emit_rust_hlo_op(
                     out,
                     "        for c in 0..{cols} {{ {dst} = ({src}) - lse; }}"
                 )?;
+                writeln!(out, "    }}")?;
+            } else if name == "castforge.im2col" && !inputs.is_empty() {
+                let in_dims = module.values[inputs[0]]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_else(|| vec![1, 1, 1, 1]);
+                let n = *in_dims.first().unwrap_or(&1);
+                let h = *in_dims.get(1).unwrap_or(&1);
+                let w = *in_dims.get(2).unwrap_or(&1);
+                let c = *in_dims.get(3).unwrap_or(&1);
+                let kh = match op.attributes.get("kh") {
+                    Some(Attribute::Int(v)) => (*v).max(1) as usize,
+                    _ => 1,
+                };
+                let kw = match op.attributes.get("kw") {
+                    Some(Attribute::Int(v)) => (*v).max(1) as usize,
+                    _ => 1,
+                };
+                let sh = match op.attributes.get("stride_h") {
+                    Some(Attribute::Int(v)) => (*v).max(1) as usize,
+                    _ => 1,
+                };
+                let sw = match op.attributes.get("stride_w") {
+                    Some(Attribute::Int(v)) => (*v).max(1) as usize,
+                    _ => 1,
+                };
+                let ph = match op.attributes.get("pad_h") {
+                    Some(Attribute::Int(v)) => (*v).max(0) as usize,
+                    _ => 0,
+                };
+                let pw = match op.attributes.get("pad_w") {
+                    Some(Attribute::Int(v)) => (*v).max(0) as usize,
+                    _ => 0,
+                };
+                let oh = match op.attributes.get("oh") {
+                    Some(Attribute::Int(v)) => (*v).max(1) as usize,
+                    _ => 1,
+                };
+                let ow = match op.attributes.get("ow") {
+                    Some(Attribute::Int(v)) => (*v).max(1) as usize,
+                    _ => 1,
+                };
+                let k_dim = kh * kw * c;
+                let src = r_idx(
+                    module,
+                    plan,
+                    inputs[0],
+                    &format!("((b * {h} + ih as usize) * {w} + iw as usize) * {c} + ci"),
+                    names,
+                    counter,
+                );
+                let dst = r_idx(
+                    module,
+                    plan,
+                    res_val,
+                    &format!("row * {k_dim} + col"),
+                    names,
+                    counter,
+                );
+                writeln!(out, "    for b in 0..{n} {{")?;
+                writeln!(out, "        for y in 0..{oh} {{")?;
+                writeln!(out, "            for x in 0..{ow} {{")?;
+                writeln!(out, "                let row = (b * {oh} + y) * {ow} + x;")?;
+                writeln!(out, "                for r in 0..{kh} {{")?;
+                writeln!(out, "                    for s in 0..{kw} {{")?;
+                writeln!(
+                    out,
+                    "                        let ih = (y * {sh} + r) as isize - {ph};"
+                )?;
+                writeln!(
+                    out,
+                    "                        let iw = (x * {sw} + s) as isize - {pw};"
+                )?;
+                writeln!(
+                    out,
+                    "                        let valid = ih >= 0 && (ih as usize) < {h} \
+                     && iw >= 0 && (iw as usize) < {w};"
+                )?;
+                writeln!(out, "                        for ci in 0..{c} {{")?;
+                writeln!(
+                    out,
+                    "                            let col = (r * {kw} + s) * {c} + ci;"
+                )?;
+                writeln!(
+                    out,
+                    "                            {dst} = if valid {{ {src} }} else {{ 0.0 }};"
+                )?;
+                writeln!(out, "                        }}")?;
+                writeln!(out, "                    }}")?;
+                writeln!(out, "                }}")?;
+                writeln!(out, "            }}")?;
+                writeln!(out, "        }}")?;
                 writeln!(out, "    }}")?;
             } else {
                 let src = r_idx(module, plan, inputs[0], "i", names, counter);

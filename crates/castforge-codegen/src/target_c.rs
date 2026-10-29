@@ -4,7 +4,7 @@ use crate::{
 };
 use anyhow::{Result, anyhow};
 use castforge_dialect_stablehlo::StableHloOp;
-use castforge_ir::{DType, Module, OpId, ValueId};
+use castforge_ir::{Attribute, DType, Module, OpId, ValueId};
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -841,6 +841,82 @@ fn emit_c_hlo_op(
                     "        for (int c = 0; c < {cols}; ++c) \
                      {res_name}[r * {cols} + c] = {x}[r * {cols} + c] - lse;"
                 )?;
+                writeln!(out, "    }}")?;
+            } else if name == "castforge.im2col" && !inputs.is_empty() {
+                let src = value_ident(module, inputs[0], names, counter);
+                let in_dims = module.values[inputs[0]]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_else(|| vec![1, 1, 1, 1]);
+                let n = *in_dims.first().unwrap_or(&1);
+                let h = *in_dims.get(1).unwrap_or(&1);
+                let w = *in_dims.get(2).unwrap_or(&1);
+                let c = *in_dims.get(3).unwrap_or(&1);
+                let kh = match op.attributes.get("kh") {
+                    Some(Attribute::Int(v)) => (*v).max(1) as usize,
+                    _ => 1,
+                };
+                let kw = match op.attributes.get("kw") {
+                    Some(Attribute::Int(v)) => (*v).max(1) as usize,
+                    _ => 1,
+                };
+                let sh = match op.attributes.get("stride_h") {
+                    Some(Attribute::Int(v)) => (*v).max(1) as usize,
+                    _ => 1,
+                };
+                let sw = match op.attributes.get("stride_w") {
+                    Some(Attribute::Int(v)) => (*v).max(1) as usize,
+                    _ => 1,
+                };
+                let ph = match op.attributes.get("pad_h") {
+                    Some(Attribute::Int(v)) => (*v).max(0) as usize,
+                    _ => 0,
+                };
+                let pw = match op.attributes.get("pad_w") {
+                    Some(Attribute::Int(v)) => (*v).max(0) as usize,
+                    _ => 0,
+                };
+                let oh = match op.attributes.get("oh") {
+                    Some(Attribute::Int(v)) => (*v).max(1) as usize,
+                    _ => 1,
+                };
+                let ow = match op.attributes.get("ow") {
+                    Some(Attribute::Int(v)) => (*v).max(1) as usize,
+                    _ => 1,
+                };
+                let k_dim = kh * kw * c;
+                writeln!(out, "    for (int b = 0; b < {n}; ++b) {{")?;
+                writeln!(out, "        for (int y = 0; y < {oh}; ++y) {{")?;
+                writeln!(out, "            for (int x = 0; x < {ow}; ++x) {{")?;
+                writeln!(out, "                int row = (b * {oh} + y) * {ow} + x;")?;
+                writeln!(out, "                for (int r = 0; r < {kh}; ++r) {{")?;
+                writeln!(out, "                    for (int s = 0; s < {kw}; ++s) {{")?;
+                writeln!(out, "                        int ih = y * {sh} + r - {ph};")?;
+                writeln!(out, "                        int iw = x * {sw} + s - {pw};")?;
+                writeln!(
+                    out,
+                    "                        int valid = (ih >= 0 && ih < {h} && \
+                     iw >= 0 && iw < {w});"
+                )?;
+                writeln!(
+                    out,
+                    "                        for (int ci = 0; ci < {c}; ++ci) {{"
+                )?;
+                writeln!(
+                    out,
+                    "                            int col = (r * {kw} + s) * {c} + ci;"
+                )?;
+                writeln!(
+                    out,
+                    "                            {res_name}[row * {k_dim} + col] = valid ? \
+                     {src}[((b * {h} + ih) * {w} + iw) * {c} + ci] : 0.0f;"
+                )?;
+                writeln!(out, "                        }}")?;
+                writeln!(out, "                    }}")?;
+                writeln!(out, "                }}")?;
+                writeln!(out, "            }}")?;
+                writeln!(out, "        }}")?;
                 writeln!(out, "    }}")?;
             } else {
                 let src = value_ident(module, inputs[0], names, counter);

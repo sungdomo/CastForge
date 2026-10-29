@@ -2,11 +2,11 @@
 
 use crate::memory_plan::build_memory_plan;
 use castforge_ir::{Attribute, Dim, Module, OpId, ValueId};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 
 /// Hardware Roofline parameters used to classify operations as compute- or memory-bound.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct HardwareRoofline {
     /// Peak compute throughput in GFLOP/s (10^9 FLOP/s, equivalent to FLOP/ns).
     pub peak_gflops: f64,
@@ -426,6 +426,18 @@ fn profile_single_op(module: &Module, op_id: OpId, roofline: &HardwareRoofline) 
             .first()
             .map(|&v| value_elems(module, v))
             .unwrap_or(out_elems),
+        "convolution" => {
+            let rhs_dims = op
+                .operands
+                .get(1)
+                .map(|&v| static_dims(module, v))
+                .unwrap_or_default();
+            let kh = rhs_dims.first().copied().unwrap_or(1);
+            let kw = rhs_dims.get(1).copied().unwrap_or(1);
+            let ci = rhs_dims.get(2).copied().unwrap_or(1);
+            2 * out_elems * kh * kw * ci
+        }
+        "im2col" => 0,
         _ => 0,
     };
 

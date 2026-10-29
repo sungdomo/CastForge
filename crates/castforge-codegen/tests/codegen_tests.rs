@@ -484,3 +484,81 @@ module @complete_fusion_and_polyhedral {
     let c_skew = generate_code_with_config(&fused, CodegenTarget::C, &cfg_skew).expect("c skew");
     assert!(c_skew.contains("[loop:skew(wavefront=\"w = m + n\")]"));
 }
+
+#[test]
+fn test_autotune_lower_conv_to_gemm_and_llama_block() {
+    let conv_mlir = r#"
+module @conv_model {
+  func.func @main(
+    %x: tensor<1x4x4x2xf32>,
+    %w: tensor<3x3x2x4xf32>,
+    %b: tensor<4x4xf32>
+  ) -> tensor<1x2x2x4xf32> {
+    %conv = stablehlo.convolution %x, %w {window_strides = [1, 1], padding = [0, 0]}
+      : (tensor<1x4x4x2xf32>, tensor<3x3x2x4xf32>) -> tensor<1x2x2x4xf32>
+    %flat = stablehlo.reshape %conv : (tensor<1x2x2x4xf32>) -> tensor<4x4xf32>
+    %biased = stablehlo.add %flat, %b : tensor<4x4xf32>
+    %out = stablehlo.reshape %biased : (tensor<4x4xf32>) -> tensor<1x2x2x4xf32>
+    func.return %out : tensor<1x2x2x4xf32>
+  }
+}
+"#;
+    let before = parse_mlir(conv_mlir).expect("parse conv_mlir");
+    let mut lowered = before.clone();
+    let registry = PassRegistry::with_builtin_passes();
+    let mut pm = PassManager::from_pipeline_str(
+        &registry,
+        "lower-conv-to-gemm,fold-reshape,fuse-matmul-epilogue,dce",
+    )
+    .expect("conv pipeline");
+    pm.run(&mut lowered).expect("run conv pipeline");
+
+    let printed = print_mlir(&lowered);
+    assert!(printed.contains("castforge.im2col"));
+    assert!(printed.contains("castforge.fused_matmul_epilogue"));
+
+    let rep = verify_module_numerics(&before, &lowered, 1e-5).expect("verify conv numerics");
+    assert!(rep.passed, "max_abs_diff = {}", rep.max_abs_diff);
+
+    // Verify Roofline schedule auto-tuner
+    let roofline = castforge_codegen::HardwareRoofline::new(1000.0, 100.0);
+    let tune = castforge_codegen::autotune_module(&lowered, &roofline);
+    assert!(!tune.candidates.is_empty());
+    assert!(tune.best.speedup_over_baseline >= 1.0);
+    let table = tune.summary_table(3);
+    assert!(table.contains("Recommended Schedule:"));
+    assert!(table.contains("--loop-order"));
+
+    // Verify codegen on lowered conv + autotuned schedule
+    let rust_conv =
+        generate_code_with_config(&lowered, CodegenTarget::Rust, &tune.best.config).expect("rust");
+    assert!(rust_conv.contains("let ih = (y * 1 + r) as isize - 0;"));
+    let c_conv =
+        generate_code_with_config(&lowered, CodegenTarget::C, &tune.best.config).expect("c");
+    assert!(c_conv.contains("int ih = y * 1 + r - 0;"));
+
+    // Verify end-to-end LLaMA Block showcase (examples/llama_block.mlir)
+    let llama_src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/llama_block.mlir"
+    ))
+    .expect("read examples/llama_block.mlir");
+    let llama_before = parse_mlir(&llama_src).expect("parse llama_block");
+    let mut llama_opt = llama_before.clone();
+    let mut llama_pm = PassManager::from_pipeline_str(&registry, "O2").expect("O2");
+    llama_pm.run(&mut llama_opt).expect("run optimize on llama");
+
+    let llama_ir = print_mlir(&llama_opt);
+    assert!(llama_ir.contains("castforge.fused_residual_rmsnorm"));
+    assert!(llama_ir.contains("castforge.fused_rope"));
+    assert!(llama_ir.contains("castforge.fused_attention"));
+    assert!(llama_ir.contains("castforge.fused_gated_mlp"));
+
+    let llama_rep =
+        verify_module_numerics(&llama_before, &llama_opt, 1e-4).expect("verify llama numerics");
+    assert!(
+        llama_rep.passed,
+        "max_abs_diff = {}",
+        llama_rep.max_abs_diff
+    );
+}

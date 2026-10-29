@@ -6,11 +6,11 @@ use crate::{
     FuseElementwisePass, FuseGatedMlpPass, FuseGeluPass, FuseHorizontalDotPass, FuseLayerNormPass,
     FuseLogSoftmaxPass, FuseLoopsPass, FuseMapReducePass, FuseMatmulEpiloguePass,
     FuseResidualNormPass, FuseRmsNormPass, FuseRopePass, FuseSoftmaxPass, FuseSwiGluPass,
-    HoistConstantsPass, InlinerPass, IrEditPass, LicmPass, MergeWeightsPass, OptO1Pass, OptO2Pass,
-    OptO3Pass, PackWeightsPass, Pass, PassOptions, PrintOpStatsPass, QuantizeWeightsPass, SccpPass,
-    SimplifyAlgebraicPass, SinkTransposePass, SpecializeShapesPass, StripDebugInfoPass,
-    StructuredPruningPass, SymbolDcePass, TaskArithmeticPass, TopologicalSortPass,
-    VerifyShapesPass,
+    HoistConstantsPass, InlinerPass, IrEditPass, LicmPass, LowerConvToGemmPass, MergeWeightsPass,
+    OptO1Pass, OptO2Pass, OptO3Pass, PackWeightsPass, Pass, PassOptions, PrintOpStatsPass,
+    QuantizeWeightsPass, SccpPass, SimplifyAlgebraicPass, SinkTransposePass, SpecializeShapesPass,
+    StripDebugInfoPass, StructuredPruningPass, SymbolDcePass, TaskArithmeticPass,
+    TopologicalSortPass, VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
 use castforge_ir::MergeMethod;
@@ -396,6 +396,11 @@ impl PassRegistry {
             "fuse-log-softmax",
             "Fuses log(softmax(x)) or x - log(reduce_sum(exp(x))) into fused_log_softmax",
             |_opts| Ok(Box::new(FuseLogSoftmaxPass)),
+        );
+        reg.register(
+            "lower-conv-to-gemm",
+            "Lowers stablehlo.convolution into im2col + stablehlo.dot_general GEMM",
+            |_opts| Ok(Box::new(LowerConvToGemmPass)),
         );
         reg.register(
             "O1",

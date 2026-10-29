@@ -19,20 +19,20 @@ support.
   (`stablehlo.add %0, %1 : tensor<...>`), including `!quant.uniform` quantized tensor types and
   `dense_resource<key>` external weight references.
 - [`crates/castforge-passes`](crates/castforge-passes): Unified `Pass`, `PassRegistry`, and
-  `PassManager` with **52 built-in compiler passes & presets** supporting static Rust construction,
+  `PassManager` with **53 built-in compiler passes & presets** supporting static Rust construction,
   CLI pipeline strings (`-p`), direct subcommand invocation, declarative TOML config files
   (`--config`), and step-by-step pass tracing.
 - [`crates/castforge-viz`](crates/castforge-viz): Computation graph exporter for **Mermaid**,
   **Graphviz DOT**, **JSON**, and a self-contained **Interactive HTML Pass Timeline, Roofline &
   Arena Memory Liveness Debugger**.
 - [`crates/castforge-codegen`](crates/castforge-codegen): Liveness analyzer (`LivenessAnalysis`),
-  greedy interval-coloring arena buffer planner (`MemoryPlan`), in-memory reference IR interpreter
-  & numerical verifier (`eval_module`), and multi-target source code generator for **Rust**,
-  **C99**, and **WebGPU WGSL**.
+  greedy interval-coloring arena buffer planner (`MemoryPlan`), Roofline schedule auto-tuner
+  (`autotune_module`), in-memory reference IR interpreter & numerical verifier (`eval_module`), and
+  multi-target source code generator for **Rust**, **C99**, and **WebGPU WGSL**.
 - [`crates/castforge-cli`](crates/castforge-cli): The `castforge` command-line tool (`opt`, `viz`,
-  `codegen`, `run`, `list-passes`, plus direct pass subcommands).
+  `codegen`, `autotune`, `profile`, `run`, `list-passes`, plus direct pass subcommands).
 
-## Built-in Transformation Passes & Presets (52 Passes)
+## Built-in Transformation Passes & Presets (53 Passes)
 
 | Pass Name | Category | Description |
 | :--- | :--- | :--- |
@@ -76,6 +76,7 @@ support.
 | `fuse-gelu` | Fusion | Fuses Tanh-approx GELU and gated GeGLU (`gelu(gate) * up`) |
 | `fuse-rope` | Fusion | Fuses Rotary Position Embedding (`RoPE`) into composite |
 | `fuse-attention` | Fusion | Fuses SDPA & GQA (`softmax(Q @ K^T * scale) @ V`) |
+| `lower-conv-to-gemm` | Lowering | Lowers 2D `convolution` (NHWC) to `im2col` + `dot_general` |
 | `decompose-composites` | Lowering | Expands `stablehlo.composite` ops to primitive StableHLO |
 | `bufferize-inplace` | Lowering | Annotates elementwise ops for in-place arena buffer reuse |
 | `fold-norm-weights` | Weight Surgery | Absorbs RMSNorm/LayerNorm scale weights into MatMuls |
@@ -92,28 +93,29 @@ support.
 ## Quick Start
 
 ```bash
-# 1. List all 52 registered passes and pipeline presets
+# 1. List all 53 registered passes and pipeline presets
 cargo run --bin castforge -- list-passes
 
-# 2. Run an optimization pipeline with automatic numerical verification
-cargo run --bin castforge -- opt examples/mlp_redundant.mlir \
-  -p "canonicalize,fuse-matmul-epilogue" --verify-numerics
+# 2. Optimize an end-to-end LLaMA block with automatic numerical verification
+cargo run --bin castforge -- opt examples/llama_block.mlir -p "O3" --verify-numerics
 
-# 3. End-to-End Weight Surgery + SafeTensors binary export
+# 3. Auto-tune polyhedral/HPC loop schedules using the Roofline & cache model
+cargo run --bin castforge -- autotune examples/llama_block.mlir -p "O3"
+
+# 4. End-to-End Weight Surgery + SafeTensors binary export
 cargo run --bin castforge -- opt examples/weight_surgery.mlir \
   -p "merge-weights(method=slerp,t=0.5),prune-structured(sparsity=0.5),externalize-weights" \
   --save-weights examples/merged_weights.safetensors
 
-# 4. Generate an Interactive HTML Pass Timeline, Roofline & Arena Memory Debugger
+# 5. Generate an Interactive HTML Pass Timeline, Roofline & Arena Memory Debugger
 cargo run --bin castforge -- viz examples/weight_surgery.mlir \
   -p "merge-weights(method=slerp,t=0.5),prune-structured(sparsity=0.5),quantize-weights(bits=8)" \
   --format html -o examples/weight_surgery_trace.html
 
-# 5. Lower the optimized model to standalone Rust, C99, or WebGPU WGSL with Arena Buffer Reuse
+# 6. Lower the optimized model to standalone Rust, C99, or WebGPU WGSL with Arena Buffer Reuse
 cargo run --bin castforge -- codegen examples/weight_surgery.mlir \
   -p "canonicalize,fuse-matmul-epilogue" --target rust --tile-size 16
 
-# 6. Profile Roofline FLOPs, memory bandwidth traffic, and arithmetic intensity
-cargo run --bin castforge -- profile examples/mlp_redundant.mlir \
-  -p "canonicalize,fuse-matmul-epilogue"
+# 7. Profile Roofline FLOPs, memory bandwidth traffic, and arithmetic intensity
+cargo run --bin castforge -- profile examples/llama_block.mlir -p "O3"
 ```

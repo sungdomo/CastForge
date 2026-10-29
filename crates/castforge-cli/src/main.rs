@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use castforge_codegen::{
     CodegenTarget, GemmLoopOrder, HardwareRoofline, TargetConfig,
-    analyze_module_cost_with_roofline, build_memory_plan, evaluate_module,
+    analyze_module_cost_with_roofline, autotune_module, build_memory_plan, evaluate_module,
     generate_code_with_config, generate_synthetic_inputs, verify_module_numerics,
 };
 use castforge_mlir::{PrintOptions, parse_mlir, print_mlir, print_mlir_with_options};
@@ -200,6 +200,28 @@ enum Commands {
         /// Peak hardware memory bandwidth in GB/s
         #[arg(long = "peak-bw-gbps", default_value_t = 100.0)]
         peak_bw_gbps: f64,
+    },
+
+    /// Auto-tune polyhedral/HPC loop schedules using the Roofline & cache model
+    Autotune {
+        /// Input MLIR file path
+        input: PathBuf,
+
+        /// Optional pass pipeline to run before schedule auto-tuning
+        #[arg(short = 'p', long = "passes")]
+        passes: Option<String>,
+
+        /// Peak hardware compute throughput in GFLOP/s
+        #[arg(long = "peak-gflops", default_value_t = 1000.0)]
+        peak_gflops: f64,
+
+        /// Peak hardware memory bandwidth in GB/s
+        #[arg(long = "peak-bw-gbps", default_value_t = 100.0)]
+        peak_bw_gbps: f64,
+
+        /// Number of top-ranked schedule candidates to display
+        #[arg(long = "top-k", default_value_t = 5)]
+        top_k: usize,
     },
 
     /// List all registered transformation and optimization passes
@@ -543,6 +565,25 @@ fn main() -> Result<()> {
             } else {
                 print!("{}", before.summary_table());
             }
+        }
+
+        Commands::Autotune {
+            input,
+            passes,
+            peak_gflops,
+            peak_bw_gbps,
+            top_k,
+        } => {
+            let src = fs::read_to_string(&input)
+                .with_context(|| format!("Failed to read {}", input.display()))?;
+            let mut module = parse_mlir(&src)?;
+            if let Some(spec) = passes {
+                let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
+                pm.run(&mut module)?;
+            }
+            let roofline = HardwareRoofline::new(peak_gflops, peak_bw_gbps);
+            let report = autotune_module(&module, &roofline);
+            print!("{}", report.summary_table(top_k));
         }
 
         Commands::ListPasses => {
