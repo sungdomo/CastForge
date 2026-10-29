@@ -1063,6 +1063,14 @@ fn emit_rust_hlo_op(
                 writeln!(out, "            }}")?;
                 writeln!(out, "        }}")?;
                 writeln!(out, "    }}")?;
+            } else if name == "castforge.fma" && inputs.len() >= 3 {
+                let a = r_idx(module, plan, inputs[0], "i", names, counter);
+                let b = r_idx(module, plan, inputs[1], "i", names, counter);
+                let c = r_idx(module, plan, inputs[2], "i", names, counter);
+                let dst = r_idx(module, plan, res_val, "i", names, counter);
+                writeln!(out, "    for i in 0..{res_len} {{")?;
+                writeln!(out, "        {dst} = ({a}).mul_add({b}, {c});")?;
+                writeln!(out, "    }}")?;
             } else {
                 let src = r_idx(module, plan, inputs[0], "i", names, counter);
                 let dst = r_idx(module, plan, res_val, "i", names, counter);

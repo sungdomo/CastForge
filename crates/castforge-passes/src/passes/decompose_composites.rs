@@ -535,6 +535,24 @@ impl Pass for DecomposeCompositesPass {
                         created += 5;
                         modified += 1;
                     }
+                    "castforge.fma" if inputs.len() >= 3 => {
+                        let (a, b, c) = (inputs[0], inputs[1], inputs[2]);
+                        let prod = insert_op_before(
+                            module,
+                            block_id,
+                            op_id,
+                            OpName::new("stablehlo", "multiply"),
+                            &[a, b],
+                            IndexMap::new(),
+                            out_ty,
+                        );
+                        let op_mut = &mut module.ops[op_id];
+                        op_mut.name = OpName::new("stablehlo", "add");
+                        op_mut.operands = SmallVec::from_slice(&[prod, c]);
+                        op_mut.attributes.clear();
+                        created += 1;
+                        modified += 1;
+                    }
                     _ => {}
                 }
             }

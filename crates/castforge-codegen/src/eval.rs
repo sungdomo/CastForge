@@ -815,6 +815,9 @@ fn eval_stablehlo_op(
                 let kh = get_i("kh", 1);
                 let kw = get_i("kw", 1);
                 eval_im2col_raw(&get_v(inputs[0]), h_in, w_in, c_in, kh, kw, res_len)
+            } else if name == "castforge.fma" && inputs.len() >= 3 {
+                let (a, b, c) = (get_v(inputs[0]), get_v(inputs[1]), get_v(inputs[2]));
+                (0..res_len).map(|i| a[i].mul_add(b[i], c[i])).collect()
             } else {
                 get_v(inputs[0])
             }

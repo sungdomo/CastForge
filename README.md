@@ -20,7 +20,7 @@ support.
   `dense_resource<key>` external weight references, plus **GGUF v2/v3** and **ONNX-JSON** model
   importers.
 - [`crates/castforge-passes`](crates/castforge-passes): Unified `Pass`, `PassRegistry`, and
-  `PassManager` with **54 built-in compiler passes & presets** supporting static Rust construction,
+  `PassManager` with **58 built-in compiler passes & presets** supporting static Rust construction,
   CLI pipeline strings (`-p`), direct subcommand invocation, declarative TOML config files
   (`--config`), and step-by-step pass tracing.
 - [`crates/castforge-viz`](crates/castforge-viz): Computation graph exporter for **Mermaid**,
@@ -34,7 +34,7 @@ support.
 - [`crates/castforge-cli`](crates/castforge-cli): The `castforge` command-line tool (`opt`, `viz`,
   `codegen`, `autotune`, `import`, `profile`, `run`, `list-passes`, plus direct pass subcommands).
 
-## Built-in Transformation Passes & Presets (54 Passes)
+## Built-in Transformation Passes & Presets (58 Passes)
 
 | Pass Name | Category | Description |
 | :--- | :--- | :--- |
@@ -80,6 +80,10 @@ support.
 | `fuse-attention` | Fusion | Fuses SDPA & GQA (`softmax(Q @ K^T * scale) @ V`) |
 | `lower-conv-to-gemm` | Lowering | Lowers 2D `convolution` (NHWC) to `im2col` + `dot_general` |
 | `autodiff` | Training | Synthesizes reverse-mode VJP gradients & optional SGD step |
+| `rematerialize` | Memory | Recomputes long-lived cheap activations to shrink arena memory |
+| `shard-spmd` | Distributed | Megatron-style 1D SPMD tensor parallelism + `all_reduce` |
+| `inject-kv-cache` | Inference | Injects `kv_cache_update` state ops before fused attention |
+| `egraph-simplify` | Folding | Distributive factoring (`a*b+a*c -> a*(b+c)`) & FMA extraction |
 | `decompose-composites` | Lowering | Expands `stablehlo.composite` ops to primitive StableHLO |
 | `bufferize-inplace` | Lowering | Annotates elementwise ops for in-place arena buffer reuse |
 | `fold-norm-weights` | Weight Surgery | Absorbs RMSNorm/LayerNorm scale weights into MatMuls |
@@ -96,7 +100,7 @@ support.
 ## Quick Start
 
 ```bash
-# 1. List all 54 registered passes and pipeline presets
+# 1. List all 58 registered passes and pipeline presets
 cargo run --bin castforge -- list-passes
 
 # 2. Optimize an end-to-end LLaMA block with automatic numerical verification

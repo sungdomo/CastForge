@@ -706,3 +706,91 @@ module @autodiff_demo {
     let jit_tune = autotune_module_jit(&onnx_opt, &roofline, 2).expect("autotune jit");
     assert!(jit_tune.best.estimated_latency_ns > 0.0);
 }
+
+#[test]
+fn test_rematerialize_shard_spmd_inject_kv_cache_and_egraph_simplify() {
+    let mlir = r#"
+module @advanced_compiler_frontiers {
+  func.func @forward(
+    %q: tensor<2x4xf32>,
+    %k: tensor<2x4xf32>,
+    %v: tensor<2x4xf32>,
+    %w1: tensor<4x4xf32>,
+    %w2: tensor<4x4xf32>
+  ) -> tensor<2x4xf32> {
+    %zero = stablehlo.constant dense<0.0> : tensor<f32>
+    %scale = stablehlo.constant dense<0.5> : tensor<2x2xf32>
+
+    // Cheap activation %cheap used both early and late across heavy ops
+    %cheap = stablehlo.tanh %q : tensor<2x4xf32>
+
+    // SDPA Attention -> fused + KV-cache injected
+    %kt = stablehlo.transpose %k, dims = [1, 0] : (tensor<2x4xf32>) -> tensor<4x2xf32>
+    %qk = stablehlo.dot_general %cheap, %kt, contracting_dims = [1] x [0]
+      : (tensor<2x4xf32>, tensor<4x2xf32>) -> tensor<2x2xf32>
+    %scores = stablehlo.multiply %qk, %scale : tensor<2x2xf32>
+    %ex = stablehlo.exponential %scores : tensor<2x2xf32>
+    %sum = stablehlo.reduce %ex, %zero
+      {dimensions = [1], reducer = "stablehlo.add"}
+      : (tensor<2x2xf32>, tensor<f32>) -> tensor<2xf32>
+    %denom = stablehlo.broadcast_in_dim %sum, dims = [0]
+      : (tensor<2xf32>) -> tensor<2x2xf32>
+    %probs = stablehlo.divide %ex, %denom : tensor<2x2xf32>
+    %attn = stablehlo.dot_general %probs, %v, contracting_dims = [1] x [0]
+      : (tensor<2x2xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+
+    // Column-Parallel + Row-Parallel GEMMs -> sharded via shard-spmd(devices=4)
+    %h1 = stablehlo.dot_general %attn, %w1, contracting_dims = [1] x [0]
+      : (tensor<2x4xf32>, tensor<4x4xf32>) -> tensor<2x4xf32>
+    %h2 = stablehlo.dot_general %h1, %w2, contracting_dims = [1] x [0]
+      : (tensor<2x4xf32>, tensor<4x4xf32>) -> tensor<2x4xf32>
+
+    // Distributive factoring + FMA: (attn * h1 + attn * h2) + cheap -> fma(attn, h1 + h2, cheap)
+    %p1 = stablehlo.multiply %attn, %h1 : tensor<2x4xf32>
+    %p2 = stablehlo.multiply %attn, %h2 : tensor<2x4xf32>
+    %dist = stablehlo.add %p1, %p2 : tensor<2x4xf32>
+    %out = stablehlo.add %dist, %cheap : tensor<2x4xf32>
+    func.return %out : tensor<2x4xf32>
+  }
+}
+"#;
+    let before = parse_mlir(mlir).expect("parse frontiers mlir");
+    let mut after = before.clone();
+    let registry = PassRegistry::with_builtin_passes();
+    let mut pm = PassManager::from_pipeline_str(
+        &registry,
+        "inject-kv-cache(max_seq_len=4096),shard-spmd(devices=4),egraph-simplify,rematerialize",
+    )
+    .expect("frontiers pipeline");
+    let res = pm.run(&mut after).expect("run frontiers pipeline");
+    assert!(res[0].changed);
+    assert!(res[1].changed);
+    assert!(res[2].changed);
+    assert!(res[3].changed);
+
+    let ir = print_mlir(&after);
+    assert!(ir.contains("castforge.kv_cache_update"));
+    assert!(ir.contains("max_seq_len = 4096"));
+    assert!(ir.contains("spmd_sharding = \"column_parallel\""));
+    assert!(ir.contains("spmd_sharding = \"row_parallel\""));
+    assert!(ir.contains("castforge.all_reduce"));
+    assert!(ir.contains("castforge.fma"));
+    assert!(ir.contains("rematerialized = true"));
+
+    let rep = verify_module_numerics(&before, &after, 1e-5).expect("verify frontiers numerics");
+    assert!(rep.passed, "max_abs_diff = {}", rep.max_abs_diff);
+
+    // Verify Rust and C99 codegen emit hardware FMA (mul_add / fmaf)
+    let rust_code = generate_code(&after, CodegenTarget::Rust).expect("rust fma");
+    assert!(rust_code.contains(".mul_add("));
+    let c_code = generate_code(&after, CodegenTarget::C).expect("c fma");
+    assert!(c_code.contains("fmaf("));
+
+    // Verify decompose-composites lowers castforge.fma back to multiply + add
+    let mut decomposed = after.clone();
+    let mut dec_pm =
+        PassManager::from_pipeline_str(&registry, "decompose-composites").expect("decompose");
+    dec_pm.run(&mut decomposed).expect("run decompose");
+    let dec_rep = verify_module_numerics(&before, &decomposed, 1e-5).expect("verify decomposed");
+    assert!(dec_rep.passed);
+}

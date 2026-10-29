@@ -918,6 +918,15 @@ fn emit_c_hlo_op(
                 writeln!(out, "            }}")?;
                 writeln!(out, "        }}")?;
                 writeln!(out, "    }}")?;
+            } else if name == "castforge.fma" && inputs.len() >= 3 {
+                let a = value_ident(module, inputs[0], names, counter);
+                let b = value_ident(module, inputs[1], names, counter);
+                let c = value_ident(module, inputs[2], names, counter);
+                writeln!(
+                    out,
+                    "    for (int i = 0; i < {res_len}; ++i) \
+                     {res_name}[i] = fmaf({a}[i], {b}[i], {c}[i]);"
+                )?;
             } else {
                 let src = value_ident(module, inputs[0], names, counter);
                 writeln!(

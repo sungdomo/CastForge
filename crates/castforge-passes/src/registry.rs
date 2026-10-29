@@ -1,16 +1,17 @@
 use crate::{
     AutodiffPass, BakeLoraPass, BufferizeInplacePass, CanonicalizePass,
     CommonSubexpressionEliminationPass, DeadCodeEliminationPass, DecomposeCompositesPass,
-    ExternalizeWeightsPass, FissionLoopsPass, FoldBroadcastPass, FoldConstantsPass,
-    FoldConvertPass, FoldNormWeightsPass, FoldReshapePass, FoldSliceConcatPass, FoldTransposePass,
-    FuseAttentionPass, FuseDequantMatmulPass, FuseElementwisePass, FuseGatedMlpPass, FuseGeluPass,
-    FuseHorizontalDotPass, FuseLayerNormPass, FuseLogSoftmaxPass, FuseLoopsPass, FuseMapReducePass,
-    FuseMatmulEpiloguePass, FuseResidualNormPass, FuseRmsNormPass, FuseRopePass, FuseSoftmaxPass,
-    FuseSwiGluPass, HoistConstantsPass, InlinerPass, IrEditPass, LicmPass, LowerConvToGemmPass,
-    MergeWeightsPass, OptO1Pass, OptO2Pass, OptO3Pass, PackWeightsPass, Pass, PassOptions,
-    PrintOpStatsPass, QuantizeWeightsPass, SccpPass, SimplifyAlgebraicPass, SinkTransposePass,
-    SpecializeShapesPass, StripDebugInfoPass, StructuredPruningPass, SymbolDcePass,
-    TaskArithmeticPass, TopologicalSortPass, VerifyShapesPass,
+    EgraphSimplifyPass, ExternalizeWeightsPass, FissionLoopsPass, FoldBroadcastPass,
+    FoldConstantsPass, FoldConvertPass, FoldNormWeightsPass, FoldReshapePass, FoldSliceConcatPass,
+    FoldTransposePass, FuseAttentionPass, FuseDequantMatmulPass, FuseElementwisePass,
+    FuseGatedMlpPass, FuseGeluPass, FuseHorizontalDotPass, FuseLayerNormPass, FuseLogSoftmaxPass,
+    FuseLoopsPass, FuseMapReducePass, FuseMatmulEpiloguePass, FuseResidualNormPass,
+    FuseRmsNormPass, FuseRopePass, FuseSoftmaxPass, FuseSwiGluPass, HoistConstantsPass,
+    InjectKvCachePass, InlinerPass, IrEditPass, LicmPass, LowerConvToGemmPass, MergeWeightsPass,
+    OptO1Pass, OptO2Pass, OptO3Pass, PackWeightsPass, Pass, PassOptions, PrintOpStatsPass,
+    QuantizeWeightsPass, RematerializePass, SccpPass, ShardSpmdPass, SimplifyAlgebraicPass,
+    SinkTransposePass, SpecializeShapesPass, StripDebugInfoPass, StructuredPruningPass,
+    SymbolDcePass, TaskArithmeticPass, TopologicalSortPass, VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
 use castforge_ir::MergeMethod;
@@ -412,6 +413,52 @@ impl PassRegistry {
                     .and_then(|s| s.parse::<f32>().ok())
                     .unwrap_or(0.0);
                 Ok(Box::new(AutodiffPass { learning_rate }))
+            },
+        );
+        reg.register(
+            "rematerialize",
+            "Recomputes long-lived cheap activations before late consumers to save memory",
+            |opts| {
+                let min_distance = opts
+                    .get("min_distance")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(3);
+                Ok(Box::new(RematerializePass { min_distance }))
+            },
+        );
+        reg.register(
+            "shard-spmd",
+            "Partitions GEMM ops for Megatron-style SPMD tensor parallelism and inserts all_reduce",
+            |opts| {
+                let num_devices = opts
+                    .get("devices")
+                    .or_else(|| opts.get("num_devices"))
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(2);
+                Ok(Box::new(ShardSpmdPass { num_devices }))
+            },
+        );
+        reg.register(
+            "inject-kv-cache",
+            "Injects autoregressive KV-cache updates (castforge.kv_cache_update) before attention",
+            |opts| {
+                let max_seq_len = opts
+                    .get("max_seq_len")
+                    .or_else(|| opts.get("seq_len"))
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(2048);
+                Ok(Box::new(InjectKvCachePass { max_seq_len }))
+            },
+        );
+        reg.register(
+            "egraph-simplify",
+            "Applies distributive algebraic factoring (a*b + a*c -> a*(b+c)) and FMA extraction",
+            |opts| {
+                let fuse_fma = opts
+                    .get("fuse_fma")
+                    .map(|s| s != "false" && s != "0")
+                    .unwrap_or(true);
+                Ok(Box::new(EgraphSimplifyPass { fuse_fma }))
             },
         );
         reg.register(
