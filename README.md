@@ -5,6 +5,16 @@ Visualization, and Code Generation toolset built around an MLIR-compatible Dual-
 Intermediate Representation (**Compute Graph + TensorStore**) with first-class **StableHLO**
 support.
 
+## Documentation
+
+- [**System Architecture & Design Document (`docs/DESIGN.md`)**](docs/DESIGN.md): Deep dive into
+  CastForge's Dual-Plane IR (`Module` + `TensorStore`), modular A-to-B `Translator` architecture,
+  static arena memory planning, polyhedral `LoopModule` IR, multi-architecture SIMD profiles, and
+  pluggable `CodegenBackend` registry.
+- [**Complete Reference of All 91 Compiler Passes (`docs/PASSES.md`)**](docs/PASSES.md): Detailed
+  explanation, CLI options, and IR transformation rules for all 91 Graph IR passes/presets and 7
+  LoopIR passes.
+
 ## Workspace Architecture
 
 - [`crates/castforge-ir`](crates/castforge-ir): Arena-allocated MLIR-compatible IR (`Module`,
