@@ -359,6 +359,67 @@ fn emit_c_hlo_op(
                 }
                 writeln!(out, "        }}")?;
                 writeln!(out, "    }}")?;
+            } else if name == "castforge.fused_softmax" && !inputs.is_empty() {
+                let x = value_ident(module, inputs[0], names, counter);
+                let dims = module.values[inputs[0]]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_else(|| vec![1, res_len]);
+                let cols = *dims.last().unwrap_or(&res_len).max(&1);
+                let rows = (res_len / cols).max(1);
+                writeln!(out, "    for (int r = 0; r < {rows}; ++r) {{")?;
+                writeln!(out, "        float sum = 0.0f;")?;
+                writeln!(out, "        for (int c = 0; c < {cols}; ++c) {{")?;
+                writeln!(out, "            float e = expf({x}[r * {cols} + c]);")?;
+                writeln!(out, "            {res_name}[r * {cols} + c] = e;")?;
+                writeln!(out, "            sum += e;")?;
+                writeln!(out, "        }}")?;
+                writeln!(
+                    out,
+                    "        for (int c = 0; c < {cols}; ++c) \
+                     {res_name}[r * {cols} + c] /= sum;"
+                )?;
+                writeln!(out, "    }}")?;
+            } else if name == "castforge.fused_rmsnorm" && !inputs.is_empty() {
+                let x = value_ident(module, inputs[0], names, counter);
+                let dims = module.values[inputs[0]]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_else(|| vec![1, res_len]);
+                let cols = *dims.last().unwrap_or(&res_len).max(&1);
+                let rows = (res_len / cols).max(1);
+                let eps = match op.attributes.get("eps") {
+                    Some(castforge_ir::Attribute::Float(f)) => *f as f32,
+                    _ => 1e-5_f32,
+                };
+                writeln!(out, "    for (int r = 0; r < {rows}; ++r) {{")?;
+                writeln!(out, "        float sq = 0.0f;")?;
+                writeln!(out, "        for (int c = 0; c < {cols}; ++c) {{")?;
+                writeln!(out, "            float v = {x}[r * {cols} + c];")?;
+                writeln!(out, "            sq += v * v;")?;
+                writeln!(out, "        }}")?;
+                writeln!(
+                    out,
+                    "        float inv = 1.0f / sqrtf(sq / {cols}.0f + {eps:.6}f);"
+                )?;
+                if let Some(&w_id) = inputs.get(1) {
+                    let w = value_ident(module, w_id, names, counter);
+                    writeln!(
+                        out,
+                        "        for (int c = 0; c < {cols}; ++c) \
+                         {res_name}[r * {cols} + c] = \
+                         {x}[r * {cols} + c] * inv * {w}[r * {cols} + c];"
+                    )?;
+                } else {
+                    writeln!(
+                        out,
+                        "        for (int c = 0; c < {cols}; ++c) \
+                         {res_name}[r * {cols} + c] = {x}[r * {cols} + c] * inv;"
+                    )?;
+                }
+                writeln!(out, "    }}")?;
             } else {
                 let src = value_ident(module, inputs[0], names, counter);
                 writeln!(

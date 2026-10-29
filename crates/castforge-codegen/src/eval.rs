@@ -387,6 +387,62 @@ fn eval_stablehlo_op(
                         }
                     })
                     .collect()
+            } else if name == "castforge.fused_softmax" && !inputs.is_empty() {
+                let x = get_v(inputs[0]);
+                let dims = module.values[res_val]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_else(|| vec![1, res_len]);
+                let cols = *dims.last().unwrap_or(&res_len).max(&1);
+                let rows = (res_len / cols).max(1);
+                let mut out = vec![0.0_f32; res_len];
+                for r in 0..rows {
+                    let row_slice = &x[r * cols..(r + 1) * cols];
+                    let max_v = row_slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum = 0.0_f32;
+                    for c in 0..cols {
+                        let e = (row_slice[c] - max_v).exp();
+                        out[r * cols + c] = e;
+                        sum += e;
+                    }
+                    for c in 0..cols {
+                        out[r * cols + c] /= sum;
+                    }
+                }
+                out
+            } else if name == "castforge.fused_rmsnorm" && !inputs.is_empty() {
+                let x = get_v(inputs[0]);
+                let w_opt = inputs.get(1).map(|&v| get_v(v));
+                let eps = match op.attributes.get("eps") {
+                    Some(castforge_ir::Attribute::Float(f)) => *f as f32,
+                    _ => 1e-5_f32,
+                };
+                let dims = module.values[res_val]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_else(|| vec![1, res_len]);
+                let cols = *dims.last().unwrap_or(&res_len).max(&1);
+                let rows = (res_len / cols).max(1);
+                let mut out = vec![0.0_f32; res_len];
+                for r in 0..rows {
+                    let mut sq_sum = 0.0_f32;
+                    for c in 0..cols {
+                        let v = x[r * cols + c];
+                        sq_sum += v * v;
+                    }
+                    let inv_rms = 1.0_f32 / (sq_sum / (cols as f32) + eps).sqrt();
+                    for c in 0..cols {
+                        let idx = r * cols + c;
+                        let w_val = w_opt
+                            .as_ref()
+                            .and_then(|w| w.get(idx).or_else(|| w.get(c)).copied())
+                            .unwrap_or(1.0);
+                        out[idx] = x[idx] * inv_rms * w_val;
+                    }
+                }
+                out
             } else {
                 get_v(inputs[0])
             }

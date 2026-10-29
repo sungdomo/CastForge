@@ -1,4 +1,4 @@
-use castforge_codegen::{CodegenTarget, generate_code};
+use castforge_codegen::{CodegenTarget, generate_code, verify_module_numerics};
 use castforge_mlir::{parse_mlir, print_mlir};
 use castforge_passes::{PassManager, PassRegistry};
 
@@ -100,4 +100,93 @@ fn test_fold_norm_weights() {
     // row 0 scaled by 2.0 -> [2.0, 4.0], row 1 scaled by 3.0 -> [12.0, 15.0]
     assert!(!printed.contains("stablehlo.multiply"));
     assert!(printed.contains("[[2.0, 4.0], [12.0, 15.0]]"));
+}
+
+const SOFTMAX_MLIR: &str = r#"
+module @softmax_demo {
+  func.func @attn_softmax(%x: tensor<2x4xf32>) -> tensor<2x4xf32> {
+    %zero = stablehlo.constant dense<0.0> : tensor<f32>
+    %exp = stablehlo.exponential %x : tensor<2x4xf32>
+    %sum = stablehlo.reduce %exp, %zero
+      {dimensions = [1], reducer = "stablehlo.add"}
+      : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+    %denom = stablehlo.broadcast_in_dim %sum, dims = [0]
+      : (tensor<2xf32>) -> tensor<2x4xf32>
+    %out = stablehlo.divide %exp, %denom : tensor<2x4xf32>
+    func.return %out : tensor<2x4xf32>
+  }
+}
+"#;
+
+#[test]
+fn test_fuse_softmax_and_decompose_composites() {
+    let before = parse_mlir(SOFTMAX_MLIR).expect("parse softmax MLIR");
+    let mut fused = before.clone();
+    let registry = PassRegistry::with_builtin_passes();
+
+    let mut pm =
+        PassManager::from_pipeline_str(&registry, "fuse-softmax").expect("fuse-softmax pipeline");
+    let res = pm.run(&mut fused).expect("run fuse-softmax");
+    assert!(res[0].changed);
+
+    let printed = print_mlir(&fused);
+    assert!(printed.contains("castforge.fused_softmax"));
+    assert!(!printed.contains("stablehlo.divide"));
+
+    let rep = verify_module_numerics(&before, &fused, 1e-5).expect("verify softmax numerics");
+    assert!(rep.passed, "max_abs_diff = {}", rep.max_abs_diff);
+
+    // Decompose back to primitive StableHLO ops and verify numerical equivalence again
+    let mut decomposed = fused.clone();
+    let mut dec_pm = PassManager::from_pipeline_str(&registry, "decompose-composites")
+        .expect("decompose pipeline");
+    dec_pm.run(&mut decomposed).expect("run decompose");
+
+    let dec_printed = print_mlir(&decomposed);
+    assert!(!dec_printed.contains("castforge.fused_softmax"));
+    assert!(dec_printed.contains("stablehlo.divide"));
+
+    let rep2 = verify_module_numerics(&before, &decomposed, 1e-5).expect("verify decomposed");
+    assert!(rep2.passed);
+}
+
+const RMSNORM_MLIR: &str = r#"
+module @rmsnorm_demo {
+  func.func @rmsnorm(%x: tensor<2x4xf32>, %weight: tensor<2x4xf32>) -> tensor<2x4xf32> {
+    %zero = stablehlo.constant dense<0.0> : tensor<f32>
+    %four = stablehlo.constant dense<4.0> : tensor<2xf32>
+    %eps = stablehlo.constant dense<0.00001> : tensor<2xf32>
+    %sq = stablehlo.multiply %x, %x : tensor<2x4xf32>
+    %sum = stablehlo.reduce %sq, %zero
+      {dimensions = [1], reducer = "stablehlo.add"}
+      : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+    %mean = stablehlo.divide %sum, %four : tensor<2xf32>
+    %var_eps = stablehlo.add %mean, %eps : tensor<2xf32>
+    %inv_rms = stablehlo.rsqrt %var_eps : tensor<2xf32>
+    %inv_bcast = stablehlo.broadcast_in_dim %inv_rms, dims = [0]
+      : (tensor<2xf32>) -> tensor<2x4xf32>
+    %normed = stablehlo.multiply %x, %inv_bcast : tensor<2x4xf32>
+    %scaled = stablehlo.multiply %normed, %weight : tensor<2x4xf32>
+    func.return %scaled : tensor<2x4xf32>
+  }
+}
+"#;
+
+#[test]
+fn test_fuse_rmsnorm_and_numeric_verification() {
+    let before = parse_mlir(RMSNORM_MLIR).expect("parse rmsnorm MLIR");
+    let mut fused = before.clone();
+    let registry = PassRegistry::with_builtin_passes();
+
+    let mut pm =
+        PassManager::from_pipeline_str(&registry, "fuse-rmsnorm").expect("fuse-rmsnorm pipeline");
+    let res = pm.run(&mut fused).expect("run fuse-rmsnorm");
+    assert!(res[0].changed);
+
+    let printed = print_mlir(&fused);
+    assert!(printed.contains("castforge.fused_rmsnorm"));
+    assert!(!printed.contains("stablehlo.rsqrt"));
+
+    let rep = verify_module_numerics(&before, &fused, 1e-5).expect("verify rmsnorm numerics");
+    assert!(rep.passed, "max_abs_diff = {}", rep.max_abs_diff);
 }

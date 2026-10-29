@@ -455,6 +455,95 @@ fn emit_rust_hlo_op(
                 }
                 writeln!(out, "        }}")?;
                 writeln!(out, "    }}")?;
+            } else if name == "castforge.fused_softmax" && !inputs.is_empty() {
+                let dims = module.values[res_val]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_else(|| vec![1, res_len]);
+                let cols = *dims.last().unwrap_or(&res_len).max(&1);
+                let rows = (res_len / cols).max(1);
+                let src = r_idx(
+                    module,
+                    plan,
+                    inputs[0],
+                    &format!("r * {cols} + c"),
+                    names,
+                    counter,
+                );
+                let dst = r_idx(
+                    module,
+                    plan,
+                    res_val,
+                    &format!("r * {cols} + c"),
+                    names,
+                    counter,
+                );
+                writeln!(out, "    for r in 0..{rows} {{")?;
+                writeln!(out, "        let mut sum = 0.0_f32;")?;
+                writeln!(out, "        for c in 0..{cols} {{")?;
+                writeln!(out, "            let e = ({src}).exp();")?;
+                writeln!(out, "            {dst} = e;")?;
+                writeln!(out, "            sum += e;")?;
+                writeln!(out, "        }}")?;
+                writeln!(out, "        for c in 0..{cols} {{")?;
+                writeln!(out, "            {dst} /= sum;")?;
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
+            } else if name == "castforge.fused_rmsnorm" && !inputs.is_empty() {
+                let dims = module.values[res_val]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_else(|| vec![1, res_len]);
+                let cols = *dims.last().unwrap_or(&res_len).max(&1);
+                let rows = (res_len / cols).max(1);
+                let eps = match op.attributes.get("eps") {
+                    Some(castforge_ir::Attribute::Float(f)) => *f as f32,
+                    _ => 1e-5_f32,
+                };
+                let src = r_idx(
+                    module,
+                    plan,
+                    inputs[0],
+                    &format!("r * {cols} + c"),
+                    names,
+                    counter,
+                );
+                let dst = r_idx(
+                    module,
+                    plan,
+                    res_val,
+                    &format!("r * {cols} + c"),
+                    names,
+                    counter,
+                );
+                writeln!(out, "    for r in 0..{rows} {{")?;
+                writeln!(out, "        let mut sq = 0.0_f32;")?;
+                writeln!(out, "        for c in 0..{cols} {{")?;
+                writeln!(out, "            let v = {src};")?;
+                writeln!(out, "            sq += v * v;")?;
+                writeln!(out, "        }}")?;
+                writeln!(
+                    out,
+                    "        let inv = 1.0_f32 / (sq / {cols}.0_f32 + {eps:?}_f32).sqrt();"
+                )?;
+                writeln!(out, "        for c in 0..{cols} {{")?;
+                if let Some(&w_id) = inputs.get(1) {
+                    let w = r_idx(
+                        module,
+                        plan,
+                        w_id,
+                        &format!("r * {cols} + c"),
+                        names,
+                        counter,
+                    );
+                    writeln!(out, "            {dst} = ({src}) * inv * ({w});")?;
+                } else {
+                    writeln!(out, "            {dst} = ({src}) * inv;")?;
+                }
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
             } else {
                 let src = r_idx(module, plan, inputs[0], "i", names, counter);
                 let dst = r_idx(module, plan, res_val, "i", names, counter);
