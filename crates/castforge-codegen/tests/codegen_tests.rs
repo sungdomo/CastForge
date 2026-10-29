@@ -955,3 +955,84 @@ module @parallel_branches {
     let dec_rep = verify_module_numerics(&before, &decomposed, 1e-5).expect("verify decomposed");
     assert!(dec_rep.passed);
 }
+
+#[test]
+fn test_modular_a_to_b_translator_chain_and_loop_ir_passes() {
+    use castforge_codegen::CodegenTranslator;
+    use castforge_ir::{Payload, TranslatorChain};
+    use castforge_mlir::MlirParseTranslator;
+    use castforge_passes::{
+        PassTranslator, PermuteLoopsPass, TileLoopsPass, UnrollLoopsPass, VectorizeLoopsPass,
+    };
+
+    let mlir = r#"
+module @chain_demo {
+  func.func @main(%x: tensor<4x4xf32>, %w: tensor<4x4xf32>) -> tensor<4x4xf32> {
+    %y = stablehlo.dot_general %x, %w, contracting_dims = [1] x [0]
+      : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xf32>
+    func.return %y : tensor<4x4xf32>
+  }
+}
+"#;
+    // 1. Test pipe-separated IR pass pipeline (A -> B -> C -> D) stamping loop attributes on IR
+    let before = parse_mlir(mlir).expect("parse chain_demo");
+    let mut scheduled = before.clone();
+    let registry = PassRegistry::with_builtin_passes();
+    let mut pm = PassManager::from_pipeline_str(
+        &registry,
+        "tile-loops(size=2) | unroll-loops(double_buffer=true) | vectorize-loops(isa=avx2)",
+    )
+    .expect("pipe-separated loop passes");
+    let res = pm.run(&mut scheduled).expect("run loop schedule passes");
+    assert!(res.iter().all(|r| r.changed));
+
+    // Codegen with default TargetConfig reads the schedule attributes directly from the IR
+    let rust_scheduled = generate_code(&scheduled, CodegenTarget::Rust).expect("rust from ir");
+    assert!(rust_scheduled.contains("for m0 in (0..4).step_by(2)"));
+    assert!(rust_scheduled.contains("[loop:double_buffer(stages=2, ping_pong"));
+    assert!(rust_scheduled.contains("_mm256_fmadd_ps"));
+
+    let c_scheduled = generate_code(&scheduled, CodegenTarget::C).expect("c from ir");
+    assert!(c_scheduled.contains("for (int m0 = 0; m0 < 4; m0 += 2)"));
+    assert!(c_scheduled.contains("[loop:double_buffer(stages=2, ping_pong"));
+    assert!(c_scheduled.contains("#include <immintrin.h>"));
+
+    // 2. Test unified TranslatorChain concatenating Text -> IR -> Loop Passes -> Rust Codegen
+    let mut chain = TranslatorChain::new()
+        .then(MlirParseTranslator)
+        .then(PassTranslator(PermuteLoopsPass {
+            order: "mkn".to_string(),
+            collapse: false,
+            skew: false,
+        }))
+        .then(PassTranslator(TileLoopsPass {
+            tile_m: 0,
+            tile_n: 0,
+            tile_k: 0,
+            l2_tile: 0,
+            reg_m: 0,
+            reg_n: 0,
+        }))
+        .then(PassTranslator(UnrollLoopsPass {
+            factor: 1,
+            prefetch: 2,
+            split_k: 1,
+            double_buffer: false,
+        }))
+        .then(PassTranslator(VectorizeLoopsPass {
+            width: 8,
+            isa: "avx2".to_string(),
+            parallel: true,
+        }))
+        .then(CodegenTranslator::new(CodegenTarget::Rust));
+
+    assert_eq!(chain.len(), 6);
+    let out_payload = chain
+        .execute(Payload::Text(mlir.to_string()))
+        .expect("execute concatenated translator chain");
+    let rust_out = out_payload.into_text().expect("text output");
+    assert!(rust_out.contains("[loop:interchange(MKN)]"));
+    assert!(rust_out.contains("[loop:software_pipeline(prefetch_dist=2)]"));
+    assert!(rust_out.contains("[loop:parallel(collapse=2, schedule=static)]"));
+    assert!(rust_out.contains("_mm256_fmadd_ps"));
+}

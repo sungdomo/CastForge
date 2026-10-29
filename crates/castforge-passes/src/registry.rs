@@ -9,10 +9,11 @@ use crate::{
     FuseRmsNormPass, FuseRopePass, FuseSoftmaxPass, FuseSwiGluPass, HoistConstantsPass,
     InjectKvCachePass, InlinerPass, IrEditPass, LicmPass, LowerConvToGemmPass, MergeWeightsPass,
     MixedPrecisionPass, OptO1Pass, OptO2Pass, OptO3Pass, PackWeightsPass, Pass, PassOptions,
-    PrintOpStatsPass, QuantizeWeightsPass, RematerializePass, SccpPass, ScheduleStreamsPass,
-    ShardSpmdPass, SimplifyAlgebraicPass, SinkTransposePass, SpecializeShapesPass,
-    StripDebugInfoPass, StructuredPruningPass, SymbolDcePass, TaskArithmeticPass,
-    TopologicalSortPass, VerifyShapesPass,
+    PermuteLoopsPass, PrintOpStatsPass, QuantizeWeightsPass, RematerializePass, SccpPass,
+    ScheduleStreamsPass, ShardSpmdPass, SimplifyAlgebraicPass, SinkTransposePass,
+    SpecializeShapesPass, StripDebugInfoPass, StructuredPruningPass, SymbolDcePass,
+    TaskArithmeticPass, TileLoopsPass, TopologicalSortPass, UnrollLoopsPass, VectorizeLoopsPass,
+    VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
 use castforge_ir::{DType, MergeMethod};
@@ -505,6 +506,134 @@ impl PassRegistry {
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(2);
                 Ok(Box::new(ScheduleStreamsPass { num_streams }))
+            },
+        );
+        reg.register(
+            "tile-loops",
+            "Translates GEMM ops by attaching L1/L2 cache and register tiling schedule attributes",
+            |opts| {
+                let size = opts
+                    .get("size")
+                    .or_else(|| opts.get("tile"))
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(16);
+                let tile_m = opts
+                    .get("tile_m")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(size);
+                let tile_n = opts
+                    .get("tile_n")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(size);
+                let tile_k = opts
+                    .get("tile_k")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(size);
+                let l2_tile = opts
+                    .get("l2_size")
+                    .or_else(|| opts.get("l2_tile"))
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let reg = opts
+                    .get("reg_tile")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let reg_m = opts
+                    .get("reg_m")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(reg);
+                let reg_n = opts
+                    .get("reg_n")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(reg);
+                Ok(Box::new(TileLoopsPass {
+                    tile_m,
+                    tile_n,
+                    tile_k,
+                    l2_tile,
+                    reg_m,
+                    reg_n,
+                }))
+            },
+        );
+        reg.register(
+            "permute-loops",
+            "Translates loop nests by attaching permutation (mnk/mkn/nkm), collapse, or skew attrs",
+            |opts| {
+                let order = opts
+                    .get("order")
+                    .cloned()
+                    .unwrap_or_else(|| "mkn".to_string());
+                let collapse = opts
+                    .get("collapse")
+                    .map(|s| s == "true" || s == "1")
+                    .unwrap_or(false);
+                let skew = opts
+                    .get("skew")
+                    .map(|s| s == "true" || s == "1")
+                    .unwrap_or(false);
+                Ok(Box::new(PermuteLoopsPass {
+                    order,
+                    collapse,
+                    skew,
+                }))
+            },
+        );
+        reg.register(
+            "unroll-loops",
+            "Translates reduction loops by attaching unroll, prefetch, split-k, and double-buffer",
+            |opts| {
+                let factor = opts
+                    .get("factor")
+                    .or_else(|| opts.get("unroll"))
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(4);
+                let prefetch = opts
+                    .get("prefetch")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let split_k = opts
+                    .get("split_k")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(1);
+                let double_buffer = opts
+                    .get("double_buffer")
+                    .map(|s| s == "true" || s == "1")
+                    .unwrap_or(false);
+                Ok(Box::new(UnrollLoopsPass {
+                    factor,
+                    prefetch,
+                    split_k,
+                    double_buffer,
+                }))
+            },
+        );
+        reg.register(
+            "vectorize-loops",
+            "Translates compute ops by attaching SIMD vectorization, ISA (avx2/neon), and parallel",
+            |opts| {
+                let isa = opts
+                    .get("isa")
+                    .cloned()
+                    .unwrap_or_else(|| "scalar".to_string());
+                let default_w = if isa.eq_ignore_ascii_case("neon") {
+                    4
+                } else {
+                    8
+                };
+                let width = opts
+                    .get("width")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(default_w);
+                let parallel = opts
+                    .get("parallel")
+                    .map(|s| s == "true" || s == "1")
+                    .unwrap_or(false);
+                Ok(Box::new(VectorizeLoopsPass {
+                    width,
+                    isa,
+                    parallel,
+                }))
             },
         );
         reg.register(

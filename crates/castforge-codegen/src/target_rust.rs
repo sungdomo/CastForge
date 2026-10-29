@@ -14,7 +14,9 @@ pub fn emit_rust_module(module: &Module) -> Result<String> {
 }
 
 /// Standalone Rust Code Generator parameterized by `TargetConfig`.
-pub fn emit_rust_module_with_config(module: &Module, config: &TargetConfig) -> Result<String> {
+pub fn emit_rust_module_with_config(module: &Module, base_cfg: &TargetConfig) -> Result<String> {
+    let mod_cfg = base_cfg.with_module_attributes(module);
+    let config = &mod_cfg;
     let mut out = String::new();
     let plan = build_memory_plan(module);
     let mod_name = module.name.as_deref().unwrap_or("castforge_model");
@@ -286,6 +288,8 @@ fn emit_rust_hlo_op(
     out: &mut String,
 ) -> Result<()> {
     let op = &module.ops[op_id];
+    let op_config = config.with_op_attributes(op);
+    let config = &op_config;
     if let Some(Attribute::Int(sid)) = op.attributes.get("stream_id") {
         writeln!(out, "    // [stream:launch(stream_id={sid})]")?;
     }

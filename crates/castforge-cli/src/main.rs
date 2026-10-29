@@ -1,19 +1,22 @@
 use anyhow::{Context, Result};
 use castforge_codegen::{
-    CodegenTarget, GemmLoopOrder, HardwareRoofline, TargetConfig,
+    CodegenTarget, CodegenTranslator, GemmLoopOrder, HardwareRoofline, TargetConfig,
     analyze_module_cost_with_roofline, autotune_module, autotune_module_jit, build_memory_plan,
     evaluate_module, generate_code_with_config, generate_synthetic_inputs, verify_module_numerics,
 };
+use castforge_ir::{Payload, TranslatorChain};
 use castforge_mlir::{
+    GgufImportTranslator, MlirParseTranslator, MlirPrintTranslator, OnnxImportTranslator,
     PrintOptions, import_gguf_file, import_onnx_file, parse_mlir, print_mlir,
     print_mlir_with_options,
 };
-use castforge_passes::{PassManager, PassRegistry};
+use castforge_passes::{PassManager, PassRegistry, parse_pass_spec_item, split_pipeline_spec};
 use castforge_viz::{
-    TimelineFrame, VizFormat, build_graph_json, render_module, render_timeline_html,
+    TimelineFrame, VizFormat, VizTranslator, build_graph_json, render_module, render_timeline_html,
 };
 use clap::{Parser, Subcommand};
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -31,10 +34,10 @@ struct Cli {
 enum Commands {
     /// Run a configurable pipeline of IR transformation passes (via -p or --config)
     Opt {
-        /// Input MLIR file path
-        input: PathBuf,
+        /// Input MLIR file path (reads from stdin if omitted or "-")
+        input: Option<PathBuf>,
 
-        /// Comma-separated pass pipeline (e.g. "fold-transpose,fold-reshape,cse,dce")
+        /// Comma- or pipe-separated pass pipeline (e.g. "fold-transpose | cse | dce")
         #[arg(short = 'p', long = "passes")]
         passes: Option<String>,
 
@@ -73,8 +76,8 @@ enum Commands {
 
     /// Execute an MLIR module directly in the reference interpreter and verify/print outputs
     Run {
-        /// Input MLIR file path
-        input: PathBuf,
+        /// Input MLIR file path (reads from stdin if omitted or "-")
+        input: Option<PathBuf>,
 
         /// Optional pass pipeline to run and numerically verify against the unoptimized module
         #[arg(short = 'p', long = "passes")]
@@ -91,8 +94,8 @@ enum Commands {
 
     /// Parse and round-trip an MLIR file (pretty or --generic form)
     Parse {
-        /// Input MLIR file path
-        input: PathBuf,
+        /// Input MLIR file path (reads from stdin if omitted or "-")
+        input: Option<PathBuf>,
 
         /// Emit canonical MLIR Generic Form
         #[arg(long)]
@@ -101,8 +104,8 @@ enum Commands {
 
     /// Export the IR computation graph or interactive Pass Timeline Debugger
     Viz {
-        /// Input MLIR file path
-        input: PathBuf,
+        /// Input MLIR file path (reads from stdin if omitted or "-")
+        input: Option<PathBuf>,
 
         /// Visualization format: mermaid, dot, json, or html
         #[arg(short = 'f', long = "format", default_value = "mermaid")]
@@ -119,8 +122,8 @@ enum Commands {
 
     /// Generate executable source code (rust, c, wgsl) from an MLIR module
     Codegen {
-        /// Input MLIR file path
-        input: PathBuf,
+        /// Input MLIR file path (reads from stdin if omitted or "-")
+        input: Option<PathBuf>,
 
         /// Codegen target: rust, c, or wgsl
         #[arg(short = 't', long = "target", default_value = "rust")]
@@ -197,8 +200,8 @@ enum Commands {
 
     /// Analyze FLOPs, memory bandwidth traffic, arithmetic intensity, and Roofline bottlenecks
     Profile {
-        /// Input MLIR file path
-        input: PathBuf,
+        /// Input MLIR file path (reads from stdin if omitted or "-")
+        input: Option<PathBuf>,
 
         /// Optional pass pipeline to compare before vs. after Roofline metrics
         #[arg(short = 'p', long = "passes")]
@@ -215,8 +218,8 @@ enum Commands {
 
     /// Auto-tune polyhedral/HPC loop schedules using the Roofline & cache model
     Autotune {
-        /// Input MLIR file path
-        input: PathBuf,
+        /// Input MLIR file path (reads from stdin if omitted or "-")
+        input: Option<PathBuf>,
 
         /// Optional pass pipeline to run before schedule auto-tuning
         #[arg(short = 'p', long = "passes")]
@@ -261,6 +264,22 @@ enum Commands {
         save_weights: Option<PathBuf>,
     },
 
+    /// Execute a concatenated sequence of modular A-to-B translators (Frontend -> IR -> Backend)
+    #[command(visible_alias = "pipe")]
+    Chain {
+        /// Input file path (reads from stdin if omitted or "-")
+        input: Option<PathBuf>,
+
+        /// Concatenated A-to-B translator stages separated by `|` or `,`
+        /// (e.g. "fuse-attention | tile-loops(size=16) | vectorize-loops(isa=avx2) | codegen-rust")
+        #[arg(short = 's', long = "stages")]
+        stages: String,
+
+        /// Optional output file path (defaults to stdout)
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
+    },
+
     /// List all registered transformation and optimization passes
     ListPasses,
 
@@ -287,8 +306,7 @@ fn main() -> Result<()> {
             verify_numerics,
             tolerance,
         } => {
-            let src = fs::read_to_string(&input)
-                .with_context(|| format!("Failed to read {}", input.display()))?;
+            let src = read_input_text(input.as_ref())?;
             let mut module = parse_mlir(&src)?;
             if let Some(w_path) = weights {
                 let count = module
@@ -376,8 +394,7 @@ fn main() -> Result<()> {
             weights,
             tolerance,
         } => {
-            let src = fs::read_to_string(&input)
-                .with_context(|| format!("Failed to read {}", input.display()))?;
+            let src = read_input_text(input.as_ref())?;
             let mut module = parse_mlir(&src)?;
             if let Some(w_path) = weights {
                 module.tensor_store.load_safetensors_file(&w_path)?;
@@ -403,8 +420,7 @@ fn main() -> Result<()> {
         }
 
         Commands::Parse { input, generic } => {
-            let src = fs::read_to_string(&input)
-                .with_context(|| format!("Failed to read {}", input.display()))?;
+            let src = read_input_text(input.as_ref())?;
             let module = parse_mlir(&src)?;
             module.verify()?;
             let formatted = print_mlir_with_options(
@@ -423,8 +439,7 @@ fn main() -> Result<()> {
             passes,
             output,
         } => {
-            let src = fs::read_to_string(&input)
-                .with_context(|| format!("Failed to read {}", input.display()))?;
+            let src = read_input_text(input.as_ref())?;
             let mut module = parse_mlir(&src)?;
 
             let fmt = match format.to_lowercase().as_str() {
@@ -505,8 +520,7 @@ fn main() -> Result<()> {
             double_buffer,
             simd_isa,
         } => {
-            let src = fs::read_to_string(&input)
-                .with_context(|| format!("Failed to read {}", input.display()))?;
+            let src = read_input_text(input.as_ref())?;
             let mut module = parse_mlir(&src)?;
             if let Some(w_path) = weights {
                 module
@@ -572,8 +586,7 @@ fn main() -> Result<()> {
             peak_gflops,
             peak_bw_gbps,
         } => {
-            let src = fs::read_to_string(&input)
-                .with_context(|| format!("Failed to read {}", input.display()))?;
+            let src = read_input_text(input.as_ref())?;
             let mut module = parse_mlir(&src)?;
             let roofline = HardwareRoofline::new(peak_gflops, peak_bw_gbps);
             let before = analyze_module_cost_with_roofline(&module, &roofline);
@@ -616,8 +629,7 @@ fn main() -> Result<()> {
             top_k,
             bench_jit,
         } => {
-            let src = fs::read_to_string(&input)
-                .with_context(|| format!("Failed to read {}", input.display()))?;
+            let src = read_input_text(input.as_ref())?;
             let mut module = parse_mlir(&src)?;
             if let Some(spec) = passes {
                 let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
@@ -666,6 +678,43 @@ fn main() -> Result<()> {
             }
         }
 
+        Commands::Chain {
+            input,
+            stages,
+            output,
+        } => {
+            let (mut chain, first_in, last_out) = build_translator_chain(&registry, &stages)?;
+            for (idx, desc) in chain.describe_stages().iter().enumerate() {
+                eprintln!("[castforge:chain] stage #{}: {desc}", idx + 1);
+            }
+            let initial = if first_in == "bytes" {
+                let bytes = match input {
+                    Some(p) if p.as_os_str() != "-" => {
+                        fs::read(&p).with_context(|| format!("Failed to read {}", p.display()))?
+                    }
+                    _ => {
+                        let mut b = Vec::new();
+                        std::io::stdin().read_to_end(&mut b)?;
+                        b
+                    }
+                };
+                Payload::Bytes(bytes)
+            } else {
+                Payload::Text(read_input_text(input.as_ref())?)
+            };
+            let result = chain.execute(initial)?;
+            let text_out = match (result, last_out) {
+                (Payload::Text(s), _) => s,
+                (Payload::Ir(m), _) => print_mlir(&m),
+                (Payload::Bytes(b), _) => format!("({} bytes)", b.len()),
+            };
+            if let Some(out_path) = output {
+                fs::write(&out_path, text_out)?;
+            } else {
+                print!("{text_out}");
+            }
+        }
+
         Commands::ListPasses => {
             println!("Available CastForge Passes:");
             println!("{:<20} DESCRIPTION", "PASS NAME");
@@ -677,11 +726,8 @@ fn main() -> Result<()> {
 
         Commands::DirectPass(args) => {
             let pass_name = &args[0];
-            let input_path = args
-                .get(1)
-                .ok_or_else(|| anyhow::anyhow!("Usage: castforge {pass_name} <input.mlir>"))?;
-            let src = fs::read_to_string(input_path)
-                .with_context(|| format!("Failed to read {input_path}"))?;
+            let input_path = args.get(1).map(PathBuf::from);
+            let src = read_input_text(input_path.as_ref())?;
             let mut module = parse_mlir(&src)?;
             let mut pm = PassManager::from_pipeline_str(&registry, pass_name)?;
             let results = pm.run(&mut module)?;
@@ -698,4 +744,133 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn read_input_text(input: Option<&PathBuf>) -> Result<String> {
+    match input {
+        Some(path) if path.as_os_str() != "-" => {
+            fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))
+        }
+        _ => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("Failed to read from stdin")?;
+            Ok(buf)
+        }
+    }
+}
+
+fn build_translator_chain(
+    registry: &PassRegistry,
+    spec: &str,
+) -> Result<(TranslatorChain, &'static str, &'static str)> {
+    let mut chain = TranslatorChain::new();
+    let items: Vec<&str> = split_pipeline_spec(spec)
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if items.is_empty() {
+        anyhow::bail!("Empty translator chain specification");
+    }
+
+    let (first_name, _) = parse_pass_spec_item(items[0])?;
+    let starts_with_frontend = matches!(
+        first_name.as_str(),
+        "parse-mlir" | "parse" | "import-onnx" | "import-gguf"
+    );
+    let mut first_in = "text";
+    if !starts_with_frontend {
+        chain.push(Box::new(MlirParseTranslator));
+    }
+
+    let mut last_out = "ir";
+    for (idx, item) in items.iter().enumerate() {
+        let (name, opts) = parse_pass_spec_item(item)?;
+        match name.as_str() {
+            "parse-mlir" | "parse" => {
+                if idx == 0 {
+                    first_in = "text";
+                }
+                chain.push(Box::new(MlirParseTranslator));
+                last_out = "ir";
+            }
+            "import-onnx" => {
+                if idx == 0 {
+                    first_in = "text";
+                }
+                chain.push(Box::new(OnnxImportTranslator));
+                last_out = "ir";
+            }
+            "import-gguf" => {
+                if idx == 0 {
+                    first_in = "bytes";
+                }
+                chain.push(Box::new(GgufImportTranslator));
+                last_out = "ir";
+            }
+            "print-mlir" | "print" => {
+                let generic = opts
+                    .get("generic")
+                    .map(|v| v == "true" || v == "1")
+                    .unwrap_or(false);
+                chain.push(Box::new(MlirPrintTranslator {
+                    options: PrintOptions {
+                        generic_form: generic,
+                        print_locations: false,
+                    },
+                }));
+                last_out = "text";
+            }
+            "codegen" | "codegen-rust" | "codegen-c" | "codegen-wgsl" => {
+                let tgt_str =
+                    opts.get("target")
+                        .map(String::as_str)
+                        .unwrap_or(match name.as_str() {
+                            "codegen-c" => "c",
+                            "codegen-wgsl" => "wgsl",
+                            _ => "rust",
+                        });
+                let tgt = match tgt_str.to_ascii_lowercase().as_str() {
+                    "c" | "c99" => CodegenTarget::C,
+                    "wgsl" | "webgpu" => CodegenTarget::Wgsl,
+                    _ => CodegenTarget::Rust,
+                };
+                chain.push(Box::new(CodegenTranslator::new(tgt)));
+                last_out = "text";
+            }
+            "viz" | "viz-mermaid" | "viz-dot" | "viz-json" | "viz-html" => {
+                let fmt_str =
+                    opts.get("format")
+                        .map(String::as_str)
+                        .unwrap_or(match name.as_str() {
+                            "viz-dot" => "dot",
+                            "viz-json" => "json",
+                            "viz-html" => "html",
+                            _ => "mermaid",
+                        });
+                let fmt = match fmt_str.to_ascii_lowercase().as_str() {
+                    "dot" | "graphviz" => VizFormat::Dot,
+                    "json" => VizFormat::Json,
+                    "html" => VizFormat::Html,
+                    _ => VizFormat::Mermaid,
+                };
+                chain.push(Box::new(VizTranslator { format: fmt }));
+                last_out = "text";
+            }
+            pass_name => {
+                let pass = registry.create_pass(pass_name, &opts)?;
+                chain.push(Box::new(pass));
+                last_out = "ir";
+            }
+        }
+    }
+
+    if last_out == "ir" {
+        chain.push(Box::new(MlirPrintTranslator::default()));
+        last_out = "text";
+    }
+
+    Ok((chain, first_in, last_out))
 }

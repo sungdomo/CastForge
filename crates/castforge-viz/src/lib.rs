@@ -78,6 +78,33 @@ pub fn render_module(module: &Module, format: VizFormat) -> String {
     }
 }
 
+/// A-to-B Visualization Translator (`Ir(Module) -> Text(Mermaid | DOT | JSON | HTML)`).
+pub struct VizTranslator {
+    pub format: VizFormat,
+}
+
+impl castforge_ir::Translator for VizTranslator {
+    fn name(&self) -> &str {
+        "viz"
+    }
+
+    fn input_kind(&self) -> &'static str {
+        "ir"
+    }
+
+    fn output_kind(&self) -> &'static str {
+        "text"
+    }
+
+    fn translate(&mut self, input: castforge_ir::Payload) -> anyhow::Result<castforge_ir::Payload> {
+        let module = input.into_ir()?;
+        Ok(castforge_ir::Payload::Text(render_module(
+            &module,
+            self.format,
+        )))
+    }
+}
+
 fn classify_op_category(op_name: &str) -> &'static str {
     if op_name.contains("constant") || op_name.contains("iota") {
         "constant"

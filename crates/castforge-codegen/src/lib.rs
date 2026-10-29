@@ -55,6 +55,51 @@ pub fn generate_code_with_config(
     }
 }
 
+/// A-to-B Backend Codegen Translator (`Ir(Module) -> Text(Rust | C99 | WGSL)`).
+pub struct CodegenTranslator {
+    pub target: CodegenTarget,
+    pub config: TargetConfig,
+}
+
+impl CodegenTranslator {
+    /// Creates a [`CodegenTranslator`] for `target` with default [`TargetConfig`].
+    pub fn new(target: CodegenTarget) -> Self {
+        Self {
+            target,
+            config: TargetConfig::default(),
+        }
+    }
+
+    /// Creates a [`CodegenTranslator`] for `target` and `config`.
+    pub fn with_config(target: CodegenTarget, config: TargetConfig) -> Self {
+        Self { target, config }
+    }
+}
+
+impl castforge_ir::Translator for CodegenTranslator {
+    fn name(&self) -> &str {
+        match self.target {
+            CodegenTarget::Rust => "codegen-rust",
+            CodegenTarget::C => "codegen-c",
+            CodegenTarget::Wgsl => "codegen-wgsl",
+        }
+    }
+
+    fn input_kind(&self) -> &'static str {
+        "ir"
+    }
+
+    fn output_kind(&self) -> &'static str {
+        "text"
+    }
+
+    fn translate(&mut self, input: castforge_ir::Payload) -> Result<castforge_ir::Payload> {
+        let module = input.into_ir()?;
+        let code = generate_code_with_config(&module, self.target, &self.config)?;
+        Ok(castforge_ir::Payload::Text(code))
+    }
+}
+
 pub(crate) fn sanitize_ident(raw: &str) -> String {
     let cleaned: String = raw
         .chars()

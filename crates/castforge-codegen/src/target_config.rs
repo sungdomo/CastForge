@@ -231,4 +231,75 @@ impl TargetConfig {
     pub fn is_register_tiled(&self) -> bool {
         self.reg_tile_m > 1 && self.reg_tile_n > 1
     }
+
+    /// Merges per-operation schedule attributes stamped by IR-to-IR loop passes
+    /// (`tile-loops`, `permute-loops`, `unroll-loops`, `vectorize-loops`) into a copy
+    /// of this [`TargetConfig`].
+    pub fn with_op_attributes(&self, op: &castforge_ir::Operation) -> Self {
+        use castforge_ir::Attribute;
+        let attrs = &op.attributes;
+        let mut cfg = *self;
+        if let Some(Attribute::Int(v)) = attrs.get("loop_tile_m") {
+            cfg.tile_m = (*v).max(0) as usize;
+        }
+        if let Some(Attribute::Int(v)) = attrs.get("loop_tile_n") {
+            cfg.tile_n = (*v).max(0) as usize;
+        }
+        if let Some(Attribute::Int(v)) = attrs.get("loop_tile_k") {
+            cfg.tile_k = (*v).max(0) as usize;
+        }
+        if let Some(Attribute::Int(v)) = attrs.get("loop_l2_tile") {
+            cfg.l2_tile_size = (*v).max(0) as usize;
+        }
+        if let Some(Attribute::Int(v)) = attrs.get("loop_reg_m") {
+            cfg.reg_tile_m = (*v).max(0) as usize;
+        }
+        if let Some(Attribute::Int(v)) = attrs.get("loop_reg_n") {
+            cfg.reg_tile_n = (*v).max(0) as usize;
+        }
+        if let Some(Attribute::String(s)) = attrs.get("loop_order") {
+            cfg.loop_order = GemmLoopOrder::parse(s);
+        }
+        if let Some(Attribute::Bool(b)) = attrs.get("loop_collapse") {
+            cfg.collapse_loops = *b;
+        }
+        if let Some(Attribute::Bool(b)) = attrs.get("loop_skew") {
+            cfg.loop_skew = *b;
+        }
+        if let Some(Attribute::Int(v)) = attrs.get("loop_unroll") {
+            cfg.unroll_factor = (*v).max(1) as usize;
+        }
+        if let Some(Attribute::Int(v)) = attrs.get("loop_prefetch") {
+            cfg.prefetch_distance = (*v).max(0) as usize;
+        }
+        if let Some(Attribute::Int(v)) = attrs.get("loop_split_k") {
+            cfg.split_k = (*v).max(1) as usize;
+        }
+        if let Some(Attribute::Bool(b)) = attrs.get("loop_double_buffer") {
+            cfg.double_buffer = *b;
+        }
+        if let Some(Attribute::Bool(b)) = attrs.get("simd_vectorize") {
+            cfg.vectorize = *b;
+        }
+        if let Some(Attribute::Int(v)) = attrs.get("simd_width") {
+            cfg.simd_width = (*v).max(1) as usize;
+        }
+        if let Some(Attribute::String(s)) = attrs.get("simd_isa") {
+            cfg = cfg.with_simd_isa(SimdIsa::parse(s));
+        }
+        if let Some(Attribute::Bool(b)) = attrs.get("loop_parallel") {
+            cfg.parallel = *b;
+        }
+        cfg
+    }
+
+    /// Scans `module` for any IR schedule attributes and returns an updated module-level
+    /// [`TargetConfig`] (used for emitting top-level SIMD headers or module banners).
+    pub fn with_module_attributes(&self, module: &castforge_ir::Module) -> Self {
+        let mut cfg = *self;
+        for (_, op) in &module.ops {
+            cfg = cfg.with_op_attributes(op);
+        }
+        cfg
+    }
 }

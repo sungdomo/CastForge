@@ -1,6 +1,7 @@
 pub mod attr;
 pub mod safetensors_io;
 pub mod tensor_store;
+pub mod translator;
 pub mod types;
 pub mod verify;
 
@@ -10,6 +11,7 @@ pub use tensor_store::{
     format_dense_i8_literal, merge_f32_tensors, parse_dense_f32_literal, prune_2d_columns_by_l1,
     quantize_symmetric_f32,
 };
+pub use translator::{Payload, Translator, TranslatorChain};
 pub use types::{DType, Dim, TensorType, Type};
 pub use verify::VerifyError;
 

@@ -37,6 +37,49 @@ pub trait Pass: Send + Sync {
     fn run(&mut self, module: &mut Module) -> Result<PassResult>;
 }
 
+impl castforge_ir::Translator for Box<dyn Pass> {
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+
+    fn input_kind(&self) -> &'static str {
+        "ir"
+    }
+
+    fn output_kind(&self) -> &'static str {
+        "ir"
+    }
+
+    fn translate(&mut self, input: castforge_ir::Payload) -> Result<castforge_ir::Payload> {
+        let mut module = input.into_ir()?;
+        (**self).run(&mut module)?;
+        Ok(castforge_ir::Payload::from_ir(module))
+    }
+}
+
+/// Adapter wrapping any concrete [`Pass`] as a [`castforge_ir::Translator`].
+pub struct PassTranslator<P: Pass>(pub P);
+
+impl<P: Pass> castforge_ir::Translator for PassTranslator<P> {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn input_kind(&self) -> &'static str {
+        "ir"
+    }
+
+    fn output_kind(&self) -> &'static str {
+        "ir"
+    }
+
+    fn translate(&mut self, input: castforge_ir::Payload) -> Result<castforge_ir::Payload> {
+        let mut module = input.into_ir()?;
+        self.0.run(&mut module)?;
+        Ok(castforge_ir::Payload::from_ir(module))
+    }
+}
+
 /// Declarative configuration file format (`pipeline.toml` or `.json`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PipelineConfig {
@@ -108,6 +151,15 @@ impl PassManager {
     /// Add a boxed pass dynamically.
     pub fn push_boxed(&mut self, pass: Box<dyn Pass>) {
         self.passes.push(pass);
+    }
+
+    /// Converts this [`PassManager`] into a [`castforge_ir::TranslatorChain`] of `ir -> ir` stages.
+    pub fn into_translator_chain(self) -> castforge_ir::TranslatorChain {
+        let mut chain = castforge_ir::TranslatorChain::new();
+        for pass in self.passes {
+            chain.push(Box::new(pass));
+        }
+        chain
     }
 
     /// Build a `PassManager` from a CLI pipeline specification string, e.g.:
@@ -200,7 +252,8 @@ impl PassManager {
     }
 }
 
-fn split_pipeline_spec(spec: &str) -> Vec<&str> {
+/// Splits a pipeline or translator-chain specification string on top-level `,` or `|` separators.
+pub fn split_pipeline_spec(spec: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut start = 0usize;
     let mut depth = 0usize;
@@ -208,7 +261,7 @@ fn split_pipeline_spec(spec: &str) -> Vec<&str> {
         match c {
             '(' => depth += 1,
             ')' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
+            ',' | '|' if depth == 0 => {
                 out.push(&spec[start..i]);
                 start = i + 1;
             }
@@ -219,7 +272,8 @@ fn split_pipeline_spec(spec: &str) -> Vec<&str> {
     out
 }
 
-fn parse_pass_spec_item(item: &str) -> Result<(String, PassOptions)> {
+/// Parses a single `name(k1=v1,k2=v2)` stage specification into `(name, options)`.
+pub fn parse_pass_spec_item(item: &str) -> Result<(String, PassOptions)> {
     let mut opts = PassOptions::new();
     if let Some(open) = item.find('(') {
         let close = item

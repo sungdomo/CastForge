@@ -31,3 +31,103 @@ pub fn print_mlir_with_options(module: &Module, opts: PrintOptions) -> String {
     let mut printer = MlirPrinter::new(module, opts);
     printer.print_module().unwrap_or_default()
 }
+
+/// A-to-B Translator (`Text(MLIR) -> Ir(Module)`).
+#[derive(Default)]
+pub struct MlirParseTranslator;
+
+impl castforge_ir::Translator for MlirParseTranslator {
+    fn name(&self) -> &str {
+        "parse-mlir"
+    }
+
+    fn input_kind(&self) -> &'static str {
+        "text"
+    }
+
+    fn output_kind(&self) -> &'static str {
+        "ir"
+    }
+
+    fn translate(&mut self, input: castforge_ir::Payload) -> anyhow::Result<castforge_ir::Payload> {
+        let src = input.into_text()?;
+        let module = parse_mlir(&src)?;
+        Ok(castforge_ir::Payload::from_ir(module))
+    }
+}
+
+/// A-to-B Translator (`Ir(Module) -> Text(MLIR)`).
+#[derive(Default)]
+pub struct MlirPrintTranslator {
+    pub options: PrintOptions,
+}
+
+impl castforge_ir::Translator for MlirPrintTranslator {
+    fn name(&self) -> &str {
+        "print-mlir"
+    }
+
+    fn input_kind(&self) -> &'static str {
+        "ir"
+    }
+
+    fn output_kind(&self) -> &'static str {
+        "text"
+    }
+
+    fn translate(&mut self, input: castforge_ir::Payload) -> anyhow::Result<castforge_ir::Payload> {
+        let module = input.into_ir()?;
+        Ok(castforge_ir::Payload::Text(print_mlir_with_options(
+            &module,
+            self.options,
+        )))
+    }
+}
+
+/// A-to-B Translator (`Text(ONNX-JSON) -> Ir(Module)`).
+#[derive(Default)]
+pub struct OnnxImportTranslator;
+
+impl castforge_ir::Translator for OnnxImportTranslator {
+    fn name(&self) -> &str {
+        "import-onnx"
+    }
+
+    fn input_kind(&self) -> &'static str {
+        "text"
+    }
+
+    fn output_kind(&self) -> &'static str {
+        "ir"
+    }
+
+    fn translate(&mut self, input: castforge_ir::Payload) -> anyhow::Result<castforge_ir::Payload> {
+        let src = input.into_text()?;
+        let module = import_onnx_json(&src)?;
+        Ok(castforge_ir::Payload::from_ir(module))
+    }
+}
+
+/// A-to-B Translator (`Bytes(GGUF) -> Ir(Module)`).
+#[derive(Default)]
+pub struct GgufImportTranslator;
+
+impl castforge_ir::Translator for GgufImportTranslator {
+    fn name(&self) -> &str {
+        "import-gguf"
+    }
+
+    fn input_kind(&self) -> &'static str {
+        "bytes"
+    }
+
+    fn output_kind(&self) -> &'static str {
+        "ir"
+    }
+
+    fn translate(&mut self, input: castforge_ir::Payload) -> anyhow::Result<castforge_ir::Payload> {
+        let bytes = input.into_bytes()?;
+        let module = import_gguf_bytes(&bytes)?;
+        Ok(castforge_ir::Payload::from_ir(module))
+    }
+}

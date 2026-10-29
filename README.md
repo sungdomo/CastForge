@@ -20,9 +20,9 @@ support.
   `dense_resource<key>` external weight references, plus **GGUF v2/v3** and **ONNX-JSON** model
   importers.
 - [`crates/castforge-passes`](crates/castforge-passes): Unified `Pass`, `PassRegistry`, and
-  `PassManager` with **62 built-in compiler passes & presets** supporting static Rust construction,
-  CLI pipeline strings (`-p`), direct subcommand invocation, declarative TOML config files
-  (`--config`), and step-by-step pass tracing.
+  `PassManager` with **66 built-in A-to-B IR translator modules & presets** supporting static Rust
+  construction, CLI pipeline strings (`-p`, comma- or `|`-separated), Unix pipe (`stdin -> stdout`)
+  invocation, declarative TOML config files (`--config`), and step-by-step pass tracing.
 - [`crates/castforge-viz`](crates/castforge-viz): Computation graph exporter for **Mermaid**,
   **Graphviz DOT**, **JSON**, and a self-contained **Interactive HTML Pass Timeline, Roofline &
   Arena Memory Liveness Debugger**.
@@ -34,7 +34,7 @@ support.
 - [`crates/castforge-cli`](crates/castforge-cli): The `castforge` command-line tool (`opt`, `viz`,
   `codegen`, `autotune`, `import`, `profile`, `run`, `list-passes`, plus direct pass subcommands).
 
-## Built-in Transformation Passes & Presets (62 Passes)
+## Built-in A-to-B Translator Modules & Presets (66 Passes)
 
 | Pass Name | Category | Description |
 | :--- | :--- | :--- |
@@ -88,6 +88,10 @@ support.
 | `fuse-moe` | Fusion | Fuses routed Mixture-of-Experts (MoE) expert GEMMs & gates |
 | `calibrate-quantize` | Precision | Calibrates activation ranges & inserts static `W8A8` scales |
 | `schedule-streams` | Concurrency | Assigns parallel branches to streams + `stream_wait` |
+| `tile-loops` | Loop Schedule | Attaches L1/L2 cache & register tiling attrs to GEMM ops |
+| `permute-loops` | Loop Schedule | Attaches loop order (`mnk`/`mkn`/`nkm`), collapse, or skew |
+| `unroll-loops` | Loop Schedule | Attaches unroll, prefetch, split-k, & double-buffer attrs |
+| `vectorize-loops` | Loop Schedule | Attaches SIMD lane width, ISA (`avx2`/`neon`), & parallel |
 | `decompose-composites` | Lowering | Expands `stablehlo.composite` ops to primitive StableHLO |
 | `bufferize-inplace` | Lowering | Annotates elementwise ops for in-place arena buffer reuse |
 | `fold-norm-weights` | Weight Surgery | Absorbs RMSNorm/LayerNorm scale weights into MatMuls |
@@ -104,8 +108,20 @@ support.
 ## Quick Start
 
 ```bash
-# 1. List all 62 registered passes and pipeline presets
+# 1. List all 66 registered A-to-B translator modules and pipeline presets
 cargo run --bin castforge -- list-passes
+
+# 2. Concatenate simple A-to-B translators via standard Unix pipes (stdin -> stdout)
+cat examples/llama_block.mlir \
+  | cargo run -q --bin castforge -- fuse-rmsnorm \
+  | cargo run -q --bin castforge -- fuse-attention \
+  | cargo run -q --bin castforge -- tile-loops(size=16) \
+  | cargo run -q --bin castforge -- vectorize-loops(isa=avx2) \
+  | cargo run -q --bin castforge -- codegen -t rust
+
+# 3. Or run a concatenated TranslatorChain in-process via `castforge chain`
+cargo run --bin castforge -- chain examples/llama_block.mlir \
+  -s "fuse-rmsnorm | fuse-attention | tile-loops(size=16) | codegen-rust"
 
 # 2. Optimize an end-to-end LLaMA block with automatic numerical verification
 cargo run --bin castforge -- opt examples/llama_block.mlir -p "O3" --verify-numerics
