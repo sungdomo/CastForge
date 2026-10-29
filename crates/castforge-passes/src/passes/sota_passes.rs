@@ -3,9 +3,12 @@
 //! `eliminate-concat-copies`, `lower-paged-attention`, `gvn`).
 
 use crate::{
-    DeadCodeEliminationPass, FuseGatedMlpPass, FuseGeluPass, FuseLayerNormPass,
-    FuseResidualNormPass, FuseRmsNormPass, FuseSwiGluPass, Pass, PassResult, StripAttributesPass,
-    StripDebugInfoPass,
+    DeadCodeEliminationPass, FoldBroadcastPass, FoldConvertPass, FoldNormWeightsPass,
+    FoldReshapePass, FoldSliceConcatPass, FoldTransposePass, FuseDequantMatmulPass,
+    FuseGatedMlpPass, FuseGeluPass, FuseHorizontalDotPass, FuseLayerNormPass,
+    FuseMatmulEpiloguePass, FuseResidualNormPass, FuseRmsNormPass, FuseSwiGluPass,
+    PadForTilingPass, Pass, PassResult, PermuteLoopsPass, SinkTransposePass, StripAttributesPass,
+    StripDebugInfoPass, TileLoopsPass, UnrollLoopsPass, VectorizeLoopsPass,
 };
 use anyhow::Result;
 use castforge_dialect_stablehlo::StableHloOp;
@@ -314,8 +317,9 @@ impl Pass for FoldBatchNormPass {
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let mut modified = 0usize;
-        let mut removed = 0usize;
+        let pre_norm = FoldNormWeightsPass.run(module)?;
+        let mut modified = pre_norm.ops_modified;
+        let mut removed = pre_norm.ops_removed;
         let blocks: Vec<BlockId> = module.blocks.keys().collect();
 
         for block_id in blocks {
@@ -738,5 +742,505 @@ fn combine_pass_results(name: &str, steps: &[PassResult]) -> PassResult {
         ops_removed: steps.iter().map(|r| r.ops_removed).sum(),
         ops_modified: steps.iter().map(|r| r.ops_modified).sum(),
         ops_created: steps.iter().map(|r| r.ops_created).sum(),
+    }
+}
+
+/// Unified View, Shape & Type-Cast Folding Pass (`fold-views`).
+///
+/// Consolidates `sink-transpose`, `fold-transpose`, `fold-reshape`, `fold-broadcast`,
+/// `fold-slice-concat`, and `fold-convert` in a single pass.
+#[derive(Default)]
+pub struct FoldViewsPass;
+
+impl Pass for FoldViewsPass {
+    fn name(&self) -> &'static str {
+        "fold-views"
+    }
+
+    fn description(&self) -> &'static str {
+        "Unified folding of transpose, reshape, broadcast, slice/concat, and convert views"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let steps = [
+            SinkTransposePass.run(module)?,
+            FoldTransposePass {
+                eliminate_identity: true,
+            }
+            .run(module)?,
+            FoldReshapePass.run(module)?,
+            FoldBroadcastPass.run(module)?,
+            FoldSliceConcatPass.run(module)?,
+            FoldConvertPass.run(module)?,
+        ];
+        Ok(combine_pass_results(self.name(), &steps))
+    }
+}
+
+/// Unified GEMM Fusion Pass (`fuse-gemm`).
+///
+/// Consolidates `fuse-horizontal-dot` (parallel QKV/Gate+Up fusion), `fuse-dequant-matmul`
+/// (producer weight dequantization + GEMM), and `fuse-matmul-epilogue` (GEMM + bias/activation).
+pub struct FuseGemmPass {
+    /// `"all"`, `"horizontal"`, `"dequant"`, or `"epilogue"`.
+    pub kind: String,
+}
+
+impl Default for FuseGemmPass {
+    fn default() -> Self {
+        Self {
+            kind: "all".to_string(),
+        }
+    }
+}
+
+impl Pass for FuseGemmPass {
+    fn name(&self) -> &'static str {
+        "fuse-gemm"
+    }
+
+    fn description(&self) -> &'static str {
+        "Unified GEMM fusion (horizontal QKV/MLP dot, dequant+GEMM, and GEMM+bias/activation)"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let k = self.kind.to_ascii_lowercase();
+        let mut steps = Vec::new();
+        if k == "all" || k == "horizontal" {
+            steps.push(FuseHorizontalDotPass.run(module)?);
+        }
+        if k == "all" || k == "dequant" {
+            steps.push(FuseDequantMatmulPass.run(module)?);
+        }
+        if k == "all" || k == "epilogue" {
+            steps.push(FuseMatmulEpiloguePass.run(module)?);
+        }
+        Ok(combine_pass_results(self.name(), &steps))
+    }
+}
+
+/// Unified Loop Schedule Pass (`schedule-loops`).
+///
+/// Consolidates `pad-for-tiling`, `tile-loops`, `permute-loops`, `unroll-loops`, and
+/// `vectorize-loops` into a single pass for configuring polyhedral/SIMD schedules.
+pub struct ScheduleLoopsPass {
+    pub tile_size: usize,
+    pub l2_tile: usize,
+    pub reg_tile: usize,
+    pub order: String,
+    pub collapse: bool,
+    pub skew: bool,
+    pub unroll_factor: usize,
+    pub prefetch: usize,
+    pub split_k: usize,
+    pub double_buffer: bool,
+    pub isa: String,
+    pub vector_width: usize,
+    pub parallel: bool,
+    pub align: i64,
+}
+
+impl Default for ScheduleLoopsPass {
+    fn default() -> Self {
+        Self {
+            tile_size: 16,
+            l2_tile: 0,
+            reg_tile: 0,
+            order: "mkn".to_string(),
+            collapse: false,
+            skew: false,
+            unroll_factor: 4,
+            prefetch: 0,
+            split_k: 1,
+            double_buffer: false,
+            isa: "avx2".to_string(),
+            vector_width: 8,
+            parallel: true,
+            align: 8,
+        }
+    }
+}
+
+impl Pass for ScheduleLoopsPass {
+    fn name(&self) -> &'static str {
+        "schedule-loops"
+    }
+
+    fn description(&self) -> &'static str {
+        "Unified loop schedule pass (tile, permute, unroll, vectorize, and pad-for-tiling)"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let steps = [
+            PadForTilingPass { align: self.align }.run(module)?,
+            TileLoopsPass {
+                tile_m: self.tile_size,
+                tile_n: self.tile_size,
+                tile_k: self.tile_size,
+                l2_tile: self.l2_tile,
+                reg_m: self.reg_tile,
+                reg_n: self.reg_tile,
+            }
+            .run(module)?,
+            PermuteLoopsPass {
+                order: self.order.clone(),
+                collapse: self.collapse,
+                skew: self.skew,
+            }
+            .run(module)?,
+            UnrollLoopsPass {
+                factor: self.unroll_factor,
+                prefetch: self.prefetch,
+                split_k: self.split_k,
+                double_buffer: self.double_buffer,
+            }
+            .run(module)?,
+            VectorizeLoopsPass {
+                width: self.vector_width,
+                isa: self.isa.clone(),
+                parallel: self.parallel,
+            }
+            .run(module)?,
+        ];
+        Ok(combine_pass_results(self.name(), &steps))
+    }
+}
+
+/// FlashDecoding / Split-KV Attention Pass (`flash-decoding`).
+///
+/// Partitions the KV sequence dimension across `split_kv` parallel splits for $M=1$ decoding
+/// attention and attaches partial log-sum-exp (`LSE`) reduction attributes.
+pub struct FlashDecodingPass {
+    pub split_kv: usize,
+}
+
+impl Default for FlashDecodingPass {
+    fn default() -> Self {
+        Self { split_kv: 4 }
+    }
+}
+
+impl Pass for FlashDecodingPass {
+    fn name(&self) -> &'static str {
+        "flash-decoding"
+    }
+
+    fn description(&self) -> &'static str {
+        "Partitions KV sequence across parallel splits with LSE reduction for LLM decoding"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let mut modified = 0usize;
+        for (_, op) in module.ops.iter_mut() {
+            let is_attn = op.is_op("stablehlo", "composite")
+                && op
+                    .attributes
+                    .get("name")
+                    .and_then(|a| a.as_str())
+                    .is_some_and(|n| n == "castforge.fused_attention");
+            if is_attn {
+                op.attributes.insert(
+                    "castforge.flash_decoding".to_string(),
+                    Attribute::Bool(true),
+                );
+                op.attributes.insert(
+                    "castforge.split_kv".to_string(),
+                    Attribute::Int(self.split_kv.max(2) as i64),
+                );
+                op.attributes.insert(
+                    "castforge.partial_lse_reduce".to_string(),
+                    Attribute::Bool(true),
+                );
+                modified += 1;
+            }
+        }
+        Ok(PassResult {
+            pass_name: self.name().to_string(),
+            changed: modified > 0,
+            ops_removed: 0,
+            ops_modified: modified,
+            ops_created: 0,
+        })
+    }
+}
+
+/// FP8 (`E4M3` / `E5M2`) & MXFP8 Microscaling Quantization Pass (`quantize-fp8`).
+///
+/// Quantizes constant weights and GEMM inputs using Hopper/Blackwell/MI300X `FP8` dynamic ranges
+/// (`448.0` for `e4m3`, `57344.0` for `e5m2`) with shared power-of-two microscaling exponents
+/// (`mxfp8 = true`, `block_size = 32`).
+pub struct QuantizeFp8Pass {
+    pub format: String,
+    pub mxfp8: bool,
+    pub block_size: usize,
+}
+
+impl Default for QuantizeFp8Pass {
+    fn default() -> Self {
+        Self {
+            format: "e4m3".to_string(),
+            mxfp8: true,
+            block_size: 32,
+        }
+    }
+}
+
+impl Pass for QuantizeFp8Pass {
+    fn name(&self) -> &'static str {
+        "quantize-fp8"
+    }
+
+    fn description(&self) -> &'static str {
+        "Applies FP8 (E4M3/E5M2) and MXFP8 block-scaled quantization to weights and GEMMs"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let mut modified = 0usize;
+        let is_e5m2 = self.format.eq_ignore_ascii_case("e5m2");
+        let fp8_max = if is_e5m2 { 57344.0_f32 } else { 448.0_f32 };
+        let grid_steps = if is_e5m2 { 15.0_f32 } else { 31.0_f32 };
+        let bsize = self.block_size.max(4);
+        let fmt_str = if is_e5m2 { "fp8_e5m2" } else { "fp8_e4m3" };
+
+        let blocks: Vec<BlockId> = module.blocks.keys().collect();
+        for block_id in blocks {
+            let ops = module.block_ops(block_id);
+            for op_id in ops {
+                let Some(op) = module.ops.get(op_id).cloned() else {
+                    continue;
+                };
+                if !op.is_op("stablehlo", "constant") || op.results.is_empty() {
+                    continue;
+                }
+                let res_id = op.results[0];
+                let Some(t_ty) = module.values[res_id].ty.as_tensor().cloned() else {
+                    continue;
+                };
+                let Some(num_elems) = t_ty.num_elements().map(|n| n as usize) else {
+                    continue;
+                };
+                if num_elems < 2 {
+                    continue;
+                }
+                let Some(val_attr) = op.attributes.get("value").cloned() else {
+                    continue;
+                };
+                let Some(raw_f32) = module.tensor_store.resolve_f32_attr(&val_attr, num_elems)
+                else {
+                    continue;
+                };
+
+                let mut deq_f32 = Vec::with_capacity(num_elems);
+                for chunk in raw_f32.chunks(bsize) {
+                    let amax = chunk.iter().fold(0.0_f32, |acc, &v| acc.max(v.abs()));
+                    let raw_scale = if amax < 1e-12 { 1.0 } else { amax / fp8_max };
+                    let scale = if self.mxfp8 {
+                        2.0_f32.powf(raw_scale.log2().ceil())
+                    } else {
+                        raw_scale
+                    };
+                    let step = (fp8_max / grid_steps).max(1e-6);
+                    for &v in chunk {
+                        let scaled = (v / scale).clamp(-fp8_max, fp8_max);
+                        let q = (scaled / step).round() * step;
+                        deq_f32.push(q * scale);
+                    }
+                }
+
+                let new_val = Attribute::DenseElements {
+                    ty: t_ty.clone(),
+                    raw_literal: format_dense_f32_literal(&deq_f32, &t_ty.shape),
+                };
+                module.ops[op_id]
+                    .attributes
+                    .insert("value".to_string(), new_val);
+                for (_, user_op) in module.ops.iter_mut() {
+                    if user_op.operands.contains(&res_id) {
+                        user_op.attributes.insert(
+                            "castforge.fp8_format".to_string(),
+                            Attribute::String(fmt_str.to_string()),
+                        );
+                        user_op
+                            .attributes
+                            .insert("castforge.mxfp8".to_string(), Attribute::Bool(self.mxfp8));
+                    }
+                }
+                modified += 1;
+            }
+        }
+
+        Ok(PassResult {
+            pass_name: self.name().to_string(),
+            changed: modified > 0,
+            ops_removed: 0,
+            ops_modified: modified,
+            ops_created: 0,
+        })
+    }
+}
+
+/// RingAttention / Context Parallelism Pass (`shard-ring-attention`).
+///
+/// Shards long-context attention across `ring_size` devices with overlapped P2P KV ring shifts.
+pub struct ShardRingAttentionPass {
+    pub ring_size: usize,
+}
+
+impl Default for ShardRingAttentionPass {
+    fn default() -> Self {
+        Self { ring_size: 4 }
+    }
+}
+
+impl Pass for ShardRingAttentionPass {
+    fn name(&self) -> &'static str {
+        "shard-ring-attention"
+    }
+
+    fn description(&self) -> &'static str {
+        "Shards sequence context across a device ring with overlapped P2P KV send/recv"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let mut modified = 0usize;
+        for (_, op) in module.ops.iter_mut() {
+            let is_attn = op.is_op("stablehlo", "composite")
+                && op
+                    .attributes
+                    .get("name")
+                    .and_then(|a| a.as_str())
+                    .is_some_and(|n| n == "castforge.fused_attention");
+            if is_attn {
+                op.attributes.insert(
+                    "castforge.ring_attention".to_string(),
+                    Attribute::Bool(true),
+                );
+                op.attributes.insert(
+                    "castforge.ring_size".to_string(),
+                    Attribute::Int(self.ring_size.max(2) as i64),
+                );
+                op.attributes.insert(
+                    "castforge.p2p_overlap".to_string(),
+                    Attribute::String("send_recv_kv".to_string()),
+                );
+                modified += 1;
+            }
+        }
+        Ok(PassResult {
+            pass_name: self.name().to_string(),
+            changed: modified > 0,
+            ops_removed: 0,
+            ops_modified: modified,
+            ops_created: 0,
+        })
+    }
+}
+
+/// Speculative Decoding Tree Attention Pass (`speculative-tree-attention`).
+///
+/// Annotates attention kernels with Medusa/EAGLE tree-structured causal verification masks over
+/// `draft_tokens` speculative candidates.
+pub struct SpeculativeTreeAttentionPass {
+    pub draft_tokens: usize,
+    pub tree_depth: usize,
+}
+
+impl Default for SpeculativeTreeAttentionPass {
+    fn default() -> Self {
+        Self {
+            draft_tokens: 4,
+            tree_depth: 2,
+        }
+    }
+}
+
+impl Pass for SpeculativeTreeAttentionPass {
+    fn name(&self) -> &'static str {
+        "speculative-tree-attention"
+    }
+
+    fn description(&self) -> &'static str {
+        "Configures Medusa/EAGLE speculative decoding tree-attention verification masks"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let mut modified = 0usize;
+        for (_, op) in module.ops.iter_mut() {
+            let is_attn = op.is_op("stablehlo", "composite")
+                && op
+                    .attributes
+                    .get("name")
+                    .and_then(|a| a.as_str())
+                    .is_some_and(|n| n == "castforge.fused_attention");
+            if is_attn {
+                op.attributes.insert(
+                    "castforge.speculative_tree".to_string(),
+                    Attribute::Bool(true),
+                );
+                op.attributes.insert(
+                    "castforge.draft_tokens".to_string(),
+                    Attribute::Int(self.draft_tokens.max(1) as i64),
+                );
+                op.attributes.insert(
+                    "castforge.tree_depth".to_string(),
+                    Attribute::Int(self.tree_depth.max(1) as i64),
+                );
+                modified += 1;
+            }
+        }
+        Ok(PassResult {
+            pass_name: self.name().to_string(),
+            changed: modified > 0,
+            ops_removed: 0,
+            ops_modified: modified,
+            ops_created: 0,
+        })
+    }
+}
+
+/// Persistent Megakernel Fusion Pass (`fuse-megakernel`).
+///
+/// Marks entry functions and their constituent compute operations for persistent cooperative-grid
+/// megakernel execution (`castforge.megakernel = true`) to eliminate per-op launch overhead.
+#[derive(Default)]
+pub struct FuseMegakernelPass;
+
+impl Pass for FuseMegakernelPass {
+    fn name(&self) -> &'static str {
+        "fuse-megakernel"
+    }
+
+    fn description(&self) -> &'static str {
+        "Fuses sequential compute ops into a persistent grid-synchronized megakernel"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let mut modified = 0usize;
+        for fn_id in module.functions() {
+            let fn_op = &mut module.ops[fn_id];
+            if fn_op.attributes.get("castforge.megakernel") != Some(&Attribute::Bool(true)) {
+                fn_op
+                    .attributes
+                    .insert("castforge.megakernel".to_string(), Attribute::Bool(true));
+                fn_op.attributes.insert(
+                    "castforge.grid_sync".to_string(),
+                    Attribute::String("cooperative_groups".to_string()),
+                );
+                modified += 1;
+            }
+        }
+        for (_, op) in module.ops.iter_mut() {
+            if op.name.dialect == "stablehlo" && op.name.name != "constant" {
+                op.attributes
+                    .insert("castforge.megakernel".to_string(), Attribute::Bool(true));
+            }
+        }
+        Ok(PassResult {
+            pass_name: self.name().to_string(),
+            changed: modified > 0,
+            ops_removed: 0,
+            ops_modified: modified,
+            ops_created: 0,
+        })
     }
 }

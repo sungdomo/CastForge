@@ -11,9 +11,9 @@ support.
   CastForge's Dual-Plane IR (`Module` + `TensorStore`), modular A-to-B `Translator` architecture,
   static arena memory planning, polyhedral `LoopModule` IR, multi-architecture SIMD profiles, and
   pluggable `CodegenBackend` registry.
-- [**Complete Reference of All 91 Compiler Passes (`docs/PASSES.md`)**](docs/PASSES.md): Detailed
-  explanation, CLI options, and IR transformation rules for all 91 Graph IR passes/presets and 7
-  LoopIR passes.
+- [**Complete Reference of All 82 Passes (`docs/PASSES.md`)**](docs/PASSES.md):
+  Detailed explanation, CLI options, and IR transformation rules for all 82 Graph IR passes/presets
+  and 7 LoopIR passes.
 
 ## Workspace Architecture
 
@@ -30,7 +30,7 @@ support.
   `dense_resource<key>` external weight references, plus symmetric **GGUF v2/v3**, **ONNX-JSON**,
   and **SafeTensors** model importers & exporters.
 - [`crates/castforge-passes`](crates/castforge-passes): Unified `Pass`, `PassRegistry`, and
-  `PassManager` with **91 built-in A-to-B IR translator modules & presets** supporting static Rust
+  `PassManager` with **82 canonical A-to-B IR translator modules & presets** supporting static Rust
   construction, CLI pipeline strings (`-p`, comma- or `|`-separated), Unix pipe (`stdin -> stdout`)
   invocation, declarative TOML config files (`--config`), and step-by-step pass tracing.
 - [`crates/castforge-viz`](crates/castforge-viz): Computation graph exporter for **Mermaid**,
@@ -48,64 +48,56 @@ support.
   `opt`, `viz`, `codegen`, `autotune`, `import`, `profile`, `run`, `list-passes`, plus direct pass
   subcommands).
 
-## Built-in A-to-B Translator Modules & Presets (91 Passes)
+## Built-in A-to-B Translator Modules & Presets (82 Canonical Passes)
 
 | Pass Name | Category | Description |
 | :--- | :--- | :--- |
-| `dce` | General IR | Dead Code Elimination (unused pure SSA ops & dead symbols) |
-| `cse` | General IR | Common Subexpression Elimination (deduplicates pure ops) |
-| `canonicalize` | General IR | Fixed-point algebraic, constant, layout, slice/concat, CSE, DCE |
+| `dce` | General IR | $O(N)$ ref-counted Dead Code Elimination (SSA ops & dead symbols) |
+| `cse` | General IR | Commutative & canonical Common Subexpression Elimination |
+| `gvn` | General IR | Cross-region Dominator-Tree Global Value Numbering |
+| `canonicalize` | General IR | Fixed-point algebraic, constant, view folding, CSE, and DCE |
 | `inliner` | General IR | Inlines `func.call` ops by splicing callee bodies into callers |
 | `symbol-dce` | General IR | Removes unreachable `private` `func.func` symbols |
-| `sccp` | General IR | Sparse Conditional Constant Propagation (`compare`/`select`) |
 | `licm` | General IR | Loop/Region-Invariant Code Motion out of nested regions |
 | `hoist-constants` | General IR | Hoists `stablehlo.constant` ops to entry and deduplicates |
 | `topological-sort` | General IR | Reorders operations inside blocks for SSA def-before-use |
-| `strip-debuginfo` | General IR | Strips source location metadata (`loc(...)`) from all ops |
+| `strip-metadata` | General IR | Strips debug locations (`loc(...)`) & transient `castforge.*` |
 | `ir-edit` | General IR | Surgical IR editing (`rename_op=from:to`, `annotate_op=k:v`) |
 | `specialize-shapes` | Shapes | Binds dynamic/symbolic dims (`?`, `B`, `S`) & infers shapes |
 | `verify-shapes` | Diagnostics | Verifies StableHLO tensor shapes and rank consistency |
 | `print-op-stats` | Diagnostics | Computes op counts, FLOPs, bytes, and Roofline intensity |
-| `fold-constants` | Folding | Constant folding for arithmetic, N-D transpose, and shape ops |
+| `fold-constants` | Folding | Constant folding & conditional `compare`/`select` SCCP |
 | `simplify-algebraic` | Folding | Identities (`x+0`, `x-x`, `x*1`, `x/1`), reassociation, order |
-| `fold-transpose` | Layout | Composes chained `transpose` ops and removes identity perms |
-| `sink-transpose` | Layout | Sinks `transpose` through elementwise ops into constants |
-| `fold-reshape` | Layout | Composes chained `reshape` ops and removes identity reshapes |
-| `fold-broadcast` | Layout | Composes `broadcast_in_dim`, folds splats, hoists unary ops |
-| `fold-slice-concat` | Layout | Composes nested `slice` ops and folds `slice(concatenate)` |
-| `fold-convert` | Layout | Eliminates redundant/round-trip `convert` casts (`f16->f32->f16`) |
+| `egraph-simplify` | Folding | Distributive factoring (`a*b+a*c -> a*(b+c)`) & FMA extraction |
+| `fold-views` | Layout | Folds `transpose`, `reshape`, `broadcast`, `slice`, and `convert` |
 | `pack-weights` | Layout | Pre-packs 2D RHS weights `[K,N]->[N,K]` for unit-stride SIMD |
 | `fuse-elementwise` | Fusion | Fuses `add` + `maximum` into `stablehlo.composite` |
 | `fuse-loops` | Fusion | Fuses multi-op elementwise loop chains into 1 register loop |
 | `fuse-map-reduce` | Fusion | Fuses elementwise map producers into `stablehlo.reduce` |
 | `fission-loops` | Lowering | Splits oversized fused loop chains (`max_steps`) for registers |
-| `fuse-matmul-epilogue` | Fusion | Fuses `dot_general` + bias + `relu`/`tanh`/`silu`/`gelu` |
-| `fuse-dequant-matmul` | Fusion | Fuses `uniform_dequantize` + `dot_general` into qGEMM |
-| `fuse-horizontal-dot` | Fusion | Horizontally fuses parallel `dot_general` ops (e.g. Q/K/V) |
-| `fuse-gated-mlp` | Fusion | Fuses dual gate/up `dot_general` + `slice`s + SwiGLU/GeGLU |
-| `fuse-softmax` | Fusion | Fuses `exp(x) / broadcast(reduce_sum(exp(x)))` into composite |
-| `fuse-log-softmax` | Fusion | Fuses `log(softmax(x))` into online `fused_log_softmax` |
-| `fuse-rmsnorm` | Fusion | Fuses `x * rsqrt(mean(x^2) + eps) * weight` into composite |
-| `fuse-residual-norm` | Fusion | Fuses `add(x, residual)` + RMSNorm into `fused_residual_rmsnorm` |
-| `fuse-layernorm` | Fusion | Fuses `(x - mean(x)) * rsqrt(var(x) + eps) * gamma + beta` |
-| `fuse-swiglu` | Fusion | Fuses SwiGLU (`gate / (1 + exp(-gate)) * up`) into composite |
-| `fuse-gelu` | Fusion | Fuses Tanh-approx GELU and gated GeGLU (`gelu(gate) * up`) |
+| `fuse-gemm` | Fusion | Unified GEMM fusion (`kind=all\|horizontal\|dequant\|epilogue`) |
+| `fuse-norm` | Fusion | Unified Norm fusion (`kind=all\|rmsnorm\|residual_rmsnorm\|layernorm`) |
+| `fuse-activations` | Fusion | Unified Activation fusion (`kind=all\|swiglu\|gelu\|gated_mlp`) |
+| `fuse-softmax` | Fusion | Unified Softmax & LogSoftmax online 3-pass composite fusion |
 | `fuse-rope` | Fusion | Fuses Rotary Position Embedding (`RoPE`) into composite |
 | `fuse-attention` | Fusion | Fuses SDPA & GQA (`softmax(Q @ K^T * scale) @ V`) |
+| `flash-decoding` | Attention | Split-KV parallel FlashDecoding with partial LSE reduction |
+| `speculative-tree-attention` | Attention | Medusa/EAGLE speculative tree-attention verification |
+| `shard-ring-attention` | Distributed | Context-parallel RingAttention with overlapped P2P KV |
+| `lower-paged-attention` | Inference | vLLM-style PagedAttention non-contiguous KV block tables |
+| `inject-kv-cache` | Inference | Injects `kv_cache_update` state ops before fused attention |
+| `fuse-moe` | Fusion | Fuses routed Mixture-of-Experts (MoE) expert GEMMs & gates |
+| `fuse-megakernel` | Fusion | Persistent cooperative-grid megakernel fusion across ops |
 | `lower-conv-to-gemm` | Lowering | Lowers 2D `convolution` (NHWC) to `im2col` + `dot_general` |
 | `autodiff` | Training | Synthesizes reverse-mode VJP gradients & optional SGD step |
 | `rematerialize` | Memory | Recomputes long-lived cheap activations to shrink arena memory |
+| `offload-activations` | Memory | Inserts `castforge.host_offload` D2H/H2D on long-lived ops |
+| `bufferize-inplace` | Memory | Annotates elementwise ops for in-place arena buffer reuse |
+| `eliminate-concat-copies` | Memory | Destination-passing zero-copy `stablehlo.concatenate` |
 | `shard-spmd` | Distributed | Megatron-style 1D SPMD tensor parallelism + `all_reduce` |
-| `inject-kv-cache` | Inference | Injects `kv_cache_update` state ops before fused attention |
-| `egraph-simplify` | Folding | Distributive factoring (`a*b+a*c -> a*(b+c)`) & FMA extraction |
-| `mixed-precision` | Precision | Automatic Mixed Precision (`f16`/`bf16` GEMM + `f32` norms) |
-| `fuse-moe` | Fusion | Fuses routed Mixture-of-Experts (MoE) expert GEMMs & gates |
-| `calibrate-quantize` | Precision | Calibrates activation ranges & inserts static `W8A8` scales |
+| `hoist-all-reduce` | Distributed | Coalesces linear `all_reduce` sums & enables overlap |
 | `schedule-streams` | Concurrency | Assigns parallel branches to streams + `stream_wait` |
-| `tile-loops` | Loop Schedule | Attaches L1/L2 cache & register tiling attrs to GEMM ops |
-| `permute-loops` | Loop Schedule | Attaches loop order (`mnk`/`mkn`/`nkm`), collapse, or skew |
-| `unroll-loops` | Loop Schedule | Attaches unroll, prefetch, split-k, & double-buffer attrs |
-| `vectorize-loops` | Loop Schedule | Attaches SIMD lane width, ISA (`avx2`/`neon`), & parallel |
+| `schedule-loops` | Loop Schedule | Unified loop tiling, permutation, unrolling, SIMD & padding |
 | `extract-subgraph` | IR Slicing | Slices backward dataflow cone (`target=%v,stop_at=%in`) |
 | `outline-subgraphs` | IR Partition | Outlines GEMM/composite ops to `@outlined_kernel_k` |
 | `reduce-ir` | IR Debugging | Delta-reduces function to minimal `max_ops` reproducer |
@@ -118,29 +110,28 @@ support.
 | `resize-batch` | IR Resizer | Rewrites leading batch dim while preserving 2D weights |
 | `dedup-functions` | IR Dedup | Merges structurally identical `func.func` definitions |
 | `normalize-ssa` | IR Canonical | Renames SSA values (`%arg0`, `%v0`) & sorts attributes |
-| `hash-ir` | IR Hashing | Stamps 64-bit FNV-1a structural hash (`castforge.ir_hash`) |
+| `hash-ir` | IR Hashing | Stamps 64-bit FNV-1a structural hash (`castforge.structural_hash`) |
 | `verify-equiv` | IR Verifier | Verifies structural/signature invariants across chains |
-| `sparsify-2to4` | Weight Surgery | Applies NVIDIA Ampere/Hopper 2:4 structured sparsity |
 | `bucket-shapes` | IR Bucketing | Synthesizes multi-bucket shape-specialized functions |
 | `convert-layout` | Layout | Canonicalizes 4D `convolution` between `NCHW` and `NHWC` |
-| `offload-activations` | Memory | Inserts `castforge.host_offload` D2H/H2D on long-lived ops |
-| `pad-for-tiling` | Loop Schedule | Computes tile-aligned `(M, K, N)` multiples (`align=8`) |
 | `split-large-gemm` | IR Partition | Splits wide `dot_general` (`N > max_n`) into sub-GEMMs |
 | `unroll-calls` | IR Unroller | Unrolls repeated `func.call` invocations (`repeat=N`) |
-| `hoist-all-reduce` | Distributed | Coalesces linear `all_reduce` sums & enables overlap |
 | `instrument-profiling` | IR Profiler | Wraps compute ops in `castforge.profile_region` timers |
-| `strip-attributes` | IR Cleaner | Strips transient `castforge.*` & schedule attributes |
 | `decompose-composites` | Lowering | Expands `stablehlo.composite` ops to primitive StableHLO |
-| `bufferize-inplace` | Lowering | Annotates elementwise ops for in-place arena buffer reuse |
-| `fold-norm-weights` | Weight Surgery | Absorbs RMSNorm/LayerNorm scale weights into MatMuls |
+| `fold-batchnorm` | Weight Surgery | Absorbs pre-GEMM Norm & post-Conv/GEMM BatchNorm scales |
 | `bake-lora` | Weight Surgery | Fuses LoRA branches `W + alpha * (A @ B)` into base weights |
 | `task-arithmetic` | Weight Surgery | Applies multi-checkpoint task vectors & DARE pruning |
 | `merge-weights` | Weight Surgery | Merges paired weights (`method=linear\|slerp\|ties,t=0.5`) |
 | `prune-structured` | Weight Surgery | Structured L1 channel pruning on weights (`sparsity=0.5`) |
+| `sparsify-2to4` | Weight Surgery | Applies NVIDIA Ampere/Hopper 2:4 structured sparsity |
 | `quantize-weights` | Weight Surgery | Symmetric `i8`/`i4` quantization + `uniform_dequantize` |
+| `quantize-groupwise` | Weight Surgery | AWQ/GPTQ group-wise (`group_size=32..128`) quantization |
+| `quantize-fp8` | Weight Surgery | Hopper/Blackwell `FP8` (`E4M3`/`E5M2`) & `MXFP8` microscaling |
+| `calibrate-quantize` | Precision | Calibrates activation ranges & inserts static `W8A8` scales |
+| `mixed-precision` | Precision | Automatic Mixed Precision (`f16`/`bf16` GEMM + `f32` norms) |
 | `externalize-weights` | Weight I/O | Moves inline `dense<...>` to `dense_resource<key>` |
-| `O1` | Preset | Inlining, SCCP, LICM, canonicalization, symbol-dce, toposort |
-| `O2` | Preset | `O1` + LoRA/Norm folding + Transformer/MatMul operator fusions |
+| `O1` | Preset | Inlining, SCCP, LICM, view/algebraic canonicalization, DCE |
+| `O2` | Preset | `O1` + LoRA/BatchNorm folding + Transformer/GEMM fusions |
 | `O3` / `llm-opt` | Preset | Shape specialization + `O2` + weight packing + inplace arena |
 
 ### Non-Pass Ecosystem A-to-B Translators (`TranslatorChain` / `castforge chain`)
@@ -165,20 +156,19 @@ support.
 ## Quick Start
 
 ```bash
-# 1. List all 91 registered A-to-B translator modules and pipeline presets
+# 1. List all 82 registered A-to-B translator modules and pipeline presets
 cargo run --bin castforge -- list-passes
 
 # 2. Concatenate simple A-to-B translators via standard Unix pipes (stdin -> stdout)
 cat examples/llama_block.mlir \
-  | cargo run -q --bin castforge -- fuse-rmsnorm \
+  | cargo run -q --bin castforge -- fuse-norm \
   | cargo run -q --bin castforge -- fuse-attention \
-  | cargo run -q --bin castforge -- tile-loops(size=16) \
-  | cargo run -q --bin castforge -- vectorize-loops(isa=avx2) \
+  | cargo run -q --bin castforge -- schedule-loops(size=16,isa=avx2) \
   | cargo run -q --bin castforge -- codegen -t rust
 
 # 3. Or run a concatenated TranslatorChain in-process via `castforge chain`
 cargo run --bin castforge -- chain examples/llama_block.mlir \
-  -s "fuse-rmsnorm | fuse-attention | tile-loops(size=16) | codegen-rust"
+  -s "fuse-norm | fuse-attention | schedule-loops(size=16,isa=avx2) | codegen-rust"
 
 # 4. Optimize an end-to-end LLaMA block with automatic numerical verification
 cargo run --bin castforge -- opt examples/llama_block.mlir -p "O3" --verify-numerics
@@ -198,7 +188,7 @@ cargo run --bin castforge -- viz examples/weight_surgery.mlir \
 
 # 8. Lower the optimized model to standalone Rust, C99, WGSL, CUDA, or Metal
 cargo run --bin castforge -- codegen examples/weight_surgery.mlir \
-  -p "canonicalize,fuse-matmul-epilogue" --target rust --tile-size 16
+  -p "canonicalize,fuse-gemm" --target rust --tile-size 16
 
 # 9. Profile Roofline FLOPs, memory bandwidth traffic, and arithmetic intensity
 cargo run --bin castforge -- profile examples/llama_block.mlir -p "O3"

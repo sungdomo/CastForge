@@ -24,11 +24,8 @@ fn test_dynamic_cli_pipeline_and_fusion() {
     let mut module = parse_mlir(SAMPLE_MLIR).expect("parse failed");
     module.verify().expect("initial verify failed");
 
-    let mut pm = PassManager::from_pipeline_str(
-        &registry,
-        "fold-transpose(eliminate_identity=true),fold-reshape,cse,dce,fuse-elementwise",
-    )
-    .expect("pipeline build failed");
+    let mut pm = PassManager::from_pipeline_str(&registry, "fold-views,cse,dce,fuse-elementwise")
+        .expect("pipeline build failed");
 
     let results = pm.run(&mut module).expect("pipeline execution failed");
     assert!(results.iter().any(|r| r.changed));
@@ -153,18 +150,15 @@ module @weight_surgery {
 fn test_run_with_trace_captures_every_pass_step() {
     let registry = PassRegistry::with_builtin_passes();
     let mut module = parse_mlir(SAMPLE_MLIR).expect("parse failed");
-    let mut pm = PassManager::from_pipeline_str(
-        &registry,
-        "fold-transpose,fold-reshape,cse,dce,fuse-elementwise",
-    )
-    .expect("pipeline build failed");
+    let mut pm = PassManager::from_pipeline_str(&registry, "fold-views,cse,dce,fuse-elementwise")
+        .expect("pipeline build failed");
 
     let steps = pm.run_with_trace(&mut module).expect("trace failed");
-    // Initial IR + 5 passes = 6 steps
-    assert_eq!(steps.len(), 6);
+    // Initial IR + 4 passes = 5 steps
+    assert_eq!(steps.len(), 5);
     assert_eq!(steps[0].label, "Initial IR");
-    assert_eq!(steps[1].label, "fold-transpose");
-    assert_eq!(steps[5].label, "fuse-elementwise");
+    assert_eq!(steps[1].label, "fold-views");
+    assert_eq!(steps[4].label, "fuse-elementwise");
 }
 
 #[test]
@@ -200,7 +194,7 @@ module @general_passes {
 
     let mut pm = PassManager::from_pipeline_str(
         &registry,
-        "inliner,symbol-dce,sccp,topological-sort,strip-debuginfo,print-op-stats",
+        "inliner,symbol-dce,fold-constants,topological-sort,strip-metadata,print-op-stats",
     )
     .expect("pipeline build failed");
 

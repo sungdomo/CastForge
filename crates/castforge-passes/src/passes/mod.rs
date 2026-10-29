@@ -151,8 +151,10 @@ pub use shard_spmd::ShardSpmdPass;
 pub use simplify_algebraic::SimplifyAlgebraicPass;
 pub use sink_transpose::SinkTransposePass;
 pub use sota_passes::{
-    EliminateConcatCopiesPass, FoldBatchNormPass, FuseActivationsPass, FuseNormPass,
-    GlobalValueNumberingPass, LowerPagedAttentionPass, QuantizeGroupwisePass, StripMetadataPass,
+    EliminateConcatCopiesPass, FlashDecodingPass, FoldBatchNormPass, FoldViewsPass,
+    FuseActivationsPass, FuseGemmPass, FuseMegakernelPass, FuseNormPass, GlobalValueNumberingPass,
+    LowerPagedAttentionPass, QuantizeFp8Pass, QuantizeGroupwisePass, ScheduleLoopsPass,
+    ShardRingAttentionPass, SpeculativeTreeAttentionPass, StripMetadataPass,
 };
 pub use sparsify_2to4::{Sparsify2To4Pass, apply_2to4_mask};
 pub use specialize_shapes::SpecializeShapesPass;

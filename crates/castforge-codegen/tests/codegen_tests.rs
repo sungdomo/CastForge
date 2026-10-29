@@ -121,7 +121,7 @@ module @numeric_verify_demo {
     let registry = PassRegistry::with_builtin_passes();
     let mut pm = PassManager::from_pipeline_str(
         &registry,
-        "fold-norm-weights,fuse-matmul-epilogue,fold-constants,dce",
+        "fold-batchnorm,fuse-gemm(kind=epilogue),fold-constants,dce",
     )
     .expect("build pipeline");
     pm.run(&mut after).expect("run pipeline");
@@ -188,8 +188,8 @@ module @roofline_demo {
     let before_mod = parse_mlir(mlir).expect("parse roofline mlir");
     let mut after_mod = before_mod.clone();
     let registry = PassRegistry::with_builtin_passes();
-    let mut pm =
-        PassManager::from_pipeline_str(&registry, "fuse-matmul-epilogue,dce").expect("pipeline");
+    let mut pm = PassManager::from_pipeline_str(&registry, "fuse-gemm(kind=epilogue),dce")
+        .expect("pipeline");
     pm.run(&mut after_mod).expect("run fusion");
 
     let roofline = HardwareRoofline::new(200.0, 50.0); // ridge point = 4.0 FLOP/Byte
@@ -431,11 +431,9 @@ module @complete_fusion_and_polyhedral {
     let before = parse_mlir(mlir).expect("parse complete mlir");
     let mut fused = before.clone();
     let registry = PassRegistry::with_builtin_passes();
-    let mut pm = PassManager::from_pipeline_str(
-        &registry,
-        "fuse-attention,fuse-log-softmax,fuse-map-reduce",
-    )
-    .expect("complete fusion pipeline");
+    let mut pm =
+        PassManager::from_pipeline_str(&registry, "fuse-softmax,fuse-attention,fuse-map-reduce")
+            .expect("complete fusion pipeline");
     let res = pm.run(&mut fused).expect("run complete fusion");
     assert!(res[0].changed);
     assert!(res[1].changed);
@@ -508,7 +506,7 @@ module @conv_model {
     let registry = PassRegistry::with_builtin_passes();
     let mut pm = PassManager::from_pipeline_str(
         &registry,
-        "lower-conv-to-gemm,fold-reshape,fuse-matmul-epilogue,dce",
+        "lower-conv-to-gemm,fold-views,fuse-gemm(kind=epilogue),dce",
     )
     .expect("conv pipeline");
     pm.run(&mut lowered).expect("run conv pipeline");
@@ -610,8 +608,8 @@ fn test_frontend_importers_autodiff_and_native_jit() {
     assert_eq!(onnx_mod.tensor_store.len(), 2);
     let mut onnx_opt = onnx_mod.clone();
     let registry = PassRegistry::with_builtin_passes();
-    let mut pm =
-        PassManager::from_pipeline_str(&registry, "fuse-matmul-epilogue,dce").expect("pipeline");
+    let mut pm = PassManager::from_pipeline_str(&registry, "fuse-gemm(kind=epilogue),dce")
+        .expect("pipeline");
     pm.run(&mut onnx_opt).expect("run fuse-matmul-epilogue");
     assert!(print_mlir(&onnx_opt).contains("castforge.fused_matmul_epilogue"));
 
@@ -980,7 +978,7 @@ module @chain_demo {
     let registry = PassRegistry::with_builtin_passes();
     let mut pm = PassManager::from_pipeline_str(
         &registry,
-        "tile-loops(size=2) | unroll-loops(double_buffer=true) | vectorize-loops(isa=avx2)",
+        "schedule-loops(size=2,double_buffer=true,isa=avx2)",
     )
     .expect("pipe-separated loop passes");
     let res = pm.run(&mut scheduled).expect("run loop schedule passes");
@@ -1167,8 +1165,8 @@ module @export_and_gpu_demo {
     // Step 4: SnapshotIrTranslator + IrDiffTranslator, RooflineReportTranslator, MemoryPlan
     let registry = PassRegistry::with_builtin_passes();
     let fuse_pass = registry
-        .create_pass("fuse-matmul-epilogue", &Default::default())
-        .expect("fuse-matmul-epilogue");
+        .create_pass("fuse-gemm", &Default::default())
+        .expect("fuse-gemm");
     let dce_pass = registry
         .create_pass("dce", &Default::default())
         .expect("dce");
@@ -1286,16 +1284,16 @@ module @ir_tools_demo {
     assert!(!red_ir.contains("stablehlo.dot_general"));
 
     let mut step1 = base.clone();
-    PassManager::from_pipeline_str(&registry, "fuse-matmul-epilogue | bisect-passes(limit=2)")
-        .unwrap()
-        .run(&mut step1)
-        .unwrap();
-    let bisect_rep = bisect_module_snapshots(
-        &base,
-        &[("fuse-matmul-epilogue".to_string(), step1.clone())],
-        1e-5,
+    PassManager::from_pipeline_str(
+        &registry,
+        "fuse-gemm(kind=epilogue) | bisect-passes(limit=2)",
     )
-    .expect("bisect snapshots");
+    .unwrap()
+    .run(&mut step1)
+    .unwrap();
+    let bisect_rep =
+        bisect_module_snapshots(&base, &[("fuse-gemm".to_string(), step1.clone())], 1e-5)
+            .expect("bisect snapshots");
     assert!(bisect_rep.first_failing_pass.is_none());
     assert!(bisect_rep.steps[0].passed);
 
@@ -1527,7 +1525,7 @@ module @advanced_ir_tools {
 #[test]
 fn test_pad_for_tiling_split_gemm_unroll_calls_hoist_all_reduce_instrument_and_strip() {
     let registry = PassRegistry::with_builtin_passes();
-    assert_eq!(registry.list().count(), 99);
+    assert_eq!(registry.list().count(), 82);
 
     let mlir = r#"
 module @final_ninety_suite {
@@ -1540,11 +1538,13 @@ module @final_ninety_suite {
 "#;
     let base = parse_mlir(mlir).expect("parse final_ninety_suite");
 
-    // 1. Tile-alignment padding (`pad-for-tiling`) + attribute stripping (`strip-attributes`)
+    // 1. Tile-alignment padding (`schedule-loops(align=8)`) + metadata stripping (`strip-metadata`)
     let mut padded = base.clone();
-    let mut pad_pm = PassManager::from_pipeline_str(&registry, "pad-for-tiling(align=8)")
-        .expect("pad-for-tiling");
-    let pad_res = pad_pm.run(&mut padded).expect("run pad-for-tiling");
+    let mut pad_pm = PassManager::from_pipeline_str(&registry, "schedule-loops(align=8)")
+        .expect("schedule-loops(align=8)");
+    let pad_res = pad_pm
+        .run(&mut padded)
+        .expect("run schedule-loops(align=8)");
     assert!(pad_res[0].changed);
     let pad_ir = print_mlir(&padded);
     assert!(pad_ir.contains("pad_align = 8"));
@@ -1552,8 +1552,8 @@ module @final_ninety_suite {
 
     let mut stripped = padded.clone();
     let mut strip_pm =
-        PassManager::from_pipeline_str(&registry, "strip-attributes").expect("strip-attributes");
-    let strip_res = strip_pm.run(&mut stripped).expect("run strip-attributes");
+        PassManager::from_pipeline_str(&registry, "strip-metadata").expect("strip-metadata");
+    let strip_res = strip_pm.run(&mut stripped).expect("run strip-metadata");
     assert!(strip_res[0].changed);
     let strip_ir = print_mlir(&stripped);
     assert!(!strip_ir.contains("pad_align"));
@@ -1855,4 +1855,32 @@ fn test_consolidated_and_sota_passes_groupwise_batchnorm_concat_paged_gvn() {
         castforge_codegen::emit_cuda_module_with_config(&attn_mod, &TargetConfig::default())
             .expect("emit cuda for paged attention");
     assert!(cuda_src.contains("PagedAttention KV block-table addressing (page_block_size=16)"));
+
+    // 4. Test flash-decoding, shard-ring-attention, speculative-tree-attention,
+    //    quantize-fp8, and fuse-megakernel
+    let mut sota5_mod = parse_mlir(attn_mlir).expect("parse attn_mlir for sota5");
+    let mut pm_sota5 = PassManager::from_pipeline_str(
+        &registry,
+        concat!(
+            "flash-decoding(kv_splits=8),",
+            "shard-ring-attention(ring_size=4),",
+            "speculative-tree-attention(tree_depth=5,tree_width=4),",
+            "fuse-megakernel(min_ops=1)"
+        ),
+    )
+    .expect("build sota5 pipeline");
+    let sota5_res = pm_sota5.run(&mut sota5_mod).expect("run sota5 pipeline");
+    assert!(sota5_res.iter().all(|r| r.changed));
+    let sota5_printed = print_mlir(&sota5_mod);
+    assert!(sota5_printed.contains("castforge.flash_decoding = true"));
+    assert!(sota5_printed.contains("castforge.ring_size = 4"));
+    assert!(sota5_printed.contains("castforge.speculative_tree = true"));
+    assert!(sota5_printed.contains("castforge.megakernel = true"));
+
+    let mut fp8_mod = parse_mlir(mlir).expect("parse mlir for fp8");
+    let mut pm_fp8 = PassManager::from_pipeline_str(&registry, "quantize-fp8(format=e4m3)")
+        .expect("build quantize-fp8");
+    let fp8_res = pm_fp8.run(&mut fp8_mod).expect("run quantize-fp8");
+    assert!(fp8_res[0].changed);
+    assert!(print_mlir(&fp8_mod).contains("fp8_e4m3"));
 }

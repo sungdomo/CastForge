@@ -2,19 +2,19 @@
 
 use crate::{
     BakeLoraPass, BufferizeInplacePass, CanonicalizePass, DeadCodeEliminationPass,
-    EgraphSimplifyPass, EliminateConcatCopiesPass, FoldBatchNormPass, FoldNormWeightsPass,
-    FuseActivationsPass, FuseAttentionPass, FuseDequantMatmulPass, FuseElementwisePass,
-    FuseMatmulEpiloguePass, FuseMoePass, FuseNormPass, FuseRopePass, FuseSoftmaxPass,
-    GlobalValueNumberingPass, HoistAllReducePass, InlinerPass, LicmPass, PackWeightsPass, Pass,
-    PassResult, SccpPass, SinkTransposePass, SpecializeShapesPass, SymbolDcePass,
-    TopologicalSortPass,
+    EgraphSimplifyPass, EliminateConcatCopiesPass, FoldBatchNormPass, FoldConstantsPass,
+    FoldViewsPass, FuseActivationsPass, FuseAttentionPass, FuseElementwisePass, FuseGemmPass,
+    FuseMoePass, FuseNormPass, FuseRopePass, FuseSoftmaxPass, GlobalValueNumberingPass,
+    HoistAllReducePass, InlinerPass, LicmPass, PackWeightsPass, Pass, PassResult,
+    SpecializeShapesPass, SymbolDcePass, TopologicalSortPass,
 };
 use anyhow::Result;
 use castforge_ir::Module;
 use indexmap::IndexMap;
 
 /// Level 1 Optimization Preset (`O1`):
-/// Runs inlining, SCCP, LICM, GVN, fixed-point canonicalization, symbol DCE, and topological sort.
+/// Runs inlining, constant folding, LICM, GVN, view folding, canonicalization, symbol DCE, and
+/// topological sort.
 pub struct OptO1Pass;
 
 impl Pass for OptO1Pass {
@@ -23,15 +23,19 @@ impl Pass for OptO1Pass {
     }
 
     fn description(&self) -> &'static str {
-        "Preset O1: Inlining, SCCP, LICM, GVN, canonicalization, symbol-dce, toposort"
+        "Preset O1: Inlining, fold-constants, LICM, GVN, fold-views, canonicalize, symbol-dce"
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let steps = [
             InlinerPass.run(module)?,
-            SccpPass.run(module)?,
+            FoldConstantsPass {
+                include_conditional: true,
+            }
+            .run(module)?,
             LicmPass.run(module)?,
             GlobalValueNumberingPass.run(module)?,
+            FoldViewsPass.run(module)?,
             CanonicalizePass.run(module)?,
             SymbolDcePass.run(module)?,
             TopologicalSortPass.run(module)?,
@@ -41,10 +45,9 @@ impl Pass for OptO1Pass {
 }
 
 /// Level 2 Optimization Preset (`O2`):
-/// Runs `O1` followed by weight folding (`bake-lora`, `fold-norm-weights`, `fold-batchnorm`),
-/// layout sinking, unified macro-fusions (`fuse-norm`, `fuse-rope`, `fuse-activations`,
-/// `fuse-attention`, `fuse-softmax`, `fuse-matmul-epilogue`, `fuse-dequant-matmul`,
-/// `fuse-elementwise`), and post-fusion cleanup.
+/// Runs `O1` followed by weight folding (`bake-lora`, `fold-batchnorm`), view folding,
+/// unified macro-fusions (`fuse-norm`, `fuse-rope`, `fuse-activations`, `fuse-attention`,
+/// `fuse-softmax`, `fuse-gemm`, `fuse-elementwise`), and post-fusion cleanup.
 pub struct OptO2Pass;
 
 impl Pass for OptO2Pass {
@@ -53,23 +56,21 @@ impl Pass for OptO2Pass {
     }
 
     fn description(&self) -> &'static str {
-        "Preset O2: O1 + LoRA/Norm/BatchNorm weight folding + unified Transformer/MatMul fusions"
+        "Preset O2: O1 + LoRA/BatchNorm weight folding + unified Transformer/GEMM fusions"
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let steps = [
             OptO1Pass.run(module)?,
-            SinkTransposePass.run(module)?,
+            FoldViewsPass.run(module)?,
             BakeLoraPass { alpha: 1.0 }.run(module)?,
-            FoldNormWeightsPass.run(module)?,
             FoldBatchNormPass.run(module)?,
             FuseNormPass::default().run(module)?,
             FuseRopePass.run(module)?,
             FuseActivationsPass::default().run(module)?,
             FuseAttentionPass.run(module)?,
             FuseSoftmaxPass.run(module)?,
-            FuseMatmulEpiloguePass.run(module)?,
-            FuseDequantMatmulPass.run(module)?,
+            FuseGemmPass::default().run(module)?,
             FuseElementwisePass.run(module)?,
             CanonicalizePass.run(module)?,
             DeadCodeEliminationPass::default().run(module)?,

@@ -20,7 +20,7 @@ module @sink_transpose_demo {
 fn test_sink_transpose_and_constant_fold() {
     let mut module = parse_mlir(SINK_TRANSPOSE_MLIR).expect("parse sink transpose MLIR");
     let registry = PassRegistry::with_builtin_passes();
-    let mut pm = PassManager::from_pipeline_str(&registry, "sink-transpose,fold-constants,dce")
+    let mut pm = PassManager::from_pipeline_str(&registry, "fold-views,fold-constants,dce")
         .expect("valid pipeline");
     let history = pm.run(&mut module).expect("run pipeline");
     assert!(history.iter().any(|r| r.changed));
@@ -53,9 +53,9 @@ module @fuse_matmul_demo {
 fn test_fuse_matmul_epilogue_and_codegen() {
     let mut module = parse_mlir(FUSE_MATMUL_EPILOGUE_MLIR).expect("parse matmul epilogue MLIR");
     let registry = PassRegistry::with_builtin_passes();
-    let mut pm =
-        PassManager::from_pipeline_str(&registry, "fuse-matmul-epilogue").expect("valid pipeline");
-    let res = pm.run(&mut module).expect("run fuse-matmul-epilogue");
+    let mut pm = PassManager::from_pipeline_str(&registry, "fuse-gemm(kind=epilogue)")
+        .expect("valid pipeline");
+    let res = pm.run(&mut module).expect("run fuse-gemm");
     assert!(res[0].changed);
     assert_eq!(res[0].ops_created, 1);
     assert_eq!(res[0].ops_removed, 2);
@@ -91,8 +91,8 @@ fn test_fold_norm_weights() {
     let mut module = parse_mlir(FOLD_NORM_WEIGHTS_MLIR).expect("parse fold norm MLIR");
     let registry = PassRegistry::with_builtin_passes();
     let mut pm =
-        PassManager::from_pipeline_str(&registry, "fold-norm-weights").expect("valid pipeline");
-    let res = pm.run(&mut module).expect("run fold-norm-weights");
+        PassManager::from_pipeline_str(&registry, "fold-batchnorm").expect("valid pipeline");
+    let res = pm.run(&mut module).expect("run fold-batchnorm");
     assert!(res[0].changed);
 
     let printed = print_mlir(&module);
@@ -179,8 +179,8 @@ fn test_fuse_rmsnorm_and_numeric_verification() {
     let registry = PassRegistry::with_builtin_passes();
 
     let mut pm =
-        PassManager::from_pipeline_str(&registry, "fuse-rmsnorm").expect("fuse-rmsnorm pipeline");
-    let res = pm.run(&mut fused).expect("run fuse-rmsnorm");
+        PassManager::from_pipeline_str(&registry, "fuse-norm(kind=rmsnorm)").expect("fuse-norm");
+    let res = pm.run(&mut fused).expect("run fuse-norm");
     assert!(res[0].changed);
 
     let printed = print_mlir(&fused);
@@ -301,12 +301,12 @@ module @qkv_horizontal_and_canon {
 fn test_horizontal_dot_broadcast_slice_concat_and_reassociation() {
     let before = parse_mlir(HORIZONTAL_DOT_AND_CANON_MLIR).expect("parse horizontal dot MLIR");
 
-    // 1. Test `fuse-horizontal-dot` in isolation: merges %q and %k into 1 `dot_general` + 2 slices
+    // 1. Test `fuse-gemm(kind=horizontal)` in isolation: merges %q and %k into 1 `dot_general`
     let mut horiz = before.clone();
     let registry = PassRegistry::with_builtin_passes();
-    let mut pm_h = PassManager::from_pipeline_str(&registry, "fuse-horizontal-dot")
-        .expect("fuse-horizontal-dot pipeline");
-    let res_h = pm_h.run(&mut horiz).expect("run fuse-horizontal-dot");
+    let mut pm_h = PassManager::from_pipeline_str(&registry, "fuse-gemm(kind=horizontal)")
+        .expect("fuse-gemm(kind=horizontal) pipeline");
+    let res_h = pm_h.run(&mut horiz).expect("run fuse-gemm");
     assert!(res_h[0].changed);
     let printed_h = print_mlir(&horiz);
     assert_eq!(printed_h.matches("stablehlo.dot_general").count(), 1);
@@ -351,11 +351,11 @@ module @convert_and_hoist {
 fn test_fold_convert_and_hoist_constants() {
     let mut module = parse_mlir(CONVERT_AND_HOIST_MLIR).expect("parse convert/hoist MLIR");
     let registry = PassRegistry::with_builtin_passes();
-    let mut pm = PassManager::from_pipeline_str(&registry, "fold-convert,hoist-constants,licm")
-        .expect("fold-convert/hoist-constants/licm pipeline");
+    let mut pm = PassManager::from_pipeline_str(&registry, "fold-views,hoist-constants,licm")
+        .expect("fold-views/hoist-constants/licm pipeline");
     let res = pm
         .run(&mut module)
-        .expect("run fold-convert/hoist-constants/licm");
+        .expect("run fold-views/hoist-constants/licm");
     assert!(res[0].changed);
     assert!(res[1].changed);
 
@@ -390,10 +390,13 @@ fn test_fuse_swiglu_and_generalized_matmul_epilogue() {
     let before = parse_mlir(SWIGLU_AND_EPILOGUE_MLIR).expect("parse swiglu MLIR");
     let registry = PassRegistry::with_builtin_passes();
 
-    // 1. Test `fuse-swiglu` + `fuse-matmul-epilogue` + `decompose-composites`
+    // 1. Test `fuse-activations(kind=swiglu)` + `fuse-gemm(kind=epilogue)` + `decompose-composites`
     let mut swiglu_mod = before.clone();
-    let mut pm = PassManager::from_pipeline_str(&registry, "fuse-swiglu,fuse-matmul-epilogue")
-        .expect("swiglu pipeline");
+    let mut pm = PassManager::from_pipeline_str(
+        &registry,
+        "fuse-activations(kind=swiglu),fuse-gemm(kind=epilogue)",
+    )
+    .expect("swiglu pipeline");
     let res = pm.run(&mut swiglu_mod).expect("run swiglu pipeline");
     assert!(res[0].changed);
     assert!(res[1].changed);
@@ -422,13 +425,13 @@ fn test_fuse_swiglu_and_generalized_matmul_epilogue() {
         verify_module_numerics(&before, &decomp_mod, 1e-5).expect("verify decomposed swiglu");
     assert!(rep_d.passed, "max_abs_diff = {}", rep_d.max_abs_diff);
 
-    // 2. Test standalone `fuse-matmul-epilogue` fusing `dot_general + bias + silu` (`bias_silu`)
+    // 2. Test standalone `fuse-gemm(kind=epilogue)` fusing `dot_general + bias + silu`
     let mut silu_epilogue_mod = before.clone();
-    let mut pm_e = PassManager::from_pipeline_str(&registry, "fuse-matmul-epilogue")
-        .expect("fuse-matmul-epilogue pipeline");
+    let mut pm_e = PassManager::from_pipeline_str(&registry, "fuse-gemm(kind=epilogue)")
+        .expect("fuse-gemm(kind=epilogue) pipeline");
     let res_e = pm_e
         .run(&mut silu_epilogue_mod)
-        .expect("run fuse-matmul-epilogue");
+        .expect("run fuse-gemm(kind=epilogue)");
     assert!(res_e[0].changed);
     let printed_e = print_mlir(&silu_epilogue_mod);
     assert!(printed_e.contains("bias_silu"));
@@ -727,9 +730,13 @@ fn test_fuse_dequant_matmul_residual_norm_layernorm_gelu_and_gated_mlp() {
 
     let mut pm_fuse = PassManager::from_pipeline_str(
         &registry,
-        "fuse-residual-norm,quantize-weights(bits=8,min_elements=4),fuse-dequant-matmul",
+        concat!(
+            "fuse-norm(kind=residual_rmsnorm),",
+            "quantize-weights(bits=8,min_elements=4),",
+            "fuse-gemm(kind=dequant)"
+        ),
     )
-    .expect("fuse-residual-norm,quantize-weights,fuse-dequant-matmul");
+    .expect("fuse-norm,quantize-weights,fuse-gemm");
     let res_fuse = pm_fuse.run(&mut mod_q).expect("run qmatmul+resnorm fusion");
     assert!(res_fuse[0].changed);
     assert!(res_fuse[2].changed);
@@ -748,11 +755,12 @@ fn test_fuse_dequant_matmul_residual_norm_layernorm_gelu_and_gated_mlp() {
     let c_q = generate_code(&mod_q, CodegenTarget::C).expect("c qmatmul codegen");
     assert!(c_q.contains("[qmatmul:on-the-fly dequant"));
 
-    // 2. Test `fuse-layernorm,fuse-gated-mlp` (which also exercises `fuse-gelu` / GeGLU)
+    // 2. Test `fuse-norm(kind=layernorm),fuse-activations` (exercises GELU + GeGLU)
     let before_ln = parse_mlir(LAYERNORM_GELU_AND_GATED_MLP_MLIR).expect("parse ln+geglu mlir");
     let mut fused_ln = before_ln.clone();
-    let mut pm_ln = PassManager::from_pipeline_str(&registry, "fuse-layernorm,fuse-gated-mlp")
-        .expect("fuse-layernorm,fuse-gated-mlp");
+    let mut pm_ln =
+        PassManager::from_pipeline_str(&registry, "fuse-norm(kind=layernorm),fuse-activations")
+            .expect("fuse-norm,fuse-activations");
     let res_ln = pm_ln.run(&mut fused_ln).expect("run ln+gated_mlp");
     assert!(res_ln[0].changed);
     assert!(res_ln[1].changed);
