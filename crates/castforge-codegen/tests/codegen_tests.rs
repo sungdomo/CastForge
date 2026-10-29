@@ -1715,3 +1715,62 @@ module @multi_arch_demo {
     assert!(halide_src.contains("// Halide DSL for multi_arch_demo (1 kernels)"));
     assert!(halide_src.contains("kernel @main("));
 }
+
+#[test]
+fn test_sota_commutative_cse_refcount_dce_and_extended_eval() {
+    use castforge_ir::tensor_store::prune_2d_columns_by_l1;
+
+    // 1. Zero-dimension and short-slice safety in prune_2d_columns_by_l1
+    let (pruned_empty, kept_empty) = prune_2d_columns_by_l1(&[], 0, 0, 4);
+    assert!(pruned_empty.is_empty());
+    assert!(kept_empty.is_empty());
+
+    // 2. Commutative CSE & attribute-order-independent CSE + O(N) reference-counted DCE
+    let mlir = r#"
+module @sota_cse_dce {
+  func.func @main(%a: tensor<4xf32>, %b: tensor<4xf32>) -> tensor<4xf32> {
+    %sum1 = stablehlo.add %a, %b : tensor<4xf32>
+    %sum2 = stablehlo.add %b, %a : tensor<4xf32>
+    %prod = stablehlo.multiply %sum1, %sum2 : tensor<4xf32>
+    %dead1 = stablehlo.negate %prod : tensor<4xf32>
+    %dead2 = stablehlo.abs %dead1 : tensor<4xf32>
+    %dead3 = stablehlo.cosine %dead2 : tensor<4xf32>
+    func.return %prod : tensor<4xf32>
+  }
+}
+"#;
+    let mut module = parse_mlir(mlir).expect("parse mlir");
+    let use_counts = module.compute_use_counts();
+    assert!(!use_counts.is_empty());
+
+    let mut pm = PassManager::new()
+        .add_pass(castforge_passes::CommonSubexpressionEliminationPass)
+        .add_pass(castforge_passes::DeadCodeEliminationPass::default());
+    let results = pm.run(&mut module).expect("run cse + dce");
+    assert_eq!(
+        results[0].ops_removed, 1,
+        "commutative add(%b, %a) deduplicated"
+    );
+    assert_eq!(
+        results[1].ops_removed, 3,
+        "3-op dead chain removed in single sweep"
+    );
+
+    // 3. Reference interpreter coverage for iota, negate, abs, cosine, sine, reverse
+    let eval_mlir = r#"
+module @eval_extended {
+  func.func @main(%x: tensor<4xf32>) -> tensor<4xf32> {
+    %iot = "stablehlo.iota"() {iota_dimension = 0 : i64} : () -> tensor<4xf32>
+    %sum = stablehlo.add %x, %iot : tensor<4xf32>
+    %neg = stablehlo.negate %sum : tensor<4xf32>
+    %ab = stablehlo.abs %neg : tensor<4xf32>
+    %rev = "stablehlo.reverse"(%ab) {dimensions = array<i64: 0>} : (tensor<4xf32>) -> tensor<4xf32>
+    func.return %rev : tensor<4xf32>
+  }
+}
+"#;
+    let eval_mod = parse_mlir(eval_mlir).expect("parse eval_mlir");
+    let out = castforge_codegen::evaluate_module(&eval_mod, &[vec![1.0, 2.0, 3.0, 4.0]])
+        .expect("evaluate extended ops");
+    assert_eq!(out[0], vec![7.0, 5.0, 3.0, 1.0]);
+}

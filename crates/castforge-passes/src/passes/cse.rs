@@ -1,9 +1,13 @@
 use crate::{Pass, PassResult};
 use anyhow::Result;
-use castforge_ir::{BlockId, Module, OpId};
+use castforge_ir::{BlockId, Module, OpId, Operation, Type, ValueId};
 use std::collections::HashMap;
 
 /// Common Subexpression Elimination Pass (`cse`).
+///
+/// Deduplicates identical pure SSA operations within each basic block, including canonicalizing
+/// operand order for commutative binary operations (`add`, `multiply`, `maximum`, `minimum`,
+/// `and`, `or`, `xor`) and canonicalizing attribute key order.
 pub struct CommonSubexpressionEliminationPass;
 
 impl Pass for CommonSubexpressionEliminationPass {
@@ -31,10 +35,7 @@ impl Pass for CommonSubexpressionEliminationPass {
                 }
                 let res_val = op.results[0];
                 let res_ty = &module.values[res_val].ty;
-                let sig = format!(
-                    "{}|operands:{:?}|attrs:{:?}|ty:{}",
-                    op.name, op.operands, op.attributes, res_ty
-                );
+                let sig = canonical_cse_signature(op, res_ty);
 
                 if let Some(&existing_op_id) = seen.get(&sig) {
                     let existing_res = module.ops[existing_op_id].results[0];
@@ -55,4 +56,37 @@ impl Pass for CommonSubexpressionEliminationPass {
             ops_created: 0,
         })
     }
+}
+
+fn is_commutative_binary_op(op: &Operation) -> bool {
+    op.name.dialect == "stablehlo"
+        && op.operands.len() == 2
+        && matches!(
+            op.name.name.as_str(),
+            "add" | "multiply" | "maximum" | "minimum" | "and" | "or" | "xor"
+        )
+}
+
+fn canonical_cse_signature(op: &Operation, res_ty: &Type) -> String {
+    let mut operand_keys: Vec<String> = op
+        .operands
+        .iter()
+        .map(|v: &ValueId| format!("{v:?}"))
+        .collect();
+    if is_commutative_binary_op(op) {
+        operand_keys.sort();
+    }
+
+    let mut attr_pairs: Vec<(&String, String)> = op
+        .attributes
+        .iter()
+        .filter(|(k, _)| !k.starts_with("castforge.") && *k != "inplace_operand")
+        .map(|(k, v)| (k, format!("{v:?}")))
+        .collect();
+    attr_pairs.sort_by(|a, b| a.0.cmp(b.0));
+
+    format!(
+        "{}|operands:{:?}|attrs:{:?}|ty:{}",
+        op.name, operand_keys, attr_pairs, res_ty
+    )
 }

@@ -297,6 +297,24 @@ impl Module {
         count
     }
 
+    /// Computes a reference-count map (`ValueId -> use_count`) across all active operations
+    /// in the module in a single $O(N)$ pass.
+    pub fn compute_use_counts(&self) -> std::collections::HashMap<ValueId, usize> {
+        let mut counts = std::collections::HashMap::with_capacity(self.values.len());
+        for (_, region) in &self.regions {
+            for &block_id in &region.blocks {
+                for &op_id in &self.blocks[block_id].ops {
+                    if let Some(op) = self.ops.get(op_id) {
+                        for &operand in &op.operands {
+                            *counts.entry(operand).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+        }
+        counts
+    }
+
     /// Returns all active `OpId`s in `block`.
     pub fn block_ops(&self, block: BlockId) -> Vec<OpId> {
         self.blocks[block].ops.clone()

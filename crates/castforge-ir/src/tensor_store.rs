@@ -187,6 +187,9 @@ pub fn prune_2d_columns_by_l1(
     cols: usize,
     keep_cols: usize,
 ) -> (Vec<f32>, Vec<usize>) {
+    if rows == 0 || cols == 0 || values.len() < rows * cols {
+        return (values.to_vec(), (0..cols).collect());
+    }
     let keep_cols = keep_cols.clamp(1, cols);
     let mut col_scores: Vec<(usize, f32)> = (0..cols)
         .map(|c| {

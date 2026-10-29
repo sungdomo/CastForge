@@ -54,7 +54,14 @@ pub fn verify_module_numerics(
     let inputs = generate_synthetic_inputs(before, None)?;
     let out_before = evaluate_module(before, &inputs)?;
     let out_after = evaluate_module(after, &inputs)?;
+    compare_output_tensors(&out_before, &out_after, tolerance)
+}
 
+fn compare_output_tensors(
+    out_before: &[Vec<f32>],
+    out_after: &[Vec<f32>],
+    tolerance: f32,
+) -> Result<NumericVerificationReport> {
     if out_before.len() != out_after.len() {
         return Err(anyhow!(
             "Output count mismatch: before={} vs after={}",
@@ -114,15 +121,20 @@ pub struct BisectReport {
 
 /// Evaluates a sequence of `(pass_name, module_snapshot)` pairs against `baseline` to pinpoint
 /// the exact pass where numerical drift exceeds `tolerance`.
+///
+/// Evaluates `baseline` once up front and reuses its reference output across all snapshots.
 pub fn bisect_module_snapshots(
     baseline: &Module,
     snapshots: &[(String, Module)],
     tolerance: f32,
 ) -> Result<BisectReport> {
+    let inputs = generate_synthetic_inputs(baseline, None)?;
+    let out_base = evaluate_module(baseline, &inputs)?;
     let mut steps = Vec::with_capacity(snapshots.len());
     let mut first_failing_pass = None;
     for (idx, (pass_name, snap)) in snapshots.iter().enumerate() {
-        let rep = verify_module_numerics(baseline, snap, tolerance)?;
+        let out_snap = evaluate_module(snap, &inputs)?;
+        let rep = compare_output_tensors(&out_base, &out_snap, tolerance)?;
         if !rep.passed && first_failing_pass.is_none() {
             first_failing_pass = Some(pass_name.clone());
         }
@@ -908,6 +920,65 @@ fn eval_stablehlo_op(
                 get_v(inputs[0])
             }
         }
+        StableHloOp::Iota { iota_dimension, .. } => {
+            let dims = module.values[res_val]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![res_len]);
+            if dims.len() == 2 && iota_dimension == 0 {
+                let cols = dims[1].max(1);
+                (0..res_len).map(|i| (i / cols) as f32).collect()
+            } else {
+                let cols = *dims.last().unwrap_or(&res_len).max(&1);
+                (0..res_len).map(|i| (i % cols) as f32).collect()
+            }
+        }
+        StableHloOp::CustomCall { inputs, .. } => inputs
+            .first()
+            .map(|&v| get_v(v))
+            .unwrap_or_else(|| vec![0.0; res_len]),
+        StableHloOp::Other { op_name } => match op_name.as_str() {
+            "negate" if !op.operands.is_empty() => {
+                get_v(op.operands[0]).into_iter().map(|x| -x).collect()
+            }
+            "abs" if !op.operands.is_empty() => {
+                get_v(op.operands[0]).into_iter().map(|x| x.abs()).collect()
+            }
+            "cosine" if !op.operands.is_empty() => {
+                get_v(op.operands[0]).into_iter().map(|x| x.cos()).collect()
+            }
+            "sine" if !op.operands.is_empty() => {
+                get_v(op.operands[0]).into_iter().map(|x| x.sin()).collect()
+            }
+            "clamp" if op.operands.len() >= 3 => {
+                let mn = get_v(op.operands[0]);
+                let x = get_v(op.operands[1]);
+                let mx = get_v(op.operands[2]);
+                (0..res_len)
+                    .map(|i| {
+                        let lo = mn.get(i).or_else(|| mn.first()).copied().unwrap_or(0.0);
+                        let hi = mx.get(i).or_else(|| mx.first()).copied().unwrap_or(0.0);
+                        x[i].clamp(lo, hi)
+                    })
+                    .collect()
+            }
+            "reverse" if !op.operands.is_empty() => {
+                let mut v = get_v(op.operands[0]);
+                v.reverse();
+                v
+            }
+            "all_reduce" if !op.operands.is_empty() => get_v(op.operands[0]),
+            _ => op
+                .operands
+                .first()
+                .map(|&v| {
+                    let mut out = get_v(v);
+                    out.resize(res_len, 0.0);
+                    out
+                })
+                .unwrap_or_else(|| vec![0.0; res_len]),
+        },
         _ => vec![0.0; res_len],
     };
 

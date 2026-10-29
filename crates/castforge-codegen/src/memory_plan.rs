@@ -1,6 +1,7 @@
 use crate::liveness::{LiveInterval, compute_module_liveness};
 use castforge_ir::{Attribute, Module, ValueDef, ValueId};
 use serde::Serialize;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BufferAllocation {
@@ -19,6 +20,8 @@ pub struct BufferAllocation {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MemoryPlan {
     pub allocations: Vec<BufferAllocation>,
+    #[serde(skip)]
+    value_to_alloc: HashMap<ValueId, usize>,
     pub total_constant_bytes: usize,
     /// Peak arena workspace bytes required with liveness-guided buffer reuse.
     pub total_activation_bytes: usize,
@@ -33,9 +36,21 @@ pub struct MemoryPlan {
 }
 
 impl MemoryPlan {
-    /// Lookup the allocation record for `val_id`.
+    /// Lookup the allocation record for `val_id` in $O(1)$ time.
     pub fn allocation_for(&self, val_id: ValueId) -> Option<&BufferAllocation> {
-        self.allocations.iter().find(|a| a.value_id == Some(val_id))
+        if let Some(&idx) = self.value_to_alloc.get(&val_id) {
+            self.allocations.get(idx)
+        } else {
+            self.allocations.iter().find(|a| a.value_id == Some(val_id))
+        }
+    }
+
+    fn push_allocation(&mut self, alloc: BufferAllocation) {
+        let idx = self.allocations.len();
+        if let Some(vid) = alloc.value_id {
+            self.value_to_alloc.insert(vid, idx);
+        }
+        self.allocations.push(alloc);
     }
 
     /// Returns the `f32` element index (`arena_offset / 4`) in the shared `arena` workspace
@@ -102,7 +117,7 @@ pub fn build_memory_plan(module: &Module) -> MemoryPlan {
 
         if iv.is_constant {
             plan.total_constant_bytes += bytes;
-            plan.allocations.push(BufferAllocation {
+            plan.push_allocation(BufferAllocation {
                 value_id: Some(val_id),
                 name,
                 num_elements: elems,
@@ -121,7 +136,7 @@ pub fn build_memory_plan(module: &Module) -> MemoryPlan {
 
         // Block arguments are caller-provided inputs; intermediate SSA op results share the arena
         if iv.is_block_arg {
-            plan.allocations.push(BufferAllocation {
+            plan.push_allocation(BufferAllocation {
                 value_id: Some(val_id),
                 name,
                 num_elements: elems,
@@ -193,7 +208,7 @@ pub fn build_memory_plan(module: &Module) -> MemoryPlan {
             (slot_idx, None)
         };
 
-        plan.allocations.push(BufferAllocation {
+        plan.push_allocation(BufferAllocation {
             value_id: Some(val_id),
             name,
             num_elements: elems,
