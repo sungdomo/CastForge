@@ -1,19 +1,20 @@
 use crate::{
-    AutodiffPass, BakeLoraPass, BufferizeInplacePass, CalibrateQuantizePass, CanonicalizePass,
-    CommonSubexpressionEliminationPass, DeadCodeEliminationPass, DecomposeCompositesPass,
-    EgraphSimplifyPass, ExternalizeWeightsPass, FissionLoopsPass, FoldBroadcastPass,
-    FoldConstantsPass, FoldConvertPass, FoldNormWeightsPass, FoldReshapePass, FoldSliceConcatPass,
-    FoldTransposePass, FuseAttentionPass, FuseDequantMatmulPass, FuseElementwisePass,
-    FuseGatedMlpPass, FuseGeluPass, FuseHorizontalDotPass, FuseLayerNormPass, FuseLogSoftmaxPass,
-    FuseLoopsPass, FuseMapReducePass, FuseMatmulEpiloguePass, FuseMoePass, FuseResidualNormPass,
-    FuseRmsNormPass, FuseRopePass, FuseSoftmaxPass, FuseSwiGluPass, HoistConstantsPass,
-    InjectKvCachePass, InlinerPass, IrEditPass, LicmPass, LowerConvToGemmPass, MergeWeightsPass,
-    MixedPrecisionPass, OptO1Pass, OptO2Pass, OptO3Pass, PackWeightsPass, Pass, PassOptions,
-    PermuteLoopsPass, PrintOpStatsPass, QuantizeWeightsPass, RematerializePass, SccpPass,
-    ScheduleStreamsPass, ShardSpmdPass, SimplifyAlgebraicPass, SinkTransposePass,
-    SpecializeShapesPass, StripDebugInfoPass, StructuredPruningPass, SymbolDcePass,
-    TaskArithmeticPass, TileLoopsPass, TopologicalSortPass, UnrollLoopsPass, VectorizeLoopsPass,
-    VerifyShapesPass,
+    AutodiffPass, BakeLoraPass, BisectPassesPass, BufferizeInplacePass, CalibrateQuantizePass,
+    CanonicalizePass, CommonSubexpressionEliminationPass, ComposeFuncsPass,
+    DeadCodeEliminationPass, DecomposeCompositesPass, EgraphSimplifyPass, ExternalizeWeightsPass,
+    ExtractSubgraphPass, FissionLoopsPass, FoldBroadcastPass, FoldConstantsPass, FoldConvertPass,
+    FoldNormWeightsPass, FoldReshapePass, FoldSliceConcatPass, FoldTransposePass,
+    FuseAttentionPass, FuseDequantMatmulPass, FuseElementwisePass, FuseGatedMlpPass, FuseGeluPass,
+    FuseHorizontalDotPass, FuseLayerNormPass, FuseLogSoftmaxPass, FuseLoopsPass, FuseMapReducePass,
+    FuseMatmulEpiloguePass, FuseMoePass, FuseResidualNormPass, FuseRmsNormPass, FuseRopePass,
+    FuseSoftmaxPass, FuseSwiGluPass, HoistConstantsPass, InjectKvCachePass, InlinerPass,
+    IrEditPass, LicmPass, LowerConvToGemmPass, MergeWeightsPass, MixedPrecisionPass, OptO1Pass,
+    OptO2Pass, OptO3Pass, OutlineSubgraphsPass, PackWeightsPass, Pass, PassOptions,
+    PermuteLoopsPass, PrintOpStatsPass, QuantizeWeightsPass, ReduceIrPass, RematerializePass,
+    SanitizeNumericsPass, SccpPass, ScheduleStreamsPass, ShardSpmdPass, SimplifyAlgebraicPass,
+    SinkTransposePass, SpecializeShapesPass, StripDebugInfoPass, StructuredPruningPass,
+    SymbolDcePass, TaskArithmeticPass, TileLoopsPass, TopologicalSortPass, UnrollLoopsPass,
+    VectorizeLoopsPass, VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
 use castforge_ir::{DType, MergeMethod};
@@ -633,6 +634,90 @@ impl PassRegistry {
                     width,
                     isa,
                     parallel,
+                }))
+            },
+        );
+        reg.register(
+            "extract-subgraph",
+            "Extracts backward dataflow slice for a target SSA value into a standalone function",
+            |opts| {
+                let target = opts
+                    .get("target")
+                    .or_else(|| opts.get("output"))
+                    .cloned()
+                    .unwrap_or_default();
+                let stop_at = opts
+                    .get("stop_at")
+                    .or_else(|| opts.get("inputs"))
+                    .cloned()
+                    .unwrap_or_default();
+                Ok(Box::new(ExtractSubgraphPass { target, stop_at }))
+            },
+        );
+        reg.register(
+            "outline-subgraphs",
+            "Outlines GEMM/composite subgraphs into private func.func kernels + func.call sites",
+            |opts| {
+                let mode = opts
+                    .get("mode")
+                    .cloned()
+                    .unwrap_or_else(|| "all".to_string());
+                Ok(Box::new(OutlineSubgraphsPass { mode }))
+            },
+        );
+        reg.register(
+            "reduce-ir",
+            "Delta-reduces a function to a minimal reproducer of at most max_ops operations",
+            |opts| {
+                let max_ops = opts
+                    .get("max_ops")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(1);
+                let keep_op = opts.get("keep_op").cloned().unwrap_or_default();
+                Ok(Box::new(ReduceIrPass { max_ops, keep_op }))
+            },
+        );
+        reg.register(
+            "bisect-passes",
+            "Verifies IR invariants and stamps a numbered bisection checkpoint on entry func",
+            |opts| {
+                let limit = opts
+                    .get("limit")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(1);
+                Ok(Box::new(BisectPassesPass { limit }))
+            },
+        );
+        reg.register(
+            "sanitize-numerics",
+            "Injects castforge.nan_guard clamps on numerically sensitive ops and function outputs",
+            |opts| {
+                let clamp_max = opts
+                    .get("clamp_max")
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(65504.0);
+                let eps = opts
+                    .get("eps")
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(1e-6);
+                Ok(Box::new(SanitizeNumericsPass { clamp_max, eps }))
+            },
+        );
+        reg.register(
+            "compose-funcs",
+            "Synthesizes a composed entry function chaining two module functions (f2(f1(x)))",
+            |opts| {
+                let first = opts.get("first").cloned().unwrap_or_default();
+                let second = opts.get("second").cloned().unwrap_or_default();
+                let entry_name = opts
+                    .get("entry")
+                    .or_else(|| opts.get("name"))
+                    .cloned()
+                    .unwrap_or_else(|| "composed_main".to_string());
+                Ok(Box::new(ComposeFuncsPass {
+                    first,
+                    second,
+                    entry_name,
                 }))
             },
         );

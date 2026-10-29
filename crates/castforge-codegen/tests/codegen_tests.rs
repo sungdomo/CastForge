@@ -1206,3 +1206,148 @@ module @export_and_gpu_demo {
         .expect("memory plan json");
     assert!(mem_json.contains("\"total_activation_bytes\""));
 }
+
+#[test]
+fn test_ir_manipulation_tools_extract_outline_reduce_bisect_sanitize_and_compose() {
+    use castforge_codegen::bisect_module_snapshots;
+    use castforge_passes::link_modules;
+
+    let mlir = r#"
+module @ir_tools_demo {
+  func.func @main(
+    %x: tensor<2x4xf32>,
+    %w: tensor<4x4xf32>,
+    %b: tensor<2x4xf32>
+  ) -> tensor<2x4xf32> {
+    %mm = stablehlo.dot_general %x, %w, contracting_dims = [1] x [0]
+      : (tensor<2x4xf32>, tensor<4x4xf32>) -> tensor<2x4xf32>
+    %biased = stablehlo.add %mm, %b : tensor<2x4xf32>
+    %act = stablehlo.exponential %biased : tensor<2x4xf32>
+    func.return %act : tensor<2x4xf32>
+  }
+}
+"#;
+    let base = parse_mlir(mlir).expect("parse ir_tools_demo");
+    let registry = PassRegistry::with_builtin_passes();
+
+    // 1. Subgraph Extractor (`extract-subgraph`): slice backward cone up to %mm
+    let mut sliced = base.clone();
+    let mut slice_pm = PassManager::from_pipeline_str(&registry, "extract-subgraph(target=mm)")
+        .expect("extract-subgraph");
+    let slice_res = slice_pm.run(&mut sliced).expect("run extract-subgraph");
+    assert!(slice_res[0].changed);
+    let sliced_ir = print_mlir(&sliced);
+    assert!(sliced_ir.contains("stablehlo.dot_general"));
+    assert!(!sliced_ir.contains("stablehlo.exponential"));
+
+    // Also test cutting at `stop_at=mm` to promote `%mm` to a function input argument
+    let mut cut_sliced = base.clone();
+    let mut cut_pm =
+        PassManager::from_pipeline_str(&registry, "extract-subgraph(target=act,stop_at=mm)")
+            .expect("cut extract-subgraph");
+    cut_pm
+        .run(&mut cut_sliced)
+        .expect("run cut extract-subgraph");
+    let cut_ir = print_mlir(&cut_sliced);
+    assert!(!cut_ir.contains("stablehlo.dot_general"));
+    assert!(cut_ir.contains("stablehlo.add"));
+    assert!(cut_ir.contains("stablehlo.exponential"));
+
+    // 2. Subgraph Outliner (`outline-subgraphs`) <-> Inliner (`inliner`) symmetric round-trip
+    let mut outlined = base.clone();
+    let mut out_pm =
+        PassManager::from_pipeline_str(&registry, "outline-subgraphs(mode=gemm)").expect("outline");
+    let out_res = out_pm.run(&mut outlined).expect("run outline");
+    assert!(out_res[0].changed);
+    let out_ir = print_mlir(&outlined);
+    assert!(out_ir.contains("func.func private @outlined_kernel_0("));
+    assert!(out_ir.contains("func.call @outlined_kernel_0("));
+    let out_rep = verify_module_numerics(&base, &outlined, 1e-5).expect("verify outlined");
+    assert!(out_rep.passed);
+
+    let mut re_inlined = outlined.clone();
+    let mut inl_pm =
+        PassManager::from_pipeline_str(&registry, "inliner | symbol-dce").expect("inliner");
+    inl_pm.run(&mut re_inlined).expect("run inliner");
+    let inl_ir = print_mlir(&re_inlined);
+    assert!(!inl_ir.contains("func.call"));
+    let inl_rep = verify_module_numerics(&base, &re_inlined, 1e-5).expect("verify re-inlined");
+    assert!(inl_rep.passed);
+
+    // 3. Delta IR Reducer (`reduce-ir`) & Pass Bisector (`bisect-passes`)
+    let mut reduced = base.clone();
+    let mut red_pm =
+        PassManager::from_pipeline_str(&registry, "reduce-ir(max_ops=1,keep_op=exponential)")
+            .expect("reduce-ir");
+    let red_res = red_pm.run(&mut reduced).expect("run reduce-ir");
+    assert!(red_res[0].changed);
+    let red_ir = print_mlir(&reduced);
+    assert!(red_ir.contains("stablehlo.exponential"));
+    assert!(!red_ir.contains("stablehlo.dot_general"));
+
+    let mut step1 = base.clone();
+    PassManager::from_pipeline_str(&registry, "fuse-matmul-epilogue | bisect-passes(limit=2)")
+        .unwrap()
+        .run(&mut step1)
+        .unwrap();
+    let bisect_rep = bisect_module_snapshots(
+        &base,
+        &[("fuse-matmul-epilogue".to_string(), step1.clone())],
+        1e-5,
+    )
+    .expect("bisect snapshots");
+    assert!(bisect_rep.first_failing_pass.is_none());
+    assert!(bisect_rep.steps[0].passed);
+
+    // 4. Numerical Sanitizer (`sanitize-numerics`) + Codegen + Decompose
+    let mut sanitized = base.clone();
+    let mut san_pm =
+        PassManager::from_pipeline_str(&registry, "sanitize-numerics(clamp_max=65504.0)")
+            .expect("sanitize-numerics");
+    let san_res = san_pm.run(&mut sanitized).expect("run sanitize");
+    assert!(san_res[0].changed);
+    let san_ir = print_mlir(&sanitized);
+    assert!(san_ir.contains("castforge.nan_guard"));
+    let san_rep = verify_module_numerics(&base, &sanitized, 1e-5).expect("verify sanitized");
+    assert!(san_rep.passed);
+
+    let san_rust = generate_code(&sanitized, CodegenTarget::Rust).expect("rust sanitized");
+    assert!(san_rust.contains("[sanitize:nan_guard(clamp_max=65504.0)]"));
+    let san_c = generate_code(&sanitized, CodegenTarget::C).expect("c sanitized");
+    assert!(san_c.contains("[sanitize:nan_guard(clamp_max=65504.0)]"));
+
+    let mut dec_san = sanitized.clone();
+    PassManager::from_pipeline_str(&registry, "decompose-composites")
+        .unwrap()
+        .run(&mut dec_san)
+        .unwrap();
+    let dec_san_rep = verify_module_numerics(&base, &dec_san, 1e-5).expect("verify dec_san");
+    assert!(dec_san_rep.passed);
+
+    // 5. Module Linker (`link_modules`) & Function Composer (`compose-funcs`)
+    let stage2_mlir = r#"
+module @stage2_mod {
+  func.func @postprocess(%h: tensor<2x4xf32>) -> tensor<2x4xf32> {
+    %y = stablehlo.tanh %h : tensor<2x4xf32>
+    func.return %y : tensor<2x4xf32>
+  }
+}
+"#;
+    let stage2 = parse_mlir(stage2_mlir).expect("parse stage2");
+    let mut linked = base.clone();
+    let count = link_modules(&mut linked, &stage2).expect("link_modules");
+    assert_eq!(count, 1);
+    assert_eq!(linked.functions().len(), 2);
+
+    let mut comp_pm = PassManager::from_pipeline_str(
+        &registry,
+        "compose-funcs(first=main,second=postprocess,entry=end_to_end)",
+    )
+    .expect("compose-funcs");
+    let comp_res = comp_pm.run(&mut linked).expect("run compose-funcs");
+    assert!(comp_res[0].changed);
+    let comp_ir = print_mlir(&linked);
+    assert!(comp_ir.contains("func.func @end_to_end("));
+    assert!(comp_ir.contains("func.call @main("));
+    assert!(comp_ir.contains("func.call @postprocess("));
+}

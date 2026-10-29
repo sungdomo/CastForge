@@ -19,8 +19,8 @@ pub use crate::cost_model::{
     analyze_module_cost_with_roofline,
 };
 pub use crate::eval::{
-    NumericVerificationReport, evaluate_function, evaluate_module, generate_synthetic_inputs,
-    verify_module_numerics,
+    BisectReport, BisectStep, NumericVerificationReport, bisect_module_snapshots,
+    evaluate_function, evaluate_module, generate_synthetic_inputs, verify_module_numerics,
 };
 pub use crate::jit::{JitBenchmarkResult, autotune_module_jit, jit_execute_and_benchmark};
 pub use crate::liveness::{LiveInterval, compute_block_liveness, compute_module_liveness};

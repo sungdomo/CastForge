@@ -18,6 +18,19 @@ pub struct PassResult {
     pub ops_created: usize,
 }
 
+impl PassResult {
+    /// Returns an unchanged [`PassResult`] for `pass_name`.
+    pub fn unchanged(pass_name: &str) -> Self {
+        Self {
+            pass_name: pass_name.to_string(),
+            changed: false,
+            ops_removed: 0,
+            ops_modified: 0,
+            ops_created: 0,
+        }
+    }
+}
+
 /// Snapshot of the IR before/after a pass for step-by-step visual debugging.
 #[derive(Debug, Clone)]
 pub struct PassTraceStep {

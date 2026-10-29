@@ -1061,6 +1061,21 @@ fn emit_c_hlo_op(
                     out,
                     "    for (int i = 0; i < {res_len}; ++i) {res_name}[i] = {src}[i];"
                 )?;
+            } else if name == "castforge.nan_guard" && !inputs.is_empty() {
+                let cmax = match op.attributes.get("clamp_max") {
+                    Some(Attribute::Float(f)) if *f > 0.0 => *f as f32,
+                    _ => 65504.0_f32,
+                };
+                let src = value_ident(module, inputs[0], names, counter);
+                writeln!(out, "    /* [sanitize:nan_guard(clamp_max={cmax:.1})] */")?;
+                writeln!(out, "    for (int i = 0; i < {res_len}; ++i) {{")?;
+                writeln!(out, "        float v = {src}[i];")?;
+                writeln!(
+                    out,
+                    "        {res_name}[i] = isnan(v) ? 0.0f : \
+                     fminf(fmaxf(v, -{cmax:.1}f), {cmax:.1}f);"
+                )?;
+                writeln!(out, "    }}")?;
             } else {
                 let src = value_ident(module, inputs[0], names, counter);
                 writeln!(

@@ -1233,6 +1233,22 @@ fn emit_rust_hlo_op(
                 writeln!(out, "    for i in 0..{res_len} {{")?;
                 writeln!(out, "        {dst} = {src};")?;
                 writeln!(out, "    }}")?;
+            } else if name == "castforge.nan_guard" && !inputs.is_empty() {
+                let cmax = match op.attributes.get("clamp_max") {
+                    Some(Attribute::Float(f)) if *f > 0.0 => *f as f32,
+                    _ => 65504.0_f32,
+                };
+                let src = r_idx(module, plan, inputs[0], "i", names, counter);
+                let dst = r_idx(module, plan, res_val, "i", names, counter);
+                writeln!(out, "    // [sanitize:nan_guard(clamp_max={cmax:.1})]")?;
+                writeln!(out, "    for i in 0..{res_len} {{")?;
+                writeln!(out, "        let v = {src};")?;
+                writeln!(
+                    out,
+                    "        {dst} = if v.is_nan() {{ 0.0_f32 }} \
+                     else {{ v.clamp(-{cmax:.1}_f32, {cmax:.1}_f32) }};"
+                )?;
+                writeln!(out, "    }}")?;
             } else {
                 let src = r_idx(module, plan, inputs[0], "i", names, counter);
                 let dst = r_idx(module, plan, res_val, "i", names, counter);

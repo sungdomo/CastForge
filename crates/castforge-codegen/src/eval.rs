@@ -90,6 +90,55 @@ pub fn verify_module_numerics(
     })
 }
 
+/// Numerical verification result for a single step in [`bisect_module_snapshots`].
+#[derive(Debug, Clone)]
+pub struct BisectStep {
+    /// Step index (`0..`).
+    pub step_index: usize,
+    /// Pass name executed at this step.
+    pub pass_name: String,
+    /// Maximum absolute numerical difference against the baseline `Module`.
+    pub max_abs_diff: f32,
+    /// Whether this step stayed within `tolerance`.
+    pub passed: bool,
+}
+
+/// Complete bisection report across a sequence of pass snapshots.
+#[derive(Debug, Clone)]
+pub struct BisectReport {
+    /// Per-step numerical comparison results.
+    pub steps: Vec<BisectStep>,
+    /// Name of the first pass that exceeded `tolerance`, if any.
+    pub first_failing_pass: Option<String>,
+}
+
+/// Evaluates a sequence of `(pass_name, module_snapshot)` pairs against `baseline` to pinpoint
+/// the exact pass where numerical drift exceeds `tolerance`.
+pub fn bisect_module_snapshots(
+    baseline: &Module,
+    snapshots: &[(String, Module)],
+    tolerance: f32,
+) -> Result<BisectReport> {
+    let mut steps = Vec::with_capacity(snapshots.len());
+    let mut first_failing_pass = None;
+    for (idx, (pass_name, snap)) in snapshots.iter().enumerate() {
+        let rep = verify_module_numerics(baseline, snap, tolerance)?;
+        if !rep.passed && first_failing_pass.is_none() {
+            first_failing_pass = Some(pass_name.clone());
+        }
+        steps.push(BisectStep {
+            step_index: idx,
+            pass_name: pass_name.clone(),
+            max_abs_diff: rep.max_abs_diff,
+            passed: rep.passed,
+        });
+    }
+    Ok(BisectReport {
+        steps,
+        first_failing_pass,
+    })
+}
+
 /// Evaluates the entry function of `module` with the given `inputs` and returns its output tensors.
 pub fn evaluate_module(module: &Module, inputs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
     let fns = module.functions();
@@ -839,6 +888,21 @@ fn eval_stablehlo_op(
                 get_v(inputs[0])
                     .into_iter()
                     .map(|x| (x / sc).round().clamp(-qmax, qmax) * sc)
+                    .collect()
+            } else if name == "castforge.nan_guard" && !inputs.is_empty() {
+                let clamp_max = match op.attributes.get("clamp_max") {
+                    Some(castforge_ir::Attribute::Float(f)) if *f > 0.0 => *f as f32,
+                    _ => 65504.0_f32,
+                };
+                get_v(inputs[0])
+                    .into_iter()
+                    .map(|x| {
+                        if x.is_nan() {
+                            0.0_f32
+                        } else {
+                            x.clamp(-clamp_max, clamp_max)
+                        }
+                    })
                     .collect()
             } else {
                 get_v(inputs[0])

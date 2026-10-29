@@ -92,6 +92,12 @@ support.
 | `permute-loops` | Loop Schedule | Attaches loop order (`mnk`/`mkn`/`nkm`), collapse, or skew |
 | `unroll-loops` | Loop Schedule | Attaches unroll, prefetch, split-k, & double-buffer attrs |
 | `vectorize-loops` | Loop Schedule | Attaches SIMD lane width, ISA (`avx2`/`neon`), & parallel |
+| `extract-subgraph` | IR Slicing | Slices backward dataflow cone (`target=%v,stop_at=%in`) |
+| `outline-subgraphs` | IR Partition | Outlines GEMM/composite ops to `@outlined_kernel_k` |
+| `reduce-ir` | IR Debugging | Delta-reduces function to minimal `max_ops` reproducer |
+| `bisect-passes` | IR Debugging | Verifies invariants & stamps bisection step checkpoints |
+| `sanitize-numerics` | IR Sanitizer | Injects `castforge.nan_guard` finite clamps on ops |
+| `compose-funcs` | IR Linker | Chains two module functions `f2(f1(x))` into entry func |
 | `decompose-composites` | Lowering | Expands `stablehlo.composite` ops to primitive StableHLO |
 | `bufferize-inplace` | Lowering | Annotates elementwise ops for in-place arena buffer reuse |
 | `fold-norm-weights` | Weight Surgery | Absorbs RMSNorm/LayerNorm scale weights into MatMuls |
