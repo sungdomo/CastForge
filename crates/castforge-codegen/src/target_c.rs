@@ -1,6 +1,6 @@
 use crate::{
-    MemoryPlan, TargetConfig, build_memory_plan, sanitize_ident, tensor_len, tensor_shape_dims,
-    value_ident,
+    GemmLoopOrder, MemoryPlan, TargetConfig, build_memory_plan, sanitize_ident, tensor_len,
+    tensor_shape_dims, value_ident,
 };
 use anyhow::{Result, anyhow};
 use castforge_dialect_stablehlo::StableHloOp;
@@ -361,7 +361,78 @@ fn emit_c_hlo_op(
                 writeln!(out, "            }}")?;
                 writeln!(out, "        }}")?;
                 writeln!(out, "    }}")?;
+            } else if config.loop_order == GemmLoopOrder::Mkn {
+                writeln!(
+                    out,
+                    "    /* [loop:interchange(MKN)] Broadcast-A row-streaming */"
+                )?;
+                writeln!(out, "    for (int m = 0; m < {m}; ++m) {{")?;
+                writeln!(
+                    out,
+                    "        for (int n = 0; n < {n}; ++n) {res_name}[m * {n} + n] = 0.0f;"
+                )?;
+                writeln!(out, "        for (int k = 0; k < {k}; ++k) {{")?;
+                writeln!(out, "            float a_val = {a}[m * {k} + k];")?;
+                if config.vectorize {
+                    writeln!(out, "            #pragma omp simd")?;
+                }
+                writeln!(
+                    out,
+                    "            for (int n = 0; n < {n}; ++n) \
+                     {res_name}[m * {n} + n] += a_val * {b}[{b_idx}];"
+                )?;
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
+            } else if config.loop_order == GemmLoopOrder::Nkm {
+                writeln!(out, "    /* [loop:interchange(NKM)] Column-stationary */")?;
+                writeln!(out, "    for (int n = 0; n < {n}; ++n) {{")?;
+                writeln!(
+                    out,
+                    "        for (int m = 0; m < {m}; ++m) {res_name}[m * {n} + n] = 0.0f;"
+                )?;
+                writeln!(out, "        for (int k = 0; k < {k}; ++k) {{")?;
+                writeln!(
+                    out,
+                    "            for (int m = 0; m < {m}; ++m) \
+                     {res_name}[m * {n} + n] += {a}[m * {k} + k] * {b}[{b_idx}];"
+                )?;
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
+            } else if config.unroll_factor > 1 {
+                let uf = config.unroll_factor;
+                let k_main = (k / uf) * uf;
+                writeln!(out, "    /* [loop:unroll(factor={uf})] */")?;
+                writeln!(out, "    for (int m = 0; m < {m}; ++m) {{")?;
+                writeln!(out, "        for (int n = 0; n < {n}; ++n) {{")?;
+                writeln!(out, "            float acc = 0.0f;")?;
+                writeln!(
+                    out,
+                    "            for (int k_base = 0; k_base < {k_main}; k_base += {uf}) {{"
+                )?;
+                for u in 0..uf {
+                    let b_u_idx = if packed {
+                        format!("n * {k} + k_base + {u}")
+                    } else {
+                        format!("(k_base + {u}) * {n} + n")
+                    };
+                    writeln!(
+                        out,
+                        "                acc += {a}[m * {k} + k_base + {u}] * {b}[{b_u_idx}];"
+                    )?;
+                }
+                writeln!(out, "            }}")?;
+                writeln!(
+                    out,
+                    "            for (int k = {k_main}; k < {k}; ++k) \
+                     acc += {a}[m * {k} + k] * {b}[{b_idx}];"
+                )?;
+                writeln!(out, "            {res_name}[m * {n} + n] = acc;")?;
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
             } else {
+                if config.vectorize {
+                    writeln!(out, "    #pragma omp simd")?;
+                }
                 writeln!(out, "    for (int m = 0; m < {m}; ++m) {{")?;
                 writeln!(out, "        for (int n = 0; n < {n}; ++n) {{")?;
                 writeln!(out, "            float acc = 0.0f;")?;
@@ -552,6 +623,15 @@ fn emit_c_hlo_op(
                 emit_c_fused_attention(
                     module, op, inputs[0], inputs[1], inputs[2], res_name, names, counter, out,
                 )?;
+            } else if name == "castforge.fused_loop_chain" {
+                let steps_str = op
+                    .attributes
+                    .get("steps")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("");
+                emit_c_fused_loop_chain(
+                    module, &inputs, res_name, res_len, steps_str, names, counter, out,
+                )?;
             } else {
                 let src = value_ident(module, inputs[0], names, counter);
                 writeln!(
@@ -634,6 +714,64 @@ fn emit_c_fused_attention(
     )?;
     writeln!(out, "            {res_name}[r * {d_v} + d] = o_acc;")?;
     writeln!(out, "        }}")?;
+    writeln!(out, "    }}")?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_c_fused_loop_chain(
+    module: &Module,
+    inputs: &[ValueId],
+    res_name: &str,
+    res_len: usize,
+    steps_str: &str,
+    names: &mut HashMap<ValueId, String>,
+    counter: &mut usize,
+    out: &mut String,
+) -> Result<()> {
+    let ext_exprs: Vec<String> = inputs
+        .iter()
+        .map(|&v| format!("{}[i]", value_ident(module, v, names, counter)))
+        .collect();
+    let specs: Vec<&str> = steps_str.split(';').filter(|s| !s.is_empty()).collect();
+    writeln!(out, "    for (int i = 0; i < {res_len}; ++i) {{")?;
+    for (idx, spec) in specs.iter().enumerate() {
+        let Some((op_name, rest)) = spec.split_once('(') else {
+            continue;
+        };
+        let args: Vec<String> = rest
+            .trim_end_matches(')')
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|tok| {
+                if tok.starts_with('s') {
+                    tok.to_string()
+                } else {
+                    tok.parse::<usize>()
+                        .ok()
+                        .and_then(|k| ext_exprs.get(k).cloned())
+                        .unwrap_or_else(|| "0.0f".to_string())
+                }
+            })
+            .collect();
+        let a0 = args.first().map(String::as_str).unwrap_or("0.0f");
+        let a1 = args.get(1).map(String::as_str).unwrap_or("0.0f");
+        let expr = match op_name.trim() {
+            "add" => format!("({a0}) + ({a1})"),
+            "subtract" => format!("({a0}) - ({a1})"),
+            "multiply" => format!("({a0}) * ({a1})"),
+            "divide" => format!("({a0}) / ({a1})"),
+            "maximum" => format!("fmaxf({a0}, {a1})"),
+            "minimum" => format!("fminf({a0}, {a1})"),
+            "exponential" => format!("expf({a0})"),
+            "tanh" => format!("tanhf({a0})"),
+            "rsqrt" => format!("1.0f / sqrtf({a0})"),
+            _ => a0.to_string(),
+        };
+        writeln!(out, "        float s{idx} = {expr};")?;
+    }
+    let last_idx = specs.len().saturating_sub(1);
+    writeln!(out, "        {res_name}[i] = s{last_idx};")?;
     writeln!(out, "    }}")?;
     Ok(())
 }

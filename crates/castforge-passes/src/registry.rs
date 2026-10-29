@@ -3,12 +3,12 @@ use crate::{
     DeadCodeEliminationPass, DecomposeCompositesPass, ExternalizeWeightsPass, FoldBroadcastPass,
     FoldConstantsPass, FoldConvertPass, FoldNormWeightsPass, FoldReshapePass, FoldSliceConcatPass,
     FoldTransposePass, FuseAttentionPass, FuseElementwisePass, FuseHorizontalDotPass,
-    FuseMatmulEpiloguePass, FuseRmsNormPass, FuseRopePass, FuseSoftmaxPass, FuseSwiGluPass,
-    HoistConstantsPass, InlinerPass, IrEditPass, LicmPass, MergeWeightsPass, OptO1Pass, OptO2Pass,
-    OptO3Pass, PackWeightsPass, Pass, PassOptions, PrintOpStatsPass, QuantizeWeightsPass, SccpPass,
-    SimplifyAlgebraicPass, SinkTransposePass, SpecializeShapesPass, StripDebugInfoPass,
-    StructuredPruningPass, SymbolDcePass, TaskArithmeticPass, TopologicalSortPass,
-    VerifyShapesPass,
+    FuseLoopsPass, FuseMatmulEpiloguePass, FuseRmsNormPass, FuseRopePass, FuseSoftmaxPass,
+    FuseSwiGluPass, HoistConstantsPass, InlinerPass, IrEditPass, LicmPass, MergeWeightsPass,
+    OptO1Pass, OptO2Pass, OptO3Pass, PackWeightsPass, Pass, PassOptions, PrintOpStatsPass,
+    QuantizeWeightsPass, SccpPass, SimplifyAlgebraicPass, SinkTransposePass, SpecializeShapesPass,
+    StripDebugInfoPass, StructuredPruningPass, SymbolDcePass, TaskArithmeticPass,
+    TopologicalSortPass, VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
 use castforge_ir::MergeMethod;
@@ -343,6 +343,11 @@ impl PassRegistry {
             "bufferize-inplace",
             "Annotates elementwise ops whose input buffer dies at the op for in-place arena reuse",
             |_opts| Ok(Box::new(BufferizeInplacePass)),
+        );
+        reg.register(
+            "fuse-loops",
+            "Fuses multi-op elementwise loop chains into a single register-pipelined loop",
+            |_opts| Ok(Box::new(FuseLoopsPass)),
         );
         reg.register(
             "O1",

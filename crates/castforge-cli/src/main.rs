@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use castforge_codegen::{
-    CodegenTarget, HardwareRoofline, TargetConfig, analyze_module_cost_with_roofline,
-    build_memory_plan, evaluate_module, generate_code_with_config, generate_synthetic_inputs,
-    verify_module_numerics,
+    CodegenTarget, GemmLoopOrder, HardwareRoofline, TargetConfig,
+    analyze_module_cost_with_roofline, build_memory_plan, evaluate_module,
+    generate_code_with_config, generate_synthetic_inputs, verify_module_numerics,
 };
 use castforge_mlir::{PrintOptions, parse_mlir, print_mlir, print_mlir_with_options};
 use castforge_passes::{PassManager, PassRegistry};
@@ -142,6 +142,18 @@ enum Commands {
         /// WebGPU `@workgroup_size` thread count per workgroup
         #[arg(long = "workgroup-size", default_value_t = 64)]
         workgroup_size: u32,
+
+        /// GEMM loop permutation order: mnk, mkn (Broadcast-A), or nkm
+        #[arg(long = "loop-order", default_value = "mnk")]
+        loop_order: String,
+
+        /// Inner-loop unroll factor (1 = disabled, 2/4/8 = unrolled with tail peeling)
+        #[arg(long = "unroll", default_value_t = 1)]
+        unroll: usize,
+
+        /// Emit explicit SIMD vectorization pragmas/annotations
+        #[arg(long = "vectorize")]
+        vectorize: bool,
     },
 
     /// Analyze FLOPs, memory bandwidth traffic, arithmetic intensity, and Roofline bottlenecks
@@ -393,6 +405,9 @@ fn main() -> Result<()> {
             output,
             tile_size,
             workgroup_size,
+            loop_order,
+            unroll,
+            vectorize,
         } => {
             let src = fs::read_to_string(&input)
                 .with_context(|| format!("Failed to read {}", input.display()))?;
@@ -433,6 +448,9 @@ fn main() -> Result<()> {
                 tile_k: tile_size,
                 simd_width: 8,
                 wgsl_workgroup_size: workgroup_size,
+                loop_order: GemmLoopOrder::parse(&loop_order),
+                unroll_factor: unroll.max(1),
+                vectorize,
             };
             let code = generate_code_with_config(&module, tgt, &cfg)?;
             if let Some(out_path) = output {

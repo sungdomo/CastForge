@@ -1,6 +1,6 @@
 use crate::{
-    MemoryPlan, TargetConfig, build_memory_plan, sanitize_ident, tensor_len, tensor_shape_dims,
-    value_ident,
+    GemmLoopOrder, MemoryPlan, TargetConfig, build_memory_plan, sanitize_ident, tensor_len,
+    tensor_shape_dims, value_ident,
 };
 use anyhow::{Result, anyhow};
 use castforge_dialect_stablehlo::StableHloOp;
@@ -436,7 +436,76 @@ fn emit_rust_hlo_op(
                 writeln!(out, "            }}")?;
                 writeln!(out, "        }}")?;
                 writeln!(out, "    }}")?;
+            } else if config.loop_order == GemmLoopOrder::Mkn {
+                writeln!(
+                    out,
+                    "    // [loop:interchange(MKN)] Broadcast-A row-streaming"
+                )?;
+                writeln!(out, "    for m in 0..{m} {{")?;
+                writeln!(out, "        for n in 0..{n} {{ {dst} = 0.0_f32; }}")?;
+                writeln!(out, "        for k in 0..{k} {{")?;
+                writeln!(out, "            let a_val = {a};")?;
+                if config.vectorize {
+                    writeln!(
+                        out,
+                        "            // [simd:vectorize(width={})]",
+                        config.simd_width
+                    )?;
+                }
+                writeln!(
+                    out,
+                    "            for n in 0..{n} {{ {dst} += a_val * {b}; }}"
+                )?;
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
+            } else if config.loop_order == GemmLoopOrder::Nkm {
+                writeln!(out, "    // [loop:interchange(NKM)] Column-stationary")?;
+                writeln!(out, "    for n in 0..{n} {{")?;
+                writeln!(out, "        for m in 0..{m} {{ {dst} = 0.0_f32; }}")?;
+                writeln!(out, "        for k in 0..{k} {{")?;
+                writeln!(out, "            for m in 0..{m} {{ {dst} += {a} * {b}; }}")?;
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
+            } else if config.unroll_factor > 1 {
+                let uf = config.unroll_factor;
+                let k_main = (k / uf) * uf;
+                writeln!(out, "    // [loop:unroll(factor={uf})]")?;
+                writeln!(out, "    for m in 0..{m} {{")?;
+                writeln!(out, "        for n in 0..{n} {{")?;
+                writeln!(out, "            let mut acc = 0.0_f32;")?;
+                writeln!(
+                    out,
+                    "            for k_base in (0..{k_main}).step_by({uf}) {{"
+                )?;
+                for u in 0..uf {
+                    let a_u = r_idx(
+                        module,
+                        plan,
+                        lhs,
+                        &format!("m * {k} + k_base + {u}"),
+                        names,
+                        counter,
+                    );
+                    let b_u_idx = if packed {
+                        format!("n * {k} + k_base + {u}")
+                    } else {
+                        format!("(k_base + {u}) * {n} + n")
+                    };
+                    let b_u = r_idx(module, plan, rhs, &b_u_idx, names, counter);
+                    writeln!(out, "                acc += {a_u} * {b_u};")?;
+                }
+                writeln!(out, "            }}")?;
+                writeln!(
+                    out,
+                    "            for k in {k_main}..{k} {{ acc += {a} * {b}; }}"
+                )?;
+                writeln!(out, "            {dst} = acc;")?;
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
             } else {
+                if config.vectorize {
+                    writeln!(out, "    // [simd:vectorize(width={})]", config.simd_width)?;
+                }
                 writeln!(out, "    for m in 0..{m} {{")?;
                 writeln!(out, "        for n in 0..{n} {{")?;
                 writeln!(out, "            let mut acc = 0.0_f32;")?;
@@ -675,6 +744,15 @@ fn emit_rust_hlo_op(
                 emit_rust_fused_attention(
                     module, plan, op, inputs[0], inputs[1], inputs[2], res_val, names, counter, out,
                 )?;
+            } else if name == "castforge.fused_loop_chain" {
+                let steps_str = op
+                    .attributes
+                    .get("steps")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("");
+                emit_rust_fused_loop_chain(
+                    module, plan, &inputs, res_val, res_len, steps_str, names, counter, out,
+                )?;
             } else {
                 let src = r_idx(module, plan, inputs[0], "i", names, counter);
                 let dst = r_idx(module, plan, res_val, "i", names, counter);
@@ -780,6 +858,66 @@ fn emit_rust_fused_attention(
     )?;
     writeln!(out, "            {dst} = o_acc;")?;
     writeln!(out, "        }}")?;
+    writeln!(out, "    }}")?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_rust_fused_loop_chain(
+    module: &Module,
+    plan: &MemoryPlan,
+    inputs: &[ValueId],
+    res_val: ValueId,
+    res_len: usize,
+    steps_str: &str,
+    names: &mut HashMap<ValueId, String>,
+    counter: &mut usize,
+    out: &mut String,
+) -> Result<()> {
+    let ext_exprs: Vec<String> = inputs
+        .iter()
+        .map(|&v| r_idx(module, plan, v, "i", names, counter))
+        .collect();
+    let dst = r_idx(module, plan, res_val, "i", names, counter);
+    let specs: Vec<&str> = steps_str.split(';').filter(|s| !s.is_empty()).collect();
+    writeln!(out, "    for i in 0..{res_len} {{")?;
+    for (idx, spec) in specs.iter().enumerate() {
+        let Some((op_name, rest)) = spec.split_once('(') else {
+            continue;
+        };
+        let args: Vec<String> = rest
+            .trim_end_matches(')')
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|tok| {
+                if tok.starts_with('s') {
+                    tok.to_string()
+                } else {
+                    tok.parse::<usize>()
+                        .ok()
+                        .and_then(|k| ext_exprs.get(k).cloned())
+                        .unwrap_or_else(|| "0.0_f32".to_string())
+                }
+            })
+            .collect();
+        let a0 = args.first().map(String::as_str).unwrap_or("0.0_f32");
+        let a1 = args.get(1).map(String::as_str).unwrap_or("0.0_f32");
+        let expr = match op_name.trim() {
+            "add" => format!("({a0}) + ({a1})"),
+            "subtract" => format!("({a0}) - ({a1})"),
+            "multiply" => format!("({a0}) * ({a1})"),
+            "divide" => format!("({a0}) / ({a1})"),
+            "maximum" => format!("({a0}).max({a1})"),
+            "minimum" => format!("({a0}).min({a1})"),
+            "exponential" => format!("({a0}).exp()"),
+            "tanh" => format!("({a0}).tanh()"),
+            "rsqrt" => format!("1.0_f32 / ({a0}).sqrt()"),
+            _ => a0.to_string(),
+        };
+        writeln!(out, "        let s{idx} = {expr};")?;
+    }
+    let last_idx = specs.len().saturating_sub(1);
+    writeln!(out, "        {dst} = s{last_idx};")?;
     writeln!(out, "    }}")?;
     Ok(())
 }

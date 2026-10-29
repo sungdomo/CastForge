@@ -18,7 +18,7 @@ pub use crate::eval::{
 pub use crate::liveness::{LiveInterval, compute_block_liveness, compute_module_liveness};
 pub use crate::memory_plan::{BufferAllocation, MemoryPlan, build_memory_plan};
 use crate::target_c::emit_c_module_with_config;
-pub use crate::target_config::TargetConfig;
+pub use crate::target_config::{GemmLoopOrder, TargetConfig};
 use crate::target_rust::emit_rust_module_with_config;
 use crate::target_wgsl::emit_wgsl_module_with_config;
 use anyhow::Result;

@@ -577,6 +577,13 @@ fn eval_stablehlo_op(
                     k_transposed,
                     &get_v,
                 )
+            } else if name == "castforge.fused_loop_chain" {
+                let steps_str = op
+                    .attributes
+                    .get("steps")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("");
+                eval_fused_loop_chain(res_len, &inputs, steps_str, &get_v)
             } else {
                 get_v(inputs[0])
             }
@@ -678,6 +685,69 @@ fn eval_fused_attention_2d(
                 out[r * d_v + d] += p * v[c * d_v + d];
             }
         }
+    }
+    out
+}
+
+fn eval_fused_loop_chain(
+    res_len: usize,
+    inputs: &[ValueId],
+    steps_str: &str,
+    get_v: &dyn Fn(ValueId) -> Vec<f32>,
+) -> Vec<f32> {
+    let ext: Vec<Vec<f32>> = inputs.iter().map(|&v| get_v(v)).collect();
+    let specs: Vec<&str> = steps_str.split(';').filter(|s| !s.is_empty()).collect();
+    let mut out = vec![0.0_f32; res_len];
+
+    for (i, out_elem) in out.iter_mut().enumerate() {
+        let mut regs: Vec<f32> = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            let Some((op_name, rest)) = spec.split_once('(') else {
+                continue;
+            };
+            let args_part = rest.trim_end_matches(')');
+            let args: Vec<f32> = args_part
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|tok| {
+                    if let Some(step_idx) = tok.strip_prefix('s') {
+                        step_idx
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|k| regs.get(k).copied())
+                            .unwrap_or(0.0)
+                    } else {
+                        tok.parse::<usize>()
+                            .ok()
+                            .and_then(|k| ext.get(k))
+                            .and_then(|v| v.get(i).copied())
+                            .unwrap_or(0.0)
+                    }
+                })
+                .collect();
+            let a0 = args.first().copied().unwrap_or(0.0);
+            let a1 = args.get(1).copied().unwrap_or(0.0);
+            let val = match op_name.trim() {
+                "add" => a0 + a1,
+                "subtract" => a0 - a1,
+                "multiply" => a0 * a1,
+                "divide" => {
+                    if a1.abs() > 1e-12 {
+                        a0 / a1
+                    } else {
+                        0.0
+                    }
+                }
+                "maximum" => a0.max(a1),
+                "minimum" => a0.min(a1),
+                "exponential" => a0.exp(),
+                "tanh" => a0.tanh(),
+                "rsqrt" => 1.0 / a0.sqrt(),
+                _ => a0,
+            };
+            regs.push(val);
+        }
+        *out_elem = regs.last().copied().unwrap_or(0.0);
     }
     out
 }

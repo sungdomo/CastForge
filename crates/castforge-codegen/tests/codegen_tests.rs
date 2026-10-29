@@ -1,5 +1,5 @@
 use castforge_codegen::{
-    BottleneckKind, CodegenTarget, HardwareRoofline, TargetConfig,
+    BottleneckKind, CodegenTarget, GemmLoopOrder, HardwareRoofline, TargetConfig,
     analyze_module_cost_with_roofline, build_memory_plan, evaluate_module, generate_code,
     generate_code_with_config, verify_module_numerics,
 };
@@ -246,4 +246,65 @@ module @inplace_demo {
     let c_code = generate_code(&inplace_mod, CodegenTarget::C).expect("c inplace");
     assert!(c_code.contains("[arena:inplace]"));
     assert!(c_code.contains("float arena[16]; /* 64 B"));
+}
+
+#[test]
+fn test_loop_interchange_unroll_vectorize_and_fuse_loops() {
+    let mlir = r#"
+module @loop_transforms_demo {
+  func.func @forward(
+    %x: tensor<4x5xf32>,
+    %w: tensor<5x4xf32>,
+    %bias: tensor<4x4xf32>
+  ) -> tensor<4x4xf32> {
+    %c = stablehlo.constant dense<0.5> : tensor<4x4xf32>
+    %mm = stablehlo.dot_general %x, %w : (tensor<4x5xf32>, tensor<5x4xf32>) -> tensor<4x4xf32>
+    %s0 = stablehlo.add %mm, %bias : tensor<4x4xf32>
+    %s1 = stablehlo.multiply %s0, %c : tensor<4x4xf32>
+    %s2 = stablehlo.tanh %s1 : tensor<4x4xf32>
+    %s3 = stablehlo.subtract %s2, %c : tensor<4x4xf32>
+    func.return %s3 : tensor<4x4xf32>
+  }
+}
+"#;
+    let before = parse_mlir(mlir).expect("parse loop mlir");
+    let mut fused = before.clone();
+    let registry = PassRegistry::with_builtin_passes();
+    let mut pm = PassManager::from_pipeline_str(&registry, "fuse-loops").expect("fuse-loops");
+    let res = pm.run(&mut fused).expect("run fuse-loops");
+    assert!(res[0].changed);
+
+    let rep = verify_module_numerics(&before, &fused, 1e-5).expect("verify fuse-loops numerics");
+    assert!(rep.passed, "max_abs_diff = {}", rep.max_abs_diff);
+
+    // 1. Test MKN (Broadcast-A) loop interchange + SIMD vectorization
+    let mkn_cfg = TargetConfig::default()
+        .with_loop_order(GemmLoopOrder::Mkn)
+        .with_vectorize(true);
+    let rust_mkn =
+        generate_code_with_config(&fused, CodegenTarget::Rust, &mkn_cfg).expect("rust mkn");
+    assert!(rust_mkn.contains("[loop:interchange(MKN)]"));
+    assert!(rust_mkn.contains("[simd:vectorize(width=8)]"));
+    assert!(rust_mkn.contains("let s0 ="));
+    assert!(rust_mkn.contains("let s3 ="));
+
+    let c_mkn = generate_code_with_config(&fused, CodegenTarget::C, &mkn_cfg).expect("c mkn");
+    assert!(c_mkn.contains("[loop:interchange(MKN)]"));
+    assert!(c_mkn.contains("#pragma omp simd"));
+    assert!(c_mkn.contains("float s0 ="));
+    assert!(c_mkn.contains("float s3 ="));
+
+    // 2. Test inner-loop unrolling (factor=2) with tail-loop peeling (K=5 -> main 0..4, tail 4..5)
+    let unroll_cfg = TargetConfig::default().with_unroll(2);
+    let rust_unroll =
+        generate_code_with_config(&fused, CodegenTarget::Rust, &unroll_cfg).expect("rust unroll");
+    assert!(rust_unroll.contains("[loop:unroll(factor=2)]"));
+    assert!(rust_unroll.contains("for k_base in (0..4).step_by(2)"));
+    assert!(rust_unroll.contains("for k in 4..5"));
+
+    let c_unroll =
+        generate_code_with_config(&fused, CodegenTarget::C, &unroll_cfg).expect("c unroll");
+    assert!(c_unroll.contains("[loop:unroll(factor=2)]"));
+    assert!(c_unroll.contains("for (int k_base = 0; k_base < 4; k_base += 2)"));
+    assert!(c_unroll.contains("for (int k = 4; k < 5; ++k)"));
 }
