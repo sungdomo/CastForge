@@ -1,12 +1,12 @@
 use crate::{
     BakeLoraPass, CanonicalizePass, CommonSubexpressionEliminationPass, DeadCodeEliminationPass,
     DecomposeCompositesPass, ExternalizeWeightsPass, FoldBroadcastPass, FoldConstantsPass,
-    FoldNormWeightsPass, FoldReshapePass, FoldSliceConcatPass, FoldTransposePass,
+    FoldConvertPass, FoldNormWeightsPass, FoldReshapePass, FoldSliceConcatPass, FoldTransposePass,
     FuseElementwisePass, FuseHorizontalDotPass, FuseMatmulEpiloguePass, FuseRmsNormPass,
-    FuseSoftmaxPass, InlinerPass, IrEditPass, MergeWeightsPass, Pass, PassOptions,
-    PrintOpStatsPass, QuantizeWeightsPass, SccpPass, SimplifyAlgebraicPass, SinkTransposePass,
-    StripDebugInfoPass, StructuredPruningPass, SymbolDcePass, TaskArithmeticPass,
-    TopologicalSortPass, VerifyShapesPass,
+    FuseSoftmaxPass, HoistConstantsPass, InlinerPass, IrEditPass, LicmPass, MergeWeightsPass, Pass,
+    PassOptions, PrintOpStatsPass, QuantizeWeightsPass, SccpPass, SimplifyAlgebraicPass,
+    SinkTransposePass, StripDebugInfoPass, StructuredPruningPass, SymbolDcePass,
+    TaskArithmeticPass, TopologicalSortPass, VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
 use castforge_ir::MergeMethod;
@@ -280,6 +280,21 @@ impl PassRegistry {
             "fuse-horizontal-dot",
             "Horizontally fuses parallel dot_general ops sharing an LHS input (e.g. Q/K/V)",
             |_opts| Ok(Box::new(FuseHorizontalDotPass)),
+        );
+        reg.register(
+            "fold-convert",
+            "Eliminates redundant or round-trip stablehlo.convert casts and folds constant casts",
+            |_opts| Ok(Box::new(FoldConvertPass)),
+        );
+        reg.register(
+            "hoist-constants",
+            "Hoists stablehlo.constant ops to block entry and deduplicates identical constants",
+            |_opts| Ok(Box::new(HoistConstantsPass)),
+        );
+        reg.register(
+            "licm",
+            "Loop/Region-Invariant Code Motion (hoists invariant pure ops out of nested regions)",
+            |_opts| Ok(Box::new(LicmPass)),
         );
         reg
     }

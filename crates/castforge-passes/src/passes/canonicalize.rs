@@ -1,7 +1,7 @@
 use crate::{
     CommonSubexpressionEliminationPass, DeadCodeEliminationPass, FoldBroadcastPass,
-    FoldConstantsPass, FoldReshapePass, FoldSliceConcatPass, FoldTransposePass, Pass, PassResult,
-    SimplifyAlgebraicPass,
+    FoldConstantsPass, FoldConvertPass, FoldReshapePass, FoldSliceConcatPass, FoldTransposePass,
+    HoistConstantsPass, Pass, PassResult, SimplifyAlgebraicPass,
 };
 use anyhow::Result;
 use castforge_ir::Module;
@@ -26,8 +26,10 @@ impl Pass for CanonicalizePass {
 
         for _ in 0..8 {
             let steps = [
+                HoistConstantsPass.run(module)?,
                 FoldConstantsPass::default().run(module)?,
                 SimplifyAlgebraicPass.run(module)?,
+                FoldConvertPass.run(module)?,
                 FoldTransposePass::default().run(module)?,
                 FoldReshapePass.run(module)?,
                 FoldBroadcastPass.run(module)?,

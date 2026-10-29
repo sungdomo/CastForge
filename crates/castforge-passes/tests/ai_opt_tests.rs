@@ -332,3 +332,36 @@ fn test_horizontal_dot_broadcast_slice_concat_and_reassociation() {
     let rep_c = verify_module_numerics(&before, &canon, 1e-5).expect("verify canonicalize");
     assert!(rep_c.passed, "max_abs_diff = {}", rep_c.max_abs_diff);
 }
+
+const CONVERT_AND_HOIST_MLIR: &str = r#"
+module @convert_and_hoist {
+  func.func @forward(%x: tensor<2x2xf16>) -> tensor<2x2xf16> {
+    %widen = stablehlo.convert %x : (tensor<2x2xf16>) -> tensor<2x2xf32>
+    %narrow = stablehlo.convert %widen : (tensor<2x2xf32>) -> tensor<2x2xf16>
+    %c1 = stablehlo.constant dense<1.0> : tensor<2x2xf16>
+    %c2 = stablehlo.constant dense<1.0> : tensor<2x2xf16>
+    %sum1 = stablehlo.add %narrow, %c1 : tensor<2x2xf16>
+    %sum2 = stablehlo.add %sum1, %c2 : tensor<2x2xf16>
+    func.return %sum2 : tensor<2x2xf16>
+  }
+}
+"#;
+
+#[test]
+fn test_fold_convert_and_hoist_constants() {
+    let mut module = parse_mlir(CONVERT_AND_HOIST_MLIR).expect("parse convert/hoist MLIR");
+    let registry = PassRegistry::with_builtin_passes();
+    let mut pm = PassManager::from_pipeline_str(&registry, "fold-convert,hoist-constants,licm")
+        .expect("fold-convert/hoist-constants/licm pipeline");
+    let res = pm
+        .run(&mut module)
+        .expect("run fold-convert/hoist-constants/licm");
+    assert!(res[0].changed);
+    assert!(res[1].changed);
+
+    let printed = print_mlir(&module);
+    // f16 -> f32 -> f16 round-trip convert is eliminated completely
+    assert!(!printed.contains("stablehlo.convert"));
+    // Duplicate constant %c2 is deduplicated into %c1
+    assert_eq!(printed.matches("stablehlo.constant").count(), 1);
+}
