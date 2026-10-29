@@ -1036,3 +1036,173 @@ module @chain_demo {
     assert!(rust_out.contains("[loop:parallel(collapse=2, schedule=static)]"));
     assert!(rust_out.contains("_mm256_fmadd_ps"));
 }
+
+#[test]
+fn test_symmetric_model_exports_loop_ir_gpu_backends_autotune_and_diff_translators() {
+    use castforge_codegen::{
+        AutotuneScheduleTranslator, CHeaderTranslator, CodegenTranslator, MemoryPlanTranslator,
+        RooflineReportTranslator, SharedLibTranslator, TensorToLoopTranslator,
+    };
+    use castforge_ir::{Payload, TranslatorChain};
+    use castforge_mlir::{
+        GgufExportTranslator, GgufImportTranslator, MlirParseTranslator, OnnxExportTranslator,
+        OnnxImportTranslator, SafetensorsExportTranslator,
+    };
+    use castforge_passes::PassRegistry;
+    use castforge_viz::{IrDiffTranslator, SnapshotIrTranslator};
+
+    let mlir = r#"
+module @export_and_gpu_demo {
+  func.func @forward(%x: tensor<2x4xf32>) -> tensor<2x4xf32> {
+    %w = stablehlo.constant dense<0.5> : tensor<4x4xf32>
+    %b = stablehlo.constant dense<0.1> : tensor<2x4xf32>
+    %mm = stablehlo.dot_general %x, %w, contracting_dims = [1] x [0]
+      : (tensor<2x4xf32>, tensor<4x4xf32>) -> tensor<2x4xf32>
+    %y = stablehlo.add %mm, %b : tensor<2x4xf32>
+    func.return %y : tensor<2x4xf32>
+  }
+}
+"#;
+
+    // Step 1: Symmetric Model Export Translators (IR -> ONNX -> IR, IR -> GGUF -> IR, SafeTensors)
+    let mut onnx_roundtrip = TranslatorChain::new()
+        .then(MlirParseTranslator)
+        .then(OnnxExportTranslator)
+        .then(OnnxImportTranslator);
+    let onnx_mod = onnx_roundtrip
+        .execute(Payload::Text(mlir.to_string()))
+        .expect("IR -> ONNX -> IR roundtrip")
+        .into_ir()
+        .expect("onnx module");
+    assert_eq!(onnx_mod.tensor_store.len(), 2);
+
+    let mut gguf_roundtrip = TranslatorChain::new()
+        .then(MlirParseTranslator)
+        .then(GgufExportTranslator)
+        .then(GgufImportTranslator);
+    let gguf_mod = gguf_roundtrip
+        .execute(Payload::Text(mlir.to_string()))
+        .expect("IR -> GGUF -> IR roundtrip")
+        .into_ir()
+        .expect("gguf module");
+    assert_eq!(gguf_mod.tensor_store.len(), 2);
+
+    let mut st_chain = TranslatorChain::new()
+        .then(MlirParseTranslator)
+        .then(SafetensorsExportTranslator);
+    let st_bytes = st_chain
+        .execute(Payload::Text(mlir.to_string()))
+        .expect("IR -> SafeTensors")
+        .into_bytes()
+        .expect("safetensors bytes");
+    assert!(st_bytes.len() > 64);
+
+    // Step 2: Progressive LoopIr, CUDA, Metal (MSL), C Header, and Native Shared Library
+    let mut loop_chain = TranslatorChain::new()
+        .then(MlirParseTranslator)
+        .then(TensorToLoopTranslator::default());
+    let loop_txt = loop_chain
+        .execute(Payload::Text(mlir.to_string()))
+        .expect("lower-to-loops")
+        .into_text()
+        .expect("loop text");
+    assert!(loop_txt.contains("kernel @forward("));
+    assert!(loop_txt.contains("GEMM 2x4x4"));
+
+    let mut cuda_chain = TranslatorChain::new()
+        .then(MlirParseTranslator)
+        .then(CodegenTranslator::new(CodegenTarget::Cuda));
+    let cuda_src = cuda_chain
+        .execute(Payload::Text(mlir.to_string()))
+        .expect("codegen-cuda")
+        .into_text()
+        .expect("cuda text");
+    assert!(cuda_src.contains("__global__ void forward_cuda_kernel("));
+    assert!(cuda_src.contains("__shared__ float shared_tile["));
+
+    let mut msl_chain = TranslatorChain::new()
+        .then(MlirParseTranslator)
+        .then(CodegenTranslator::new(CodegenTarget::Msl));
+    let msl_src = msl_chain
+        .execute(Payload::Text(mlir.to_string()))
+        .expect("codegen-msl")
+        .into_text()
+        .expect("msl text");
+    assert!(msl_src.contains("#include <metal_stdlib>"));
+    assert!(msl_src.contains("kernel void forward_msl_kernel("));
+
+    let mut hdr_chain = TranslatorChain::new()
+        .then(MlirParseTranslator)
+        .then(CHeaderTranslator);
+    let hdr_src = hdr_chain
+        .execute(Payload::Text(mlir.to_string()))
+        .expect("codegen-header")
+        .into_text()
+        .expect("header text");
+    assert!(hdr_src.contains("#ifndef CASTFORGE_EXPORT_AND_GPU_DEMO_H"));
+    assert!(hdr_src.contains("void forward("));
+
+    let mut lib_chain = TranslatorChain::new()
+        .then(MlirParseTranslator)
+        .then(SharedLibTranslator::default());
+    let lib_bytes = lib_chain
+        .execute(Payload::Text(mlir.to_string()))
+        .expect("compile-lib")
+        .into_bytes()
+        .expect("shared lib bytes");
+    assert!(lib_bytes.len() > 1024);
+
+    // Step 3: Pipeable AutotuneScheduleTranslator (IR -> Autotune -> Codegen)
+    let mut autotune_chain = TranslatorChain::new()
+        .then(MlirParseTranslator)
+        .then(AutotuneScheduleTranslator::default())
+        .then(CodegenTranslator::new(CodegenTarget::Rust));
+    let tuned_rust = autotune_chain
+        .execute(Payload::Text(mlir.to_string()))
+        .expect("autotune-schedule -> codegen-rust")
+        .into_text()
+        .expect("tuned rust");
+    assert!(tuned_rust.contains("pub fn forward("));
+
+    // Step 4: SnapshotIrTranslator + IrDiffTranslator, RooflineReportTranslator, MemoryPlan
+    let registry = PassRegistry::with_builtin_passes();
+    let fuse_pass = registry
+        .create_pass("fuse-matmul-epilogue", &Default::default())
+        .expect("fuse-matmul-epilogue");
+    let dce_pass = registry
+        .create_pass("dce", &Default::default())
+        .expect("dce");
+    let mut diff_chain = TranslatorChain::new()
+        .then(MlirParseTranslator)
+        .then(SnapshotIrTranslator)
+        .then(fuse_pass)
+        .then(dce_pass)
+        .then(IrDiffTranslator::default());
+    let diff_txt = diff_chain
+        .execute(Payload::Text(mlir.to_string()))
+        .expect("snapshot-ir -> fuse-elementwise -> dce -> ir-diff")
+        .into_text()
+        .expect("diff text");
+    assert!(diff_txt.contains("--- a/module.mlir"));
+    assert!(diff_txt.contains("castforge.fused_matmul_epilogue"));
+
+    let mut roofline_chain = TranslatorChain::new()
+        .then(MlirParseTranslator)
+        .then(RooflineReportTranslator::default());
+    let roofline_json = roofline_chain
+        .execute(Payload::Text(mlir.to_string()))
+        .expect("roofline-report")
+        .into_text()
+        .expect("roofline json");
+    assert!(roofline_json.contains("\"total_flops\""));
+
+    let mut mem_chain = TranslatorChain::new()
+        .then(MlirParseTranslator)
+        .then(MemoryPlanTranslator);
+    let mem_json = mem_chain
+        .execute(Payload::Text(mlir.to_string()))
+        .expect("memory-plan")
+        .into_text()
+        .expect("memory plan json");
+    assert!(mem_json.contains("\"total_activation_bytes\""));
+}

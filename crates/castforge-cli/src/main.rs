@@ -1,18 +1,21 @@
 use anyhow::{Context, Result};
 use castforge_codegen::{
-    CodegenTarget, CodegenTranslator, GemmLoopOrder, HardwareRoofline, TargetConfig,
-    analyze_module_cost_with_roofline, autotune_module, autotune_module_jit, build_memory_plan,
-    evaluate_module, generate_code_with_config, generate_synthetic_inputs, verify_module_numerics,
+    AutotuneScheduleTranslator, CHeaderTranslator, CodegenTarget, CodegenTranslator, GemmLoopOrder,
+    HardwareRoofline, MemoryPlanTranslator, RooflineReportTranslator, SharedLibTranslator,
+    TargetConfig, TensorToLoopTranslator, analyze_module_cost_with_roofline, autotune_module,
+    autotune_module_jit, build_memory_plan, evaluate_module, generate_code_with_config,
+    generate_synthetic_inputs, verify_module_numerics,
 };
 use castforge_ir::{Payload, TranslatorChain};
 use castforge_mlir::{
-    GgufImportTranslator, MlirParseTranslator, MlirPrintTranslator, OnnxImportTranslator,
-    PrintOptions, import_gguf_file, import_onnx_file, parse_mlir, print_mlir,
-    print_mlir_with_options,
+    GgufExportTranslator, GgufImportTranslator, MlirParseTranslator, MlirPrintTranslator,
+    OnnxExportTranslator, OnnxImportTranslator, PrintOptions, SafetensorsExportTranslator,
+    import_gguf_file, import_onnx_file, parse_mlir, print_mlir, print_mlir_with_options,
 };
 use castforge_passes::{PassManager, PassRegistry, parse_pass_spec_item, split_pipeline_spec};
 use castforge_viz::{
-    TimelineFrame, VizFormat, VizTranslator, build_graph_json, render_module, render_timeline_html,
+    IrDiffTranslator, SnapshotIrTranslator, TimelineFrame, VizFormat, VizTranslator,
+    build_graph_json, render_module, render_timeline_html,
 };
 use clap::{Parser, Subcommand};
 use std::fs;
@@ -537,6 +540,8 @@ fn main() -> Result<()> {
             let tgt = match target.to_lowercase().as_str() {
                 "c" | "c99" => CodegenTarget::C,
                 "wgsl" | "webgpu" => CodegenTarget::Wgsl,
+                "cuda" | "cu" => CodegenTarget::Cuda,
+                "msl" | "metal" => CodegenTarget::Msl,
                 _ => CodegenTarget::Rust,
             };
 
@@ -703,15 +708,26 @@ fn main() -> Result<()> {
                 Payload::Text(read_input_text(input.as_ref())?)
             };
             let result = chain.execute(initial)?;
-            let text_out = match (result, last_out) {
-                (Payload::Text(s), _) => s,
-                (Payload::Ir(m), _) => print_mlir(&m),
-                (Payload::Bytes(b), _) => format!("({} bytes)", b.len()),
-            };
-            if let Some(out_path) = output {
-                fs::write(&out_path, text_out)?;
-            } else {
-                print!("{text_out}");
+            match (result, output) {
+                (Payload::Bytes(b), Some(out_path)) => {
+                    fs::write(&out_path, &b)?;
+                }
+                (Payload::Bytes(b), None) => {
+                    println!("({} bytes)", b.len());
+                }
+                (Payload::Text(s), Some(out_path)) => {
+                    fs::write(&out_path, s)?;
+                }
+                (Payload::Text(s), None) => {
+                    print!("{s}");
+                }
+                (Payload::Ir(m), Some(out_path)) => {
+                    fs::write(&out_path, print_mlir(&m))?;
+                }
+                (Payload::Ir(m), None) => {
+                    let _ = last_out;
+                    print!("{}", print_mlir(&m));
+                }
             }
         }
 
@@ -810,6 +826,18 @@ fn build_translator_chain(
                 chain.push(Box::new(GgufImportTranslator));
                 last_out = "ir";
             }
+            "export-onnx" => {
+                chain.push(Box::new(OnnxExportTranslator));
+                last_out = "text";
+            }
+            "export-gguf" => {
+                chain.push(Box::new(GgufExportTranslator));
+                last_out = "bytes";
+            }
+            "export-safetensors" => {
+                chain.push(Box::new(SafetensorsExportTranslator));
+                last_out = "bytes";
+            }
             "print-mlir" | "print" => {
                 let generic = opts
                     .get("generic")
@@ -823,18 +851,55 @@ fn build_translator_chain(
                 }));
                 last_out = "text";
             }
-            "codegen" | "codegen-rust" | "codegen-c" | "codegen-wgsl" => {
+            "lower-to-loops" => {
+                chain.push(Box::new(TensorToLoopTranslator::default()));
+                last_out = "text";
+            }
+            "codegen-header" => {
+                chain.push(Box::new(CHeaderTranslator));
+                last_out = "text";
+            }
+            "compile-lib" => {
+                chain.push(Box::new(SharedLibTranslator::default()));
+                last_out = "bytes";
+            }
+            "autotune-schedule" => {
+                chain.push(Box::new(AutotuneScheduleTranslator::default()));
+                last_out = "ir";
+            }
+            "roofline-report" => {
+                chain.push(Box::new(RooflineReportTranslator::default()));
+                last_out = "text";
+            }
+            "memory-plan" => {
+                chain.push(Box::new(MemoryPlanTranslator));
+                last_out = "text";
+            }
+            "snapshot-ir" => {
+                chain.push(Box::new(SnapshotIrTranslator));
+                last_out = "ir";
+            }
+            "ir-diff" => {
+                chain.push(Box::new(IrDiffTranslator::default()));
+                last_out = "text";
+            }
+            "codegen" | "codegen-rust" | "codegen-c" | "codegen-wgsl" | "codegen-cuda"
+            | "codegen-msl" | "codegen-metal" => {
                 let tgt_str =
                     opts.get("target")
                         .map(String::as_str)
                         .unwrap_or(match name.as_str() {
                             "codegen-c" => "c",
                             "codegen-wgsl" => "wgsl",
+                            "codegen-cuda" => "cuda",
+                            "codegen-msl" | "codegen-metal" => "msl",
                             _ => "rust",
                         });
                 let tgt = match tgt_str.to_ascii_lowercase().as_str() {
                     "c" | "c99" => CodegenTarget::C,
                     "wgsl" | "webgpu" => CodegenTarget::Wgsl,
+                    "cuda" | "cu" => CodegenTarget::Cuda,
+                    "msl" | "metal" => CodegenTarget::Msl,
                     _ => CodegenTarget::Rust,
                 };
                 chain.push(Box::new(CodegenTranslator::new(tgt)));

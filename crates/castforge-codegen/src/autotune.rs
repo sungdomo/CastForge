@@ -326,3 +326,118 @@ fn static_shape(module: &Module, val_id: castforge_ir::ValueId) -> Vec<usize> {
         })
         .unwrap_or_default()
 }
+
+/// Stamps the schedule parameters of `config` (`loop_tile_m`, `loop_order`, `loop_unroll`,
+/// `simd_vectorize`, etc.) directly onto all compute operations in `module`.
+pub fn apply_schedule_to_module(module: &mut Module, config: &TargetConfig) {
+    use castforge_ir::Attribute;
+    for (_, op) in module.ops.iter_mut() {
+        if op.is_op("builtin", "module")
+            || op.is_op("func", "func")
+            || op.is_op("func", "return")
+            || op.is_op("stablehlo", "constant")
+        {
+            continue;
+        }
+        if config.tile_m > 0 {
+            op.attributes.insert(
+                "loop_tile_m".to_string(),
+                Attribute::Int(config.tile_m as i64),
+            );
+            op.attributes.insert(
+                "loop_tile_n".to_string(),
+                Attribute::Int(config.tile_n as i64),
+            );
+            op.attributes.insert(
+                "loop_tile_k".to_string(),
+                Attribute::Int(config.tile_k as i64),
+            );
+        }
+        if config.l2_tile_size > 0 {
+            op.attributes.insert(
+                "loop_l2_tile".to_string(),
+                Attribute::Int(config.l2_tile_size as i64),
+            );
+        }
+        if config.reg_tile_m > 1 && config.reg_tile_n > 1 {
+            op.attributes.insert(
+                "loop_reg_m".to_string(),
+                Attribute::Int(config.reg_tile_m as i64),
+            );
+            op.attributes.insert(
+                "loop_reg_n".to_string(),
+                Attribute::Int(config.reg_tile_n as i64),
+            );
+        }
+        op.attributes.insert(
+            "loop_order".to_string(),
+            Attribute::String(config.loop_order.as_str().to_string()),
+        );
+        if config.unroll_factor > 1 {
+            op.attributes.insert(
+                "loop_unroll".to_string(),
+                Attribute::Int(config.unroll_factor as i64),
+            );
+        }
+        if config.prefetch_distance > 0 {
+            op.attributes.insert(
+                "loop_prefetch".to_string(),
+                Attribute::Int(config.prefetch_distance as i64),
+            );
+        }
+        if config.split_k > 1 {
+            op.attributes.insert(
+                "loop_split_k".to_string(),
+                Attribute::Int(config.split_k as i64),
+            );
+        }
+        if config.double_buffer {
+            op.attributes
+                .insert("loop_double_buffer".to_string(), Attribute::Bool(true));
+        }
+        if config.vectorize {
+            op.attributes
+                .insert("simd_vectorize".to_string(), Attribute::Bool(true));
+            op.attributes.insert(
+                "simd_width".to_string(),
+                Attribute::Int(config.simd_width as i64),
+            );
+        }
+        if config.parallel {
+            op.attributes
+                .insert("loop_parallel".to_string(), Attribute::Bool(true));
+        }
+    }
+}
+
+/// Pipeable Auto-Tuning Schedule Translator (`Ir(Module) -> Ir(Module)`).
+///
+/// Evaluates the Roofline-guided polyhedral schedule search space (`autotune_module`) and
+/// stamps the winning [`TargetConfig`] attributes directly onto the IR so downstream
+/// `codegen-*` translators automatically emit the optimal schedule.
+#[derive(Default)]
+pub struct AutotuneScheduleTranslator {
+    /// Target hardware Roofline model used for schedule scoring.
+    pub roofline: HardwareRoofline,
+}
+
+impl castforge_ir::Translator for AutotuneScheduleTranslator {
+    fn name(&self) -> &str {
+        "autotune-schedule"
+    }
+
+    fn input_kind(&self) -> &'static str {
+        "ir"
+    }
+
+    fn output_kind(&self) -> &'static str {
+        "ir"
+    }
+
+    fn translate(&mut self, input: castforge_ir::Payload) -> anyhow::Result<castforge_ir::Payload> {
+        let mut module = input.into_ir()?;
+        let report = autotune_module(&module, &self.roofline);
+        apply_schedule_to_module(&mut module, &report.best.config);
+        Ok(castforge_ir::Payload::from_ir(module))
+    }
+}

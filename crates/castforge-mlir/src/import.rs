@@ -199,12 +199,55 @@ pub fn import_gguf_bytes(bytes: &[u8]) -> Result<Module> {
     Ok(module)
 }
 
-/// Serializes all tensors in `module.tensor_store` into a valid binary GGUF v3 byte buffer.
+/// Collects all weight tensors from `module.tensor_store`, falling back to inline
+/// `stablehlo.constant` operations when `tensor_store` is empty.
+pub fn collect_module_tensors(module: &Module) -> TensorStore {
+    if !module.tensor_store.is_empty() {
+        return module.tensor_store.clone();
+    }
+    let mut store = TensorStore::new();
+    let mut idx = 0usize;
+    for (_, op) in module.ops.iter() {
+        if !op.is_op("stablehlo", "constant") {
+            continue;
+        }
+        let Some(&res_val) = op.results.first() else {
+            continue;
+        };
+        let Some(tensor_ty) = module.values[res_val].ty.as_tensor().cloned() else {
+            continue;
+        };
+        let n = tensor_ty.num_elements().unwrap_or(1).max(1) as usize;
+        let vals = op
+            .attributes
+            .get("value")
+            .and_then(|a| module.tensor_store.resolve_f32_attr(a, n))
+            .unwrap_or_else(|| vec![0.0; n]);
+        let name = module.values[res_val]
+            .ssa_name
+            .as_deref()
+            .map(|s| s.trim_start_matches('%').to_string())
+            .unwrap_or_else(|| {
+                idx += 1;
+                format!("const_{idx}.weight")
+            });
+        store.insert(TensorEntry::from_f32(
+            name,
+            TensorType::new(tensor_ty.shape, DType::F32),
+            vals,
+        ));
+    }
+    store
+}
+
+/// Serializes all tensors in `module.tensor_store` (or inline constants) into a valid binary
+/// GGUF v3 byte buffer.
 pub fn export_gguf_bytes(module: &Module) -> Vec<u8> {
+    let store = collect_module_tensors(module);
     let mut out = Vec::new();
     out.extend_from_slice(GGUF_MAGIC);
     out.extend_from_slice(&3u32.to_le_bytes()); // version 3
-    let tensor_count = module.tensor_store.len() as u64;
+    let tensor_count = store.len() as u64;
     out.extend_from_slice(&tensor_count.to_le_bytes());
     out.extend_from_slice(&1u64.to_le_bytes()); // 1 metadata KV: general.name
 
@@ -213,10 +256,10 @@ pub fn export_gguf_bytes(module: &Module) -> Vec<u8> {
     out.extend_from_slice(&8u32.to_le_bytes()); // GGUF_TYPE_STRING
     write_gguf_string(&mut out, mod_name);
 
-    let mut raw_payloads: Vec<Vec<u8>> = Vec::with_capacity(module.tensor_store.len());
+    let mut raw_payloads: Vec<Vec<u8>> = Vec::with_capacity(store.len());
     let mut current_offset = 0usize;
 
-    for (name, tensor) in module.tensor_store.iter() {
+    for (name, tensor) in store.iter() {
         write_gguf_string(&mut out, name);
         let static_dims: Vec<u64> = tensor
             .ty

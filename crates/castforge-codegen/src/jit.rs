@@ -235,7 +235,7 @@ pub fn jit_execute_and_benchmark(
                 bail!("cc JIT compilation failed: {stderr}");
             }
         }
-        CodegenTarget::Wgsl => {
+        CodegenTarget::Wgsl | CodegenTarget::Cuda | CodegenTarget::Msl => {
             let _ = fs::remove_dir_all(&tmp_dir);
             bail!("Native CPU JIT execution supports Rust and C99 targets");
         }

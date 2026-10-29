@@ -24,6 +24,15 @@ impl GemmLoopOrder {
             _ => Self::Mnk,
         }
     }
+
+    /// Returns the canonical lowercase string (`"mnk"`, `"mkn"`, `"nkm"`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Mnk => "mnk",
+            Self::Mkn => "mkn",
+            Self::Nkm => "nkm",
+        }
+    }
 }
 
 /// Hardware SIMD instruction set architecture for explicit intrinsic emission.

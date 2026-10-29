@@ -105,6 +105,24 @@ support.
 | `O2` | Preset | `O1` + LoRA/Norm folding + Transformer/MatMul operator fusions |
 | `O3` / `llm-opt` | Preset | Shape specialization + `O2` + weight packing + inplace arena |
 
+### Non-Pass Ecosystem A-to-B Translators (`TranslatorChain` / `castforge chain`)
+
+| Translator Stage | Signature (`A -> B`) | Description |
+| :--- | :--- | :--- |
+| `parse-mlir` / `print-mlir` | `text <-> ir` | MLIR parser and printer |
+| `import-onnx` / `export-onnx` | `text <-> ir` | Symmetric ONNX-JSON graph importer & exporter |
+| `import-gguf` / `export-gguf` | `bytes <-> ir` | Symmetric GGUF v3 binary importer & exporter |
+| `export-safetensors` | `ir -> bytes` | SafeTensors weight serializer |
+| `lower-to-loops` | `ir -> text` | Progressive Tensor IR to `LoopModule` lowering |
+| `autotune-schedule` | `ir -> ir` | Stamps winning Roofline schedule attrs onto IR |
+| `codegen-rust` / `codegen-c` | `ir -> text` | Standalone Rust & C99 kernel emitter |
+| `codegen-wgsl` / `codegen-cuda` | `ir -> text` | WebGPU WGSL & NVIDIA CUDA `.cu` GPU emitter |
+| `codegen-msl` / `codegen-header` | `ir -> text` | Apple Metal `.metal` & C/C++ `.h` FFI header |
+| `compile-lib` | `ir -> bytes` | Compiles C99 kernel to native `.so`/`.dylib` |
+| `snapshot-ir` / `ir-diff` | `ir -> ir` / `text` | Captures IR snapshot & emits unified MLIR diff |
+| `roofline-report` / `memory-plan` | `ir -> text` | Emits JSON Roofline cost & arena memory plan |
+| `viz-mermaid` / `viz-dot` / `viz-html` | `ir -> text` | Graph visualization & HTML debugger |
+
 ## Quick Start
 
 ```bash

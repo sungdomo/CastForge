@@ -332,3 +332,135 @@ pub fn render_json(module: &Module) -> String {
     let graph = build_graph_json(module);
     serde_json::to_string_pretty(&graph).unwrap_or_default()
 }
+
+/// Computes a unified line-by-line MLIR diff and operation-count delta between `before` and
+/// `after`.
+pub fn diff_modules(before: &Module, after: &Module) -> String {
+    let before_txt = print_mlir(before);
+    let after_txt = print_mlir(after);
+    diff_mlir_strings(&before_txt, &after_txt)
+}
+
+/// Computes a unified diff between two MLIR text strings.
+pub fn diff_mlir_strings(before_txt: &str, after_txt: &str) -> String {
+    let before_lines: Vec<&str> = before_txt.lines().collect();
+    let after_lines: Vec<&str> = after_txt.lines().collect();
+    let mut out = String::new();
+    let _ = writeln!(out, "--- a/module.mlir");
+    let _ = writeln!(out, "+++ b/module.mlir");
+
+    let max_len = before_lines.len().max(after_lines.len());
+    let mut removed = 0usize;
+    let mut added = 0usize;
+    for i in 0..max_len {
+        match (before_lines.get(i), after_lines.get(i)) {
+            (Some(a), Some(b)) if a == b => {
+                let _ = writeln!(out, "  {a}");
+            }
+            (Some(a), Some(b)) => {
+                let _ = writeln!(out, "- {a}");
+                let _ = writeln!(out, "+ {b}");
+                removed += 1;
+                added += 1;
+            }
+            (Some(a), None) => {
+                let _ = writeln!(out, "- {a}");
+                removed += 1;
+            }
+            (None, Some(b)) => {
+                let _ = writeln!(out, "+ {b}");
+                added += 1;
+            }
+            (None, None) => {}
+        }
+    }
+    let _ = writeln!(out, "// Summary: -{removed} removed / +{added} added lines");
+    out
+}
+
+/// Pipeable IR Snapshot Translator (`Ir(Module) -> Ir(Module)`).
+///
+/// Captures the current MLIR text into the root `builtin.module` attribute
+/// `"castforge.snapshot_mlir"` so a downstream [`IrDiffTranslator`] (`ir-diff`) can emit a
+/// unified before/after diff across any sequence of intervening passes.
+#[derive(Default)]
+pub struct SnapshotIrTranslator;
+
+impl castforge_ir::Translator for SnapshotIrTranslator {
+    fn name(&self) -> &str {
+        "snapshot-ir"
+    }
+
+    fn input_kind(&self) -> &'static str {
+        "ir"
+    }
+
+    fn output_kind(&self) -> &'static str {
+        "ir"
+    }
+
+    fn translate(&mut self, input: castforge_ir::Payload) -> anyhow::Result<castforge_ir::Payload> {
+        let mut module = input.into_ir()?;
+        let snap = print_mlir(&module);
+        if let Some(&fn_op) = module.functions().first() {
+            module.ops[fn_op].attributes.insert(
+                "castforge.snapshot_mlir".to_string(),
+                castforge_ir::Attribute::String(snap),
+            );
+        }
+        Ok(castforge_ir::Payload::from_ir(module))
+    }
+}
+
+/// Pipeable IR Diff Translator (`Ir(Module) -> Text(Unified Diff)`).
+///
+/// Compares the incoming [`Module`] against an explicit `baseline` module or the snapshot
+/// recorded by an upstream [`SnapshotIrTranslator`] (`snapshot-ir`).
+#[derive(Default)]
+pub struct IrDiffTranslator {
+    pub baseline: Option<Module>,
+}
+
+impl IrDiffTranslator {
+    /// Creates an [`IrDiffTranslator`] comparing against `baseline`.
+    pub fn with_baseline(baseline: Module) -> Self {
+        Self {
+            baseline: Some(baseline),
+        }
+    }
+}
+
+impl castforge_ir::Translator for IrDiffTranslator {
+    fn name(&self) -> &str {
+        "ir-diff"
+    }
+
+    fn input_kind(&self) -> &'static str {
+        "ir"
+    }
+
+    fn output_kind(&self) -> &'static str {
+        "text"
+    }
+
+    fn translate(&mut self, input: castforge_ir::Payload) -> anyhow::Result<castforge_ir::Payload> {
+        let mut module = input.into_ir()?;
+        let snap_attr = module.functions().first().and_then(|&fn_op| {
+            module.ops[fn_op]
+                .attributes
+                .swap_remove("castforge.snapshot_mlir")
+        });
+        let after_txt = print_mlir(&module);
+        let before_txt = if let Some(base) = &self.baseline {
+            print_mlir(base)
+        } else if let Some(castforge_ir::Attribute::String(s)) = snap_attr {
+            s
+        } else {
+            after_txt.clone()
+        };
+        Ok(castforge_ir::Payload::Text(diff_mlir_strings(
+            &before_txt,
+            &after_txt,
+        )))
+    }
+}
