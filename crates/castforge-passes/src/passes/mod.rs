@@ -1,3 +1,4 @@
+pub mod bake_lora;
 pub mod canonicalize;
 pub mod cse;
 pub mod dce;
@@ -22,9 +23,11 @@ pub mod simplify_algebraic;
 pub mod sink_transpose;
 pub mod strip_debuginfo;
 pub mod symbol_dce;
+pub mod task_arithmetic;
 pub mod topological_sort;
 pub mod verify_shapes;
 
+pub use bake_lora::BakeLoraPass;
 pub use canonicalize::CanonicalizePass;
 pub use cse::CommonSubexpressionEliminationPass;
 pub use dce::DeadCodeEliminationPass;
@@ -49,5 +52,6 @@ pub use simplify_algebraic::SimplifyAlgebraicPass;
 pub use sink_transpose::SinkTransposePass;
 pub use strip_debuginfo::StripDebugInfoPass;
 pub use symbol_dce::SymbolDcePass;
+pub use task_arithmetic::TaskArithmeticPass;
 pub use topological_sort::TopologicalSortPass;
 pub use verify_shapes::VerifyShapesPass;

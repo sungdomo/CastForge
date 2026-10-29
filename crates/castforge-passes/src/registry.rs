@@ -1,11 +1,11 @@
 use crate::{
-    CanonicalizePass, CommonSubexpressionEliminationPass, DeadCodeEliminationPass,
+    BakeLoraPass, CanonicalizePass, CommonSubexpressionEliminationPass, DeadCodeEliminationPass,
     DecomposeCompositesPass, ExternalizeWeightsPass, FoldConstantsPass, FoldNormWeightsPass,
     FoldReshapePass, FoldTransposePass, FuseElementwisePass, FuseMatmulEpiloguePass,
     FuseRmsNormPass, FuseSoftmaxPass, InlinerPass, IrEditPass, MergeWeightsPass, Pass, PassOptions,
     PrintOpStatsPass, QuantizeWeightsPass, SccpPass, SimplifyAlgebraicPass, SinkTransposePass,
-    StripDebugInfoPass, StructuredPruningPass, SymbolDcePass, TopologicalSortPass,
-    VerifyShapesPass,
+    StripDebugInfoPass, StructuredPruningPass, SymbolDcePass, TaskArithmeticPass,
+    TopologicalSortPass, VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
 use castforge_ir::MergeMethod;
@@ -230,6 +230,32 @@ impl PassRegistry {
             "decompose-composites",
             "Expands stablehlo.composite operations back into primitive StableHLO ops",
             |_opts| Ok(Box::new(DecomposeCompositesPass)),
+        );
+        reg.register(
+            "bake-lora",
+            "Fuses LoRA adapter branches W + alpha * (A @ B) into base weight matrices",
+            |opts| {
+                let alpha = opts
+                    .get("alpha")
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(1.0);
+                Ok(Box::new(BakeLoraPass { alpha }))
+            },
+        );
+        reg.register(
+            "task-arithmetic",
+            "Applies multi-checkpoint task vector arithmetic and DARE pruning (lambda, drop_rate)",
+            |opts| {
+                let lambda = opts
+                    .get("lambda")
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(1.0);
+                let drop_rate = opts
+                    .get("drop_rate")
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(0.0);
+                Ok(Box::new(TaskArithmeticPass { lambda, drop_rate }))
+            },
         );
         reg
     }
