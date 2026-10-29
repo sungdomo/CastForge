@@ -255,6 +255,16 @@ fn emit_wgsl_func(module: &Module, fn_op_id: OpId, out: &mut String) -> Result<(
                         )?;
                         writeln!(out, "        }}")?;
                         writeln!(out, "    }}")?;
+                    } else if name == "castforge.fused_swiglu" && inputs.len() >= 2 {
+                        let g = value_ident(module, inputs[0], &mut names, &mut counter);
+                        let u = value_ident(module, inputs[1], &mut names, &mut counter);
+                        writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+                        writeln!(out, "    for (var i = 0u; i < {res_len}u; i = i + 1u) {{")?;
+                        writeln!(
+                            out,
+                            "        {res_name}[i] = ({g}[i] / (1.0 + exp(-{g}[i]))) * {u}[i];"
+                        )?;
+                        writeln!(out, "    }}")?;
                     } else {
                         let a = value_ident(module, inputs[0], &mut names, &mut counter);
                         writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;

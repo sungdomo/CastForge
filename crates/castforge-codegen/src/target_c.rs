@@ -353,6 +353,16 @@ fn emit_c_hlo_op(
                     "bias_tanh" => {
                         writeln!(out, "            {res_name}[idx] = tanhf(val);")?;
                     }
+                    "bias_silu" => {
+                        writeln!(
+                            out,
+                            "            {res_name}[idx] = val / (1.0f + expf(-val));"
+                        )?;
+                    }
+                    "bias_scale" if inputs.len() >= 4 => {
+                        let s = value_ident(module, inputs[3], names, counter);
+                        writeln!(out, "            {res_name}[idx] = val * {s}[idx];")?;
+                    }
                     _ => {
                         writeln!(out, "            {res_name}[idx] = val;")?;
                     }
@@ -420,6 +430,14 @@ fn emit_c_hlo_op(
                     )?;
                 }
                 writeln!(out, "    }}")?;
+            } else if name == "castforge.fused_swiglu" && inputs.len() >= 2 {
+                let g = value_ident(module, inputs[0], names, counter);
+                let u = value_ident(module, inputs[1], names, counter);
+                writeln!(
+                    out,
+                    "    for (int i = 0; i < {res_len}; ++i) \
+                     {res_name}[i] = ({g}[i] / (1.0f + expf(-{g}[i]))) * {u}[i];"
+                )?;
             } else {
                 let src = value_ident(module, inputs[0], names, counter);
                 writeln!(

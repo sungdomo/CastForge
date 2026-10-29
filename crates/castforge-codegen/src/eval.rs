@@ -456,6 +456,8 @@ fn eval_stablehlo_op(
                         match epilogue {
                             "bias_relu" => val.max(z[i]),
                             "bias_tanh" => val.tanh(),
+                            "bias_silu" => val / (1.0 + (-val).exp()),
+                            "bias_scale" => val * z[i],
                             _ => val,
                         }
                     })
@@ -516,6 +518,12 @@ fn eval_stablehlo_op(
                     }
                 }
                 out
+            } else if name == "castforge.fused_swiglu" && inputs.len() >= 2 {
+                let g = get_v(inputs[0]);
+                let u = get_v(inputs[1]);
+                (0..res_len)
+                    .map(|i| (g[i] / (1.0 + (-g[i]).exp())) * u[i])
+                    .collect()
             } else {
                 get_v(inputs[0])
             }

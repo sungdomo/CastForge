@@ -449,6 +449,13 @@ fn emit_rust_hlo_op(
                     "bias_tanh" => {
                         writeln!(out, "            {dst} = val.tanh();")?;
                     }
+                    "bias_silu" => {
+                        writeln!(out, "            {dst} = val / (1.0_f32 + (-val).exp());")?;
+                    }
+                    "bias_scale" if inputs.len() >= 4 => {
+                        let s = r_idx(module, plan, inputs[3], "idx", names, counter);
+                        writeln!(out, "            {dst} = val * ({s});")?;
+                    }
                     _ => {
                         writeln!(out, "            {dst} = val;")?;
                     }
@@ -543,6 +550,17 @@ fn emit_rust_hlo_op(
                     writeln!(out, "            {dst} = ({src}) * inv;")?;
                 }
                 writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
+            } else if name == "castforge.fused_swiglu" && inputs.len() >= 2 {
+                let gate = r_idx(module, plan, inputs[0], "i", names, counter);
+                let up = r_idx(module, plan, inputs[1], "i", names, counter);
+                let dst = r_idx(module, plan, res_val, "i", names, counter);
+                writeln!(out, "    for i in 0..{res_len} {{")?;
+                writeln!(out, "        let g = {gate};")?;
+                writeln!(
+                    out,
+                    "        {dst} = (g / (1.0_f32 + (-g).exp())) * ({up});"
+                )?;
                 writeln!(out, "    }}")?;
             } else {
                 let src = r_idx(module, plan, inputs[0], "i", names, counter);

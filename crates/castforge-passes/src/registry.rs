@@ -3,10 +3,10 @@ use crate::{
     DecomposeCompositesPass, ExternalizeWeightsPass, FoldBroadcastPass, FoldConstantsPass,
     FoldConvertPass, FoldNormWeightsPass, FoldReshapePass, FoldSliceConcatPass, FoldTransposePass,
     FuseElementwisePass, FuseHorizontalDotPass, FuseMatmulEpiloguePass, FuseRmsNormPass,
-    FuseSoftmaxPass, HoistConstantsPass, InlinerPass, IrEditPass, LicmPass, MergeWeightsPass, Pass,
-    PassOptions, PrintOpStatsPass, QuantizeWeightsPass, SccpPass, SimplifyAlgebraicPass,
-    SinkTransposePass, StripDebugInfoPass, StructuredPruningPass, SymbolDcePass,
-    TaskArithmeticPass, TopologicalSortPass, VerifyShapesPass,
+    FuseSoftmaxPass, FuseSwiGluPass, HoistConstantsPass, InlinerPass, IrEditPass, LicmPass,
+    MergeWeightsPass, Pass, PassOptions, PrintOpStatsPass, QuantizeWeightsPass, SccpPass,
+    SimplifyAlgebraicPass, SinkTransposePass, StripDebugInfoPass, StructuredPruningPass,
+    SymbolDcePass, TaskArithmeticPass, TopologicalSortPass, VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
 use castforge_ir::MergeMethod;
@@ -295,6 +295,11 @@ impl PassRegistry {
             "licm",
             "Loop/Region-Invariant Code Motion (hoists invariant pure ops out of nested regions)",
             |_opts| Ok(Box::new(LicmPass)),
+        );
+        reg.register(
+            "fuse-swiglu",
+            "Fuses SwiGLU (gate / (1 + exp(-gate)) * up) into stablehlo.composite (fused_swiglu)",
+            |_opts| Ok(Box::new(FuseSwiGluPass)),
         );
         reg
     }

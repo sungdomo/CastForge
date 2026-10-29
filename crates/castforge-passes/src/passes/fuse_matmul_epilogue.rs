@@ -1,3 +1,4 @@
+use crate::passes::fuse_swiglu::match_silu_val;
 use crate::{DeadCodeEliminationPass, Pass, PassResult};
 use anyhow::Result;
 use castforge_dialect_stablehlo::StableHloOp;
@@ -5,9 +6,11 @@ use castforge_ir::{Attribute, BlockId, Module, OpName, ValueDef};
 use indexmap::IndexMap;
 use smallvec::SmallVec;
 
-/// AI Optimization Pass: Fuses `stablehlo.dot_general` + bias `stablehlo.add`
-/// (+ optional activation `stablehlo.maximum` or `stablehlo.tanh`) into a single
-/// `stablehlo.composite` operation (`"castforge.fused_matmul_epilogue"`).
+/// AI Optimization Pass: Generalized MatMul Epilogue Fusion (`fuse-matmul-epilogue`).
+///
+/// Fuses `stablehlo.dot_general` + bias `stablehlo.add` + optional chained elementwise
+/// consumers (`relu`, `tanh`, `silu`, or `scale` multiply) into a single `stablehlo.composite`
+/// operation (`"castforge.fused_matmul_epilogue"`), eliminating intermediate memory traffic.
 pub struct FuseMatmulEpiloguePass;
 
 impl Pass for FuseMatmulEpiloguePass {
@@ -16,7 +19,7 @@ impl Pass for FuseMatmulEpiloguePass {
     }
 
     fn description(&self) -> &'static str {
-        "Fuses dot_general + bias add (+ optional relu/tanh) into stablehlo.composite"
+        "Fuses dot_general + bias add (+ relu/tanh/silu/scale epilogue) into stablehlo.composite"
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
@@ -25,7 +28,11 @@ impl Pass for FuseMatmulEpiloguePass {
         let blocks: Vec<BlockId> = module.blocks.keys().collect();
 
         for block_id in blocks {
-            // Pass 1: Look for `maximum(add(dot_general, bias), zero)` or `tanh(add(dot, bias))`
+            // Pass 1: Look for multi-op epilogue chains rooted at `dot_general + bias`:
+            // - `silu(add(dot, bias))` (`bias_silu`)
+            // - `maximum(add(dot, bias), zero)` (`bias_relu`)
+            // - `tanh(add(dot, bias))` (`bias_tanh`)
+            // - `multiply(add(dot, bias), scale)` (`bias_scale`)
             let ops = module.block_ops(block_id);
             for op_id in ops {
                 let Some(op) = module.ops.get(op_id) else {
@@ -34,6 +41,39 @@ impl Pass for FuseMatmulEpiloguePass {
                 let Some(hlo) = StableHloOp::from_op(op) else {
                     continue;
                 };
+
+                // Check `silu(add(dot, bias))` rooted at `Divide`
+                if let StableHloOp::Divide { result, .. } = hlo
+                    && let Some(add_val) = match_silu_val(module, result)
+                    && let Some(MatmulAddMatch {
+                        lhs,
+                        rhs,
+                        bias,
+                        dot_attrs,
+                        ..
+                    }) = match_add_of_dot_ignoring_uses(module, add_val)
+                {
+                    let mut attrs = dot_attrs;
+                    attrs.insert(
+                        "name".to_string(),
+                        Attribute::String("castforge.fused_matmul_epilogue".to_string()),
+                    );
+                    attrs.insert(
+                        "decomposition".to_string(),
+                        Attribute::SymbolRef("fused_matmul_bias_silu_impl".to_string()),
+                    );
+                    attrs.insert(
+                        "epilogue".to_string(),
+                        Attribute::String("bias_silu".to_string()),
+                    );
+
+                    let op_mut = &mut module.ops[op_id];
+                    op_mut.name = OpName::new("stablehlo", "composite");
+                    op_mut.operands = SmallVec::from_slice(&[lhs, rhs, bias]);
+                    op_mut.attributes = attrs;
+                    created += 1;
+                    continue;
+                }
 
                 match hlo {
                     StableHloOp::Maximum {
@@ -114,8 +154,59 @@ impl Pass for FuseMatmulEpiloguePass {
                         module.remove_op(block_id, dot_op_id);
                         removed += 2;
                     }
+                    StableHloOp::Multiply {
+                        lhs: m_lhs,
+                        rhs: m_rhs,
+                        ..
+                    } => {
+                        let matched = match_add_of_dot(module, m_lhs)
+                            .map(|m| (m, m_rhs))
+                            .or_else(|| match_add_of_dot(module, m_rhs).map(|m| (m, m_lhs)));
+                        let Some((
+                            MatmulAddMatch {
+                                add_op_id,
+                                dot_op_id,
+                                lhs,
+                                rhs,
+                                bias,
+                                dot_attrs,
+                            },
+                            scale_val,
+                        )) = matched
+                        else {
+                            continue;
+                        };
+                        let mut attrs = dot_attrs;
+                        attrs.insert(
+                            "name".to_string(),
+                            Attribute::String("castforge.fused_matmul_epilogue".to_string()),
+                        );
+                        attrs.insert(
+                            "decomposition".to_string(),
+                            Attribute::SymbolRef("fused_matmul_bias_scale_impl".to_string()),
+                        );
+                        attrs.insert(
+                            "epilogue".to_string(),
+                            Attribute::String("bias_scale".to_string()),
+                        );
+
+                        let op_mut = &mut module.ops[op_id];
+                        op_mut.name = OpName::new("stablehlo", "composite");
+                        op_mut.operands = SmallVec::from_slice(&[lhs, rhs, bias, scale_val]);
+                        op_mut.attributes = attrs;
+                        created += 1;
+
+                        module.remove_op(block_id, add_op_id);
+                        module.remove_op(block_id, dot_op_id);
+                        removed += 2;
+                    }
                     _ => {}
                 }
+            }
+
+            if created > 0 {
+                let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
+                removed += dce_res.ops_removed;
             }
 
             // Pass 2: Look for remaining `add(dot_general(x, w), bias)` without activation

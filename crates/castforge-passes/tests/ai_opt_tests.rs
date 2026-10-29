@@ -365,3 +365,74 @@ fn test_fold_convert_and_hoist_constants() {
     // Duplicate constant %c2 is deduplicated into %c1
     assert_eq!(printed.matches("stablehlo.constant").count(), 1);
 }
+
+const SWIGLU_AND_EPILOGUE_MLIR: &str = r#"
+module @swiglu_and_epilogue {
+  func.func @forward(%x: tensor<2x2xf32>, %up: tensor<2x2xf32>) -> tensor<2x2xf32> {
+    %w = stablehlo.constant dense<[[1.0, 0.5], [-0.5, 2.0]]> : tensor<2x2xf32>
+    %b = stablehlo.constant dense<[[0.1, -0.1], [0.2, 0.3]]> : tensor<2x2xf32>
+    %zero = stablehlo.constant dense<0.0> : tensor<2x2xf32>
+    %one = stablehlo.constant dense<1.0> : tensor<2x2xf32>
+    %mm = stablehlo.dot_general %x, %w : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+    %gate = stablehlo.add %mm, %b : tensor<2x2xf32>
+    %neg = stablehlo.subtract %zero, %gate : tensor<2x2xf32>
+    %exp = stablehlo.exponential %neg : tensor<2x2xf32>
+    %denom = stablehlo.add %exp, %one : tensor<2x2xf32>
+    %silu = stablehlo.divide %gate, %denom : tensor<2x2xf32>
+    %out = stablehlo.multiply %silu, %up : tensor<2x2xf32>
+    func.return %out : tensor<2x2xf32>
+  }
+}
+"#;
+
+#[test]
+fn test_fuse_swiglu_and_generalized_matmul_epilogue() {
+    let before = parse_mlir(SWIGLU_AND_EPILOGUE_MLIR).expect("parse swiglu MLIR");
+    let registry = PassRegistry::with_builtin_passes();
+
+    // 1. Test `fuse-swiglu` + `fuse-matmul-epilogue` + `decompose-composites`
+    let mut swiglu_mod = before.clone();
+    let mut pm = PassManager::from_pipeline_str(&registry, "fuse-swiglu,fuse-matmul-epilogue")
+        .expect("swiglu pipeline");
+    let res = pm.run(&mut swiglu_mod).expect("run swiglu pipeline");
+    assert!(res[0].changed);
+    assert!(res[1].changed);
+
+    let printed = print_mlir(&swiglu_mod);
+    assert!(printed.contains("castforge.fused_swiglu"));
+    assert!(printed.contains("castforge.fused_matmul_epilogue"));
+
+    let rep = verify_module_numerics(&before, &swiglu_mod, 1e-5).expect("verify swiglu numerics");
+    assert!(rep.passed, "max_abs_diff = {}", rep.max_abs_diff);
+
+    // Codegen for Rust, C, and WGSL
+    for target in [CodegenTarget::Rust, CodegenTarget::C, CodegenTarget::Wgsl] {
+        let code = generate_code(&swiglu_mod, target).expect("codegen swiglu");
+        assert!(!code.is_empty());
+    }
+
+    // Decompose back to primitive ops and verify bit-accuracy
+    let mut decomp_mod = swiglu_mod.clone();
+    let mut pm_d = PassManager::from_pipeline_str(&registry, "decompose-composites")
+        .expect("decompose pipeline");
+    pm_d.run(&mut decomp_mod).expect("run decompose");
+    let printed_d = print_mlir(&decomp_mod);
+    assert!(!printed_d.contains("stablehlo.composite"));
+    let rep_d =
+        verify_module_numerics(&before, &decomp_mod, 1e-5).expect("verify decomposed swiglu");
+    assert!(rep_d.passed, "max_abs_diff = {}", rep_d.max_abs_diff);
+
+    // 2. Test standalone `fuse-matmul-epilogue` fusing `dot_general + bias + silu` (`bias_silu`)
+    let mut silu_epilogue_mod = before.clone();
+    let mut pm_e = PassManager::from_pipeline_str(&registry, "fuse-matmul-epilogue")
+        .expect("fuse-matmul-epilogue pipeline");
+    let res_e = pm_e
+        .run(&mut silu_epilogue_mod)
+        .expect("run fuse-matmul-epilogue");
+    assert!(res_e[0].changed);
+    let printed_e = print_mlir(&silu_epilogue_mod);
+    assert!(printed_e.contains("bias_silu"));
+    let rep_e =
+        verify_module_numerics(&before, &silu_epilogue_mod, 1e-5).expect("verify bias_silu");
+    assert!(rep_e.passed, "max_abs_diff = {}", rep_e.max_abs_diff);
+}

@@ -130,6 +130,43 @@ impl Pass for DecomposeCompositesPass {
                                 created += 1;
                                 modified += 1;
                             }
+                            "bias_silu" => {
+                                let add_val = insert_op_before(
+                                    module,
+                                    block_id,
+                                    op_id,
+                                    OpName::new("stablehlo", "add"),
+                                    &[dot_val, inputs[2]],
+                                    IndexMap::new(),
+                                    out_ty.clone(),
+                                );
+                                let denom_val = insert_silu_denom_before(
+                                    module, block_id, op_id, add_val, &out_ty,
+                                );
+                                let op_mut = &mut module.ops[op_id];
+                                op_mut.name = OpName::new("stablehlo", "divide");
+                                op_mut.operands = SmallVec::from_slice(&[add_val, denom_val]);
+                                op_mut.attributes.clear();
+                                created += 6;
+                                modified += 1;
+                            }
+                            "bias_scale" if inputs.len() >= 4 => {
+                                let add_val = insert_op_before(
+                                    module,
+                                    block_id,
+                                    op_id,
+                                    OpName::new("stablehlo", "add"),
+                                    &[dot_val, inputs[2]],
+                                    IndexMap::new(),
+                                    out_ty,
+                                );
+                                let op_mut = &mut module.ops[op_id];
+                                op_mut.name = OpName::new("stablehlo", "multiply");
+                                op_mut.operands = SmallVec::from_slice(&[add_val, inputs[3]]);
+                                op_mut.attributes.clear();
+                                created += 1;
+                                modified += 1;
+                            }
                             _ => {
                                 let op_mut = &mut module.ops[op_id];
                                 op_mut.name = OpName::new("stablehlo", "add");
@@ -138,6 +175,27 @@ impl Pass for DecomposeCompositesPass {
                                 modified += 1;
                             }
                         }
+                    }
+                    "castforge.fused_swiglu" if inputs.len() >= 2 => {
+                        let gate = inputs[0];
+                        let up = inputs[1];
+                        let denom_val =
+                            insert_silu_denom_before(module, block_id, op_id, gate, &out_ty);
+                        let silu_val = insert_op_before(
+                            module,
+                            block_id,
+                            op_id,
+                            OpName::new("stablehlo", "divide"),
+                            &[gate, denom_val],
+                            IndexMap::new(),
+                            out_ty,
+                        );
+                        let op_mut = &mut module.ops[op_id];
+                        op_mut.name = OpName::new("stablehlo", "multiply");
+                        op_mut.operands = SmallVec::from_slice(&[silu_val, up]);
+                        op_mut.attributes.clear();
+                        created += 6;
+                        modified += 1;
                     }
                     "castforge.fused_softmax" if !inputs.is_empty() => {
                         let x = inputs[0];
@@ -232,6 +290,81 @@ fn reduced_row_type(out_ty: &Type) -> (Type, i64, Vec<i64>) {
         }),
         0,
         vec![0],
+    )
+}
+
+fn insert_silu_denom_before(
+    module: &mut Module,
+    block_id: BlockId,
+    before_op: OpId,
+    x: ValueId,
+    out_ty: &Type,
+) -> ValueId {
+    let t_ty = out_ty.as_tensor().cloned().unwrap_or(TensorType {
+        shape: Vec::new(),
+        dtype: DType::F32,
+        encoding: None,
+    });
+    let mut z_attrs = IndexMap::new();
+    z_attrs.insert(
+        "value".to_string(),
+        Attribute::DenseElements {
+            ty: t_ty.clone(),
+            raw_literal: "0.0".to_string(),
+        },
+    );
+    let zero_val = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "constant"),
+        &[],
+        z_attrs,
+        out_ty.clone(),
+    );
+    let mut one_attrs = IndexMap::new();
+    one_attrs.insert(
+        "value".to_string(),
+        Attribute::DenseElements {
+            ty: t_ty,
+            raw_literal: "1.0".to_string(),
+        },
+    );
+    let one_val = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "constant"),
+        &[],
+        one_attrs,
+        out_ty.clone(),
+    );
+    let neg_val = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "subtract"),
+        &[zero_val, x],
+        IndexMap::new(),
+        out_ty.clone(),
+    );
+    let exp_val = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "exponential"),
+        &[neg_val],
+        IndexMap::new(),
+        out_ty.clone(),
+    );
+    insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "add"),
+        &[exp_val, one_val],
+        IndexMap::new(),
+        out_ty.clone(),
     )
 }
 
