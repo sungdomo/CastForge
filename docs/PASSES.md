@@ -1,8 +1,8 @@
-# CastForge v1.0.0 — Complete Reference of All 91 Compiler Passes
+# CastForge — Complete Reference of All 99 Graph IR Passes (+ 7 LoopIR Passes)
 
-CastForge provides **91 built-in modular A-to-B IR passes & presets** in `castforge-passes` (plus
-**7 Imperative LoopIR passes** in `castforge-codegen`). Every pass implements the unified `Pass`
-and `Translator` traits and can be invoked via:
+CastForge provides **99 built-in modular A-to-B IR passes & presets** in `castforge-passes` (plus
+**7 Imperative LoopIR passes** in `castforge-codegen`, totaling **106 passes**). Every pass
+implements the unified `Pass` and `Translator` traits and can be invoked via:
 
 - **CLI pipeline:** `castforge opt model.mlir -p "pass-name(opt1=val1,opt2=val2)"`
 - **Translator chain:** `castforge chain model.mlir -s "pass-a | pass-b | lower-to-loops"`
@@ -14,18 +14,18 @@ and `Translator` traits and can be invoked via:
 
 | Category | Count | Section |
 | :--- | :---: | :--- |
-| **1. General MLIR & Algebraic Passes** | 19 | Section 1 |
-| **2. Weight Surgery & Quantization** | 11 | Section 2 |
-| **3. Transformer & Operator Fusions** | 17 | Section 3 |
+| **1. General MLIR & Algebraic Passes** | 20 | Section 1 |
+| **2. Weight Surgery & Quantization** | 13 | Section 2 |
+| **3. Transformer & Operator Fusions** | 19 | Section 3 |
 | **4. Shape, Layout & GEMM Lowering** | 7 | Section 4 |
-| **5. Memory, Rematerialization & Offload** | 3 | Section 5 |
-| **6. Distributed SPMD, Streams & Autodiff** | 5 | Section 6 |
+| **5. Memory, Rematerialization & Offload** | 4 | Section 5 |
+| **6. Distributed SPMD, Streams & Autodiff** | 6 | Section 6 |
 | **7. Graph Schedule & Loop-Chain Passes** | 6 | Section 7 |
-| **8. IR Surgery, Verification & Tooling** | 19 | Section 8 |
+| **8. IR Surgery, Verification & Tooling** | 20 | Section 8 |
 | **9. Optimization Pipeline Presets** | 4 | Section 9 |
 | **10. Polyhedral / Imperative LoopIR** | +7 | Section 10 |
 
-*(Total: **91 registered Graph IR passes/presets** in `PassRegistry` + **7 LoopIR passes**.)*
+*(Total: **99 registered Graph IR passes/presets** in `PassRegistry` + **7 LoopIR passes**.)*
 
 ---
 
@@ -138,9 +138,15 @@ and `Translator` traits and can be invoked via:
 - **Explanation:** Verifies SSA dominance, operand/result counts, element types, and `dot_general`
   contracting/batching dimension compatibility across all operations.
 
+### 1.20 `gvn` (`GlobalValueNumberingPass`)
+- **Options:** None
+- **Explanation:** Dominator-tree / cross-region Global Value Numbering (`GVN`). Propagates
+  canonical value numbers from outer regions into nested regions and basic blocks, canonicalizes
+  commutative binary operations, and eliminates redundant computations across basic blocks.
+
 ---
 
-## 2. Weight Surgery & Quantization Passes (11 Passes)
+## 2. Weight Surgery & Quantization Passes (13 Passes)
 
 ### 2.1 `quantize-weights` (`QuantizeWeightsPass`)
 - **Options:** `bits=8|4` (default: `8`), `min_elements=N` (default: `2`)
@@ -206,9 +212,22 @@ and `Translator` traits and can be invoked via:
 - **Explanation:** Moves inline `dense<...>` weight literals with at least `min_elements` into
   `Module::tensor_store` as `dense_resource<w_N>` handles (or inlines them back when `inline=true`).
 
+### 2.12 `quantize-groupwise` (`QuantizeGroupwisePass`)
+- **Options:** `bits=4|8` (default: `4`), `group_size=N` (default: `32`), `awq_salient=true|false`
+- **Explanation:** Group-wise / Activation-Aware Weight Quantization (`AWQ` / `GPTQ` style).
+  Partitions 2D weight tensors into contiguous blocks of `group_size`, computes per-group symmetric
+  quantization scales, preserves top salient channels at $2\times$ grid resolution when
+  `awq_salient=true`, and stamps `castforge.quant_scheme = "awq_groupwise"`.
+
+### 2.13 `fold-batchnorm` (`FoldBatchNormPass`)
+- **Options:** None
+- **Explanation:** Absorbs inference BatchNorm channel scaling (`multiply(conv_or_dot(X, W),
+  scale)`) directly into the preceding `stablehlo.convolution` or `stablehlo.dot_general` constant
+  filter/weight tensor (`W'[r, c] = W[r, c] * scale[c]`), eliminating runtime BatchNorm overhead.
+
 ---
 
-## 3. Transformer & Operator Fusion Passes (17 Passes)
+## 3. Transformer & Operator Fusion Passes (19 Passes)
 
 ### 3.1 `fuse-elementwise` (`FuseElementwisePass`)
 - **Options:** None
@@ -302,6 +321,16 @@ and `Translator` traits and can be invoked via:
   `fused_matmul_epilogue`, `fused_softmax`, `fused_rmsnorm`) back into standard primitive
   StableHLO operations for portable export.
 
+### 3.18 `fuse-norm` (`FuseNormPass`)
+- **Options:** `kind=all|rmsnorm|residual_rmsnorm|layernorm` (default: `all`)
+- **Explanation:** Consolidated normalization fusion engine combining `fuse-residual-norm`,
+  `fuse-rmsnorm`, and `fuse-layernorm` with longest-match priority in a single pipeline stage.
+
+### 3.19 `fuse-activations` (`FuseActivationsPass`)
+- **Options:** `kind=all|swiglu|gelu|gated_mlp` (default: `all`)
+- **Explanation:** Consolidated activation and gated-MLP fusion engine combining `fuse-swiglu`,
+  `fuse-gelu` (GELU + GeGLU), and `fuse-gated-mlp` in bottom-up order.
+
 ---
 
 ## 4. Shape Specialization, Layout & GEMM Lowering Passes (7 Passes)
@@ -367,9 +396,15 @@ and `Translator` traits and can be invoked via:
   `castforge.prefetch_to_device` (H2D DMA) custom calls around activations whose live range exceeds
   `min_span` instructions.
 
+### 5.4 `eliminate-concat-copies` (`EliminateConcatCopiesPass`)
+- **Options:** None
+- **Explanation:** Destination-passing zero-copy concatenation optimization. Annotates pure
+  producer operands of `stablehlo.concatenate` with `castforge.concat_dest` and
+  `castforge.concat_elem_offset` so producers write directly into destination sub-slices.
+
 ---
 
-## 6. Distributed SPMD, Async Streams & Autodiff Passes (5 Passes)
+## 6. Distributed SPMD, Async Streams & Autodiff Passes (6 Passes)
 
 ### 6.1 `shard-spmd` (`ShardSpmdPass`)
 - **Options:** `devices=N` (default: `2`)
@@ -393,7 +428,12 @@ and `Translator` traits and can be invoked via:
 - **Explanation:** Injects `castforge.kv_cache_update` composites on $K$ and $V$ inputs of
   `fused_attention` for stateful autoregressive LLM token decoding.
 
-### 6.5 `autodiff` (`AutodiffPass`)
+### 6.5 `lower-paged-attention` (`LowerPagedAttentionPass`)
+- **Options:** `page_block_size=N` (default: `16`), `max_blocks=N` (default: `64`)
+- **Explanation:** Lowers `castforge.fused_attention` into vLLM-style **PagedAttention** with
+  non-contiguous block-table KV addressing (`castforge.paged_attention = true`).
+
+### 6.6 `autodiff` (`AutodiffPass`)
 - **Options:** `lr=f32` (default: `0.0`)
 - **Explanation:** Reverse-mode Automatic Differentiation (`VJP`). Synthesizes backward adjoint
   operations (`dL/dX`, `dL/dW`) in StableHLO and, when `lr > 0`, emits in-graph Stochastic Gradient
@@ -531,6 +571,11 @@ and `Translator` traits and can be invoked via:
 - **Options:** None
 - **Explanation:** Strips all compiler-internal `castforge.*` and schedule attributes while
   preserving standard MLIR and StableHLO semantics for strict upstream portability.
+
+### 8.20 `strip-metadata` (`StripMetadataPass`)
+- **Options:** `debuginfo=true|false` (default: `true`), `attributes=true|false` (default: `true`)
+- **Explanation:** Unified pass combining `strip-debuginfo` and `strip-attributes` in a single
+  stage.
 
 ---
 

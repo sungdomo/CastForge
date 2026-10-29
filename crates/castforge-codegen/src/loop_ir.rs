@@ -195,6 +195,38 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                 len,
             });
 
+            if op
+                .attributes
+                .get("castforge.paged_attention")
+                .is_some_and(|a| matches!(a, castforge_ir::Attribute::Bool(true)))
+            {
+                let blk_sz = match op.attributes.get("castforge.page_block_size") {
+                    Some(castforge_ir::Attribute::Int(b)) => *b,
+                    _ => 16,
+                };
+                body.push(LoopStmt::Comment(format!(
+                    "PagedAttention KV block-table addressing (page_block_size={blk_sz})"
+                )));
+            }
+            if op
+                .attributes
+                .get("castforge.zero_copy_concat")
+                .is_some_and(|a| matches!(a, castforge_ir::Attribute::Bool(true)))
+            {
+                body.push(LoopStmt::Comment(
+                    "Zero-copy destination-passing concatenate".to_string(),
+                ));
+            }
+            if let Some(scheme) = op
+                .attributes
+                .get("castforge.quant_scheme")
+                .and_then(|a| a.as_str())
+            {
+                body.push(LoopStmt::Comment(format!(
+                    "Groupwise quantized weight ({scheme})"
+                )));
+            }
+
             if op.is_op("stablehlo", "dot_general") && op.operands.len() >= 2 {
                 let lhs = value_ident(module, op.operands[0], &mut names, &mut counter);
                 let rhs = value_ident(module, op.operands[1], &mut names, &mut counter);

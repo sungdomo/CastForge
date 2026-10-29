@@ -67,6 +67,7 @@ pub mod schedule_streams;
 pub mod shard_spmd;
 pub mod simplify_algebraic;
 pub mod sink_transpose;
+pub mod sota_passes;
 pub mod sparsify_2to4;
 pub mod specialize_shapes;
 pub mod strip_debuginfo;
@@ -149,6 +150,10 @@ pub use schedule_streams::ScheduleStreamsPass;
 pub use shard_spmd::ShardSpmdPass;
 pub use simplify_algebraic::SimplifyAlgebraicPass;
 pub use sink_transpose::SinkTransposePass;
+pub use sota_passes::{
+    EliminateConcatCopiesPass, FoldBatchNormPass, FuseActivationsPass, FuseNormPass,
+    GlobalValueNumberingPass, LowerPagedAttentionPass, QuantizeGroupwisePass, StripMetadataPass,
+};
 pub use sparsify_2to4::{Sparsify2To4Pass, apply_2to4_mask};
 pub use specialize_shapes::SpecializeShapesPass;
 pub use strip_debuginfo::StripDebugInfoPass;

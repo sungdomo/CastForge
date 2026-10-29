@@ -1527,7 +1527,7 @@ module @advanced_ir_tools {
 #[test]
 fn test_pad_for_tiling_split_gemm_unroll_calls_hoist_all_reduce_instrument_and_strip() {
     let registry = PassRegistry::with_builtin_passes();
-    assert_eq!(registry.list().count(), 91);
+    assert_eq!(registry.list().count(), 99);
 
     let mlir = r#"
 module @final_ninety_suite {
@@ -1773,4 +1773,86 @@ module @eval_extended {
     let out = castforge_codegen::evaluate_module(&eval_mod, &[vec![1.0, 2.0, 3.0, 4.0]])
         .expect("evaluate extended ops");
     assert_eq!(out[0], vec![7.0, 5.0, 3.0, 1.0]);
+}
+
+#[test]
+fn test_consolidated_and_sota_passes_groupwise_batchnorm_concat_paged_gvn() {
+    let registry = PassRegistry::with_builtin_passes();
+
+    // 1. Test fold-batchnorm, quantize-groupwise, eliminate-concat-copies, gvn, strip-metadata
+    let mlir = concat!(
+        "module @sota_pipeline {\n",
+        "  func.func @main(%x: tensor<2x2xf32>, %r: tensor<2x2xf32>) -> tensor<2x4xf32> {\n",
+        "    %w = stablehlo.constant dense<[[1.0, 2.0], [3.0, 4.0]]> : tensor<2x2xf32>\n",
+        "    %scale = stablehlo.constant dense<[[0.5, 2.0], [0.5, 2.0]]> : tensor<2x2xf32>\n",
+        "    %mm = \"stablehlo.dot_general\"(%x, %w) ",
+        "{lhs_contracting_dimensions = array<i64: 1>, ",
+        "rhs_contracting_dimensions = array<i64: 0>} ",
+        ": (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>\n",
+        "    %bn = stablehlo.multiply %mm, %scale : tensor<2x2xf32>\n",
+        "    %dup1 = stablehlo.add %bn, %r : tensor<2x2xf32>\n",
+        "    %dup2 = stablehlo.add %r, %bn : tensor<2x2xf32>\n",
+        "    %cat = \"stablehlo.concatenate\"(%dup1, %dup2) {dimension = 1 : i64} ",
+        ": (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x4xf32>\n",
+        "    func.return %cat : tensor<2x4xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut module = parse_mlir(mlir).expect("parse sota_pipeline");
+    let baseline = module.clone();
+
+    let mut pm_bn =
+        PassManager::from_pipeline_str(&registry, "fold-batchnorm,gvn,eliminate-concat-copies")
+            .expect("build sota pipeline");
+    let res = pm_bn.run(&mut module).expect("run sota pipeline");
+    assert!(res[0].changed, "fold-batchnorm absorbed scale into weight");
+    assert_eq!(res[1].ops_removed, 1, "gvn deduplicated commutative add");
+    assert!(res[2].changed, "eliminate-concat-copies routed producer");
+
+    let rep = verify_module_numerics(&baseline, &module, 1e-4).expect("verify numerics");
+    assert!(rep.passed, "fold-batchnorm + gvn numerically equivalent");
+
+    let printed = print_mlir(&module);
+    assert!(printed.contains("castforge.batchnorm_folded = true"));
+    assert!(printed.contains("castforge.zero_copy_concat = true"));
+
+    // 2. Test quantize-groupwise (AWQ/GPTQ style) + strip-metadata
+    let mut pm_gw = PassManager::from_pipeline_str(
+        &registry,
+        "quantize-groupwise(bits=4,group_size=2,awq_salient=true)",
+    )
+    .expect("build quantize-groupwise");
+    let gw_res = pm_gw.run(&mut module).expect("run quantize-groupwise");
+    assert!(gw_res[0].changed);
+    assert!(print_mlir(&module).contains("awq_groupwise"));
+
+    let mut pm_strip =
+        PassManager::from_pipeline_str(&registry, "strip-metadata").expect("strip-metadata");
+    pm_strip.run(&mut module).expect("run strip-metadata");
+    assert!(!print_mlir(&module).contains("castforge.batchnorm_folded"));
+
+    // 3. Test fuse-norm, fuse-activations, and lower-paged-attention
+    let attn_mlir = concat!(
+        "module @paged_attn_demo {\n",
+        "  func.func @main(%q: tensor<2x2xf32>, %k: tensor<2x2xf32>, %v: tensor<2x2xf32>) ",
+        "-> tensor<2x2xf32> {\n",
+        "    %att = \"stablehlo.composite\"(%q, %k, %v) ",
+        "{decomposition = @attn, name = \"castforge.fused_attention\", scale = 0.70710678 : f32} ",
+        ": (tensor<2x2xf32>, tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>\n",
+        "    func.return %att : tensor<2x2xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut attn_mod = parse_mlir(attn_mlir).expect("parse attn_mlir");
+    let mut pm_paged = PassManager::from_pipeline_str(
+        &registry,
+        "fuse-norm,fuse-activations,lower-paged-attention(page_block_size=16,max_blocks=64)",
+    )
+    .expect("build paged-attention pipeline");
+    let paged_res = pm_paged.run(&mut attn_mod).expect("run paged-attention");
+    assert!(paged_res[2].changed);
+    let cuda_src =
+        castforge_codegen::emit_cuda_module_with_config(&attn_mod, &TargetConfig::default())
+            .expect("emit cuda for paged attention");
+    assert!(cuda_src.contains("PagedAttention KV block-table addressing (page_block_size=16)"));
 }

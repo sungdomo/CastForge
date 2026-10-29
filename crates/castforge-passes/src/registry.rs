@@ -2,23 +2,25 @@ use crate::{
     AutodiffPass, BakeLoraPass, BisectPassesPass, BucketShapesPass, BufferizeInplacePass,
     CalibrateQuantizePass, CanonicalizePass, CommonSubexpressionEliminationPass, ComposeFuncsPass,
     ConvertLayoutPass, DeadCodeEliminationPass, DecomposeCompositesPass, DedupFunctionsPass,
-    EgraphSimplifyPass, ExternalizeWeightsPass, ExtractSubgraphPass, FissionLoopsPass,
-    FoldBroadcastPass, FoldConstantsPass, FoldConvertPass, FoldNormWeightsPass, FoldReshapePass,
-    FoldSliceConcatPass, FoldTransposePass, FreezeInputsPass, FuseAttentionPass,
-    FuseDequantMatmulPass, FuseElementwisePass, FuseGatedMlpPass, FuseGeluPass,
-    FuseHorizontalDotPass, FuseLayerNormPass, FuseLogSoftmaxPass, FuseLoopsPass, FuseMapReducePass,
-    FuseMatmulEpiloguePass, FuseMoePass, FuseResidualNormPass, FuseRmsNormPass, FuseRopePass,
-    FuseSoftmaxPass, FuseSwiGluPass, HashIrPass, HoistAllReducePass, HoistConstantsPass,
+    EgraphSimplifyPass, EliminateConcatCopiesPass, ExternalizeWeightsPass, ExtractSubgraphPass,
+    FissionLoopsPass, FoldBatchNormPass, FoldBroadcastPass, FoldConstantsPass, FoldConvertPass,
+    FoldNormWeightsPass, FoldReshapePass, FoldSliceConcatPass, FoldTransposePass, FreezeInputsPass,
+    FuseActivationsPass, FuseAttentionPass, FuseDequantMatmulPass, FuseElementwisePass,
+    FuseGatedMlpPass, FuseGeluPass, FuseHorizontalDotPass, FuseLayerNormPass, FuseLogSoftmaxPass,
+    FuseLoopsPass, FuseMapReducePass, FuseMatmulEpiloguePass, FuseMoePass, FuseNormPass,
+    FuseResidualNormPass, FuseRmsNormPass, FuseRopePass, FuseSoftmaxPass, FuseSwiGluPass,
+    GlobalValueNumberingPass, HashIrPass, HoistAllReducePass, HoistConstantsPass,
     InjectKvCachePass, InlinerPass, InstrumentProfilingPass, IrEditPass, LicmPass,
-    LowerConvToGemmPass, MergeWeightsPass, MixedPrecisionPass, NormalizeSsaPass,
-    OffloadActivationsPass, OptO1Pass, OptO2Pass, OptO3Pass, OutlineSubgraphsPass, PackWeightsPass,
-    PadForTilingPass, ParameterizeConstantsPass, Pass, PassOptions, PermuteLoopsPass,
-    PrintOpStatsPass, QuantizeWeightsPass, ReduceIrPass, RematerializePass, ResizeBatchPass,
-    SanitizeNumericsPass, SccpPass, ScheduleStreamsPass, ShardSpmdPass, SimplifyAlgebraicPass,
-    SinkTransposePass, Sparsify2To4Pass, SpecializeShapesPass, SplitLargeGemmPass,
-    StripAttributesPass, StripDebugInfoPass, StructuredPruningPass, SymbolDcePass,
-    TapIntermediatesPass, TaskArithmeticPass, TileLoopsPass, TopologicalSortPass, UnrollCallsPass,
-    UnrollLoopsPass, VectorizeLoopsPass, VerifyEquivPass, VerifyShapesPass,
+    LowerConvToGemmPass, LowerPagedAttentionPass, MergeWeightsPass, MixedPrecisionPass,
+    NormalizeSsaPass, OffloadActivationsPass, OptO1Pass, OptO2Pass, OptO3Pass,
+    OutlineSubgraphsPass, PackWeightsPass, PadForTilingPass, ParameterizeConstantsPass, Pass,
+    PassOptions, PermuteLoopsPass, PrintOpStatsPass, QuantizeGroupwisePass, QuantizeWeightsPass,
+    ReduceIrPass, RematerializePass, ResizeBatchPass, SanitizeNumericsPass, SccpPass,
+    ScheduleStreamsPass, ShardSpmdPass, SimplifyAlgebraicPass, SinkTransposePass, Sparsify2To4Pass,
+    SpecializeShapesPass, SplitLargeGemmPass, StripAttributesPass, StripDebugInfoPass,
+    StripMetadataPass, StructuredPruningPass, SymbolDcePass, TapIntermediatesPass,
+    TaskArithmeticPass, TileLoopsPass, TopologicalSortPass, UnrollCallsPass, UnrollLoopsPass,
+    VectorizeLoopsPass, VerifyEquivPass, VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
 use castforge_ir::{DType, MergeMethod};
@@ -902,6 +904,98 @@ impl PassRegistry {
             "strip-attributes",
             "Strips transient castforge.* and schedule attributes for portable StableHLO export",
             |_opts| Ok(Box::new(StripAttributesPass)),
+        );
+        reg.register(
+            "fuse-norm",
+            "Unified normalization fusion (Residual+RMSNorm, RMSNorm, and LayerNorm)",
+            |opts| {
+                let kind = opts
+                    .get("kind")
+                    .cloned()
+                    .unwrap_or_else(|| "all".to_string());
+                Ok(Box::new(FuseNormPass { kind }))
+            },
+        );
+        reg.register(
+            "fuse-activations",
+            "Unified activation & gated-MLP fusion (SwiGLU, GELU, GeGLU, and FusedGatedMLP)",
+            |opts| {
+                let kind = opts
+                    .get("kind")
+                    .cloned()
+                    .unwrap_or_else(|| "all".to_string());
+                Ok(Box::new(FuseActivationsPass { kind }))
+            },
+        );
+        reg.register(
+            "strip-metadata",
+            "Strips debug locations and transient castforge.* attributes for portable export",
+            |opts| {
+                let debuginfo = opts.get("debuginfo").map(|s| s != "false").unwrap_or(true);
+                let attributes = opts.get("attributes").map(|s| s != "false").unwrap_or(true);
+                Ok(Box::new(StripMetadataPass {
+                    debuginfo,
+                    attributes,
+                }))
+            },
+        );
+        reg.register(
+            "quantize-groupwise",
+            "Group-wise AWQ/GPTQ weight quantization (bits=4|8, group_size=32, awq_salient=true)",
+            |opts| {
+                let bits = opts
+                    .get("bits")
+                    .and_then(|s| s.parse::<u8>().ok())
+                    .unwrap_or(4);
+                let group_size = opts
+                    .get("group_size")
+                    .or_else(|| opts.get("group"))
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(32);
+                let awq_salient = opts
+                    .get("awq_salient")
+                    .map(|s| s != "false")
+                    .unwrap_or(true);
+                Ok(Box::new(QuantizeGroupwisePass {
+                    bits,
+                    group_size,
+                    awq_salient,
+                }))
+            },
+        );
+        reg.register(
+            "fold-batchnorm",
+            "Absorbs inference BatchNorm scale/shift into preceding convolution or dot_general",
+            |_opts| Ok(Box::new(FoldBatchNormPass)),
+        );
+        reg.register(
+            "eliminate-concat-copies",
+            "Eliminates intermediate concatenate copies by routing producer outputs into dest",
+            |_opts| Ok(Box::new(EliminateConcatCopiesPass)),
+        );
+        reg.register(
+            "lower-paged-attention",
+            "Lowers fused_attention to vLLM-style PagedAttention with block-table KV addressing",
+            |opts| {
+                let page_block_size = opts
+                    .get("page_block_size")
+                    .or_else(|| opts.get("block_size"))
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(16);
+                let max_blocks = opts
+                    .get("max_blocks")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(64);
+                Ok(Box::new(LowerPagedAttentionPass {
+                    page_block_size,
+                    max_blocks,
+                }))
+            },
+        );
+        reg.register(
+            "gvn",
+            "Dominator-aware Global Value Numbering across nested regions and basic blocks",
+            |_opts| Ok(Box::new(GlobalValueNumberingPass)),
         );
         reg.register(
             "O1",
