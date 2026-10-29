@@ -1624,3 +1624,94 @@ module @square_block {
     let prof_rep = verify_module_numerics(&base, &prof_mod, 1e-5).expect("verify prof_mod");
     assert!(prof_rep.passed);
 }
+
+#[test]
+fn test_multi_arch_simd_profiles_and_pluggable_backend_registry() {
+    use castforge_codegen::{BackendRegistry, CodegenBackend, LoopModule};
+
+    let mlir = r#"
+module @multi_arch_demo {
+  func.func @main(%x: tensor<2x4xf32>, %w: tensor<4x4xf32>) -> tensor<2x4xf32> {
+    %y = stablehlo.dot_general %x, %w, contracting_dims = [1] x [0]
+      : (tensor<2x4xf32>, tensor<4x4xf32>) -> tensor<2x4xf32>
+    func.return %y : tensor<2x4xf32>
+  }
+}
+"#;
+    let module = parse_mlir(mlir).expect("parse multi_arch_demo");
+
+    // 1. Multi-arch hardware profiles (`x86_64-avx512`, `aarch64-sve`, `riscv64-rvv`, `wasm32`)
+    for (arch, expected_isa, expected_intr, expected_lanes) in [
+        ("x86_64-avx512", "avx512", "_mm512_fmadd_ps", 16),
+        ("aarch64-sve", "sve", "svmla_f32_x", 8),
+        ("riscv64-rvv", "rvv", "__riscv_vfmacc_vv_f32m1", 8),
+        ("wasm32-simd128", "wasm_simd128", "f32x4_add_mul", 4),
+    ] {
+        let cfg = TargetConfig::for_arch(arch)
+            .with_loop_order(GemmLoopOrder::Mnk)
+            .with_unroll(1);
+        assert_eq!(cfg.simd_isa.as_str(), expected_isa);
+        assert_eq!(cfg.simd_isa.intrinsic_name(), expected_intr);
+        assert_eq!(cfg.simd_width, expected_lanes);
+        let c_code = generate_code_with_config(
+            &module,
+            CodegenTarget::C,
+            &TargetConfig::default().with_simd_isa(cfg.simd_isa),
+        )
+        .expect("emit C for arch");
+        assert!(c_code.contains(expected_intr));
+        let rs_code = generate_code_with_config(
+            &module,
+            CodegenTarget::Rust,
+            &TargetConfig::default().with_simd_isa(cfg.simd_isa),
+        )
+        .expect("emit Rust for arch");
+        assert!(rs_code.contains(expected_intr));
+    }
+
+    // 2. Built-in AMD ROCm HIP (`codegen-hip`) and Khronos OpenCL (`codegen-opencl`) targets
+    let hip_code = generate_code(&module, CodegenTarget::Hip).expect("emit hip");
+    assert!(hip_code.contains("#include <hip/hip_runtime.h>"));
+    assert!(hip_code.contains("hipLaunchKernelGGL(main_hip_kernel"));
+
+    let ocl_code = generate_code(&module, CodegenTarget::OpenCl).expect("emit opencl");
+    assert!(ocl_code.contains("__kernel void main_opencl_kernel("));
+    assert!(ocl_code.contains("get_global_id(0)"));
+
+    // 3. Pluggable `CodegenBackend` + `BackendRegistry` for adding a new target in ~15 lines
+    struct CustomHalideBackend;
+    impl CodegenBackend for CustomHalideBackend {
+        fn name(&self) -> &'static str {
+            "halide"
+        }
+        fn file_extension(&self) -> &'static str {
+            "hl.cpp"
+        }
+        fn description(&self) -> &'static str {
+            "Custom Halide/DSL backend registered dynamically via BackendRegistry"
+        }
+        fn emit_from_loop_ir(
+            &self,
+            loop_mod: &LoopModule,
+            _config: &TargetConfig,
+        ) -> anyhow::Result<String> {
+            Ok(format!(
+                "// Halide DSL for {} ({} kernels)\n{}",
+                loop_mod.name,
+                loop_mod.kernels.len(),
+                loop_mod
+            ))
+        }
+    }
+
+    let mut backends = BackendRegistry::with_builtin_backends();
+    assert_eq!(backends.list().count(), 7);
+    backends.register(Box::new(CustomHalideBackend));
+    assert_eq!(backends.list().count(), 8);
+
+    let halide_src = backends
+        .generate("halide", &module, &TargetConfig::default())
+        .expect("generate custom halide target");
+    assert!(halide_src.contains("// Halide DSL for multi_arch_demo (1 kernels)"));
+    assert!(halide_src.contains("kernel @main("));
+}

@@ -4,6 +4,7 @@
 //! library) (`castforge-codegen`).
 
 pub mod autotune;
+pub mod backend;
 pub mod cost_model;
 pub mod eval;
 pub mod jit;
@@ -18,6 +19,10 @@ pub mod target_wgsl;
 pub use crate::autotune::{
     AutotuneCandidate, AutotuneReport, AutotuneScheduleTranslator, apply_schedule_to_module,
     autotune_module,
+};
+pub use crate::backend::{
+    BackendRegistry, C99Backend, CodegenBackend, CudaBackend, CustomBackendTranslator, HipBackend,
+    MslBackend, OpenClBackend, RustBackend, WgslBackend, emit_c_like_loop_stmt,
 };
 pub use crate::cost_model::{
     BottleneckKind, HardwareRoofline, ModuleCostReport, OpCostProfile, analyze_module_cost,
@@ -35,10 +40,7 @@ pub use crate::loop_ir::{
     emit_msl_module_with_config, lower_to_loop_ir,
 };
 pub use crate::memory_plan::{BufferAllocation, MemoryPlan, build_memory_plan};
-use crate::target_c::emit_c_module_with_config;
 pub use crate::target_config::{GemmLoopOrder, SimdIsa, TargetConfig};
-use crate::target_rust::emit_rust_module_with_config;
-use crate::target_wgsl::emit_wgsl_module_with_config;
 use anyhow::Result;
 use castforge_ir::{Dim, Module, TensorType, ValueId};
 use serde::{Deserialize, Serialize};
@@ -51,6 +53,37 @@ pub enum CodegenTarget {
     Wgsl,
     Cuda,
     Msl,
+    Hip,
+    OpenCl,
+}
+
+impl CodegenTarget {
+    /// Parses a target identifier string (`"rust"`, `"c"`, `"wgsl"`, `"cuda"`, `"msl"`, `"hip"`,
+    /// `"opencl"`).
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "c" | "c99" => Self::C,
+            "wgsl" | "webgpu" => Self::Wgsl,
+            "cuda" | "cu" | "nvptx" => Self::Cuda,
+            "msl" | "metal" => Self::Msl,
+            "hip" | "rocm" => Self::Hip,
+            "opencl" | "cl" => Self::OpenCl,
+            _ => Self::Rust,
+        }
+    }
+
+    /// Returns the canonical lowercase target name.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::C => "c",
+            Self::Wgsl => "wgsl",
+            Self::Cuda => "cuda",
+            Self::Msl => "msl",
+            Self::Hip => "hip",
+            Self::OpenCl => "opencl",
+        }
+    }
 }
 
 /// Generate executable source code from a CastForge `Module` for the requested `CodegenTarget`.
@@ -58,22 +91,17 @@ pub fn generate_code(module: &Module, target: CodegenTarget) -> Result<String> {
     generate_code_with_config(module, target, &TargetConfig::default())
 }
 
-/// Generate executable source code parameterized by hardware `TargetConfig` (tiling, SIMD, WGSL).
+/// Generate executable source code parameterized by `TargetConfig` via [`BackendRegistry`].
 pub fn generate_code_with_config(
     module: &Module,
     target: CodegenTarget,
     config: &TargetConfig,
 ) -> Result<String> {
-    match target {
-        CodegenTarget::Rust => emit_rust_module_with_config(module, config),
-        CodegenTarget::C => emit_c_module_with_config(module, config),
-        CodegenTarget::Wgsl => emit_wgsl_module_with_config(module, config),
-        CodegenTarget::Cuda => emit_cuda_module_with_config(module, config),
-        CodegenTarget::Msl => emit_msl_module_with_config(module, config),
-    }
+    let reg = BackendRegistry::with_builtin_backends();
+    reg.generate(target.as_str(), module, config)
 }
 
-/// A-to-B Backend Codegen Translator (`Ir(Module) -> Text(Rust | C99 | WGSL | CUDA | MSL)`).
+/// A-to-B Backend Codegen Translator (`Ir(Module) -> Text(Rust|C99|WGSL|CUDA|MSL|HIP|OpenCL)`).
 pub struct CodegenTranslator {
     pub target: CodegenTarget,
     pub config: TargetConfig,
@@ -102,6 +130,8 @@ impl castforge_ir::Translator for CodegenTranslator {
             CodegenTarget::Wgsl => "codegen-wgsl",
             CodegenTarget::Cuda => "codegen-cuda",
             CodegenTarget::Msl => "codegen-msl",
+            CodegenTarget::Hip => "codegen-hip",
+            CodegenTarget::OpenCl => "codegen-opencl",
         }
     }
 

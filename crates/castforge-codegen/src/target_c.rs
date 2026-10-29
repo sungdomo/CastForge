@@ -78,6 +78,35 @@ pub fn emit_c_module_with_config(module: &Module, base_cfg: &TargetConfig) -> Re
             writeln!(out, "}}")?;
             writeln!(out, "#endif\n")?;
         }
+        SimdIsa::Avx512 => {
+            writeln!(out, "#if defined(__AVX512F__)")?;
+            writeln!(out, "#include <immintrin.h>")?;
+            writeln!(
+                out,
+                "static inline void castforge_avx512_fma16(\
+                 float* dst, const float* a, const float* b) {{"
+            )?;
+            writeln!(
+                out,
+                "    __m512 va = _mm512_loadu_ps(a), \
+                 vb = _mm512_loadu_ps(b), vc = _mm512_loadu_ps(dst);"
+            )?;
+            writeln!(
+                out,
+                "    _mm512_storeu_ps(dst, _mm512_fmadd_ps(va, vb, vc));"
+            )?;
+            writeln!(out, "}}")?;
+            writeln!(out, "#endif\n")?;
+        }
+        SimdIsa::Sve | SimdIsa::Rvv | SimdIsa::WasmSimd128 => {
+            writeln!(
+                out,
+                "/* [arch:simd_target(isa={}, intrinsic=\"{}\", lanes={})] */\n",
+                config.simd_isa.as_str(),
+                config.simd_isa.intrinsic_name(),
+                config.simd_isa.default_lanes()
+            )?;
+        }
         SimdIsa::Scalar => writeln!(out)?,
     }
 
@@ -602,6 +631,15 @@ fn emit_c_hlo_op(
                         writeln!(
                             out,
                             "    /* [simd:isa(neon, intrinsic=\"vfmaq_f32\", width=4)] */"
+                        )?;
+                    }
+                    SimdIsa::Avx512 | SimdIsa::Sve | SimdIsa::Rvv | SimdIsa::WasmSimd128 => {
+                        writeln!(
+                            out,
+                            "    /* [simd:isa({}, intrinsic=\"{}\", width={})] */",
+                            config.simd_isa.as_str(),
+                            config.simd_isa.intrinsic_name(),
+                            config.simd_isa.default_lanes()
                         )?;
                     }
                     SimdIsa::Scalar => {}

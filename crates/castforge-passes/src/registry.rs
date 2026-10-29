@@ -615,16 +615,16 @@ impl PassRegistry {
         );
         reg.register(
             "vectorize-loops",
-            "Translates compute ops by attaching SIMD vectorization, ISA (avx2/neon), and parallel",
+            "Translates compute ops by attaching SIMD vectorization, ISA, and parallel attrs",
             |opts| {
                 let isa = opts
                     .get("isa")
                     .cloned()
                     .unwrap_or_else(|| "scalar".to_string());
-                let default_w = if isa.eq_ignore_ascii_case("neon") {
-                    4
-                } else {
-                    8
+                let default_w = match isa.to_ascii_lowercase().as_str() {
+                    "avx512" | "avx-512" | "avx512f" => 16,
+                    "neon" | "aarch64" | "arm64" | "wasm" | "wasm32" | "simd128" => 4,
+                    _ => 8,
                 };
                 let width = opts
                     .get("width")

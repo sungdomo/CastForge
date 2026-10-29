@@ -78,6 +78,15 @@ pub fn emit_rust_module_with_config(module: &Module, base_cfg: &TargetConfig) ->
             writeln!(out, "    vst1q_f32(c, r);")?;
             writeln!(out, "}}\n")?;
         }
+        SimdIsa::Avx512 | SimdIsa::Sve | SimdIsa::Rvv | SimdIsa::WasmSimd128 => {
+            writeln!(
+                out,
+                "// [arch:simd_target(isa={}, intrinsic=\"{}\", lanes={})]\n",
+                config.simd_isa.as_str(),
+                config.simd_isa.intrinsic_name(),
+                config.simd_isa.default_lanes()
+            )?;
+        }
         SimdIsa::Scalar => {}
     }
 
@@ -667,6 +676,15 @@ fn emit_rust_hlo_op(
                         writeln!(
                             out,
                             "    // [simd:isa(neon, intrinsic=\"vfmaq_f32\", width=4)]"
+                        )?;
+                    }
+                    SimdIsa::Avx512 | SimdIsa::Sve | SimdIsa::Rvv | SimdIsa::WasmSimd128 => {
+                        writeln!(
+                            out,
+                            "    // [simd:isa({}, intrinsic=\"{}\", width={})]",
+                            config.simd_isa.as_str(),
+                            config.simd_isa.intrinsic_name(),
+                            config.simd_isa.default_lanes()
                         )?;
                     }
                     SimdIsa::Scalar => {}

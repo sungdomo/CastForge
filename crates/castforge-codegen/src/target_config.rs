@@ -35,7 +35,7 @@ impl GemmLoopOrder {
     }
 }
 
-/// Hardware SIMD instruction set architecture for explicit intrinsic emission.
+/// Hardware SIMD instruction set architecture for explicit multi-arch intrinsic emission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SimdIsa {
     /// Portable scalar / auto-vectorized loops (`#pragma omp simd`).
@@ -43,17 +43,66 @@ pub enum SimdIsa {
     Scalar,
     /// x86_64 AVX2 + FMA 256-bit (`8 x f32`) hardware intrinsics (`_mm256_fmadd_ps`).
     Avx2,
+    /// x86_64 AVX-512F 512-bit (`16 x f32`) hardware intrinsics (`_mm512_fmadd_ps`).
+    Avx512,
     /// ARM64 NEON 128-bit (`4 x f32`) hardware intrinsics (`vfmaq_f32`).
     Neon,
+    /// ARM64 SVE/SVE2 scalable vector (`8 x f32`) hardware intrinsics (`svmla_f32_x`).
+    Sve,
+    /// RISC-V Vector 1.0 (`rv64gcv`, `8 x f32`) hardware intrinsics (`__riscv_vfmacc_vv_f32m1`).
+    Rvv,
+    /// WebAssembly SIMD128 (`wasm32`, `4 x f32`) hardware intrinsics (`f32x4_mul` + `f32x4_add`).
+    WasmSimd128,
 }
 
 impl SimdIsa {
-    /// Parses a SIMD ISA identifier (`"scalar"`, `"avx2"`, `"neon"`).
+    /// Parses a multi-architecture SIMD ISA identifier (`"scalar"`, `"avx2"`, `"avx512"`,
+    /// `"neon"`, `"sve"`, `"rvv"`, `"wasm"`).
     pub fn parse(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
+            "avx512" | "avx-512" | "avx512f" => Self::Avx512,
             "avx2" | "fma" | "x86_64" => Self::Avx2,
+            "sve" | "sve2" | "armv9" => Self::Sve,
             "neon" | "aarch64" | "arm64" => Self::Neon,
+            "rvv" | "riscv" | "riscv64" => Self::Rvv,
+            "wasm" | "wasm32" | "simd128" | "wasm-simd128" => Self::WasmSimd128,
             _ => Self::Scalar,
+        }
+    }
+
+    /// Canonical lowercase ISA identifier string.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Scalar => "scalar",
+            Self::Avx2 => "avx2",
+            Self::Avx512 => "avx512",
+            Self::Neon => "neon",
+            Self::Sve => "sve",
+            Self::Rvv => "rvv",
+            Self::WasmSimd128 => "wasm_simd128",
+        }
+    }
+
+    /// Default `f32` vector lane width for this architecture.
+    pub fn default_lanes(&self) -> usize {
+        match self {
+            Self::Scalar => 1,
+            Self::Avx512 => 16,
+            Self::Avx2 | Self::Sve | Self::Rvv => 8,
+            Self::Neon | Self::WasmSimd128 => 4,
+        }
+    }
+
+    /// Primary FMA/MAC hardware intrinsic symbol for this ISA.
+    pub fn intrinsic_name(&self) -> &'static str {
+        match self {
+            Self::Scalar => "scalar_fma",
+            Self::Avx2 => "_mm256_fmadd_ps",
+            Self::Avx512 => "_mm512_fmadd_ps",
+            Self::Neon => "vfmaq_f32",
+            Self::Sve => "svmla_f32_x",
+            Self::Rvv => "__riscv_vfmacc_vv_f32m1",
+            Self::WasmSimd128 => "f32x4_add_mul",
         }
     }
 }
@@ -214,21 +263,55 @@ impl TargetConfig {
         self
     }
 
-    /// Select the target hardware SIMD instruction set (`Scalar`, `Avx2`, `Neon`).
+    /// Select the target hardware SIMD instruction set (`Scalar`, `Avx2`, `Avx512`, `Neon`, `Sve`,
+    /// `Rvv`, `WasmSimd128`).
     pub fn with_simd_isa(mut self, isa: SimdIsa) -> Self {
         self.simd_isa = isa;
-        match isa {
-            SimdIsa::Avx2 => {
-                self.vectorize = true;
-                self.simd_width = 8;
-            }
-            SimdIsa::Neon => {
-                self.vectorize = true;
-                self.simd_width = 4;
-            }
-            SimdIsa::Scalar => {}
+        if isa != SimdIsa::Scalar {
+            self.vectorize = true;
+            self.simd_width = isa.default_lanes();
         }
         self
+    }
+
+    /// Creates a pre-tuned hardware [`TargetConfig`] for a named CPU or GPU architecture profile
+    /// (`"x86_64-avx2"`, `"x86_64-avx512"`, `"aarch64-neon"`, `"aarch64-sve"`, `"riscv64-rvv"`,
+    /// `"wasm32-simd128"`, `"cuda-sm80"`, `"rocm-gfx90a"`, `"metal-apple"`, `"webgpu"`).
+    pub fn for_arch(arch: &str) -> Self {
+        match arch.trim().to_ascii_lowercase().as_str() {
+            "x86_64-avx512" | "avx512" => Self::cpu_tiled(32)
+                .with_simd_isa(SimdIsa::Avx512)
+                .with_loop_order(GemmLoopOrder::Mkn)
+                .with_unroll(4)
+                .with_parallel(true),
+            "x86_64-avx2" | "x86_64" | "avx2" => Self::cpu_tiled(16)
+                .with_simd_isa(SimdIsa::Avx2)
+                .with_loop_order(GemmLoopOrder::Mkn)
+                .with_unroll(4)
+                .with_parallel(true),
+            "aarch64-sve" | "sve" => Self::cpu_tiled(16)
+                .with_simd_isa(SimdIsa::Sve)
+                .with_loop_order(GemmLoopOrder::Mkn)
+                .with_unroll(4)
+                .with_parallel(true),
+            "aarch64-neon" | "aarch64" | "arm64" | "neon" => Self::cpu_tiled(16)
+                .with_simd_isa(SimdIsa::Neon)
+                .with_loop_order(GemmLoopOrder::Mkn)
+                .with_unroll(4)
+                .with_parallel(true),
+            "riscv64-rvv" | "riscv64" | "rvv" => Self::cpu_tiled(16)
+                .with_simd_isa(SimdIsa::Rvv)
+                .with_loop_order(GemmLoopOrder::Mkn)
+                .with_unroll(2),
+            "wasm32-simd128" | "wasm32" | "wasm" => Self::cpu_tiled(8)
+                .with_simd_isa(SimdIsa::WasmSimd128)
+                .with_loop_order(GemmLoopOrder::Mkn),
+            "cuda-sm80" | "cuda" | "rocm-gfx90a" | "hip" => Self::gpu_workgroup(16, 256),
+            "metal-apple" | "metal" | "msl" | "opencl" | "webgpu" | "wgsl" => {
+                Self::gpu_workgroup(16, 64)
+            }
+            _ => Self::default(),
+        }
     }
 
     /// Returns `true` when 2D/3D loop tiling is enabled.

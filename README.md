@@ -28,10 +28,12 @@ support.
   HTML Pass Timeline, Roofline & Arena Memory Liveness Debugger**.
 - [`crates/castforge-codegen`](crates/castforge-codegen): Liveness analyzer (`LivenessAnalysis`),
   greedy interval-coloring arena buffer planner (`MemoryPlan`), progressive `LoopModule` IR,
-  Roofline & native JIT schedule auto-tuner (`autotune_module`, `autotune_module_jit`), in-memory
-  reference IR interpreter & numerical verifier (`evaluate_module`), and multi-target codegen for
-  **Rust**, **C99**, **WebGPU WGSL**, **NVIDIA CUDA (`.cu`)**, **Apple Metal (`.metal`)**, **C/C++
-  FFI Header (`.h`)**, and **Native Shared Libraries (`.so`/`.dylib`)**.
+  pluggable `CodegenBackend` & `BackendRegistry`, multi-architecture SIMD profiles (`x86_64`
+  AVX2/AVX-512, `aarch64` NEON/SVE, `riscv64` RVV, `wasm32` SIMD128), Roofline & native JIT
+  schedule auto-tuner, in-memory reference IR interpreter, and 7 built-in codegen targets:
+  **Rust**, **C99**, **WebGPU WGSL**, **NVIDIA CUDA (`.cu`)**, **Apple Metal (`.metal`)**, **AMD
+  ROCm HIP (`.hip.cpp`)**, and **Khronos OpenCL (`.cl`)**, plus **C/C++ FFI Header (`.h`)** and
+  **Native Shared Libraries (`.so`/`.dylib`)**.
 - [`crates/castforge-cli`](crates/castforge-cli): The `castforge` command-line tool (`chain`,
   `opt`, `viz`, `codegen`, `autotune`, `import`, `profile`, `run`, `list-passes`, plus direct pass
   subcommands).
@@ -143,7 +145,8 @@ support.
 | `autotune-schedule` | `ir -> ir` | Stamps winning Roofline schedule attrs onto IR |
 | `codegen-rust` / `codegen-c` | `ir -> text` | Standalone Rust & C99 kernel emitter |
 | `codegen-wgsl` / `codegen-cuda` | `ir -> text` | WebGPU WGSL & NVIDIA CUDA `.cu` GPU emitter |
-| `codegen-msl` / `codegen-header` | `ir -> text` | Apple Metal `.metal` & C/C++ `.h` FFI header |
+| `codegen-msl` / `codegen-hip` | `ir -> text` | Apple Metal `.metal` & AMD ROCm `.hip.cpp` |
+| `codegen-opencl` / `codegen-header` | `ir -> text` | OpenCL `.cl` & C/C++ `.h` FFI header |
 | `compile-lib` | `ir -> bytes` | Compiles C99 kernel to native `.so`/`.dylib` |
 | `snapshot-ir` / `ir-diff` | `ir -> ir` / `text` | Captures IR snapshot & emits unified MLIR diff |
 | `roofline-report` / `memory-plan` | `ir -> text` | Emits JSON Roofline cost & arena memory plan |

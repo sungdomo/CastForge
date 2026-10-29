@@ -540,13 +540,7 @@ fn main() -> Result<()> {
                 pm.run(&mut module)?;
             }
 
-            let tgt = match target.to_lowercase().as_str() {
-                "c" | "c99" => CodegenTarget::C,
-                "wgsl" | "webgpu" => CodegenTarget::Wgsl,
-                "cuda" | "cu" => CodegenTarget::Cuda,
-                "msl" | "metal" => CodegenTarget::Msl,
-                _ => CodegenTarget::Rust,
-            };
+            let tgt = CodegenTarget::parse(&target);
 
             let plan = build_memory_plan(&module);
             eprintln!(
@@ -887,7 +881,8 @@ fn build_translator_chain(
                 last_out = "text";
             }
             "codegen" | "codegen-rust" | "codegen-c" | "codegen-wgsl" | "codegen-cuda"
-            | "codegen-msl" | "codegen-metal" => {
+            | "codegen-msl" | "codegen-metal" | "codegen-hip" | "codegen-rocm"
+            | "codegen-opencl" | "codegen-cl" => {
                 let tgt_str =
                     opts.get("target")
                         .map(String::as_str)
@@ -896,16 +891,16 @@ fn build_translator_chain(
                             "codegen-wgsl" => "wgsl",
                             "codegen-cuda" => "cuda",
                             "codegen-msl" | "codegen-metal" => "msl",
+                            "codegen-hip" | "codegen-rocm" => "hip",
+                            "codegen-opencl" | "codegen-cl" => "opencl",
                             _ => "rust",
                         });
-                let tgt = match tgt_str.to_ascii_lowercase().as_str() {
-                    "c" | "c99" => CodegenTarget::C,
-                    "wgsl" | "webgpu" => CodegenTarget::Wgsl,
-                    "cuda" | "cu" => CodegenTarget::Cuda,
-                    "msl" | "metal" => CodegenTarget::Msl,
-                    _ => CodegenTarget::Rust,
+                let tgt = CodegenTarget::parse(tgt_str);
+                let cfg = match opts.get("arch") {
+                    Some(arch) => TargetConfig::for_arch(arch),
+                    None => TargetConfig::default(),
                 };
-                chain.push(Box::new(CodegenTranslator::new(tgt)));
+                chain.push(Box::new(CodegenTranslator::with_config(tgt, cfg)));
                 last_out = "text";
             }
             "viz" | "viz-mermaid" | "viz-dot" | "viz-json" | "viz-html" => {
