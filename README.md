@@ -20,7 +20,7 @@ support.
   `dense_resource<key>` external weight references, plus **GGUF v2/v3** and **ONNX-JSON** model
   importers.
 - [`crates/castforge-passes`](crates/castforge-passes): Unified `Pass`, `PassRegistry`, and
-  `PassManager` with **84 built-in A-to-B IR translator modules & presets** supporting static Rust
+  `PassManager` with **91 built-in A-to-B IR translator modules & presets** supporting static Rust
   construction, CLI pipeline strings (`-p`, comma- or `|`-separated), Unix pipe (`stdin -> stdout`)
   invocation, declarative TOML config files (`--config`), and step-by-step pass tracing.
 - [`crates/castforge-viz`](crates/castforge-viz): Computation graph exporter for **Mermaid**,
@@ -34,7 +34,7 @@ support.
 - [`crates/castforge-cli`](crates/castforge-cli): The `castforge` command-line tool (`opt`, `viz`,
   `codegen`, `autotune`, `import`, `profile`, `run`, `list-passes`, plus direct pass subcommands).
 
-## Built-in A-to-B Translator Modules & Presets (84 Passes)
+## Built-in A-to-B Translator Modules & Presets (91 Passes)
 
 | Pass Name | Category | Description |
 | :--- | :--- | :--- |
@@ -110,6 +110,12 @@ support.
 | `bucket-shapes` | IR Bucketing | Synthesizes multi-bucket shape-specialized functions |
 | `convert-layout` | Layout | Canonicalizes 4D `convolution` between `NCHW` and `NHWC` |
 | `offload-activations` | Memory | Inserts `castforge.host_offload` D2H/H2D on long-lived ops |
+| `pad-for-tiling` | Loop Schedule | Computes tile-aligned `(M, K, N)` multiples (`align=8`) |
+| `split-large-gemm` | IR Partition | Splits wide `dot_general` (`N > max_n`) into sub-GEMMs |
+| `unroll-calls` | IR Unroller | Unrolls repeated `func.call` invocations (`repeat=N`) |
+| `hoist-all-reduce` | Distributed | Coalesces linear `all_reduce` sums & enables overlap |
+| `instrument-profiling` | IR Profiler | Wraps compute ops in `castforge.profile_region` timers |
+| `strip-attributes` | IR Cleaner | Strips transient `castforge.*` & schedule attributes |
 | `decompose-composites` | Lowering | Expands `stablehlo.composite` ops to primitive StableHLO |
 | `bufferize-inplace` | Lowering | Annotates elementwise ops for in-place arena buffer reuse |
 | `fold-norm-weights` | Weight Surgery | Absorbs RMSNorm/LayerNorm scale weights into MatMuls |

@@ -1094,6 +1094,25 @@ fn emit_c_hlo_op(
                     out,
                     "    for (int i = 0; i < {res_len}; ++i) {res_name}[i] = {src}[i];"
                 )?;
+            } else if name == "castforge.profile_region" && !inputs.is_empty() {
+                let pid = match op.attributes.get("profile_id") {
+                    Some(Attribute::Int(v)) => *v,
+                    _ => 0,
+                };
+                let label = op
+                    .attributes
+                    .get("profile_label")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("op");
+                let src = value_ident(module, inputs[0], names, counter);
+                writeln!(
+                    out,
+                    "    /* [profile:region(id={pid}, label=\"{label}\")] */"
+                )?;
+                writeln!(
+                    out,
+                    "    for (int i = 0; i < {res_len}; ++i) {res_name}[i] = {src}[i];"
+                )?;
             } else {
                 let src = value_ident(module, inputs[0], names, counter);
                 writeln!(

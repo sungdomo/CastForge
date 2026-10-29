@@ -1523,3 +1523,104 @@ module @advanced_ir_tools {
     let layout_rep = verify_module_numerics(&base, &layout_mod, 1e-5).expect("verify layout_mod");
     assert!(layout_rep.passed);
 }
+
+#[test]
+fn test_pad_for_tiling_split_gemm_unroll_calls_hoist_all_reduce_instrument_and_strip() {
+    let registry = PassRegistry::with_builtin_passes();
+    assert_eq!(registry.list().count(), 91);
+
+    let mlir = r#"
+module @final_ninety_suite {
+  func.func @main(%x: tensor<3x4xf32>, %w: tensor<4x4xf32>) -> tensor<3x4xf32> {
+    %y = stablehlo.dot_general %x, %w, contracting_dims = [1] x [0]
+      : (tensor<3x4xf32>, tensor<4x4xf32>) -> tensor<3x4xf32>
+    func.return %y : tensor<3x4xf32>
+  }
+}
+"#;
+    let base = parse_mlir(mlir).expect("parse final_ninety_suite");
+
+    // 1. Tile-alignment padding (`pad-for-tiling`) + attribute stripping (`strip-attributes`)
+    let mut padded = base.clone();
+    let mut pad_pm = PassManager::from_pipeline_str(&registry, "pad-for-tiling(align=8)")
+        .expect("pad-for-tiling");
+    let pad_res = pad_pm.run(&mut padded).expect("run pad-for-tiling");
+    assert!(pad_res[0].changed);
+    let pad_ir = print_mlir(&padded);
+    assert!(pad_ir.contains("pad_align = 8"));
+    assert!(pad_ir.contains("padded_mnk = array<i64: 8, 8, 8>"));
+
+    let mut stripped = padded.clone();
+    let mut strip_pm =
+        PassManager::from_pipeline_str(&registry, "strip-attributes").expect("strip-attributes");
+    let strip_res = strip_pm.run(&mut stripped).expect("run strip-attributes");
+    assert!(strip_res[0].changed);
+    let strip_ir = print_mlir(&stripped);
+    assert!(!strip_ir.contains("pad_align"));
+    assert!(!strip_ir.contains("padded_mnk"));
+
+    // 2. Large GEMM Column-Splitting (`split-large-gemm`) + exact numerical verification
+    let mut split_gemm = base.clone();
+    let mut split_pm = PassManager::from_pipeline_str(&registry, "split-large-gemm(max_n=2)")
+        .expect("split-large-gemm");
+    let split_res = split_pm.run(&mut split_gemm).expect("run split-large-gemm");
+    assert!(split_res[0].changed);
+    assert_eq!(split_res[0].ops_created, 5);
+    let split_ir = print_mlir(&split_gemm);
+    assert!(split_ir.contains("stablehlo.slice"));
+    assert!(split_ir.contains("stablehlo.concatenate"));
+    let split_rep = verify_module_numerics(&base, &split_gemm, 1e-5).expect("verify split_gemm");
+    assert!(split_rep.passed);
+
+    // 3. Outlining + Bounded Call Unroller (`outline-subgraphs | unroll-calls(repeat=3) | inliner`)
+    let sq_mlir = r#"
+module @square_block {
+  func.func @main(%x: tensor<4x4xf32>, %w: tensor<4x4xf32>) -> tensor<4x4xf32> {
+    %y = stablehlo.dot_general %x, %w, contracting_dims = [1] x [0]
+      : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xf32>
+    func.return %y : tensor<4x4xf32>
+  }
+}
+"#;
+    let mut unrolled = parse_mlir(sq_mlir).expect("parse square_block");
+    let mut unroll_pm = PassManager::from_pipeline_str(
+        &registry,
+        "outline-subgraphs(mode=gemm) | unroll-calls(repeat=3)",
+    )
+    .expect("outline + unroll-calls");
+    let unroll_res = unroll_pm.run(&mut unrolled).expect("run unroll-calls");
+    assert!(unroll_res[1].changed);
+    assert_eq!(unroll_res[1].ops_created, 2);
+    let unroll_ir = print_mlir(&unrolled);
+    assert!(unroll_ir.contains("%call_u1 = func.call @outlined_kernel_0("));
+    assert!(unroll_ir.contains("%call_u2 = func.call @outlined_kernel_0("));
+
+    // 4. Collective Communication Coalescer (`shard-spmd | hoist-all-reduce`)
+    let mut spmd_mod = base.clone();
+    let mut spmd_pm =
+        PassManager::from_pipeline_str(&registry, "shard-spmd(devices=4) | hoist-all-reduce")
+            .expect("shard-spmd + hoist-all-reduce");
+    let spmd_res = spmd_pm.run(&mut spmd_mod).expect("run hoist-all-reduce");
+    assert!(spmd_res[0].changed);
+    assert!(spmd_res[1].changed);
+    let spmd_ir = print_mlir(&spmd_mod);
+    assert!(spmd_ir.contains("async_overlap = true"));
+
+    // 5. Per-Op Profiling Region Injector (`instrument-profiling`) + Rust/C99 codegen + Decompose
+    let mut prof_mod = base.clone();
+    let mut prof_pm =
+        PassManager::from_pipeline_str(&registry, "instrument-profiling(filter=gemm)")
+            .expect("instrument-profiling");
+    let prof_res = prof_pm
+        .run(&mut prof_mod)
+        .expect("run instrument-profiling");
+    assert!(prof_res[0].changed);
+    let prof_ir = print_mlir(&prof_mod);
+    assert!(prof_ir.contains("castforge.profile_region"));
+    let prof_rust = generate_code(&prof_mod, CodegenTarget::Rust).expect("emit rust prof");
+    assert!(prof_rust.contains("[profile:region(id=0, label=\"stablehlo.dot_general\")]"));
+    let prof_c = generate_code(&prof_mod, CodegenTarget::C).expect("emit c prof");
+    assert!(prof_c.contains("[profile:region(id=0, label=\"stablehlo.dot_general\")]"));
+    let prof_rep = verify_module_numerics(&base, &prof_mod, 1e-5).expect("verify prof_mod");
+    assert!(prof_rep.passed);
+}

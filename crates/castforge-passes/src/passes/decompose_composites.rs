@@ -612,6 +612,7 @@ impl Pass for DecomposeCompositesPass {
                     | "castforge.static_quantize"
                     | "castforge.nan_guard"
                     | "castforge.host_offload"
+                    | "castforge.profile_region"
                         if !inputs.is_empty() =>
                     {
                         let op_mut = &mut module.ops[op_id];

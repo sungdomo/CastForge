@@ -8,16 +8,17 @@ use crate::{
     FuseDequantMatmulPass, FuseElementwisePass, FuseGatedMlpPass, FuseGeluPass,
     FuseHorizontalDotPass, FuseLayerNormPass, FuseLogSoftmaxPass, FuseLoopsPass, FuseMapReducePass,
     FuseMatmulEpiloguePass, FuseMoePass, FuseResidualNormPass, FuseRmsNormPass, FuseRopePass,
-    FuseSoftmaxPass, FuseSwiGluPass, HashIrPass, HoistConstantsPass, InjectKvCachePass,
-    InlinerPass, IrEditPass, LicmPass, LowerConvToGemmPass, MergeWeightsPass, MixedPrecisionPass,
-    NormalizeSsaPass, OffloadActivationsPass, OptO1Pass, OptO2Pass, OptO3Pass,
-    OutlineSubgraphsPass, PackWeightsPass, ParameterizeConstantsPass, Pass, PassOptions,
-    PermuteLoopsPass, PrintOpStatsPass, QuantizeWeightsPass, ReduceIrPass, RematerializePass,
-    ResizeBatchPass, SanitizeNumericsPass, SccpPass, ScheduleStreamsPass, ShardSpmdPass,
-    SimplifyAlgebraicPass, SinkTransposePass, Sparsify2To4Pass, SpecializeShapesPass,
-    StripDebugInfoPass, StructuredPruningPass, SymbolDcePass, TapIntermediatesPass,
-    TaskArithmeticPass, TileLoopsPass, TopologicalSortPass, UnrollLoopsPass, VectorizeLoopsPass,
-    VerifyEquivPass, VerifyShapesPass,
+    FuseSoftmaxPass, FuseSwiGluPass, HashIrPass, HoistAllReducePass, HoistConstantsPass,
+    InjectKvCachePass, InlinerPass, InstrumentProfilingPass, IrEditPass, LicmPass,
+    LowerConvToGemmPass, MergeWeightsPass, MixedPrecisionPass, NormalizeSsaPass,
+    OffloadActivationsPass, OptO1Pass, OptO2Pass, OptO3Pass, OutlineSubgraphsPass, PackWeightsPass,
+    PadForTilingPass, ParameterizeConstantsPass, Pass, PassOptions, PermuteLoopsPass,
+    PrintOpStatsPass, QuantizeWeightsPass, ReduceIrPass, RematerializePass, ResizeBatchPass,
+    SanitizeNumericsPass, SccpPass, ScheduleStreamsPass, ShardSpmdPass, SimplifyAlgebraicPass,
+    SinkTransposePass, Sparsify2To4Pass, SpecializeShapesPass, SplitLargeGemmPass,
+    StripAttributesPass, StripDebugInfoPass, StructuredPruningPass, SymbolDcePass,
+    TapIntermediatesPass, TaskArithmeticPass, TileLoopsPass, TopologicalSortPass, UnrollCallsPass,
+    UnrollLoopsPass, VectorizeLoopsPass, VerifyEquivPass, VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
 use castforge_ir::{DType, MergeMethod};
@@ -843,6 +844,64 @@ impl PassRegistry {
                     .unwrap_or(2);
                 Ok(Box::new(OffloadActivationsPass { min_span }))
             },
+        );
+        reg.register(
+            "pad-for-tiling",
+            "Computes tile-aligned (M, K, N) multiples for GEMM ops to eliminate remainder tails",
+            |opts| {
+                let align = opts
+                    .get("align")
+                    .or_else(|| opts.get("multiple"))
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(8);
+                Ok(Box::new(PadForTilingPass { align }))
+            },
+        );
+        reg.register(
+            "split-large-gemm",
+            "Splits wide dot_general GEMMs (N > max_n) into sliced sub-GEMMs + concatenate",
+            |opts| {
+                let max_n = opts
+                    .get("max_n")
+                    .or_else(|| opts.get("limit"))
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(2);
+                Ok(Box::new(SplitLargeGemmPass { max_n }))
+            },
+        );
+        reg.register(
+            "unroll-calls",
+            "Unrolls repeated func.call invocations (repeat=N) for stacked layer blocks",
+            |opts| {
+                let repeat = opts
+                    .get("repeat")
+                    .or_else(|| opts.get("count"))
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(2);
+                Ok(Box::new(UnrollCallsPass { repeat }))
+            },
+        );
+        reg.register(
+            "hoist-all-reduce",
+            "Coalesces linear all_reduce sums, eliminates redundant collectives, and overlaps",
+            |_opts| Ok(Box::new(HoistAllReducePass)),
+        );
+        reg.register(
+            "instrument-profiling",
+            "Injects castforge.profile_region timing markers around target compute operations",
+            |opts| {
+                let filter = opts
+                    .get("filter")
+                    .or_else(|| opts.get("ops"))
+                    .cloned()
+                    .unwrap_or_else(|| "gemm".to_string());
+                Ok(Box::new(InstrumentProfilingPass { filter }))
+            },
+        );
+        reg.register(
+            "strip-attributes",
+            "Strips transient castforge.* and schedule attributes for portable StableHLO export",
+            |_opts| Ok(Box::new(StripAttributesPass)),
         );
         reg.register(
             "O1",

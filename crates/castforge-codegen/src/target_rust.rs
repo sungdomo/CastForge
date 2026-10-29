@@ -1267,6 +1267,22 @@ fn emit_rust_hlo_op(
                 writeln!(out, "    for i in 0..{res_len} {{")?;
                 writeln!(out, "        {dst} = {src};")?;
                 writeln!(out, "    }}")?;
+            } else if name == "castforge.profile_region" && !inputs.is_empty() {
+                let pid = match op.attributes.get("profile_id") {
+                    Some(Attribute::Int(v)) => *v,
+                    _ => 0,
+                };
+                let label = op
+                    .attributes
+                    .get("profile_label")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("op");
+                let src = r_idx(module, plan, inputs[0], "i", names, counter);
+                let dst = r_idx(module, plan, res_val, "i", names, counter);
+                writeln!(out, "    // [profile:region(id={pid}, label=\"{label}\")]")?;
+                writeln!(out, "    for i in 0..{res_len} {{")?;
+                writeln!(out, "        {dst} = {src};")?;
+                writeln!(out, "    }}")?;
             } else {
                 let src = r_idx(module, plan, inputs[0], "i", names, counter);
                 let dst = r_idx(module, plan, res_val, "i", names, counter);
