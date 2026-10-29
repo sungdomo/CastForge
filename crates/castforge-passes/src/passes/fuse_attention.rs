@@ -18,6 +18,7 @@ struct AttentionMatch {
     q: ValueId,
     k: ValueId,
     v: ValueId,
+    mask: Option<ValueId>,
     scale: f64,
     k_transposed: bool,
     is_gqa: bool,
@@ -58,6 +59,7 @@ impl Pass for FuseAttentionPass {
                     q,
                     k,
                     v,
+                    mask,
                     scale,
                     k_transposed,
                     is_gqa,
@@ -82,10 +84,18 @@ impl Pass for FuseAttentionPass {
                 if is_gqa {
                     attrs.insert("gqa".to_string(), Attribute::Bool(true));
                 }
+                if mask.is_some() {
+                    attrs.insert("masked".to_string(), Attribute::Bool(true));
+                }
+
+                let mut operands = SmallVec::from_slice(&[q, k, v]);
+                if let Some(m_val) = mask {
+                    operands.push(m_val);
+                }
 
                 let op_mut = &mut module.ops[op_id];
                 op_mut.name = OpName::new("stablehlo", "composite");
-                op_mut.operands = SmallVec::from_slice(&[q, k, v]);
+                op_mut.operands = operands;
                 op_mut.attributes = attrs;
                 created += 1;
             }
@@ -119,7 +129,8 @@ fn match_sdpa_chain(module: &Module, probs_val: ValueId, v_val: ValueId) -> Opti
     }
 
     let scores_val = inputs[0];
-    let (qk_val, scale) = unwrap_optional_scale(module, scores_val);
+    let (pre_mask_val, mask) = unwrap_optional_mask(module, scores_val);
+    let (qk_val, scale) = unwrap_optional_scale(module, pre_mask_val);
 
     let ValueDef::OpResult { op: qk_op_id, .. } = module.values[qk_val].def else {
         return None;
@@ -143,10 +154,43 @@ fn match_sdpa_chain(module: &Module, probs_val: ValueId, v_val: ValueId) -> Opti
         q,
         k: k_unwrapped,
         v: v_val,
+        mask,
         scale,
         k_transposed,
         is_gqa,
     })
+}
+
+fn unwrap_optional_mask(module: &Module, val: ValueId) -> (ValueId, Option<ValueId>) {
+    let ValueDef::OpResult { op: op_id, .. } = module.values[val].def else {
+        return (val, None);
+    };
+    let Some(op) = module.ops.get(op_id) else {
+        return (val, None);
+    };
+    if let Some(StableHloOp::Add { lhs, rhs, .. }) = StableHloOp::from_op(op) {
+        let (qk_cand, _) = unwrap_optional_scale(module, lhs);
+        if let ValueDef::OpResult { op: qk_id, .. } = module.values[qk_cand].def
+            && module
+                .ops
+                .get(qk_id)
+                .and_then(StableHloOp::from_op)
+                .is_some_and(|h| matches!(h, StableHloOp::DotGeneral { .. }))
+        {
+            return (lhs, Some(rhs));
+        }
+        let (qk_cand_r, _) = unwrap_optional_scale(module, rhs);
+        if let ValueDef::OpResult { op: qk_id, .. } = module.values[qk_cand_r].def
+            && module
+                .ops
+                .get(qk_id)
+                .and_then(StableHloOp::from_op)
+                .is_some_and(|h| matches!(h, StableHloOp::DotGeneral { .. }))
+        {
+            return (rhs, Some(lhs));
+        }
+    }
+    (val, None)
 }
 
 fn unwrap_optional_scale(module: &Module, val: ValueId) -> (ValueId, f64) {

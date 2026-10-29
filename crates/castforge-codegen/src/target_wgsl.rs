@@ -324,6 +324,30 @@ fn emit_wgsl_func(
                         )?;
                         writeln!(out, "        }}")?;
                         writeln!(out, "    }}")?;
+                    } else if name == "castforge.fused_gelu" && !inputs.is_empty() {
+                        let x = value_ident(module, inputs[0], &mut names, &mut counter);
+                        writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+                        writeln!(out, "    for (var i = 0u; i < {res_len}u; i = i + 1u) {{")?;
+                        writeln!(out, "        let v = {x}[i];")?;
+                        writeln!(
+                            out,
+                            "        {res_name}[i] = 0.5 * v * \
+                             (1.0 + tanh(0.7978846 * (v + 0.044715 * v * v * v)));"
+                        )?;
+                        writeln!(out, "    }}")?;
+                    } else if name == "castforge.fused_geglu" && inputs.len() >= 2 {
+                        let g = value_ident(module, inputs[0], &mut names, &mut counter);
+                        let u = value_ident(module, inputs[1], &mut names, &mut counter);
+                        writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+                        writeln!(out, "    for (var i = 0u; i < {res_len}u; i = i + 1u) {{")?;
+                        writeln!(out, "        let v = {g}[i];")?;
+                        writeln!(
+                            out,
+                            "        let gv = 0.5 * v * \
+                             (1.0 + tanh(0.7978846 * (v + 0.044715 * v * v * v)));"
+                        )?;
+                        writeln!(out, "        {res_name}[i] = gv * {u}[i];")?;
+                        writeln!(out, "    }}")?;
                     } else {
                         let a = value_ident(module, inputs[0], &mut names, &mut counter);
                         writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;

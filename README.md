@@ -19,7 +19,7 @@ support.
   (`stablehlo.add %0, %1 : tensor<...>`), including `!quant.uniform` quantized tensor types and
   `dense_resource<key>` external weight references.
 - [`crates/castforge-passes`](crates/castforge-passes): Unified `Pass`, `PassRegistry`, and
-  `PassManager` with **50 built-in compiler passes & presets** supporting static Rust construction,
+  `PassManager` with **52 built-in compiler passes & presets** supporting static Rust construction,
   CLI pipeline strings (`-p`), direct subcommand invocation, declarative TOML config files
   (`--config`), and step-by-step pass tracing.
 - [`crates/castforge-viz`](crates/castforge-viz): Computation graph exporter for **Mermaid**,
@@ -32,7 +32,7 @@ support.
 - [`crates/castforge-cli`](crates/castforge-cli): The `castforge` command-line tool (`opt`, `viz`,
   `codegen`, `run`, `list-passes`, plus direct pass subcommands).
 
-## Built-in Transformation Passes & Presets (50 Passes)
+## Built-in Transformation Passes & Presets (52 Passes)
 
 | Pass Name | Category | Description |
 | :--- | :--- | :--- |
@@ -61,12 +61,14 @@ support.
 | `pack-weights` | Layout | Pre-packs 2D RHS weights `[K,N]->[N,K]` for unit-stride SIMD |
 | `fuse-elementwise` | Fusion | Fuses `add` + `maximum` into `stablehlo.composite` |
 | `fuse-loops` | Fusion | Fuses multi-op elementwise loop chains into 1 register loop |
+| `fuse-map-reduce` | Fusion | Fuses elementwise map producers into `stablehlo.reduce` |
 | `fission-loops` | Lowering | Splits oversized fused loop chains (`max_steps`) for registers |
 | `fuse-matmul-epilogue` | Fusion | Fuses `dot_general` + bias + `relu`/`tanh`/`silu`/`gelu` |
 | `fuse-dequant-matmul` | Fusion | Fuses `uniform_dequantize` + `dot_general` into qGEMM |
 | `fuse-horizontal-dot` | Fusion | Horizontally fuses parallel `dot_general` ops (e.g. Q/K/V) |
 | `fuse-gated-mlp` | Fusion | Fuses dual gate/up `dot_general` + `slice`s + SwiGLU/GeGLU |
 | `fuse-softmax` | Fusion | Fuses `exp(x) / broadcast(reduce_sum(exp(x)))` into composite |
+| `fuse-log-softmax` | Fusion | Fuses `log(softmax(x))` into online `fused_log_softmax` |
 | `fuse-rmsnorm` | Fusion | Fuses `x * rsqrt(mean(x^2) + eps) * weight` into composite |
 | `fuse-residual-norm` | Fusion | Fuses `add(x, residual)` + RMSNorm into `fused_residual_rmsnorm` |
 | `fuse-layernorm` | Fusion | Fuses `(x - mean(x)) * rsqrt(var(x) + eps) * gamma + beta` |
@@ -90,7 +92,7 @@ support.
 ## Quick Start
 
 ```bash
-# 1. List all 50 registered passes and pipeline presets
+# 1. List all 52 registered passes and pipeline presets
 cargo run --bin castforge -- list-passes
 
 # 2. Run an optimization pipeline with automatic numerical verification

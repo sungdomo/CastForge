@@ -416,7 +416,54 @@ fn emit_rust_hlo_op(
             if config.parallel {
                 writeln!(out, "    // [loop:parallel(collapse=2, schedule=static)]")?;
             }
-            if config.is_register_tiled() {
+            if config.l2_tile_size > 0 {
+                let l2 = config.l2_tile_size;
+                let l1 = config.tile_m.max(1);
+                writeln!(out, "    // [loop:l2_tile(L2={l2}, L1={l1})]")?;
+            }
+            if config.prefetch_distance > 0 {
+                let pd = config.prefetch_distance;
+                writeln!(out, "    // [loop:software_pipeline(prefetch_dist={pd})]")?;
+            }
+            if config.split_k > 1 {
+                let sk = config.split_k;
+                let chunk = k.div_ceil(sk).max(1);
+                writeln!(out, "    // [loop:split_k(splits={sk}, chunk={chunk})]")?;
+                writeln!(out, "    for m in 0..{m} {{")?;
+                writeln!(out, "        for n in 0..{n} {{")?;
+                writeln!(out, "            let mut acc_parts = [0.0_f32; {sk}];")?;
+                writeln!(out, "            for s in 0..{sk} {{")?;
+                writeln!(out, "                let k_start = (s * {chunk}).min({k});")?;
+                writeln!(
+                    out,
+                    "                let k_end = ((s + 1) * {chunk}).min({k});"
+                )?;
+                writeln!(out, "                for k in k_start..k_end {{")?;
+                writeln!(out, "                    acc_parts[s] += {a} * {b};")?;
+                writeln!(out, "                }}")?;
+                writeln!(out, "            }}")?;
+                writeln!(
+                    out,
+                    "            {dst} = acc_parts.iter().copied().sum::<f32>();"
+                )?;
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
+            } else if config.loop_skew {
+                let waves = (m + n).saturating_sub(1).max(1);
+                writeln!(out, "    // [loop:skew(wavefront=\"w = m + n\")]")?;
+                writeln!(out, "    for w in 0..{waves} {{")?;
+                writeln!(out, "        let m_min = w.saturating_sub({n} - 1);")?;
+                writeln!(out, "        let m_max = (w + 1).min({m});")?;
+                writeln!(out, "        for m in m_min..m_max {{")?;
+                writeln!(out, "            let n = w - m;")?;
+                writeln!(out, "            let mut acc = 0.0_f32;")?;
+                writeln!(out, "            for k in 0..{k} {{")?;
+                writeln!(out, "                acc += {a} * {b};")?;
+                writeln!(out, "            }}")?;
+                writeln!(out, "            {dst} = acc;")?;
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
+            } else if config.is_register_tiled() {
                 let (mr, nr) = (config.reg_tile_m, config.reg_tile_n);
                 let (m_main, n_main) = ((m / mr) * mr, (n / nr) * nr);
                 writeln!(out, "    // [loop:unroll_and_jam(mr={mr}, nr={nr})]")?;
@@ -857,6 +904,72 @@ fn emit_rust_hlo_op(
                 emit_rust_gated_mlp(
                     module, plan, op, inputs[0], inputs[1], res_val, res_len, names, counter, out,
                 )?;
+            } else if name == "castforge.fused_map_reduce" && inputs.len() >= 2 {
+                let in_len = tensor_len(module, inputs[0]);
+                let inner = (in_len / res_len.max(1)).max(1);
+                let init0 = r_idx(module, plan, inputs[1], "0", names, counter);
+                let src = r_idx(
+                    module,
+                    plan,
+                    inputs[0],
+                    &format!("o * {inner} + k"),
+                    names,
+                    counter,
+                );
+                let dst = r_idx(module, plan, res_val, "o", names, counter);
+                let map_op = op
+                    .attributes
+                    .get("map_op")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("exponential");
+                let map_expr = match map_op {
+                    "square" => format!("({src}) * ({src})"),
+                    "exponential" => format!("({src}).exp()"),
+                    "tanh" => format!("({src}).tanh()"),
+                    "rsqrt" => format!("1.0_f32 / ({src}).sqrt()"),
+                    _ => src,
+                };
+                writeln!(out, "    for o in 0..{res_len} {{")?;
+                writeln!(out, "        let mut acc = {init0};")?;
+                writeln!(out, "        for k in 0..{inner} {{ acc += {map_expr}; }}")?;
+                writeln!(out, "        {dst} = acc;")?;
+                writeln!(out, "    }}")?;
+            } else if name == "castforge.fused_log_softmax" && !inputs.is_empty() {
+                let dims = module.values[res_val]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_else(|| vec![1, res_len]);
+                let cols = *dims.last().unwrap_or(&res_len).max(&1);
+                let rows = (res_len / cols).max(1);
+                let src = r_idx(
+                    module,
+                    plan,
+                    inputs[0],
+                    &format!("r * {cols} + c"),
+                    names,
+                    counter,
+                );
+                let dst = r_idx(
+                    module,
+                    plan,
+                    res_val,
+                    &format!("r * {cols} + c"),
+                    names,
+                    counter,
+                );
+                writeln!(out, "    for r in 0..{rows} {{")?;
+                writeln!(out, "        let mut sum = 0.0_f32;")?;
+                writeln!(
+                    out,
+                    "        for c in 0..{cols} {{ sum += ({src}).exp(); }}"
+                )?;
+                writeln!(out, "        let lse = sum.ln();")?;
+                writeln!(
+                    out,
+                    "        for c in 0..{cols} {{ {dst} = ({src}) - lse; }}"
+                )?;
+                writeln!(out, "    }}")?;
             } else {
                 let src = r_idx(module, plan, inputs[0], "i", names, counter);
                 let dst = r_idx(module, plan, res_val, "i", names, counter);

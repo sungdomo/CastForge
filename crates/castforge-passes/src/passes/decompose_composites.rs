@@ -317,6 +317,224 @@ impl Pass for DecomposeCompositesPass {
                         created += 7;
                         modified += 1;
                     }
+                    "castforge.fused_rmsnorm" if !inputs.is_empty() => {
+                        let eps = match op.attributes.get("eps") {
+                            Some(Attribute::Float(f)) => *f as f32,
+                            _ => 1e-5,
+                        };
+                        let (norm_val, c_cnt) = insert_rmsnorm_core_before(
+                            module, block_id, op_id, inputs[0], eps, &out_ty,
+                        );
+                        created += c_cnt;
+                        if let Some(&w_val) = inputs.get(1) {
+                            let op_mut = &mut module.ops[op_id];
+                            op_mut.name = OpName::new("stablehlo", "multiply");
+                            op_mut.operands = SmallVec::from_slice(&[norm_val, w_val]);
+                            op_mut.attributes.clear();
+                            modified += 1;
+                        } else {
+                            let one_t =
+                                insert_splat_tensor_before(module, block_id, op_id, &out_ty, 1.0);
+                            let op_mut = &mut module.ops[op_id];
+                            op_mut.name = OpName::new("stablehlo", "multiply");
+                            op_mut.operands = SmallVec::from_slice(&[norm_val, one_t]);
+                            op_mut.attributes.clear();
+                            created += 1;
+                            modified += 1;
+                        }
+                    }
+                    "castforge.fused_residual_rmsnorm" if inputs.len() >= 2 => {
+                        let eps = match op.attributes.get("eps") {
+                            Some(Attribute::Float(f)) => *f as f32,
+                            _ => 1e-5,
+                        };
+                        let h_val = insert_op_before(
+                            module,
+                            block_id,
+                            op_id,
+                            OpName::new("stablehlo", "add"),
+                            &[inputs[0], inputs[1]],
+                            IndexMap::new(),
+                            out_ty.clone(),
+                        );
+                        let (norm_val, c_cnt) = insert_rmsnorm_core_before(
+                            module, block_id, op_id, h_val, eps, &out_ty,
+                        );
+                        created += 1 + c_cnt;
+                        let w_val = inputs.get(2).copied().unwrap_or_else(|| {
+                            insert_splat_tensor_before(module, block_id, op_id, &out_ty, 1.0)
+                        });
+                        let op_mut = &mut module.ops[op_id];
+                        op_mut.name = OpName::new("stablehlo", "multiply");
+                        op_mut.operands = SmallVec::from_slice(&[norm_val, w_val]);
+                        op_mut.attributes.clear();
+                        modified += 1;
+                    }
+                    "castforge.fused_gelu" if !inputs.is_empty() => {
+                        let gelu_val =
+                            insert_gelu_before(module, block_id, op_id, inputs[0], &out_ty);
+                        let zero_t = insert_zero_tensor_before(module, block_id, op_id, &out_ty);
+                        let op_mut = &mut module.ops[op_id];
+                        op_mut.name = OpName::new("stablehlo", "add");
+                        op_mut.operands = SmallVec::from_slice(&[gelu_val, zero_t]);
+                        op_mut.attributes.clear();
+                        created += 9;
+                        modified += 1;
+                    }
+                    "castforge.fused_geglu" if inputs.len() >= 2 => {
+                        let gelu_val =
+                            insert_gelu_before(module, block_id, op_id, inputs[0], &out_ty);
+                        let op_mut = &mut module.ops[op_id];
+                        op_mut.name = OpName::new("stablehlo", "multiply");
+                        op_mut.operands = SmallVec::from_slice(&[gelu_val, inputs[1]]);
+                        op_mut.attributes.clear();
+                        created += 8;
+                        modified += 1;
+                    }
+                    "castforge.fused_qmatmul" if inputs.len() >= 2 => {
+                        let w_q = inputs[1];
+                        let w_f32_ty = if let Some(t) = module.values[w_q].ty.as_tensor() {
+                            Type::Tensor(TensorType {
+                                shape: t.shape.clone(),
+                                dtype: DType::F32,
+                                encoding: None,
+                            })
+                        } else {
+                            out_ty.clone()
+                        };
+                        let deq_val = insert_op_before(
+                            module,
+                            block_id,
+                            op_id,
+                            OpName::new("stablehlo", "uniform_dequantize"),
+                            &[w_q],
+                            IndexMap::new(),
+                            w_f32_ty,
+                        );
+                        let packed = op
+                            .attributes
+                            .get("packed_rhs")
+                            .is_some_and(|a| matches!(a, Attribute::Bool(true)));
+                        let mut dot_attrs = IndexMap::new();
+                        dot_attrs.insert(
+                            "lhs_contracting_dimensions".to_string(),
+                            Attribute::DenseIntArray(vec![1]),
+                        );
+                        dot_attrs.insert(
+                            "rhs_contracting_dimensions".to_string(),
+                            Attribute::DenseIntArray(vec![if packed { 1 } else { 0 }]),
+                        );
+                        let op_mut = &mut module.ops[op_id];
+                        op_mut.name = OpName::new("stablehlo", "dot_general");
+                        op_mut.operands = SmallVec::from_slice(&[inputs[0], deq_val]);
+                        op_mut.attributes = dot_attrs;
+                        created += 1;
+                        modified += 1;
+                    }
+                    "castforge.fused_map_reduce" if inputs.len() >= 2 => {
+                        let map_op = op
+                            .attributes
+                            .get("map_op")
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("exponential")
+                            .to_string();
+                        let x_ty = module.values[inputs[0]].ty.clone();
+                        let mapped_val = if map_op == "square" {
+                            insert_op_before(
+                                module,
+                                block_id,
+                                op_id,
+                                OpName::new("stablehlo", "multiply"),
+                                &[inputs[0], inputs[0]],
+                                IndexMap::new(),
+                                x_ty,
+                            )
+                        } else {
+                            insert_op_before(
+                                module,
+                                block_id,
+                                op_id,
+                                OpName::new("stablehlo", &map_op),
+                                &[inputs[0]],
+                                IndexMap::new(),
+                                x_ty,
+                            )
+                        };
+                        let mut red_attrs = IndexMap::new();
+                        if let Some(d) = op.attributes.get("dimensions") {
+                            red_attrs.insert("dimensions".to_string(), d.clone());
+                        }
+                        if let Some(r) = op.attributes.get("reducer") {
+                            red_attrs.insert("reducer".to_string(), r.clone());
+                        }
+                        let op_mut = &mut module.ops[op_id];
+                        op_mut.name = OpName::new("stablehlo", "reduce");
+                        op_mut.operands = SmallVec::from_slice(&[mapped_val, inputs[1]]);
+                        op_mut.attributes = red_attrs;
+                        created += 1;
+                        modified += 1;
+                    }
+                    "castforge.fused_log_softmax" if !inputs.is_empty() => {
+                        let x = inputs[0];
+                        let exp_val = insert_op_before(
+                            module,
+                            block_id,
+                            op_id,
+                            OpName::new("stablehlo", "exponential"),
+                            &[x],
+                            IndexMap::new(),
+                            out_ty.clone(),
+                        );
+                        let (red_ty, axis, bcast_dims) = reduced_row_type(&out_ty);
+                        let zero_init = insert_scalar_const_before(module, block_id, op_id, 0.0);
+                        let mut red_attrs = IndexMap::new();
+                        red_attrs.insert(
+                            "dimensions".to_string(),
+                            Attribute::DenseIntArray(vec![axis]),
+                        );
+                        red_attrs.insert(
+                            "reducer".to_string(),
+                            Attribute::String("stablehlo.add".to_string()),
+                        );
+                        let sum_val = insert_op_before(
+                            module,
+                            block_id,
+                            op_id,
+                            OpName::new("stablehlo", "reduce"),
+                            &[exp_val, zero_init],
+                            red_attrs.clone(),
+                            red_ty.clone(),
+                        );
+                        let log_sum = insert_op_before(
+                            module,
+                            block_id,
+                            op_id,
+                            OpName::new("stablehlo", "log"),
+                            &[sum_val],
+                            IndexMap::new(),
+                            red_ty,
+                        );
+                        let mut bcast_attrs = IndexMap::new();
+                        bcast_attrs.insert(
+                            "broadcast_dimensions".to_string(),
+                            Attribute::DenseIntArray(bcast_dims),
+                        );
+                        let lse_bcast = insert_op_before(
+                            module,
+                            block_id,
+                            op_id,
+                            OpName::new("stablehlo", "broadcast_in_dim"),
+                            &[log_sum],
+                            bcast_attrs,
+                            out_ty,
+                        );
+                        let op_mut = &mut module.ops[op_id];
+                        op_mut.name = OpName::new("stablehlo", "subtract");
+                        op_mut.operands = SmallVec::from_slice(&[x, lse_bcast]);
+                        op_mut.attributes.clear();
+                        created += 5;
+                        modified += 1;
+                    }
                     _ => {}
                 }
             }
@@ -588,4 +806,228 @@ fn insert_op_before(
         block_ops.push(new_op_id);
     }
     val_id
+}
+
+fn insert_splat_tensor_before(
+    module: &mut Module,
+    block_id: BlockId,
+    before_op: OpId,
+    ty: &Type,
+    val: f32,
+) -> ValueId {
+    let t_ty = ty.as_tensor().cloned().unwrap_or(TensorType {
+        shape: Vec::new(),
+        dtype: DType::F32,
+        encoding: None,
+    });
+    let mut attrs = IndexMap::new();
+    attrs.insert(
+        "value".to_string(),
+        Attribute::DenseElements {
+            ty: t_ty,
+            raw_literal: format!("{val}"),
+        },
+    );
+    insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "constant"),
+        &[],
+        attrs,
+        ty.clone(),
+    )
+}
+
+fn insert_rmsnorm_core_before(
+    module: &mut Module,
+    block_id: BlockId,
+    before_op: OpId,
+    x: ValueId,
+    eps: f32,
+    out_ty: &Type,
+) -> (ValueId, usize) {
+    let sq_val = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "multiply"),
+        &[x, x],
+        IndexMap::new(),
+        out_ty.clone(),
+    );
+    let (red_ty, axis, bcast_dims) = reduced_row_type(out_ty);
+    let cols = out_ty
+        .as_tensor()
+        .and_then(|t| match t.shape.last() {
+            Some(Dim::Static(c)) => Some(*c as f32),
+            _ => None,
+        })
+        .unwrap_or(1.0);
+    let zero_init = insert_scalar_const_before(module, block_id, before_op, 0.0);
+    let mut red_attrs = IndexMap::new();
+    red_attrs.insert(
+        "dimensions".to_string(),
+        Attribute::DenseIntArray(vec![axis]),
+    );
+    red_attrs.insert(
+        "reducer".to_string(),
+        Attribute::String("stablehlo.add".to_string()),
+    );
+    let sum_val = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "reduce"),
+        &[sq_val, zero_init],
+        red_attrs,
+        red_ty.clone(),
+    );
+    let n_const = insert_splat_tensor_before(module, block_id, before_op, &red_ty, cols);
+    let mean_val = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "divide"),
+        &[sum_val, n_const],
+        IndexMap::new(),
+        red_ty.clone(),
+    );
+    let eps_const = insert_splat_tensor_before(module, block_id, before_op, &red_ty, eps);
+    let var_eps = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "add"),
+        &[mean_val, eps_const],
+        IndexMap::new(),
+        red_ty.clone(),
+    );
+    let inv_rms = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "rsqrt"),
+        &[var_eps],
+        IndexMap::new(),
+        red_ty,
+    );
+    let mut bcast_attrs = IndexMap::new();
+    bcast_attrs.insert(
+        "broadcast_dimensions".to_string(),
+        Attribute::DenseIntArray(bcast_dims),
+    );
+    let inv_bcast = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "broadcast_in_dim"),
+        &[inv_rms],
+        bcast_attrs,
+        out_ty.clone(),
+    );
+    let norm_val = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "multiply"),
+        &[x, inv_bcast],
+        IndexMap::new(),
+        out_ty.clone(),
+    );
+    (norm_val, 9)
+}
+
+fn insert_gelu_before(
+    module: &mut Module,
+    block_id: BlockId,
+    before_op: OpId,
+    x: ValueId,
+    out_ty: &Type,
+) -> ValueId {
+    let half = insert_splat_tensor_before(module, block_id, before_op, out_ty, 0.5);
+    let one = insert_splat_tensor_before(module, block_id, before_op, out_ty, 1.0);
+    let c_k = insert_splat_tensor_before(module, block_id, before_op, out_ty, 0.797_884_6);
+    let c_a = insert_splat_tensor_before(module, block_id, before_op, out_ty, 0.044715);
+    let x2 = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "multiply"),
+        &[x, x],
+        IndexMap::new(),
+        out_ty.clone(),
+    );
+    let x3 = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "multiply"),
+        &[x2, x],
+        IndexMap::new(),
+        out_ty.clone(),
+    );
+    let ax3 = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "multiply"),
+        &[c_a, x3],
+        IndexMap::new(),
+        out_ty.clone(),
+    );
+    let poly = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "add"),
+        &[x, ax3],
+        IndexMap::new(),
+        out_ty.clone(),
+    );
+    let inner = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "multiply"),
+        &[c_k, poly],
+        IndexMap::new(),
+        out_ty.clone(),
+    );
+    let th = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "tanh"),
+        &[inner],
+        IndexMap::new(),
+        out_ty.clone(),
+    );
+    let one_p = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "add"),
+        &[one, th],
+        IndexMap::new(),
+        out_ty.clone(),
+    );
+    let hx = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "multiply"),
+        &[half, x],
+        IndexMap::new(),
+        out_ty.clone(),
+    );
+    insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "multiply"),
+        &[hx, one_p],
+        IndexMap::new(),
+        out_ty.clone(),
+    )
 }

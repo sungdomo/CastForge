@@ -339,7 +339,67 @@ fn emit_c_hlo_op(
                     "    #pragma omp parallel for collapse(2) schedule(static)"
                 )?;
             }
-            if config.is_register_tiled() {
+            if config.l2_tile_size > 0 {
+                let l2 = config.l2_tile_size;
+                let l1 = config.tile_m.max(1);
+                writeln!(out, "    /* [loop:l2_tile(L2={l2}, L1={l1})] */")?;
+            }
+            if config.prefetch_distance > 0 {
+                let pd = config.prefetch_distance;
+                writeln!(
+                    out,
+                    "    /* [loop:software_pipeline(prefetch_dist={pd})] __builtin_prefetch */"
+                )?;
+            }
+            if config.split_k > 1 {
+                let sk = config.split_k;
+                let chunk = k.div_ceil(sk).max(1);
+                writeln!(out, "    /* [loop:split_k(splits={sk}, chunk={chunk})] */")?;
+                writeln!(out, "    for (int m = 0; m < {m}; ++m) {{")?;
+                writeln!(out, "        for (int n = 0; n < {n}; ++n) {{")?;
+                writeln!(out, "            float acc_parts[{sk}] = {{0}};")?;
+                writeln!(out, "            for (int s = 0; s < {sk}; ++s) {{")?;
+                writeln!(
+                    out,
+                    "                int k_start = (s * {chunk} < {k}) ? s * {chunk} : {k};"
+                )?;
+                writeln!(
+                    out,
+                    "                int k_end = ((s + 1) * {chunk} < {k}) \
+                     ? (s + 1) * {chunk} : {k};"
+                )?;
+                writeln!(
+                    out,
+                    "                for (int k = k_start; k < k_end; ++k) \
+                     acc_parts[s] += {a}[m * {k} + k] * {b}[{b_idx}];"
+                )?;
+                writeln!(out, "            }}")?;
+                writeln!(out, "            float total = 0.0f;")?;
+                writeln!(
+                    out,
+                    "            for (int s = 0; s < {sk}; ++s) total += acc_parts[s];"
+                )?;
+                writeln!(out, "            {res_name}[m * {n} + n] = total;")?;
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
+            } else if config.loop_skew {
+                let waves = (m + n).saturating_sub(1).max(1);
+                writeln!(out, "    /* [loop:skew(wavefront=\"w = m + n\")] */")?;
+                writeln!(out, "    for (int w = 0; w < {waves}; ++w) {{")?;
+                writeln!(out, "        int m_min = (w >= {n}) ? (w - {n} + 1) : 0;")?;
+                writeln!(out, "        int m_max = (w + 1 < {m}) ? (w + 1) : {m};")?;
+                writeln!(out, "        for (int m = m_min; m < m_max; ++m) {{")?;
+                writeln!(out, "            int n = w - m;")?;
+                writeln!(out, "            float acc = 0.0f;")?;
+                writeln!(
+                    out,
+                    "            for (int k = 0; k < {k}; ++k) \
+                     acc += {a}[m * {k} + k] * {b}[{b_idx}];"
+                )?;
+                writeln!(out, "            {res_name}[m * {n} + n] = acc;")?;
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
+            } else if config.is_register_tiled() {
                 let (mr, nr) = (config.reg_tile_m, config.reg_tile_n);
                 let (m_main, n_main) = ((m / mr) * mr, (n / nr) * nr);
                 writeln!(out, "    /* [loop:unroll_and_jam(mr={mr}, nr={nr})] */")?;
@@ -733,6 +793,55 @@ fn emit_c_hlo_op(
                 emit_c_gated_mlp(
                     module, op, inputs[0], inputs[1], res_name, names, counter, out,
                 )?;
+            } else if name == "castforge.fused_map_reduce" && inputs.len() >= 2 {
+                let x = value_ident(module, inputs[0], names, counter);
+                let init = value_ident(module, inputs[1], names, counter);
+                let in_len = tensor_len(module, inputs[0]);
+                let inner = (in_len / res_len.max(1)).max(1);
+                let map_op = op
+                    .attributes
+                    .get("map_op")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("exponential");
+                let idx_s = format!("o * {inner} + k");
+                let map_expr = match map_op {
+                    "square" => format!("{x}[{idx_s}] * {x}[{idx_s}]"),
+                    "exponential" => format!("expf({x}[{idx_s}])"),
+                    "tanh" => format!("tanhf({x}[{idx_s}])"),
+                    "rsqrt" => format!("1.0f / sqrtf({x}[{idx_s}])"),
+                    _ => format!("{x}[{idx_s}]"),
+                };
+                writeln!(out, "    for (int o = 0; o < {res_len}; ++o) {{")?;
+                writeln!(out, "        float acc = {init}[0];")?;
+                writeln!(
+                    out,
+                    "        for (int k = 0; k < {inner}; ++k) acc += {map_expr};"
+                )?;
+                writeln!(out, "        {res_name}[o] = acc;")?;
+                writeln!(out, "    }}")?;
+            } else if name == "castforge.fused_log_softmax" && !inputs.is_empty() {
+                let x = value_ident(module, inputs[0], names, counter);
+                let dims = module.values[inputs[0]]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_else(|| vec![1, res_len]);
+                let cols = *dims.last().unwrap_or(&res_len).max(&1);
+                let rows = (res_len / cols).max(1);
+                writeln!(out, "    for (int r = 0; r < {rows}; ++r) {{")?;
+                writeln!(out, "        float sum = 0.0f;")?;
+                writeln!(
+                    out,
+                    "        for (int c = 0; c < {cols}; ++c) \
+                     sum += expf({x}[r * {cols} + c]);"
+                )?;
+                writeln!(out, "        float lse = logf(sum);")?;
+                writeln!(
+                    out,
+                    "        for (int c = 0; c < {cols}; ++c) \
+                     {res_name}[r * {cols} + c] = {x}[r * {cols} + c] - lse;"
+                )?;
+                writeln!(out, "    }}")?;
             } else {
                 let src = value_ident(module, inputs[0], names, counter);
                 writeln!(

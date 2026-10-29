@@ -240,6 +240,11 @@ fn eval_stablehlo_op(
             .unwrap_or_else(|| vec![0.0; tensor_len(module, vid)])
     };
 
+    if op.is_op("stablehlo", "log") && !op.operands.is_empty() {
+        let out: Vec<f32> = get_v(op.operands[0]).into_iter().map(|x| x.ln()).collect();
+        env.insert(res_val, out);
+        return Ok(());
+    }
     let Some(hlo) = StableHloOp::from_op(op) else {
         env.insert(res_val, vec![0.0; res_len]);
         return Ok(());
@@ -584,6 +589,7 @@ fn eval_stablehlo_op(
                     inputs[0],
                     inputs[1],
                     inputs[2],
+                    inputs.get(3).copied(),
                     scale,
                     k_transposed,
                     &get_v,
@@ -744,6 +750,55 @@ fn eval_stablehlo_op(
                     }
                 }
                 out
+            } else if name == "castforge.fused_map_reduce" && inputs.len() >= 2 {
+                let x = get_v(inputs[0]);
+                let init = get_v(inputs[1]).first().copied().unwrap_or(0.0);
+                let map_op = op
+                    .attributes
+                    .get("map_op")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("exponential");
+                let inner = (x.len() / res_len.max(1)).max(1);
+                (0..res_len)
+                    .map(|o| {
+                        let mut acc = init;
+                        for k in 0..inner {
+                            let v = x[o * inner + k];
+                            let mv = match map_op {
+                                "square" => v * v,
+                                "exponential" => v.exp(),
+                                "tanh" => v.tanh(),
+                                "rsqrt" => 1.0 / v.sqrt(),
+                                _ => v,
+                            };
+                            acc += mv;
+                        }
+                        acc
+                    })
+                    .collect()
+            } else if name == "castforge.fused_log_softmax" && !inputs.is_empty() {
+                let x = get_v(inputs[0]);
+                let dims = module.values[res_val]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_else(|| vec![1, res_len]);
+                let cols = *dims.last().unwrap_or(&res_len).max(&1);
+                let rows = (res_len / cols).max(1);
+                let mut out = vec![0.0_f32; res_len];
+                for r in 0..rows {
+                    let row_slice = &x[r * cols..(r + 1) * cols];
+                    let max_v = row_slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum = 0.0_f32;
+                    for &v in row_slice {
+                        sum += (v - max_v).exp();
+                    }
+                    let lse = max_v + sum.ln();
+                    for c in 0..cols {
+                        out[r * cols + c] = row_slice[c] - lse;
+                    }
+                }
+                out
             } else {
                 get_v(inputs[0])
             }
@@ -799,11 +854,13 @@ fn eval_matmul_2d(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn eval_fused_attention_2d(
     module: &Module,
     q_id: ValueId,
     k_id: ValueId,
     v_id: ValueId,
+    mask_opt: Option<ValueId>,
     scale: f32,
     k_transposed: bool,
     get_v: &dyn Fn(ValueId) -> Vec<f32>,
@@ -823,6 +880,7 @@ fn eval_fused_attention_2d(
     let d_v = *v_dims.get(1).unwrap_or(&1);
 
     let qk = eval_matmul_2d(module, q_id, k_id, k_transposed, get_v);
+    let mask_v = mask_opt.map(get_v);
     let v = get_v(v_id);
     let mut out = vec![0.0_f32; seq_q * d_v];
 
@@ -830,12 +888,23 @@ fn eval_fused_attention_2d(
         let row_scores = &qk[r * seq_kv..(r + 1) * seq_kv];
         let max_s = row_scores
             .iter()
-            .map(|&s| s * scale)
+            .enumerate()
+            .map(|(c, &s)| {
+                let m_add = mask_v
+                    .as_ref()
+                    .and_then(|m| m.get(r * seq_kv + c).copied())
+                    .unwrap_or(0.0);
+                s * scale + m_add
+            })
             .fold(f32::NEG_INFINITY, f32::max);
         let mut probs = vec![0.0_f32; seq_kv];
         let mut sum = 0.0_f32;
         for (c, &s) in row_scores.iter().enumerate() {
-            let e = (s * scale - max_s).exp();
+            let m_add = mask_v
+                .as_ref()
+                .and_then(|m| m.get(r * seq_kv + c).copied())
+                .unwrap_or(0.0);
+            let e = (s * scale + m_add - max_s).exp();
             probs[c] = e;
             sum += e;
         }

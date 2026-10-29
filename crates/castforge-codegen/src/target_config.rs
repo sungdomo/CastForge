@@ -54,6 +54,14 @@ pub struct TargetConfig {
     pub collapse_loops: bool,
     /// Emit multicore parallel outer-loop work-sharing (`#pragma omp parallel for`).
     pub parallel: bool,
+    /// Outer L2/L3 cache tile size (`0` disables hierarchical 2-level L2->L1 cache blocking).
+    pub l2_tile_size: usize,
+    /// Software pipelining / hardware prefetch distance in iterations (`0` disables prefetching).
+    pub prefetch_distance: usize,
+    /// Split-K reduction partitioning factor (`1` disables Split-K; `> 1` partitions `k`).
+    pub split_k: usize,
+    /// Enable polyhedral wavefront loop skewing (`w = i + j` diagonal wavefront traversal).
+    pub loop_skew: bool,
 }
 
 impl Default for TargetConfig {
@@ -71,6 +79,10 @@ impl Default for TargetConfig {
             reg_tile_n: 0,
             collapse_loops: false,
             parallel: false,
+            l2_tile_size: 0,
+            prefetch_distance: 0,
+            split_k: 1,
+            loop_skew: false,
         }
     }
 }
@@ -131,6 +143,30 @@ impl TargetConfig {
     /// Enable or disable multicore parallel outer-loop work-sharing.
     pub fn with_parallel(mut self, enabled: bool) -> Self {
         self.parallel = enabled;
+        self
+    }
+
+    /// Configure hierarchical L2 cache tile size wrapping L1 `tile_m`/`tile_n`/`tile_k` blocks.
+    pub fn with_l2_tile_size(mut self, l2_tile: usize) -> Self {
+        self.l2_tile_size = l2_tile;
+        self
+    }
+
+    /// Configure software pipelining / hardware prefetch lookahead distance along `k`.
+    pub fn with_prefetch(mut self, distance: usize) -> Self {
+        self.prefetch_distance = distance;
+        self
+    }
+
+    /// Configure Split-K reduction partitioning across `splits` partial accumulators.
+    pub fn with_split_k(mut self, splits: usize) -> Self {
+        self.split_k = splits.max(1);
+        self
+    }
+
+    /// Enable or disable polyhedral wavefront loop skewing (`w = i + j`).
+    pub fn with_loop_skew(mut self, enabled: bool) -> Self {
+        self.loop_skew = enabled;
         self
     }
 

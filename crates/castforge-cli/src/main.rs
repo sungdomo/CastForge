@@ -166,6 +166,22 @@ enum Commands {
         /// Emit multicore parallel outer-loop work-sharing
         #[arg(long = "parallel")]
         parallel: bool,
+
+        /// Outer L2 cache tile size (0 = disabled)
+        #[arg(long = "l2-tile-size", default_value_t = 0)]
+        l2_tile_size: usize,
+
+        /// Software pipelining / prefetch distance in iterations (0 = disabled)
+        #[arg(long = "prefetch", default_value_t = 0)]
+        prefetch: usize,
+
+        /// Split-K reduction partitioning factor (1 = disabled)
+        #[arg(long = "split-k", default_value_t = 1)]
+        split_k: usize,
+
+        /// Enable polyhedral wavefront loop skewing (w = m + n)
+        #[arg(long = "loop-skew")]
+        loop_skew: bool,
     },
 
     /// Analyze FLOPs, memory bandwidth traffic, arithmetic intensity, and Roofline bottlenecks
@@ -423,6 +439,10 @@ fn main() -> Result<()> {
             reg_tile,
             collapse_loops,
             parallel,
+            l2_tile_size,
+            prefetch,
+            split_k,
+            loop_skew,
         } => {
             let src = fs::read_to_string(&input)
                 .with_context(|| format!("Failed to read {}", input.display()))?;
@@ -470,6 +490,10 @@ fn main() -> Result<()> {
                 reg_tile_n: reg_tile,
                 collapse_loops,
                 parallel,
+                l2_tile_size,
+                prefetch_distance: prefetch,
+                split_k: split_k.max(1),
+                loop_skew,
             };
             let code = generate_code_with_config(&module, tgt, &cfg)?;
             if let Some(out_path) = output {

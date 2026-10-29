@@ -4,12 +4,13 @@ use crate::{
     FoldBroadcastPass, FoldConstantsPass, FoldConvertPass, FoldNormWeightsPass, FoldReshapePass,
     FoldSliceConcatPass, FoldTransposePass, FuseAttentionPass, FuseDequantMatmulPass,
     FuseElementwisePass, FuseGatedMlpPass, FuseGeluPass, FuseHorizontalDotPass, FuseLayerNormPass,
-    FuseLoopsPass, FuseMatmulEpiloguePass, FuseResidualNormPass, FuseRmsNormPass, FuseRopePass,
-    FuseSoftmaxPass, FuseSwiGluPass, HoistConstantsPass, InlinerPass, IrEditPass, LicmPass,
-    MergeWeightsPass, OptO1Pass, OptO2Pass, OptO3Pass, PackWeightsPass, Pass, PassOptions,
-    PrintOpStatsPass, QuantizeWeightsPass, SccpPass, SimplifyAlgebraicPass, SinkTransposePass,
-    SpecializeShapesPass, StripDebugInfoPass, StructuredPruningPass, SymbolDcePass,
-    TaskArithmeticPass, TopologicalSortPass, VerifyShapesPass,
+    FuseLogSoftmaxPass, FuseLoopsPass, FuseMapReducePass, FuseMatmulEpiloguePass,
+    FuseResidualNormPass, FuseRmsNormPass, FuseRopePass, FuseSoftmaxPass, FuseSwiGluPass,
+    HoistConstantsPass, InlinerPass, IrEditPass, LicmPass, MergeWeightsPass, OptO1Pass, OptO2Pass,
+    OptO3Pass, PackWeightsPass, Pass, PassOptions, PrintOpStatsPass, QuantizeWeightsPass, SccpPass,
+    SimplifyAlgebraicPass, SinkTransposePass, SpecializeShapesPass, StripDebugInfoPass,
+    StructuredPruningPass, SymbolDcePass, TaskArithmeticPass, TopologicalSortPass,
+    VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
 use castforge_ir::MergeMethod;
@@ -385,6 +386,16 @@ impl PassRegistry {
             "fuse-gated-mlp",
             "Fuses dual gate/up dot_general + slices + SwiGLU/GeGLU into fused_gated_mlp",
             |_opts| Ok(Box::new(FuseGatedMlpPass)),
+        );
+        reg.register(
+            "fuse-map-reduce",
+            "Fuses elementwise map producers directly into stablehlo.reduce (fused_map_reduce)",
+            |_opts| Ok(Box::new(FuseMapReducePass)),
+        );
+        reg.register(
+            "fuse-log-softmax",
+            "Fuses log(softmax(x)) or x - log(reduce_sum(exp(x))) into fused_log_softmax",
+            |_opts| Ok(Box::new(FuseLogSoftmaxPass)),
         );
         reg.register(
             "O1",

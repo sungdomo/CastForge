@@ -3,7 +3,7 @@ use castforge_codegen::{
     analyze_module_cost_with_roofline, build_memory_plan, evaluate_module, generate_code,
     generate_code_with_config, verify_module_numerics,
 };
-use castforge_mlir::parse_mlir;
+use castforge_mlir::{parse_mlir, print_mlir};
 use castforge_passes::{PassManager, PassRegistry};
 
 #[test]
@@ -377,4 +377,110 @@ module @advanced_loops_demo {
     assert!(c_code.contains("[loop:unroll_and_jam(mr=2, nr=2)]"));
     assert!(c_code.contains("float acc[2][2] = {0};"));
     assert!(c_code.contains("[loop:coalesce(2D->1D, len=16)]"));
+}
+
+#[test]
+fn test_masked_attention_map_reduce_log_softmax_and_polyhedral_loops() {
+    let mlir = r#"
+module @complete_fusion_and_polyhedral {
+  func.func @forward(
+    %q: tensor<2x4xf32>,
+    %k: tensor<2x4xf32>,
+    %v: tensor<2x4xf32>,
+    %mask: tensor<2x2xf32>,
+    %w: tensor<4x4xf32>
+  ) -> tensor<2xf32> {
+    %zero = stablehlo.constant dense<0.0> : tensor<f32>
+    %scale = stablehlo.constant dense<0.5> : tensor<2x2xf32>
+
+    // 1. Masked Attention: softmax((Q @ K^T) * scale + mask) @ V
+    %kt = stablehlo.transpose %k, dims = [1, 0] : (tensor<2x4xf32>) -> tensor<4x2xf32>
+    %qk = stablehlo.dot_general %q, %kt, contracting_dims = [1] x [0]
+      : (tensor<2x4xf32>, tensor<4x2xf32>) -> tensor<2x2xf32>
+    %scaled = stablehlo.multiply %qk, %scale : tensor<2x2xf32>
+    %masked = stablehlo.add %scaled, %mask : tensor<2x2xf32>
+    %exp = stablehlo.exponential %masked : tensor<2x2xf32>
+    %sum = stablehlo.reduce %exp, %zero
+      {dimensions = [1], reducer = "stablehlo.add"}
+      : (tensor<2x2xf32>, tensor<f32>) -> tensor<2xf32>
+    %denom = stablehlo.broadcast_in_dim %sum, dims = [0]
+      : (tensor<2xf32>) -> tensor<2x2xf32>
+    %probs = stablehlo.divide %exp, %denom : tensor<2x2xf32>
+    %attn = stablehlo.dot_general %probs, %v, contracting_dims = [1] x [0]
+      : (tensor<2x2xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+
+    // 2. GEMM + LogSoftmax + Map-Reduce (reduce_sum(square(log_softmax(mm))))
+    %mm = stablehlo.dot_general %attn, %w, contracting_dims = [1] x [0]
+      : (tensor<2x4xf32>, tensor<4x4xf32>) -> tensor<2x4xf32>
+    %e2 = stablehlo.exponential %mm : tensor<2x4xf32>
+    %s2 = stablehlo.reduce %e2, %zero
+      {dimensions = [1], reducer = "stablehlo.add"}
+      : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+    %d2 = stablehlo.broadcast_in_dim %s2, dims = [0]
+      : (tensor<2xf32>) -> tensor<2x4xf32>
+    %sm2 = stablehlo.divide %e2, %d2 : tensor<2x4xf32>
+    %lsm = stablehlo.log %sm2 : tensor<2x4xf32>
+    %sq = stablehlo.multiply %lsm, %lsm : tensor<2x4xf32>
+    %out = stablehlo.reduce %sq, %zero
+      {dimensions = [1], reducer = "stablehlo.add"}
+      : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+    func.return %out : tensor<2xf32>
+  }
+}
+"#;
+    let before = parse_mlir(mlir).expect("parse complete mlir");
+    let mut fused = before.clone();
+    let registry = PassRegistry::with_builtin_passes();
+    let mut pm = PassManager::from_pipeline_str(
+        &registry,
+        "fuse-attention,fuse-log-softmax,fuse-map-reduce",
+    )
+    .expect("complete fusion pipeline");
+    let res = pm.run(&mut fused).expect("run complete fusion");
+    assert!(res[0].changed);
+    assert!(res[1].changed);
+    assert!(res[2].changed);
+
+    let printed = print_mlir(&fused);
+    assert!(printed.contains("castforge.fused_attention"));
+    assert!(printed.contains("masked = true"));
+    assert!(printed.contains("castforge.fused_log_softmax"));
+    assert!(printed.contains("castforge.fused_map_reduce"));
+
+    let rep = verify_module_numerics(&before, &fused, 1e-5).expect("verify complete fusion");
+    assert!(rep.passed, "max_abs_diff = {}", rep.max_abs_diff);
+
+    // Verify decompose-composites round-trip on map_reduce + log_softmax
+    let mut decomposed = fused.clone();
+    let mut dec_pm =
+        PassManager::from_pipeline_str(&registry, "decompose-composites").expect("decompose");
+    dec_pm.run(&mut decomposed).expect("run decompose");
+    let dec_rep = verify_module_numerics(&before, &decomposed, 1e-5).expect("verify decomposed");
+    assert!(dec_rep.passed, "max_abs_diff = {}", dec_rep.max_abs_diff);
+
+    // Verify Split-K, L2 tiling, and Software Pipelining codegen
+    let cfg_sk = TargetConfig::cpu_tiled(2)
+        .with_l2_tile_size(4)
+        .with_prefetch(4)
+        .with_split_k(2);
+    let rust_sk =
+        generate_code_with_config(&fused, CodegenTarget::Rust, &cfg_sk).expect("rust split-k");
+    assert!(rust_sk.contains("[loop:l2_tile(L2=4, L1=2)]"));
+    assert!(rust_sk.contains("[loop:software_pipeline(prefetch_dist=4)]"));
+    assert!(rust_sk.contains("[loop:split_k(splits=2, chunk=2)]"));
+    assert!(rust_sk.contains("let lse = sum.ln();"));
+
+    let c_sk = generate_code_with_config(&fused, CodegenTarget::C, &cfg_sk).expect("c split-k");
+    assert!(c_sk.contains("[loop:l2_tile(L2=4, L1=2)]"));
+    assert!(c_sk.contains("__builtin_prefetch"));
+    assert!(c_sk.contains("float acc_parts[2] = {0};"));
+    assert!(c_sk.contains("float lse = logf(sum);"));
+
+    // Verify Polyhedral Wavefront Loop Skewing codegen
+    let cfg_skew = TargetConfig::default().with_loop_skew(true);
+    let rust_skew =
+        generate_code_with_config(&fused, CodegenTarget::Rust, &cfg_skew).expect("rust skew");
+    assert!(rust_skew.contains("[loop:skew(wavefront=\"w = m + n\")]"));
+    let c_skew = generate_code_with_config(&fused, CodegenTarget::C, &cfg_skew).expect("c skew");
+    assert!(c_skew.contains("[loop:skew(wavefront=\"w = m + n\")]"));
 }
