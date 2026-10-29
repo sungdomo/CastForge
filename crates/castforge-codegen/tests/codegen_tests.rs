@@ -794,3 +794,96 @@ module @advanced_compiler_frontiers {
     let dec_rep = verify_module_numerics(&before, &decomposed, 1e-5).expect("verify decomposed");
     assert!(dec_rep.passed);
 }
+
+#[test]
+fn test_mixed_precision_fuse_moe_flash_attention_and_double_buffer() {
+    let moe_mlir = r#"
+module @moe_block {
+  func.func @main(
+    %x: tensor<2x4xf32>,
+    %w0: tensor<4x4xf32>,
+    %w1: tensor<4x4xf32>,
+    %g0: tensor<2x4xf32>,
+    %g1: tensor<2x4xf32>,
+    %k: tensor<2x4xf32>,
+    %v: tensor<2x4xf32>
+  ) -> tensor<2x4xf32> {
+    %e0 = stablehlo.dot_general %x, %w0, contracting_dims = [1] x [0]
+      : (tensor<2x4xf32>, tensor<4x4xf32>) -> tensor<2x4xf32>
+    %e1 = stablehlo.dot_general %x, %w1, contracting_dims = [1] x [0]
+      : (tensor<2x4xf32>, tensor<4x4xf32>) -> tensor<2x4xf32>
+    %m0 = stablehlo.multiply %e0, %g0 : tensor<2x4xf32>
+    %m1 = stablehlo.multiply %e1, %g1 : tensor<2x4xf32>
+    %moe = stablehlo.add %m0, %m1 : tensor<2x4xf32>
+
+    %zero = stablehlo.constant dense<0.0> : tensor<f32>
+    %scale = stablehlo.constant dense<0.5> : tensor<2x2xf32>
+    %kt = stablehlo.transpose %k, dims = [1, 0] : (tensor<2x4xf32>) -> tensor<4x2xf32>
+    %qk = stablehlo.dot_general %moe, %kt, contracting_dims = [1] x [0]
+      : (tensor<2x4xf32>, tensor<4x2xf32>) -> tensor<2x2xf32>
+    %scores = stablehlo.multiply %qk, %scale : tensor<2x2xf32>
+    %ex = stablehlo.exponential %scores : tensor<2x2xf32>
+    %sum = stablehlo.reduce %ex, %zero
+      {dimensions = [1], reducer = "stablehlo.add"}
+      : (tensor<2x2xf32>, tensor<f32>) -> tensor<2xf32>
+    %denom = stablehlo.broadcast_in_dim %sum, dims = [0]
+      : (tensor<2xf32>) -> tensor<2x2xf32>
+    %probs = stablehlo.divide %ex, %denom : tensor<2x2xf32>
+    %out = stablehlo.dot_general %probs, %v, contracting_dims = [1] x [0]
+      : (tensor<2x2xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+    func.return %out : tensor<2x4xf32>
+  }
+}
+"#;
+    let before = parse_mlir(moe_mlir).expect("parse moe_block");
+    let mut fused = before.clone();
+    let registry = PassRegistry::with_builtin_passes();
+    let mut pm = PassManager::from_pipeline_str(&registry, "fuse-moe,fuse-attention")
+        .expect("moe+attn pipeline");
+    let res = pm.run(&mut fused).expect("run moe+attn");
+    assert!(res[0].changed);
+    assert!(res[1].changed);
+
+    let ir = print_mlir(&fused);
+    assert!(ir.contains("castforge.fused_moe"));
+    assert!(ir.contains("castforge.fused_attention"));
+
+    let rep = verify_module_numerics(&before, &fused, 1e-5).expect("verify moe+attn");
+    assert!(rep.passed, "max_abs_diff = {}", rep.max_abs_diff);
+
+    // Verify FlashAttention-2 online softmax and fused MoE in Rust & C99 codegen
+    let rust_code = generate_code(&fused, CodegenTarget::Rust).expect("rust moe+flash");
+    assert!(rust_code.contains("[moe:fused_routed_experts(num_experts=2)]"));
+    assert!(rust_code.contains("[attention:flash_online_softmax(O(1)_workspace"));
+    assert!(rust_code.contains("m_prev.max(s)"));
+    let c_code = generate_code(&fused, CodegenTarget::C).expect("c moe+flash");
+    assert!(c_code.contains("[moe:fused_routed_experts(num_experts=2)]"));
+    assert!(c_code.contains("[attention:flash_online_softmax(O(1)_workspace"));
+
+    // Verify decompose-composites lowers castforge.fused_moe back to dot_general + multiply + add
+    let mut decomposed = fused.clone();
+    let mut dec_pm =
+        PassManager::from_pipeline_str(&registry, "decompose-composites").expect("decompose");
+    dec_pm.run(&mut decomposed).expect("run decompose");
+    let dec_rep = verify_module_numerics(&before, &decomposed, 1e-5).expect("verify decomposed");
+    assert!(dec_rep.passed);
+
+    // Verify mixed-precision pass (bf16 & f16) and ping-pong double buffering
+    let mut mp_mod = before.clone();
+    let mut mp_pm =
+        PassManager::from_pipeline_str(&registry, "mixed-precision(dtype=bf16)").expect("mp");
+    let mp_res = mp_pm.run(&mut mp_mod).expect("run mp");
+    assert!(mp_res[0].changed);
+    let mp_ir = print_mlir(&mp_mod);
+    assert!(mp_ir.contains("stablehlo.convert"));
+    assert!(mp_ir.contains("tensor<2x4xbf16>"));
+    assert!(mp_ir.contains("tensor<4x4xbf16>"));
+    let mp_rep = verify_module_numerics(&before, &mp_mod, 1e-5).expect("verify mp");
+    assert!(mp_rep.passed);
+
+    let cfg_db = TargetConfig::cpu_tiled(2).with_double_buffer(true);
+    let rust_db = generate_code_with_config(&before, CodegenTarget::Rust, &cfg_db).expect("r db");
+    assert!(rust_db.contains("[loop:double_buffer(stages=2, ping_pong"));
+    let c_db = generate_code_with_config(&before, CodegenTarget::C, &cfg_db).expect("c db");
+    assert!(c_db.contains("[loop:double_buffer(stages=2, ping_pong"));
+}

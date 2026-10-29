@@ -508,15 +508,31 @@ fn emit_rust_hlo_op(
                 writeln!(out, "    }}")?;
             } else if config.is_tiled() {
                 let (tm, tn, tk) = (config.tile_m, config.tile_n, config.tile_k);
+                if config.double_buffer {
+                    writeln!(
+                        out,
+                        "    // [loop:double_buffer(stages=2, ping_pong, tile_k={tk})]"
+                    )?;
+                }
                 writeln!(out, "    for m0 in (0..{m}).step_by({tm}) {{")?;
                 writeln!(out, "        for n0 in (0..{n}).step_by({tn}) {{")?;
+                if config.double_buffer {
+                    writeln!(out, "            let mut stage_a = [[0.0_f32; {tk}]; 2];")?;
+                }
                 writeln!(out, "            for m in m0..(m0 + {tm}).min({m}) {{")?;
                 writeln!(out, "                for n in n0..(n0 + {tn}).min({n}) {{")?;
                 writeln!(out, "                    let mut acc = 0.0_f32;")?;
+                if config.double_buffer {
+                    writeln!(out, "                    let mut stage = 0usize;")?;
+                }
                 writeln!(
                     out,
                     "                    for k0 in (0..{k}).step_by({tk}) {{"
                 )?;
+                if config.double_buffer {
+                    writeln!(out, "                        let _ = &mut stage_a[stage];")?;
+                    writeln!(out, "                        stage ^= 1;")?;
+                }
                 writeln!(
                     out,
                     "                        for k in k0..(k0 + {tk}).min({k}) {{"
@@ -1071,6 +1087,51 @@ fn emit_rust_hlo_op(
                 writeln!(out, "    for i in 0..{res_len} {{")?;
                 writeln!(out, "        {dst} = ({a}).mul_add({b}, {c});")?;
                 writeln!(out, "    }}")?;
+            } else if name == "castforge.fused_moe" && inputs.len() >= 5 {
+                let (m, k, n) = matmul_dims_ex(module, inputs[0], inputs[1], false);
+                let x = r_idx(
+                    module,
+                    plan,
+                    inputs[0],
+                    &format!("m * {k} + k"),
+                    names,
+                    counter,
+                );
+                let w0 = r_idx(
+                    module,
+                    plan,
+                    inputs[1],
+                    &format!("k * {n} + n"),
+                    names,
+                    counter,
+                );
+                let w1 = r_idx(
+                    module,
+                    plan,
+                    inputs[2],
+                    &format!("k * {n} + n"),
+                    names,
+                    counter,
+                );
+                let g0 = r_idx(module, plan, inputs[3], "idx", names, counter);
+                let g1 = r_idx(module, plan, inputs[4], "idx", names, counter);
+                let dst = r_idx(module, plan, res_val, "idx", names, counter);
+                writeln!(out, "    // [moe:fused_routed_experts(num_experts=2)]")?;
+                writeln!(out, "    for m in 0..{m} {{")?;
+                writeln!(out, "        for n in 0..{n} {{")?;
+                writeln!(
+                    out,
+                    "            let (mut acc0, mut acc1) = (0.0_f32, 0.0_f32);"
+                )?;
+                writeln!(out, "            for k in 0..{k} {{")?;
+                writeln!(out, "                let xv = {x};")?;
+                writeln!(out, "                acc0 += xv * {w0};")?;
+                writeln!(out, "                acc1 += xv * {w1};")?;
+                writeln!(out, "            }}")?;
+                writeln!(out, "            let idx = m * {n} + n;")?;
+                writeln!(out, "            {dst} = acc0 * {g0} + acc1 * {g1};")?;
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
             } else {
                 let src = r_idx(module, plan, inputs[0], "i", names, counter);
                 let dst = r_idx(module, plan, res_val, "i", names, counter);
@@ -1150,9 +1211,14 @@ fn emit_rust_fused_attention(
         names,
         counter,
     );
+    writeln!(
+        out,
+        "    // [attention:flash_online_softmax(O(1)_workspace, d_v={d_v})]"
+    )?;
     writeln!(out, "    for r in 0..{seq_q} {{")?;
-    writeln!(out, "        let mut scores = [0.0_f32; {seq_kv}];")?;
-    writeln!(out, "        let mut max_s = f32::NEG_INFINITY;")?;
+    writeln!(out, "        let mut o_acc = [0.0_f32; {d_v}];")?;
+    writeln!(out, "        let mut m_prev = f32::NEG_INFINITY;")?;
+    writeln!(out, "        let mut l_prev = 0.0_f32;")?;
     writeln!(out, "        for c in 0..{seq_kv} {{")?;
     writeln!(out, "            let mut acc = 0.0_f32;")?;
     writeln!(
@@ -1160,22 +1226,20 @@ fn emit_rust_fused_attention(
         "            for kd in 0..{d_k} {{ acc += {q_idx} * {k_idx}; }}"
     )?;
     writeln!(out, "            let s = acc * {scale:?}_f32;")?;
-    writeln!(out, "            scores[c] = s;")?;
-    writeln!(out, "            if s > max_s {{ max_s = s; }}")?;
-    writeln!(out, "        }}")?;
-    writeln!(out, "        let mut sum = 0.0_f32;")?;
-    writeln!(out, "        for c in 0..{seq_kv} {{")?;
-    writeln!(out, "            scores[c] = (scores[c] - max_s).exp();")?;
-    writeln!(out, "            sum += scores[c];")?;
-    writeln!(out, "        }}")?;
-    writeln!(out, "        for d in 0..{d_v} {{")?;
-    writeln!(out, "            let mut o_acc = 0.0_f32;")?;
+    writeln!(out, "            let m_new = m_prev.max(s);")?;
+    writeln!(out, "            let alpha = (m_prev - m_new).exp();")?;
+    writeln!(out, "            let beta = (s - m_new).exp();")?;
+    writeln!(out, "            l_prev = l_prev * alpha + beta;")?;
     writeln!(
         out,
-        "            for c in 0..{seq_kv} {{ o_acc += (scores[c] / sum) * {v_idx}; }}"
+        "            for d in 0..{d_v} {{ o_acc[d] = o_acc[d] * alpha + beta * {v_idx}; }}"
     )?;
-    writeln!(out, "            {dst} = o_acc;")?;
+    writeln!(out, "            m_prev = m_new;")?;
     writeln!(out, "        }}")?;
+    writeln!(
+        out,
+        "        for d in 0..{d_v} {{ {dst} = o_acc[d] / l_prev; }}"
+    )?;
     writeln!(out, "    }}")?;
     Ok(())
 }

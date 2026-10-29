@@ -567,10 +567,10 @@ fn test_fuse_rope_and_gqa_attention() {
 
     let rust_code = generate_code(&fused, CodegenTarget::Rust).expect("rust codegen");
     assert!(rust_code.contains("let rot = if c < 2"));
-    assert!(rust_code.contains("let mut scores = [0.0_f32; 2];"));
+    assert!(rust_code.contains("let mut o_acc = [0.0_f32; 4];"));
 
     let c_code = generate_code(&fused, CodegenTarget::C).expect("c codegen");
-    assert!(c_code.contains("float scores[2];"));
+    assert!(c_code.contains("float o_acc[4] = {0};"));
 
     // Also verify decompose-composites restores primitive RoPE ops
     let mut decomposed = fused.clone();

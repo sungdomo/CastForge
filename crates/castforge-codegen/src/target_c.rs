@@ -438,6 +438,12 @@ fn emit_c_hlo_op(
                 writeln!(out, "    }}")?;
             } else if config.is_tiled() {
                 let (tm, tn, tk) = (config.tile_m, config.tile_n, config.tile_k);
+                if config.double_buffer {
+                    writeln!(
+                        out,
+                        "    /* [loop:double_buffer(stages=2, ping_pong, tile_k={tk})] */"
+                    )?;
+                }
                 writeln!(out, "    for (int m0 = 0; m0 < {m}; m0 += {tm}) {{")?;
                 writeln!(out, "        for (int n0 = 0; n0 < {n}; n0 += {tn}) {{")?;
                 writeln!(
@@ -449,10 +455,16 @@ fn emit_c_hlo_op(
                     "                for (int n = n0; n < n0 + {tn} && n < {n}; ++n) {{"
                 )?;
                 writeln!(out, "                    float acc = 0.0f;")?;
+                if config.double_buffer {
+                    writeln!(out, "                    int stage = 0;")?;
+                }
                 writeln!(
                     out,
                     "                    for (int k0 = 0; k0 < {k}; k0 += {tk}) {{"
                 )?;
+                if config.double_buffer {
+                    writeln!(out, "                        stage ^= 1;")?;
+                }
                 writeln!(
                     out,
                     "                        for (int k = k0; k < k0 + {tk} && k < {k}; ++k) \
@@ -927,6 +939,29 @@ fn emit_c_hlo_op(
                     "    for (int i = 0; i < {res_len}; ++i) \
                      {res_name}[i] = fmaf({a}[i], {b}[i], {c}[i]);"
                 )?;
+            } else if name == "castforge.fused_moe" && inputs.len() >= 5 {
+                let (m, k, n) = matmul_dims_ex(module, inputs[0], inputs[1], false);
+                let x = value_ident(module, inputs[0], names, counter);
+                let w0 = value_ident(module, inputs[1], names, counter);
+                let w1 = value_ident(module, inputs[2], names, counter);
+                let g0 = value_ident(module, inputs[3], names, counter);
+                let g1 = value_ident(module, inputs[4], names, counter);
+                writeln!(out, "    /* [moe:fused_routed_experts(num_experts=2)] */")?;
+                writeln!(out, "    for (int m = 0; m < {m}; ++m) {{")?;
+                writeln!(out, "        for (int n = 0; n < {n}; ++n) {{")?;
+                writeln!(out, "            float acc0 = 0.0f, acc1 = 0.0f;")?;
+                writeln!(out, "            for (int k = 0; k < {k}; ++k) {{")?;
+                writeln!(out, "                float xv = {x}[m * {k} + k];")?;
+                writeln!(out, "                acc0 += xv * {w0}[k * {n} + n];")?;
+                writeln!(out, "                acc1 += xv * {w1}[k * {n} + n];")?;
+                writeln!(out, "            }}")?;
+                writeln!(out, "            int idx = m * {n} + n;")?;
+                writeln!(
+                    out,
+                    "            {res_name}[idx] = acc0 * {g0}[idx] + acc1 * {g1}[idx];"
+                )?;
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
             } else {
                 let src = value_ident(module, inputs[0], names, counter);
                 writeln!(
@@ -983,32 +1018,36 @@ fn emit_c_fused_attention(
     } else {
         format!("kd * {seq_kv} + c")
     };
+    writeln!(
+        out,
+        "    /* [attention:flash_online_softmax(O(1)_workspace, d_v={d_v})] */"
+    )?;
     writeln!(out, "    for (int r = 0; r < {seq_q}; ++r) {{")?;
-    writeln!(out, "        float scores[{seq_kv}];")?;
-    writeln!(out, "        float max_s = -1e30f;")?;
+    writeln!(out, "        float o_acc[{d_v}] = {{0}};")?;
+    writeln!(out, "        float m_prev = -1e30f;")?;
+    writeln!(out, "        float l_prev = 0.0f;")?;
     writeln!(out, "        for (int c = 0; c < {seq_kv}; ++c) {{")?;
     writeln!(out, "            float acc = 0.0f;")?;
     writeln!(
         out,
         "            for (int kd = 0; kd < {d_k}; ++kd) acc += {q}[r * {d_k} + kd] * {k}[{k_idx}];"
     )?;
-    writeln!(out, "            scores[c] = acc * {scale:.6}f;")?;
-    writeln!(out, "            if (scores[c] > max_s) max_s = scores[c];")?;
-    writeln!(out, "        }}")?;
-    writeln!(out, "        float sum = 0.0f;")?;
-    writeln!(out, "        for (int c = 0; c < {seq_kv}; ++c) {{")?;
-    writeln!(out, "            scores[c] = expf(scores[c] - max_s);")?;
-    writeln!(out, "            sum += scores[c];")?;
-    writeln!(out, "        }}")?;
-    writeln!(out, "        for (int d = 0; d < {d_v}; ++d) {{")?;
-    writeln!(out, "            float o_acc = 0.0f;")?;
+    writeln!(out, "            float s = acc * {scale:.6}f;")?;
+    writeln!(out, "            float m_new = fmaxf(m_prev, s);")?;
+    writeln!(out, "            float alpha = expf(m_prev - m_new);")?;
+    writeln!(out, "            float beta = expf(s - m_new);")?;
+    writeln!(out, "            l_prev = l_prev * alpha + beta;")?;
     writeln!(
         out,
-        "            for (int c = 0; c < {seq_kv}; ++c) \
-         o_acc += (scores[c] / sum) * {v}[c * {d_v} + d];"
+        "            for (int d = 0; d < {d_v}; ++d) \
+         o_acc[d] = o_acc[d] * alpha + beta * {v}[c * {d_v} + d];"
     )?;
-    writeln!(out, "            {res_name}[r * {d_v} + d] = o_acc;")?;
+    writeln!(out, "            m_prev = m_new;")?;
     writeln!(out, "        }}")?;
+    writeln!(
+        out,
+        "        for (int d = 0; d < {d_v}; ++d) {res_name}[r * {d_v} + d] = o_acc[d] / l_prev;"
+    )?;
     writeln!(out, "    }}")?;
     Ok(())
 }

@@ -818,6 +818,14 @@ fn eval_stablehlo_op(
             } else if name == "castforge.fma" && inputs.len() >= 3 {
                 let (a, b, c) = (get_v(inputs[0]), get_v(inputs[1]), get_v(inputs[2]));
                 (0..res_len).map(|i| a[i].mul_add(b[i], c[i])).collect()
+            } else if name == "castforge.fused_moe" && inputs.len() >= 5 {
+                let e0 = eval_matmul_2d(module, inputs[0], inputs[1], false, &get_v);
+                let e1 = eval_matmul_2d(module, inputs[0], inputs[2], false, &get_v);
+                let g0 = get_v(inputs[3]);
+                let g1 = get_v(inputs[4]);
+                (0..res_len)
+                    .map(|i| e0[i] * g0[i % g0.len()] + e1[i] * g1[i % g1.len()])
+                    .collect()
             } else {
                 get_v(inputs[0])
             }

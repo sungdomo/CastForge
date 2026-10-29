@@ -20,7 +20,7 @@ support.
   `dense_resource<key>` external weight references, plus **GGUF v2/v3** and **ONNX-JSON** model
   importers.
 - [`crates/castforge-passes`](crates/castforge-passes): Unified `Pass`, `PassRegistry`, and
-  `PassManager` with **58 built-in compiler passes & presets** supporting static Rust construction,
+  `PassManager` with **60 built-in compiler passes & presets** supporting static Rust construction,
   CLI pipeline strings (`-p`), direct subcommand invocation, declarative TOML config files
   (`--config`), and step-by-step pass tracing.
 - [`crates/castforge-viz`](crates/castforge-viz): Computation graph exporter for **Mermaid**,
@@ -34,7 +34,7 @@ support.
 - [`crates/castforge-cli`](crates/castforge-cli): The `castforge` command-line tool (`opt`, `viz`,
   `codegen`, `autotune`, `import`, `profile`, `run`, `list-passes`, plus direct pass subcommands).
 
-## Built-in Transformation Passes & Presets (58 Passes)
+## Built-in Transformation Passes & Presets (60 Passes)
 
 | Pass Name | Category | Description |
 | :--- | :--- | :--- |
@@ -84,6 +84,8 @@ support.
 | `shard-spmd` | Distributed | Megatron-style 1D SPMD tensor parallelism + `all_reduce` |
 | `inject-kv-cache` | Inference | Injects `kv_cache_update` state ops before fused attention |
 | `egraph-simplify` | Folding | Distributive factoring (`a*b+a*c -> a*(b+c)`) & FMA extraction |
+| `mixed-precision` | Precision | Automatic Mixed Precision (`f16`/`bf16` GEMM + `f32` norms) |
+| `fuse-moe` | Fusion | Fuses routed Mixture-of-Experts (MoE) expert GEMMs & gates |
 | `decompose-composites` | Lowering | Expands `stablehlo.composite` ops to primitive StableHLO |
 | `bufferize-inplace` | Lowering | Annotates elementwise ops for in-place arena buffer reuse |
 | `fold-norm-weights` | Weight Surgery | Absorbs RMSNorm/LayerNorm scale weights into MatMuls |
@@ -100,7 +102,7 @@ support.
 ## Quick Start
 
 ```bash
-# 1. List all 58 registered passes and pipeline presets
+# 1. List all 60 registered passes and pipeline presets
 cargo run --bin castforge -- list-passes
 
 # 2. Optimize an end-to-end LLaMA block with automatic numerical verification

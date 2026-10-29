@@ -62,6 +62,8 @@ pub struct TargetConfig {
     pub split_k: usize,
     /// Enable polyhedral wavefront loop skewing (`w = i + j` diagonal wavefront traversal).
     pub loop_skew: bool,
+    /// Enable 2-stage software-pipelined ping-pong tile double-buffering across K tiles.
+    pub double_buffer: bool,
 }
 
 impl Default for TargetConfig {
@@ -83,6 +85,7 @@ impl Default for TargetConfig {
             prefetch_distance: 0,
             split_k: 1,
             loop_skew: false,
+            double_buffer: false,
         }
     }
 }
@@ -167,6 +170,12 @@ impl TargetConfig {
     /// Enable or disable polyhedral wavefront loop skewing (`w = i + j`).
     pub fn with_loop_skew(mut self, enabled: bool) -> Self {
         self.loop_skew = enabled;
+        self
+    }
+
+    /// Enable or disable 2-stage software-pipelined ping-pong tile double-buffering.
+    pub fn with_double_buffer(mut self, enabled: bool) -> Self {
+        self.double_buffer = enabled;
         self
     }
 

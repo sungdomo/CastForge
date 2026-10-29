@@ -553,6 +553,61 @@ impl Pass for DecomposeCompositesPass {
                         created += 1;
                         modified += 1;
                     }
+                    "castforge.fused_moe" if inputs.len() >= 5 => {
+                        let (x, w0, w1, g0, g1) =
+                            (inputs[0], inputs[1], inputs[2], inputs[3], inputs[4]);
+                        let mut dot_attrs = IndexMap::new();
+                        dot_attrs.insert(
+                            "lhs_contracting_dimensions".to_string(),
+                            Attribute::Array(vec![Attribute::Int(1)]),
+                        );
+                        dot_attrs.insert(
+                            "rhs_contracting_dimensions".to_string(),
+                            Attribute::Array(vec![Attribute::Int(0)]),
+                        );
+                        let e0 = insert_op_before(
+                            module,
+                            block_id,
+                            op_id,
+                            OpName::new("stablehlo", "dot_general"),
+                            &[x, w0],
+                            dot_attrs.clone(),
+                            out_ty.clone(),
+                        );
+                        let e1 = insert_op_before(
+                            module,
+                            block_id,
+                            op_id,
+                            OpName::new("stablehlo", "dot_general"),
+                            &[x, w1],
+                            dot_attrs,
+                            out_ty.clone(),
+                        );
+                        let m0 = insert_op_before(
+                            module,
+                            block_id,
+                            op_id,
+                            OpName::new("stablehlo", "multiply"),
+                            &[e0, g0],
+                            IndexMap::new(),
+                            out_ty.clone(),
+                        );
+                        let m1 = insert_op_before(
+                            module,
+                            block_id,
+                            op_id,
+                            OpName::new("stablehlo", "multiply"),
+                            &[e1, g1],
+                            IndexMap::new(),
+                            out_ty,
+                        );
+                        let op_mut = &mut module.ops[op_id];
+                        op_mut.name = OpName::new("stablehlo", "add");
+                        op_mut.operands = SmallVec::from_slice(&[m0, m1]);
+                        op_mut.attributes.clear();
+                        created += 4;
+                        modified += 1;
+                    }
                     _ => {}
                 }
             }

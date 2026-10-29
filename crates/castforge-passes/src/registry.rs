@@ -5,16 +5,17 @@ use crate::{
     FoldConstantsPass, FoldConvertPass, FoldNormWeightsPass, FoldReshapePass, FoldSliceConcatPass,
     FoldTransposePass, FuseAttentionPass, FuseDequantMatmulPass, FuseElementwisePass,
     FuseGatedMlpPass, FuseGeluPass, FuseHorizontalDotPass, FuseLayerNormPass, FuseLogSoftmaxPass,
-    FuseLoopsPass, FuseMapReducePass, FuseMatmulEpiloguePass, FuseResidualNormPass,
+    FuseLoopsPass, FuseMapReducePass, FuseMatmulEpiloguePass, FuseMoePass, FuseResidualNormPass,
     FuseRmsNormPass, FuseRopePass, FuseSoftmaxPass, FuseSwiGluPass, HoistConstantsPass,
     InjectKvCachePass, InlinerPass, IrEditPass, LicmPass, LowerConvToGemmPass, MergeWeightsPass,
-    OptO1Pass, OptO2Pass, OptO3Pass, PackWeightsPass, Pass, PassOptions, PrintOpStatsPass,
-    QuantizeWeightsPass, RematerializePass, SccpPass, ShardSpmdPass, SimplifyAlgebraicPass,
-    SinkTransposePass, SpecializeShapesPass, StripDebugInfoPass, StructuredPruningPass,
-    SymbolDcePass, TaskArithmeticPass, TopologicalSortPass, VerifyShapesPass,
+    MixedPrecisionPass, OptO1Pass, OptO2Pass, OptO3Pass, PackWeightsPass, Pass, PassOptions,
+    PrintOpStatsPass, QuantizeWeightsPass, RematerializePass, SccpPass, ShardSpmdPass,
+    SimplifyAlgebraicPass, SinkTransposePass, SpecializeShapesPass, StripDebugInfoPass,
+    StructuredPruningPass, SymbolDcePass, TaskArithmeticPass, TopologicalSortPass,
+    VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
-use castforge_ir::MergeMethod;
+use castforge_ir::{DType, MergeMethod};
 use indexmap::IndexMap;
 
 pub type PassFactory = Box<dyn Fn(&PassOptions) -> Result<Box<dyn Pass>> + Send + Sync>;
@@ -460,6 +461,23 @@ impl PassRegistry {
                     .unwrap_or(true);
                 Ok(Box::new(EgraphSimplifyPass { fuse_fma }))
             },
+        );
+        reg.register(
+            "mixed-precision",
+            "Applies Automatic Mixed Precision (f16/bf16) casts to GEMM/Conv ops",
+            |opts| {
+                let dtype_str = opts.get("dtype").map(|s| s.to_ascii_lowercase());
+                let target_dtype = match dtype_str.as_deref() {
+                    Some("bf16") | Some("bfloat16") => DType::BF16,
+                    _ => DType::F16,
+                };
+                Ok(Box::new(MixedPrecisionPass { target_dtype }))
+            },
+        );
+        reg.register(
+            "fuse-moe",
+            "Fuses routed Mixture-of-Experts (MoE) expert GEMMs and gate combine into fused_moe",
+            |_opts| Ok(Box::new(FuseMoePass)),
         );
         reg.register(
             "O1",

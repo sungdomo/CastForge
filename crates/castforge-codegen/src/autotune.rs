@@ -146,6 +146,7 @@ pub fn autotune_module(module: &Module, roofline: &HardwareRoofline) -> Autotune
                                         prefetch_distance: pf,
                                         split_k: sk,
                                         loop_skew: false,
+                                        double_buffer: l1 >= 16,
                                     };
                                     let cand = score_candidate(
                                         &cfg,
