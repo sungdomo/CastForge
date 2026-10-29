@@ -1,3 +1,4 @@
+use crate::passes::fuse_gelu::match_gelu_op;
 use crate::passes::fuse_swiglu::match_silu_val;
 use crate::{DeadCodeEliminationPass, Pass, PassResult};
 use anyhow::Result;
@@ -65,6 +66,38 @@ impl Pass for FuseMatmulEpiloguePass {
                     attrs.insert(
                         "epilogue".to_string(),
                         Attribute::String("bias_silu".to_string()),
+                    );
+
+                    let op_mut = &mut module.ops[op_id];
+                    op_mut.name = OpName::new("stablehlo", "composite");
+                    op_mut.operands = SmallVec::from_slice(&[lhs, rhs, bias]);
+                    op_mut.attributes = attrs;
+                    created += 1;
+                    continue;
+                }
+
+                // Check `gelu(add(dot, bias))` rooted at `Multiply`
+                if let Some(add_val) = match_gelu_op(module, op)
+                    && let Some(MatmulAddMatch {
+                        lhs,
+                        rhs,
+                        bias,
+                        dot_attrs,
+                        ..
+                    }) = match_add_of_dot_ignoring_uses(module, add_val)
+                {
+                    let mut attrs = dot_attrs;
+                    attrs.insert(
+                        "name".to_string(),
+                        Attribute::String("castforge.fused_matmul_epilogue".to_string()),
+                    );
+                    attrs.insert(
+                        "decomposition".to_string(),
+                        Attribute::SymbolRef("fused_matmul_bias_gelu_impl".to_string()),
+                    );
+                    attrs.insert(
+                        "epilogue".to_string(),
+                        Attribute::String("bias_gelu".to_string()),
                     );
 
                     let op_mut = &mut module.ops[op_id];

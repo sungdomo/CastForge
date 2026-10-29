@@ -2,8 +2,9 @@ use crate::{
     BakeLoraPass, BufferizeInplacePass, CanonicalizePass, CommonSubexpressionEliminationPass,
     DeadCodeEliminationPass, DecomposeCompositesPass, ExternalizeWeightsPass, FissionLoopsPass,
     FoldBroadcastPass, FoldConstantsPass, FoldConvertPass, FoldNormWeightsPass, FoldReshapePass,
-    FoldSliceConcatPass, FoldTransposePass, FuseAttentionPass, FuseElementwisePass,
-    FuseHorizontalDotPass, FuseLoopsPass, FuseMatmulEpiloguePass, FuseRmsNormPass, FuseRopePass,
+    FoldSliceConcatPass, FoldTransposePass, FuseAttentionPass, FuseDequantMatmulPass,
+    FuseElementwisePass, FuseGatedMlpPass, FuseGeluPass, FuseHorizontalDotPass, FuseLayerNormPass,
+    FuseLoopsPass, FuseMatmulEpiloguePass, FuseResidualNormPass, FuseRmsNormPass, FuseRopePass,
     FuseSoftmaxPass, FuseSwiGluPass, HoistConstantsPass, InlinerPass, IrEditPass, LicmPass,
     MergeWeightsPass, OptO1Pass, OptO2Pass, OptO3Pass, PackWeightsPass, Pass, PassOptions,
     PrintOpStatsPass, QuantizeWeightsPass, SccpPass, SimplifyAlgebraicPass, SinkTransposePass,
@@ -359,6 +360,31 @@ impl PassRegistry {
                     .unwrap_or(2);
                 Ok(Box::new(FissionLoopsPass { max_steps }))
             },
+        );
+        reg.register(
+            "fuse-dequant-matmul",
+            "Fuses uniform_dequantize + dot_general into on-the-fly quantized GEMM (fused_qmatmul)",
+            |_opts| Ok(Box::new(FuseDequantMatmulPass)),
+        );
+        reg.register(
+            "fuse-residual-norm",
+            "Fuses add(x, residual) + RMSNorm into stablehlo.composite (fused_residual_rmsnorm)",
+            |_opts| Ok(Box::new(FuseResidualNormPass)),
+        );
+        reg.register(
+            "fuse-layernorm",
+            "Fuses (x - mean(x)) * rsqrt(var(x) + eps) * gamma + beta into fused_layernorm",
+            |_opts| Ok(Box::new(FuseLayerNormPass)),
+        );
+        reg.register(
+            "fuse-gelu",
+            "Fuses GELU and gated GeGLU (gelu(gate) * up) into stablehlo.composite",
+            |_opts| Ok(Box::new(FuseGeluPass)),
+        );
+        reg.register(
+            "fuse-gated-mlp",
+            "Fuses dual gate/up dot_general + slices + SwiGLU/GeGLU into fused_gated_mlp",
+            |_opts| Ok(Box::new(FuseGatedMlpPass)),
         );
         reg.register(
             "O1",

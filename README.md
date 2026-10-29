@@ -19,7 +19,7 @@ support.
   (`stablehlo.add %0, %1 : tensor<...>`), including `!quant.uniform` quantized tensor types and
   `dense_resource<key>` external weight references.
 - [`crates/castforge-passes`](crates/castforge-passes): Unified `Pass`, `PassRegistry`, and
-  `PassManager` with **45 built-in compiler passes & presets** supporting static Rust construction,
+  `PassManager` with **50 built-in compiler passes & presets** supporting static Rust construction,
   CLI pipeline strings (`-p`), direct subcommand invocation, declarative TOML config files
   (`--config`), and step-by-step pass tracing.
 - [`crates/castforge-viz`](crates/castforge-viz): Computation graph exporter for **Mermaid**,
@@ -32,7 +32,7 @@ support.
 - [`crates/castforge-cli`](crates/castforge-cli): The `castforge` command-line tool (`opt`, `viz`,
   `codegen`, `run`, `list-passes`, plus direct pass subcommands).
 
-## Built-in Transformation Passes & Presets (45 Passes)
+## Built-in Transformation Passes & Presets (50 Passes)
 
 | Pass Name | Category | Description |
 | :--- | :--- | :--- |
@@ -62,11 +62,16 @@ support.
 | `fuse-elementwise` | Fusion | Fuses `add` + `maximum` into `stablehlo.composite` |
 | `fuse-loops` | Fusion | Fuses multi-op elementwise loop chains into 1 register loop |
 | `fission-loops` | Lowering | Splits oversized fused loop chains (`max_steps`) for registers |
-| `fuse-matmul-epilogue` | Fusion | Fuses `dot_general` + bias (`relu`/`tanh`/`silu`/`scale`) |
+| `fuse-matmul-epilogue` | Fusion | Fuses `dot_general` + bias + `relu`/`tanh`/`silu`/`gelu` |
+| `fuse-dequant-matmul` | Fusion | Fuses `uniform_dequantize` + `dot_general` into qGEMM |
 | `fuse-horizontal-dot` | Fusion | Horizontally fuses parallel `dot_general` ops (e.g. Q/K/V) |
+| `fuse-gated-mlp` | Fusion | Fuses dual gate/up `dot_general` + `slice`s + SwiGLU/GeGLU |
 | `fuse-softmax` | Fusion | Fuses `exp(x) / broadcast(reduce_sum(exp(x)))` into composite |
 | `fuse-rmsnorm` | Fusion | Fuses `x * rsqrt(mean(x^2) + eps) * weight` into composite |
+| `fuse-residual-norm` | Fusion | Fuses `add(x, residual)` + RMSNorm into `fused_residual_rmsnorm` |
+| `fuse-layernorm` | Fusion | Fuses `(x - mean(x)) * rsqrt(var(x) + eps) * gamma + beta` |
 | `fuse-swiglu` | Fusion | Fuses SwiGLU (`gate / (1 + exp(-gate)) * up`) into composite |
+| `fuse-gelu` | Fusion | Fuses Tanh-approx GELU and gated GeGLU (`gelu(gate) * up`) |
 | `fuse-rope` | Fusion | Fuses Rotary Position Embedding (`RoPE`) into composite |
 | `fuse-attention` | Fusion | Fuses SDPA & GQA (`softmax(Q @ K^T * scale) @ V`) |
 | `decompose-composites` | Lowering | Expands `stablehlo.composite` ops to primitive StableHLO |
@@ -85,7 +90,7 @@ support.
 ## Quick Start
 
 ```bash
-# 1. List all 45 registered passes and pipeline presets
+# 1. List all 50 registered passes and pipeline presets
 cargo run --bin castforge -- list-passes
 
 # 2. Run an optimization pipeline with automatic numerical verification

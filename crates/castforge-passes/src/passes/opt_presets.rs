@@ -2,10 +2,10 @@
 
 use crate::{
     BakeLoraPass, BufferizeInplacePass, CanonicalizePass, DeadCodeEliminationPass,
-    FoldNormWeightsPass, FuseAttentionPass, FuseElementwisePass, FuseMatmulEpiloguePass,
-    FuseRmsNormPass, FuseRopePass, FuseSoftmaxPass, FuseSwiGluPass, InlinerPass, LicmPass,
-    PackWeightsPass, Pass, PassResult, SccpPass, SinkTransposePass, SpecializeShapesPass,
-    SymbolDcePass, TopologicalSortPass,
+    FoldNormWeightsPass, FuseAttentionPass, FuseDequantMatmulPass, FuseElementwisePass,
+    FuseGeluPass, FuseLayerNormPass, FuseMatmulEpiloguePass, FuseRmsNormPass, FuseRopePass,
+    FuseSoftmaxPass, FuseSwiGluPass, InlinerPass, LicmPass, PackWeightsPass, Pass, PassResult,
+    SccpPass, SinkTransposePass, SpecializeShapesPass, SymbolDcePass, TopologicalSortPass,
 };
 use anyhow::Result;
 use castforge_ir::Module;
@@ -59,11 +59,14 @@ impl Pass for OptO2Pass {
             BakeLoraPass { alpha: 1.0 }.run(module)?,
             FoldNormWeightsPass.run(module)?,
             FuseRmsNormPass.run(module)?,
+            FuseLayerNormPass.run(module)?,
             FuseRopePass.run(module)?,
             FuseSwiGluPass.run(module)?,
+            FuseGeluPass.run(module)?,
             FuseAttentionPass.run(module)?,
             FuseSoftmaxPass.run(module)?,
             FuseMatmulEpiloguePass.run(module)?,
+            FuseDequantMatmulPass.run(module)?,
             FuseElementwisePass.run(module)?,
             CanonicalizePass.run(module)?,
             DeadCodeEliminationPass::default().run(module)?,

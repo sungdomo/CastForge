@@ -315,7 +315,7 @@ fn profile_single_op(module: &Module, op_id: OpId, roofline: &HardwareRoofline) 
         .unwrap_or(0);
 
     let flops = match short {
-        "dot_general" | "fused_matmul_bias" | "fused_matmul_epilogue" => {
+        "dot_general" | "fused_matmul_bias" | "fused_matmul_epilogue" | "fused_qmatmul" => {
             let lhs_dims = op
                 .operands
                 .first()
@@ -332,8 +332,10 @@ fn profile_single_op(module: &Module, op_id: OpId, roofline: &HardwareRoofline) 
             let mut gemm_flops = 2 * m * n * k;
             if short == "fused_matmul_bias" {
                 gemm_flops += m * n;
-            } else if short == "fused_matmul_epilogue" {
-                gemm_flops += m * n;
+            } else if short == "fused_matmul_epilogue" || short == "fused_qmatmul" {
+                if op.operands.len() >= 3 {
+                    gemm_flops += m * n;
+                }
                 let epilogue = match op.attributes.get("epilogue") {
                     Some(Attribute::String(s)) => s.as_str(),
                     _ => "bias",
@@ -341,10 +343,27 @@ fn profile_single_op(module: &Module, op_id: OpId, roofline: &HardwareRoofline) 
                 gemm_flops += match epilogue {
                     "bias_relu" | "bias_scale" => m * n,
                     "bias_tanh" | "bias_silu" => 4 * m * n,
+                    "bias_gelu" => 8 * m * n,
                     _ => 0,
                 };
             }
             gemm_flops
+        }
+        "fused_gated_mlp" => {
+            let lhs_dims = op
+                .operands
+                .first()
+                .map(|&v| static_dims(module, v))
+                .unwrap_or_default();
+            let out_dims = op
+                .results
+                .first()
+                .map(|&v| static_dims(module, v))
+                .unwrap_or_default();
+            let m = out_dims.first().copied().unwrap_or(1);
+            let n = out_dims.get(1).copied().unwrap_or(1);
+            let k = lhs_dims.last().copied().unwrap_or(1);
+            4 * m * n * k + 5 * m * n
         }
         "lora_linear" => {
             let x_dims = op
@@ -381,10 +400,24 @@ fn profile_single_op(module: &Module, op_id: OpId, roofline: &HardwareRoofline) 
             };
             4 * s * s * d + 5 * s * s
         }
-        "swiglu" | "fused_swiglu" | "layer_norm" => 6 * out_elems,
+        "swiglu" | "fused_swiglu" | "fused_geglu" | "layer_norm" | "fused_layernorm" => {
+            6 * out_elems
+        }
         "rope" | "fused_rope" => 3 * out_elems,
-        "gelu" | "silu" | "sigmoid" | "logistic" | "tanh" | "exp" | "log" | "rsqrt" | "sqrt"
-        | "rms_norm" | "fused_rmsnorm" | "fused_softmax" => 4 * out_elems,
+        "gelu"
+        | "fused_gelu"
+        | "silu"
+        | "sigmoid"
+        | "logistic"
+        | "tanh"
+        | "exp"
+        | "log"
+        | "rsqrt"
+        | "sqrt"
+        | "rms_norm"
+        | "fused_rmsnorm"
+        | "fused_residual_rmsnorm"
+        | "fused_softmax" => 4 * out_elems,
         "fma" => 2 * out_elems,
         "add" | "subtract" | "multiply" | "divide" | "maximum" | "minimum" | "power" | "negate"
         | "abs" | "relu" | "clamp" | "dequantize_int8" => out_elems,

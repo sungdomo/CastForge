@@ -625,3 +625,150 @@ fn test_o1_o2_o3_and_llm_opt_presets() {
     assert!(!printed_sym.contains('?'));
     assert!(printed_sym.contains("packed_rhs = true"));
 }
+
+const DEQUANT_MATMUL_AND_RESIDUAL_NORM_MLIR: &str = r#"
+module @qmatmul_and_res_norm {
+  func.func @forward(
+    %x: tensor<2x2xf32>,
+    %res: tensor<2x2xf32>,
+    %rw: tensor<2x2xf32>
+  ) -> tensor<2x2xf32> {
+    %zero = stablehlo.constant dense<0.0> : tensor<f32>
+    %two = stablehlo.constant dense<2.0> : tensor<2xf32>
+    %eps = stablehlo.constant dense<0.00001> : tensor<2xf32>
+    %w = stablehlo.constant dense<[[0.5, -0.25], [0.75, 0.5]]> : tensor<2x2xf32>
+
+    // Residual Add + RMSNorm: h = x + res
+    %h = stablehlo.add %x, %res : tensor<2x2xf32>
+    %sq = stablehlo.multiply %h, %h : tensor<2x2xf32>
+    %sum = stablehlo.reduce %sq, %zero
+      {dimensions = [1], reducer = "stablehlo.add"}
+      : (tensor<2x2xf32>, tensor<f32>) -> tensor<2xf32>
+    %mean = stablehlo.divide %sum, %two : tensor<2xf32>
+    %var = stablehlo.add %mean, %eps : tensor<2xf32>
+    %inv = stablehlo.rsqrt %var : tensor<2xf32>
+    %inv_b = stablehlo.broadcast_in_dim %inv, dims = [0] : (tensor<2xf32>) -> tensor<2x2xf32>
+    %norm0 = stablehlo.multiply %h, %inv_b : tensor<2x2xf32>
+    %norm = stablehlo.multiply %norm0, %rw : tensor<2x2xf32>
+
+    %out = stablehlo.dot_general %norm, %w, contracting_dims = [1] x [0]
+      : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+    func.return %out : tensor<2x2xf32>
+  }
+}
+"#;
+
+const LAYERNORM_GELU_AND_GATED_MLP_MLIR: &str = r#"
+module @layernorm_gelu_gated_mlp {
+  func.func @forward(%x: tensor<2x2xf32>) -> tensor<2x2xf32> {
+    %zero = stablehlo.constant dense<0.0> : tensor<f32>
+    %two = stablehlo.constant dense<2.0> : tensor<2xf32>
+    %eps = stablehlo.constant dense<0.00001> : tensor<2xf32>
+    %gamma = stablehlo.constant dense<[[1.0, 1.0], [1.0, 1.0]]> : tensor<2x2xf32>
+    %beta = stablehlo.constant dense<[[0.1, -0.1], [0.1, -0.1]]> : tensor<2x2xf32>
+
+    // 1. Decomposed LayerNorm(x, gamma, beta)
+    %sum_x = stablehlo.reduce %x, %zero
+      {dimensions = [1], reducer = "stablehlo.add"}
+      : (tensor<2x2xf32>, tensor<f32>) -> tensor<2xf32>
+    %mean_x = stablehlo.divide %sum_x, %two : tensor<2xf32>
+    %mean_b = stablehlo.broadcast_in_dim %mean_x, dims = [0] : (tensor<2xf32>) -> tensor<2x2xf32>
+    %centered = stablehlo.subtract %x, %mean_b : tensor<2x2xf32>
+    %c_sq = stablehlo.multiply %centered, %centered : tensor<2x2xf32>
+    %sum_v = stablehlo.reduce %c_sq, %zero
+      {dimensions = [1], reducer = "stablehlo.add"}
+      : (tensor<2x2xf32>, tensor<f32>) -> tensor<2xf32>
+    %var_x = stablehlo.divide %sum_v, %two : tensor<2xf32>
+    %var_eps = stablehlo.add %var_x, %eps : tensor<2xf32>
+    %inv_std = stablehlo.rsqrt %var_eps : tensor<2xf32>
+    %inv_b = stablehlo.broadcast_in_dim %inv_std, dims = [0] : (tensor<2xf32>) -> tensor<2x2xf32>
+    %ln0 = stablehlo.multiply %centered, %inv_b : tensor<2x2xf32>
+    %ln1 = stablehlo.multiply %ln0, %gamma : tensor<2x2xf32>
+    %ln = stablehlo.add %ln1, %beta : tensor<2x2xf32>
+
+    // 2. Dual Gate/Up projections + GeGLU: gelu(gate) * up
+    %wg = stablehlo.constant dense<[[0.5, -0.3], [0.2, 0.4]]> : tensor<2x2xf32>
+    %wu = stablehlo.constant dense<[[0.3, 0.6], [-0.4, 0.2]]> : tensor<2x2xf32>
+    %gate = stablehlo.dot_general %ln, %wg, contracting_dims = [1] x [0]
+      : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+    %up = stablehlo.dot_general %ln, %wu, contracting_dims = [1] x [0]
+      : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+
+    %half = stablehlo.constant dense<0.5> : tensor<2x2xf32>
+    %one = stablehlo.constant dense<1.0> : tensor<2x2xf32>
+    %c_k = stablehlo.constant dense<0.79788456> : tensor<2x2xf32>
+    %c_a = stablehlo.constant dense<0.044715> : tensor<2x2xf32>
+    %g2 = stablehlo.multiply %gate, %gate : tensor<2x2xf32>
+    %g3 = stablehlo.multiply %g2, %gate : tensor<2x2xf32>
+    %ag3 = stablehlo.multiply %c_a, %g3 : tensor<2x2xf32>
+    %poly = stablehlo.add %gate, %ag3 : tensor<2x2xf32>
+    %inner = stablehlo.multiply %c_k, %poly : tensor<2x2xf32>
+    %th = stablehlo.tanh %inner : tensor<2x2xf32>
+    %one_p = stablehlo.add %one, %th : tensor<2x2xf32>
+    %half_g = stablehlo.multiply %half, %gate : tensor<2x2xf32>
+    %gelu_g = stablehlo.multiply %half_g, %one_p : tensor<2x2xf32>
+    %out = stablehlo.multiply %gelu_g, %up : tensor<2x2xf32>
+    func.return %out : tensor<2x2xf32>
+  }
+}
+"#;
+
+#[test]
+fn test_fuse_dequant_matmul_residual_norm_layernorm_gelu_and_gated_mlp() {
+    let registry = PassRegistry::with_builtin_passes();
+
+    // 1. Test `fuse-residual-norm,quantize-weights(bits=8,min_elements=4),fuse-dequant-matmul`
+    let mut mod_q = parse_mlir(DEQUANT_MATMUL_AND_RESIDUAL_NORM_MLIR).expect("parse qmatmul mlir");
+    let mut pm_q_only =
+        PassManager::from_pipeline_str(&registry, "quantize-weights(bits=8,min_elements=4)")
+            .expect("quant pipe");
+    let mut ref_quantized = mod_q.clone();
+    pm_q_only.run(&mut ref_quantized).expect("run quant");
+
+    let mut pm_fuse = PassManager::from_pipeline_str(
+        &registry,
+        "fuse-residual-norm,quantize-weights(bits=8,min_elements=4),fuse-dequant-matmul",
+    )
+    .expect("fuse-residual-norm,quantize-weights,fuse-dequant-matmul");
+    let res_fuse = pm_fuse.run(&mut mod_q).expect("run qmatmul+resnorm fusion");
+    assert!(res_fuse[0].changed);
+    assert!(res_fuse[2].changed);
+
+    let printed_q = print_mlir(&mod_q);
+    assert!(printed_q.contains("castforge.fused_residual_rmsnorm"));
+    assert!(printed_q.contains("castforge.fused_qmatmul"));
+    assert!(!printed_q.contains("stablehlo.uniform_dequantize"));
+
+    let rep_q =
+        verify_module_numerics(&ref_quantized, &mod_q, 1e-5).expect("verify qmatmul numerics");
+    assert!(rep_q.passed, "max_abs_diff = {}", rep_q.max_abs_diff);
+
+    let rust_q = generate_code(&mod_q, CodegenTarget::Rust).expect("rust qmatmul codegen");
+    assert!(rust_q.contains("[qmatmul:on-the-fly dequant"));
+    let c_q = generate_code(&mod_q, CodegenTarget::C).expect("c qmatmul codegen");
+    assert!(c_q.contains("[qmatmul:on-the-fly dequant"));
+
+    // 2. Test `fuse-layernorm,fuse-gated-mlp` (which also exercises `fuse-gelu` / GeGLU)
+    let before_ln = parse_mlir(LAYERNORM_GELU_AND_GATED_MLP_MLIR).expect("parse ln+geglu mlir");
+    let mut fused_ln = before_ln.clone();
+    let mut pm_ln = PassManager::from_pipeline_str(&registry, "fuse-layernorm,fuse-gated-mlp")
+        .expect("fuse-layernorm,fuse-gated-mlp");
+    let res_ln = pm_ln.run(&mut fused_ln).expect("run ln+gated_mlp");
+    assert!(res_ln[0].changed);
+    assert!(res_ln[1].changed);
+
+    let printed_ln = print_mlir(&fused_ln);
+    assert!(printed_ln.contains("castforge.fused_layernorm"));
+    assert!(printed_ln.contains("castforge.fused_gated_mlp"));
+    assert!(printed_ln.contains("activation = \"geglu\""));
+
+    let rep_ln = verify_module_numerics(&before_ln, &fused_ln, 1e-5).expect("verify ln+gated_mlp");
+    assert!(rep_ln.passed, "max_abs_diff = {}", rep_ln.max_abs_diff);
+
+    let rust_ln = generate_code(&fused_ln, CodegenTarget::Rust).expect("rust ln+gated_mlp codegen");
+    assert!(rust_ln.contains("let mean = sum / 2.0_f32;"));
+    assert!(rust_ln.contains("0.79788456_f32"));
+    let c_ln = generate_code(&fused_ln, CodegenTarget::C).expect("c ln+gated_mlp codegen");
+    assert!(c_ln.contains("float mean = sum / 2.0f;"));
+    assert!(c_ln.contains("0.79788456f"));
+}

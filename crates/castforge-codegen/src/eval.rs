@@ -176,11 +176,21 @@ pub fn evaluate_function(
                 .as_tensor()
                 .ok_or_else(|| anyhow!("constant without tensor type"))?;
             let val_attr = op.attributes.get("value");
-            if let DType::QuantUniform { .. } = &t_ty.dtype {
+            if let DType::QuantUniform {
+                scale, zero_point, ..
+            } = &t_ty.dtype
+            {
                 let q_vals = val_attr
                     .and_then(|a| module.tensor_store.resolve_i8_attr(a, res_len))
                     .unwrap_or_else(|| vec![0; res_len]);
+                let sc = scale.parse::<f32>().unwrap_or(1.0);
+                let zp = *zero_point;
+                let deq: Vec<f32> = q_vals
+                    .iter()
+                    .map(|&q| (q as i32 - zp as i32) as f32 * sc)
+                    .collect();
                 q_env.insert(res_val, q_vals);
+                env.insert(res_val, deq);
             } else {
                 let vals = val_attr
                     .and_then(|a| module.tensor_store.resolve_f32_attr(a, res_len))
@@ -469,6 +479,7 @@ fn eval_stablehlo_op(
                             "bias_relu" => val.max(z[i]),
                             "bias_tanh" => val.tanh(),
                             "bias_silu" => val / (1.0 + (-val).exp()),
+                            "bias_gelu" => eval_gelu_scalar(val),
                             "bias_scale" => val * z[i],
                             _ => val,
                         }
@@ -584,6 +595,155 @@ fn eval_stablehlo_op(
                     .and_then(|a| a.as_str())
                     .unwrap_or("");
                 eval_fused_loop_chain(res_len, &inputs, steps_str, &get_v)
+            } else if name == "castforge.fused_qmatmul" && inputs.len() >= 2 {
+                let packed = op
+                    .attributes
+                    .get("packed_rhs")
+                    .is_some_and(|a| matches!(a, castforge_ir::Attribute::Bool(true)));
+                let mm = eval_matmul_2d(module, inputs[0], inputs[1], packed, &get_v);
+                if inputs.len() >= 3 {
+                    let bias = get_v(inputs[2]);
+                    let epilogue = op
+                        .attributes
+                        .get("epilogue")
+                        .and_then(|a| a.as_str())
+                        .unwrap_or("bias");
+                    let z = inputs
+                        .get(3)
+                        .map(|&v| get_v(v))
+                        .unwrap_or_else(|| vec![0.0; res_len]);
+                    (0..res_len)
+                        .map(|i| {
+                            let val = mm[i] + bias[i];
+                            match epilogue {
+                                "bias_relu" => val.max(z[i]),
+                                "bias_tanh" => val.tanh(),
+                                "bias_silu" => val / (1.0 + (-val).exp()),
+                                "bias_gelu" => eval_gelu_scalar(val),
+                                "bias_scale" => val * z[i],
+                                _ => val,
+                            }
+                        })
+                        .collect()
+                } else {
+                    mm
+                }
+            } else if name == "castforge.fused_residual_rmsnorm" && inputs.len() >= 2 {
+                let (x, res_in) = (get_v(inputs[0]), get_v(inputs[1]));
+                let w_opt = inputs.get(2).map(|&v| get_v(v));
+                let eps = match op.attributes.get("eps") {
+                    Some(castforge_ir::Attribute::Float(f)) => *f as f32,
+                    _ => 1e-5_f32,
+                };
+                let dims = module.values[res_val]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_else(|| vec![1, res_len]);
+                let cols = *dims.last().unwrap_or(&res_len).max(&1);
+                let rows = (res_len / cols).max(1);
+                let mut out = vec![0.0_f32; res_len];
+                for r in 0..rows {
+                    let mut sq_sum = 0.0_f32;
+                    for c in 0..cols {
+                        let idx = r * cols + c;
+                        let h = x[idx] + res_in[idx];
+                        sq_sum += h * h;
+                    }
+                    let inv_rms = 1.0_f32 / (sq_sum / (cols as f32) + eps).sqrt();
+                    for c in 0..cols {
+                        let idx = r * cols + c;
+                        let h = x[idx] + res_in[idx];
+                        let w_val = w_opt
+                            .as_ref()
+                            .and_then(|w| w.get(idx).or_else(|| w.get(c)).copied())
+                            .unwrap_or(1.0);
+                        out[idx] = h * inv_rms * w_val;
+                    }
+                }
+                out
+            } else if name == "castforge.fused_layernorm" && !inputs.is_empty() {
+                let x = get_v(inputs[0]);
+                let g_opt = inputs.get(1).map(|&v| get_v(v));
+                let b_opt = inputs.get(2).map(|&v| get_v(v));
+                let eps = match op.attributes.get("eps") {
+                    Some(castforge_ir::Attribute::Float(f)) => *f as f32,
+                    _ => 1e-5_f32,
+                };
+                let dims = module.values[res_val]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_else(|| vec![1, res_len]);
+                let cols = *dims.last().unwrap_or(&res_len).max(&1);
+                let rows = (res_len / cols).max(1);
+                let mut out = vec![0.0_f32; res_len];
+                for r in 0..rows {
+                    let mut sum = 0.0_f32;
+                    for c in 0..cols {
+                        sum += x[r * cols + c];
+                    }
+                    let mean = sum / (cols as f32);
+                    let mut var_sum = 0.0_f32;
+                    for c in 0..cols {
+                        let d = x[r * cols + c] - mean;
+                        var_sum += d * d;
+                    }
+                    let inv_std = 1.0_f32 / (var_sum / (cols as f32) + eps).sqrt();
+                    for c in 0..cols {
+                        let idx = r * cols + c;
+                        let g_v = g_opt
+                            .as_ref()
+                            .and_then(|g| g.get(idx).or_else(|| g.get(c)).copied())
+                            .unwrap_or(1.0);
+                        let b_v = b_opt
+                            .as_ref()
+                            .and_then(|b| b.get(idx).or_else(|| b.get(c)).copied())
+                            .unwrap_or(0.0);
+                        out[idx] = (x[idx] - mean) * inv_std * g_v + b_v;
+                    }
+                }
+                out
+            } else if name == "castforge.fused_gelu" && !inputs.is_empty() {
+                let x = get_v(inputs[0]);
+                x.into_iter().map(eval_gelu_scalar).collect()
+            } else if name == "castforge.fused_geglu" && inputs.len() >= 2 {
+                let (g, u) = (get_v(inputs[0]), get_v(inputs[1]));
+                (0..res_len)
+                    .map(|i| eval_gelu_scalar(g[i]) * u[i])
+                    .collect()
+            } else if name == "castforge.fused_gated_mlp" && inputs.len() >= 2 {
+                let packed = op
+                    .attributes
+                    .get("packed_rhs")
+                    .is_some_and(|a| matches!(a, castforge_ir::Attribute::Bool(true)));
+                let act = op
+                    .attributes
+                    .get("activation")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("swiglu");
+                let wide = eval_matmul_2d(module, inputs[0], inputs[1], packed, &get_v);
+                let out_dims = module.values[res_val]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_else(|| vec![1, res_len]);
+                let n = *out_dims.last().unwrap_or(&res_len).max(&1);
+                let m = (res_len / n).max(1);
+                let mut out = vec![0.0_f32; res_len];
+                for r in 0..m {
+                    for c in 0..n {
+                        let gate = wide[r * (2 * n) + c];
+                        let up = wide[r * (2 * n) + n + c];
+                        let g_act = if act == "geglu" {
+                            eval_gelu_scalar(gate)
+                        } else {
+                            gate / (1.0 + (-gate).exp())
+                        };
+                        out[r * n + c] = g_act * up;
+                    }
+                }
+                out
             } else {
                 get_v(inputs[0])
             }
@@ -750,4 +910,8 @@ fn eval_fused_loop_chain(
         *out_elem = regs.last().copied().unwrap_or(0.0);
     }
     out
+}
+
+fn eval_gelu_scalar(x: f32) -> f32 {
+    0.5 * x * (1.0 + (0.797_884_6_f32 * (x + 0.044715_f32 * x * x * x)).tanh())
 }

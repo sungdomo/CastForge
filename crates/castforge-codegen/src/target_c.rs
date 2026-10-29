@@ -558,6 +558,13 @@ fn emit_c_hlo_op(
                             "            {res_name}[idx] = val / (1.0f + expf(-val));"
                         )?;
                     }
+                    "bias_gelu" => {
+                        writeln!(
+                            out,
+                            "            {res_name}[idx] = 0.5f * val * \
+                             (1.0f + tanhf(0.79788456f * (val + 0.044715f * val * val * val)));"
+                        )?;
+                    }
                     "bias_scale" if inputs.len() >= 4 => {
                         let s = value_ident(module, inputs[3], names, counter);
                         writeln!(out, "            {res_name}[idx] = val * {s}[idx];")?;
@@ -691,6 +698,40 @@ fn emit_c_hlo_op(
                     .unwrap_or("");
                 emit_c_fused_loop_chain(
                     module, &inputs, res_name, res_len, steps_str, names, counter, out,
+                )?;
+            } else if name == "castforge.fused_qmatmul" && inputs.len() >= 2 {
+                emit_c_qmatmul(module, op, &inputs, res_name, names, counter, out)?;
+            } else if name == "castforge.fused_residual_rmsnorm" && inputs.len() >= 2 {
+                emit_c_residual_rmsnorm(
+                    module, op, &inputs, res_name, res_len, names, counter, out,
+                )?;
+            } else if name == "castforge.fused_layernorm" && !inputs.is_empty() {
+                emit_c_layernorm(module, op, &inputs, res_name, res_len, names, counter, out)?;
+            } else if name == "castforge.fused_gelu" && !inputs.is_empty() {
+                let x = value_ident(module, inputs[0], names, counter);
+                writeln!(out, "    for (int i = 0; i < {res_len}; ++i) {{")?;
+                writeln!(out, "        float v = {x}[i];")?;
+                writeln!(
+                    out,
+                    "        {res_name}[i] = 0.5f * v * \
+                     (1.0f + tanhf(0.79788456f * (v + 0.044715f * v * v * v)));"
+                )?;
+                writeln!(out, "    }}")?;
+            } else if name == "castforge.fused_geglu" && inputs.len() >= 2 {
+                let g = value_ident(module, inputs[0], names, counter);
+                let u = value_ident(module, inputs[1], names, counter);
+                writeln!(out, "    for (int i = 0; i < {res_len}; ++i) {{")?;
+                writeln!(out, "        float v = {g}[i];")?;
+                writeln!(
+                    out,
+                    "        float gv = 0.5f * v * \
+                     (1.0f + tanhf(0.79788456f * (v + 0.044715f * v * v * v)));"
+                )?;
+                writeln!(out, "        {res_name}[i] = gv * {u}[i];")?;
+                writeln!(out, "    }}")?;
+            } else if name == "castforge.fused_gated_mlp" && inputs.len() >= 2 {
+                emit_c_gated_mlp(
+                    module, op, inputs[0], inputs[1], res_name, names, counter, out,
                 )?;
             } else {
                 let src = value_ident(module, inputs[0], names, counter);
@@ -834,4 +875,262 @@ fn emit_c_fused_loop_chain(
     writeln!(out, "        {res_name}[i] = s{last_idx};")?;
     writeln!(out, "    }}")?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_c_qmatmul(
+    module: &Module,
+    op: &castforge_ir::Operation,
+    inputs: &[ValueId],
+    res_name: &str,
+    names: &mut HashMap<ValueId, String>,
+    counter: &mut usize,
+    out: &mut String,
+) -> Result<()> {
+    let packed = op
+        .attributes
+        .get("packed_rhs")
+        .is_some_and(|a| matches!(a, castforge_ir::Attribute::Bool(true)));
+    let scale = match op.attributes.get("scale") {
+        Some(castforge_ir::Attribute::Float(f)) => *f as f32,
+        _ => 1.0_f32,
+    };
+    let zp = match op.attributes.get("zero_point") {
+        Some(castforge_ir::Attribute::Int(z)) => *z as i32,
+        _ => 0,
+    };
+    let (m, k, n) = matmul_dims_ex(module, inputs[0], inputs[1], packed);
+    let a = value_ident(module, inputs[0], names, counter);
+    let w_q = value_ident(module, inputs[1], names, counter);
+    let b_idx = if packed {
+        format!("n * {k} + k")
+    } else {
+        format!("k * {n} + n")
+    };
+    writeln!(
+        out,
+        "    /* [qmatmul:on-the-fly dequant(scale={scale:.6}, zp={zp})] */"
+    )?;
+    writeln!(out, "    for (int m = 0; m < {m}; ++m) {{")?;
+    writeln!(out, "        for (int n = 0; n < {n}; ++n) {{")?;
+    writeln!(out, "            float acc = 0.0f;")?;
+    writeln!(out, "            for (int k = 0; k < {k}; ++k) {{")?;
+    writeln!(
+        out,
+        "                float w_val = ((float)((int){w_q}[{b_idx}] - {zp})) * {scale:.6}f;"
+    )?;
+    writeln!(out, "                acc += {a}[m * {k} + k] * w_val;")?;
+    writeln!(out, "            }}")?;
+    if let Some(&bias_id) = inputs.get(2) {
+        let bias = value_ident(module, bias_id, names, counter);
+        writeln!(
+            out,
+            "            {res_name}[m * {n} + n] = acc + {bias}[m * {n} + n];"
+        )?;
+    } else {
+        writeln!(out, "            {res_name}[m * {n} + n] = acc;")?;
+    }
+    writeln!(out, "        }}")?;
+    writeln!(out, "    }}")?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_c_residual_rmsnorm(
+    module: &Module,
+    op: &castforge_ir::Operation,
+    inputs: &[ValueId],
+    res_name: &str,
+    res_len: usize,
+    names: &mut HashMap<ValueId, String>,
+    counter: &mut usize,
+    out: &mut String,
+) -> Result<()> {
+    let x = value_ident(module, inputs[0], names, counter);
+    let res_in = value_ident(module, inputs[1], names, counter);
+    let dims = module.values[inputs[0]]
+        .ty
+        .as_tensor()
+        .map(tensor_shape_dims)
+        .unwrap_or_else(|| vec![1, res_len]);
+    let cols = *dims.last().unwrap_or(&res_len).max(&1);
+    let rows = (res_len / cols).max(1);
+    let eps = match op.attributes.get("eps") {
+        Some(castforge_ir::Attribute::Float(f)) => *f as f32,
+        _ => 1e-5_f32,
+    };
+    writeln!(out, "    for (int r = 0; r < {rows}; ++r) {{")?;
+    writeln!(out, "        float sq = 0.0f;")?;
+    writeln!(out, "        for (int c = 0; c < {cols}; ++c) {{")?;
+    writeln!(
+        out,
+        "            float h = {x}[r * {cols} + c] + {res_in}[r * {cols} + c];"
+    )?;
+    writeln!(out, "            sq += h * h;")?;
+    writeln!(out, "        }}")?;
+    writeln!(
+        out,
+        "        float inv = 1.0f / sqrtf(sq / {cols}.0f + {eps:.6}f);"
+    )?;
+    if let Some(&w_id) = inputs.get(2) {
+        let w = value_ident(module, w_id, names, counter);
+        writeln!(
+            out,
+            "        for (int c = 0; c < {cols}; ++c) \
+             {res_name}[r * {cols} + c] = \
+             ({x}[r * {cols} + c] + {res_in}[r * {cols} + c]) * inv * {w}[r * {cols} + c];"
+        )?;
+    } else {
+        writeln!(
+            out,
+            "        for (int c = 0; c < {cols}; ++c) \
+             {res_name}[r * {cols} + c] = ({x}[r * {cols} + c] + {res_in}[r * {cols} + c]) * inv;"
+        )?;
+    }
+    writeln!(out, "    }}")?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_c_layernorm(
+    module: &Module,
+    op: &castforge_ir::Operation,
+    inputs: &[ValueId],
+    res_name: &str,
+    res_len: usize,
+    names: &mut HashMap<ValueId, String>,
+    counter: &mut usize,
+    out: &mut String,
+) -> Result<()> {
+    let x = value_ident(module, inputs[0], names, counter);
+    let dims = module.values[inputs[0]]
+        .ty
+        .as_tensor()
+        .map(tensor_shape_dims)
+        .unwrap_or_else(|| vec![1, res_len]);
+    let cols = *dims.last().unwrap_or(&res_len).max(&1);
+    let rows = (res_len / cols).max(1);
+    let eps = match op.attributes.get("eps") {
+        Some(castforge_ir::Attribute::Float(f)) => *f as f32,
+        _ => 1e-5_f32,
+    };
+    writeln!(out, "    for (int r = 0; r < {rows}; ++r) {{")?;
+    writeln!(out, "        float sum = 0.0f;")?;
+    writeln!(
+        out,
+        "        for (int c = 0; c < {cols}; ++c) sum += {x}[r * {cols} + c];"
+    )?;
+    writeln!(out, "        float mean = sum / {cols}.0f;")?;
+    writeln!(out, "        float var_s = 0.0f;")?;
+    writeln!(
+        out,
+        "        for (int c = 0; c < {cols}; ++c) \
+         {{ float d = {x}[r * {cols} + c] - mean; var_s += d * d; }}"
+    )?;
+    writeln!(
+        out,
+        "        float inv = 1.0f / sqrtf(var_s / {cols}.0f + {eps:.6}f);"
+    )?;
+    let mut expr = format!("({x}[r * {cols} + c] - mean) * inv");
+    if let Some(&g_id) = inputs.get(1) {
+        let g = value_ident(module, g_id, names, counter);
+        expr = format!("{expr} * {g}[r * {cols} + c]");
+    }
+    if let Some(&b_id) = inputs.get(2) {
+        let b = value_ident(module, b_id, names, counter);
+        expr = format!("{expr} + {b}[r * {cols} + c]");
+    }
+    writeln!(
+        out,
+        "        for (int c = 0; c < {cols}; ++c) {res_name}[r * {cols} + c] = {expr};"
+    )?;
+    writeln!(out, "    }}")?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_c_gated_mlp(
+    module: &Module,
+    op: &castforge_ir::Operation,
+    x_id: ValueId,
+    w_id: ValueId,
+    res_name: &str,
+    names: &mut HashMap<ValueId, String>,
+    counter: &mut usize,
+    out: &mut String,
+) -> Result<()> {
+    let packed = op
+        .attributes
+        .get("packed_rhs")
+        .is_some_and(|a| matches!(a, castforge_ir::Attribute::Bool(true)));
+    let act = op
+        .attributes
+        .get("activation")
+        .and_then(|a| a.as_str())
+        .unwrap_or("swiglu");
+    let (m, k, wide_n) = matmul_dims_ex(module, x_id, w_id, packed);
+    let n = (wide_n / 2).max(1);
+    let a = value_ident(module, x_id, names, counter);
+    let w = value_ident(module, w_id, names, counter);
+    let wg_idx = if packed {
+        format!("n * {k} + k")
+    } else {
+        format!("k * {wide_n} + n")
+    };
+    let wu_idx = if packed {
+        format!("(n + {n}) * {k} + k")
+    } else {
+        format!("k * {wide_n} + n + {n}")
+    };
+    writeln!(out, "    for (int m = 0; m < {m}; ++m) {{")?;
+    writeln!(out, "        for (int n = 0; n < {n}; ++n) {{")?;
+    writeln!(out, "            float gate = 0.0f;")?;
+    writeln!(out, "            float up = 0.0f;")?;
+    writeln!(out, "            for (int k = 0; k < {k}; ++k) {{")?;
+    writeln!(out, "                float xv = {a}[m * {k} + k];")?;
+    writeln!(out, "                gate += xv * {w}[{wg_idx}];")?;
+    writeln!(out, "                up += xv * {w}[{wu_idx}];")?;
+    writeln!(out, "            }}")?;
+    if act == "geglu" {
+        writeln!(
+            out,
+            "            float g_act = 0.5f * gate * \
+             (1.0f + tanhf(0.79788456f * (gate + 0.044715f * gate * gate * gate)));"
+        )?;
+    } else {
+        writeln!(
+            out,
+            "            float g_act = gate / (1.0f + expf(-gate));"
+        )?;
+    }
+    writeln!(out, "            {res_name}[m * {n} + n] = g_act * up;")?;
+    writeln!(out, "        }}")?;
+    writeln!(out, "    }}")?;
+    Ok(())
+}
+
+fn matmul_dims_ex(
+    module: &Module,
+    lhs: ValueId,
+    rhs: ValueId,
+    packed: bool,
+) -> (usize, usize, usize) {
+    let lhs_dims = module.values[lhs]
+        .ty
+        .as_tensor()
+        .map(tensor_shape_dims)
+        .unwrap_or_else(|| vec![1, 1]);
+    let rhs_dims = module.values[rhs]
+        .ty
+        .as_tensor()
+        .map(tensor_shape_dims)
+        .unwrap_or_else(|| vec![1, 1]);
+    let m = *lhs_dims.first().unwrap_or(&1);
+    let k = *lhs_dims.get(1).unwrap_or(&1);
+    let n = if packed {
+        *rhs_dims.first().unwrap_or(&1)
+    } else {
+        *rhs_dims.get(1).unwrap_or(&1)
+    };
+    (m, k, n)
 }
