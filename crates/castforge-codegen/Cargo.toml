@@ -3,7 +3,8 @@ name = "castforge-codegen"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Static buffer planner and multi-target codegen (Rust, C99, WGSL) for CastForge"
+repository.workspace = true
+description = "Arena memory planner, LoopIR, JIT/Roofline autotuner, and multi-target codegen"
 
 [dependencies]
 castforge-ir.workspace = true

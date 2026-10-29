@@ -1,3 +1,8 @@
+//! Liveness analyzer, interval-coloring arena [`MemoryPlan`], progressive [`LoopModule`] IR,
+//! Roofline & native JIT schedule auto-tuner, reference IR interpreter, and multi-target code
+//! generator (Rust, C99, WebGPU WGSL, NVIDIA CUDA, Apple Metal, C/C++ header, and native shared
+//! library) (`castforge-codegen`).
+
 pub mod autotune;
 pub mod cost_model;
 pub mod eval;

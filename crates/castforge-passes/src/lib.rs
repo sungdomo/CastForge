@@ -1,3 +1,6 @@
+//! Unified [`Pass`], [`PassRegistry`], [`PassManager`], and **91 built-in A-to-B IR translator
+//! passes & presets** (`castforge-passes`).
+
 pub mod passes;
 pub mod registry;
 pub use passes::*;

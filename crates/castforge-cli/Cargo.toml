@@ -3,6 +3,7 @@ name = "castforge-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Command-line interface for the CastForge AI Model IR Transformation Suite"
 
 [[bin]]

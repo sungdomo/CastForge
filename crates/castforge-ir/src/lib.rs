@@ -1,3 +1,10 @@
+//! Core MLIR-compatible Dual-Plane Intermediate Representation (`castforge-ir`).
+//!
+//! Provides arena-allocated SSA IR data structures ([`Module`], [`Operation`], [`Value`],
+//! [`Block`], [`Region`], [`Type`], [`Attribute`], [`Location`]), the [`TensorStore`] weight
+//! plane, SafeTensors binary I/O, and the composable [`Translator`] / [`TranslatorChain`]
+//! A-to-B pipeline abstraction.
+
 pub mod attr;
 pub mod safetensors_io;
 pub mod tensor_store;

@@ -3,7 +3,8 @@ name = "castforge-mlir"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Pure-Rust MLIR (Generic + StableHLO/Func) parser and printer for CastForge"
+repository.workspace = true
+description = "Pure-Rust MLIR parser/printer and symmetric ONNX/GGUF/SafeTensors I/O for CastForge"
 
 [dependencies]
 anyhow.workspace = true

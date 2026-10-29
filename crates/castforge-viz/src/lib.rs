@@ -1,3 +1,6 @@
+//! Computation graph visualization exporter (Mermaid, Graphviz DOT, JSON, Interactive HTML
+//! Pass Timeline Debugger) and IR snapshot diffing translators (`castforge-viz`).
+
 pub mod timeline;
 pub use timeline::render_timeline_html;
 

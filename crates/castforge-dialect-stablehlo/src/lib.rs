@@ -1,3 +1,6 @@
+//! Strongly-typed `stablehlo` and `func` dialect views and shape verifiers
+//! (`castforge-dialect-stablehlo`).
+
 pub mod verify;
 pub use verify::{FuncView, verify_stablehlo_shapes};
 

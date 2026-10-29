@@ -3,7 +3,8 @@ name = "castforge-viz"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Graph visualization exporter (Mermaid, DOT, JSON, HTML Debugger) for CastForge"
+repository.workspace = true
+description = "Graph visualization exporter (Mermaid, DOT, JSON, HTML, Diff) for CastForge"
 
 [dependencies]
 castforge-ir.workspace = true

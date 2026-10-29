@@ -1,3 +1,6 @@
+//! Pure-Rust MLIR parser & printer and symmetric ONNX-JSON / GGUF / SafeTensors model translators
+//! (`castforge-mlir`).
+
 pub mod export;
 pub mod import;
 pub mod parser;

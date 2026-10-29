@@ -11,9 +11,13 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/sungdomo/CastForge"
+readme = "README.md"
+keywords = ["mlir", "stablehlo", "compiler", "llm", "codegen"]
+categories = ["compilers", "science"]
 
 [workspace.dependencies]
 slotmap = { version = "1.0", features = ["serde"] }

@@ -3,6 +3,7 @@ name = "castforge-ir"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Core MLIR-compatible Dual-Plane IR (Compute Graph + TensorStore) for CastForge"
 
 [dependencies]

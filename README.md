@@ -17,22 +17,24 @@ support.
 - [`crates/castforge-mlir`](crates/castforge-mlir): Zero-C++ MLIR parser & printer supporting both
   **MLIR Generic Form** (`"stablehlo.add"(...)`) and **Pretty/Custom Syntax**
   (`stablehlo.add %0, %1 : tensor<...>`), `!quant.uniform` quantized tensor types,
-  `dense_resource<key>` external weight references, plus **GGUF v2/v3** and **ONNX-JSON** model
-  importers.
+  `dense_resource<key>` external weight references, plus symmetric **GGUF v2/v3**, **ONNX-JSON**,
+  and **SafeTensors** model importers & exporters.
 - [`crates/castforge-passes`](crates/castforge-passes): Unified `Pass`, `PassRegistry`, and
   `PassManager` with **91 built-in A-to-B IR translator modules & presets** supporting static Rust
   construction, CLI pipeline strings (`-p`, comma- or `|`-separated), Unix pipe (`stdin -> stdout`)
   invocation, declarative TOML config files (`--config`), and step-by-step pass tracing.
 - [`crates/castforge-viz`](crates/castforge-viz): Computation graph exporter for **Mermaid**,
-  **Graphviz DOT**, **JSON**, and a self-contained **Interactive HTML Pass Timeline, Roofline &
-  Arena Memory Liveness Debugger**.
+  **Graphviz DOT**, **JSON**, unified **MLIR Snapshot Diffing**, and a self-contained **Interactive
+  HTML Pass Timeline, Roofline & Arena Memory Liveness Debugger**.
 - [`crates/castforge-codegen`](crates/castforge-codegen): Liveness analyzer (`LivenessAnalysis`),
-  greedy interval-coloring arena buffer planner (`MemoryPlan`), Roofline & native JIT schedule
-  auto-tuner (`autotune_module`, `autotune_module_jit`), in-memory reference IR interpreter &
-  numerical verifier (`eval_module`), and multi-target source code generator for **Rust**, **C99**,
-  and **WebGPU WGSL**.
-- [`crates/castforge-cli`](crates/castforge-cli): The `castforge` command-line tool (`opt`, `viz`,
-  `codegen`, `autotune`, `import`, `profile`, `run`, `list-passes`, plus direct pass subcommands).
+  greedy interval-coloring arena buffer planner (`MemoryPlan`), progressive `LoopModule` IR,
+  Roofline & native JIT schedule auto-tuner (`autotune_module`, `autotune_module_jit`), in-memory
+  reference IR interpreter & numerical verifier (`evaluate_module`), and multi-target codegen for
+  **Rust**, **C99**, **WebGPU WGSL**, **NVIDIA CUDA (`.cu`)**, **Apple Metal (`.metal`)**, **C/C++
+  FFI Header (`.h`)**, and **Native Shared Libraries (`.so`/`.dylib`)**.
+- [`crates/castforge-cli`](crates/castforge-cli): The `castforge` command-line tool (`chain`,
+  `opt`, `viz`, `codegen`, `autotune`, `import`, `profile`, `run`, `list-passes`, plus direct pass
+  subcommands).
 
 ## Built-in A-to-B Translator Modules & Presets (91 Passes)
 
@@ -150,7 +152,7 @@ support.
 ## Quick Start
 
 ```bash
-# 1. List all 66 registered A-to-B translator modules and pipeline presets
+# 1. List all 91 registered A-to-B translator modules and pipeline presets
 cargo run --bin castforge -- list-passes
 
 # 2. Concatenate simple A-to-B translators via standard Unix pipes (stdin -> stdout)
@@ -165,26 +167,26 @@ cat examples/llama_block.mlir \
 cargo run --bin castforge -- chain examples/llama_block.mlir \
   -s "fuse-rmsnorm | fuse-attention | tile-loops(size=16) | codegen-rust"
 
-# 2. Optimize an end-to-end LLaMA block with automatic numerical verification
+# 4. Optimize an end-to-end LLaMA block with automatic numerical verification
 cargo run --bin castforge -- opt examples/llama_block.mlir -p "O3" --verify-numerics
 
-# 3. Auto-tune polyhedral/HPC loop schedules (analytical Roofline or native CPU JIT)
+# 5. Auto-tune polyhedral/HPC loop schedules (analytical Roofline or native CPU JIT)
 cargo run --bin castforge -- autotune examples/llama_block.mlir -p "O3" --bench-jit
 
-# 4. End-to-End Weight Surgery + SafeTensors binary export
+# 6. End-to-End Weight Surgery + SafeTensors binary export
 cargo run --bin castforge -- opt examples/weight_surgery.mlir \
   -p "merge-weights(method=slerp,t=0.5),prune-structured(sparsity=0.5),externalize-weights" \
   --save-weights examples/merged_weights.safetensors
 
-# 5. Generate an Interactive HTML Pass Timeline, Roofline & Arena Memory Debugger
+# 7. Generate an Interactive HTML Pass Timeline, Roofline & Arena Memory Debugger
 cargo run --bin castforge -- viz examples/weight_surgery.mlir \
   -p "merge-weights(method=slerp,t=0.5),prune-structured(sparsity=0.5),quantize-weights(bits=8)" \
   --format html -o examples/weight_surgery_trace.html
 
-# 6. Lower the optimized model to standalone Rust, C99, or WebGPU WGSL with Arena Buffer Reuse
+# 8. Lower the optimized model to standalone Rust, C99, WGSL, CUDA, or Metal
 cargo run --bin castforge -- codegen examples/weight_surgery.mlir \
   -p "canonicalize,fuse-matmul-epilogue" --target rust --tile-size 16
 
-# 7. Profile Roofline FLOPs, memory bandwidth traffic, and arithmetic intensity
+# 9. Profile Roofline FLOPs, memory bandwidth traffic, and arithmetic intensity
 cargo run --bin castforge -- profile examples/llama_block.mlir -p "O3"
 ```

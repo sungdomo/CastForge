@@ -1,3 +1,6 @@
+//! Command-line interface (`castforge`) for the CastForge AI Model IR Transformation,
+//! Optimization, Visualization, and Code Generation Suite.
+
 use anyhow::{Context, Result};
 use castforge_codegen::{
     AutotuneScheduleTranslator, CHeaderTranslator, CodegenTarget, CodegenTranslator, GemmLoopOrder,
