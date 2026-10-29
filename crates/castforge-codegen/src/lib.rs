@@ -1,3 +1,4 @@
+pub mod cost_model;
 pub mod eval;
 pub mod liveness;
 pub mod memory_plan;
@@ -6,6 +7,10 @@ pub mod target_config;
 pub mod target_rust;
 pub mod target_wgsl;
 
+pub use crate::cost_model::{
+    BottleneckKind, HardwareRoofline, ModuleCostReport, OpCostProfile, analyze_module_cost,
+    analyze_module_cost_with_roofline,
+};
 pub use crate::eval::{
     NumericVerificationReport, evaluate_function, evaluate_module, generate_synthetic_inputs,
     verify_module_numerics,

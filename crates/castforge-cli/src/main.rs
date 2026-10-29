@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use castforge_codegen::{
-    CodegenTarget, TargetConfig, build_memory_plan, evaluate_module, generate_code_with_config,
-    generate_synthetic_inputs, verify_module_numerics,
+    CodegenTarget, HardwareRoofline, TargetConfig, analyze_module_cost_with_roofline,
+    build_memory_plan, evaluate_module, generate_code_with_config, generate_synthetic_inputs,
+    verify_module_numerics,
 };
 use castforge_mlir::{PrintOptions, parse_mlir, print_mlir, print_mlir_with_options};
 use castforge_passes::{PassManager, PassRegistry};
@@ -141,6 +142,24 @@ enum Commands {
         /// WebGPU `@workgroup_size` thread count per workgroup
         #[arg(long = "workgroup-size", default_value_t = 64)]
         workgroup_size: u32,
+    },
+
+    /// Analyze FLOPs, memory bandwidth traffic, arithmetic intensity, and Roofline bottlenecks
+    Profile {
+        /// Input MLIR file path
+        input: PathBuf,
+
+        /// Optional pass pipeline to compare before vs. after Roofline metrics
+        #[arg(short = 'p', long = "passes")]
+        passes: Option<String>,
+
+        /// Peak hardware compute throughput in GFLOP/s
+        #[arg(long = "peak-gflops", default_value_t = 1000.0)]
+        peak_gflops: f64,
+
+        /// Peak hardware memory bandwidth in GB/s
+        #[arg(long = "peak-bw-gbps", default_value_t = 100.0)]
+        peak_bw_gbps: f64,
     },
 
     /// List all registered transformation and optimization passes
@@ -420,6 +439,48 @@ fn main() -> Result<()> {
                 fs::write(&out_path, code)?;
             } else {
                 print!("{code}");
+            }
+        }
+
+        Commands::Profile {
+            input,
+            passes,
+            peak_gflops,
+            peak_bw_gbps,
+        } => {
+            let src = fs::read_to_string(&input)
+                .with_context(|| format!("Failed to read {}", input.display()))?;
+            let mut module = parse_mlir(&src)?;
+            let roofline = HardwareRoofline::new(peak_gflops, peak_bw_gbps);
+            let before = analyze_module_cost_with_roofline(&module, &roofline);
+            if let Some(spec) = passes {
+                println!("=== Baseline Cost Profile ===");
+                print!("{}", before.summary_table());
+                let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
+                pm.run(&mut module)?;
+                let after = analyze_module_cost_with_roofline(&module, &roofline);
+                println!("\n=== Optimized Cost Profile ({spec}) ===");
+                print!("{}", after.summary_table());
+                let traffic_saved = before
+                    .total_memory_traffic_bytes
+                    .saturating_sub(after.total_memory_traffic_bytes);
+                println!(
+                    "\nMemory Traffic Saved: {} B ({:.1}% reduction) | \
+                     Est. Speedup: {:.2}x",
+                    traffic_saved,
+                    if before.total_memory_traffic_bytes > 0 {
+                        100.0 * traffic_saved as f64 / before.total_memory_traffic_bytes as f64
+                    } else {
+                        0.0
+                    },
+                    if after.estimated_latency_ns > 0.0 {
+                        before.estimated_latency_ns / after.estimated_latency_ns
+                    } else {
+                        1.0
+                    }
+                );
+            } else {
+                print!("{}", before.summary_table());
             }
         }
 

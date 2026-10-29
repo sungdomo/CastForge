@@ -96,5 +96,9 @@ cargo run --bin castforge -- viz examples/weight_surgery.mlir \
 
 # 5. Lower the optimized model to standalone Rust, C99, or WebGPU WGSL with Arena Buffer Reuse
 cargo run --bin castforge -- codegen examples/weight_surgery.mlir \
-  -p "canonicalize,fuse-matmul-epilogue" --target rust
+  -p "canonicalize,fuse-matmul-epilogue" --target rust --tile-size 16
+
+# 6. Profile Roofline FLOPs, memory bandwidth traffic, and arithmetic intensity
+cargo run --bin castforge -- profile examples/mlp_redundant.mlir \
+  -p "canonicalize,fuse-matmul-epilogue"
 ```

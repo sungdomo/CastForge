@@ -1,5 +1,6 @@
 use castforge_codegen::{
-    CodegenTarget, TargetConfig, build_memory_plan, evaluate_module, generate_code,
+    BottleneckKind, CodegenTarget, HardwareRoofline, TargetConfig,
+    analyze_module_cost_with_roofline, build_memory_plan, evaluate_module, generate_code,
     generate_code_with_config, verify_module_numerics,
 };
 use castforge_mlir::parse_mlir;
@@ -165,4 +166,44 @@ module @tiled_gemm_demo {
         generate_code_with_config(&module, CodegenTarget::Wgsl, &gpu_cfg).expect("tiled wgsl");
     assert!(wgsl_tiled.contains("var<workgroup> wg_tile_a: array<f32, 16>;"));
     assert!(wgsl_tiled.contains("@compute @workgroup_size(128)"));
+}
+
+#[test]
+fn test_roofline_cost_model_before_and_after_fusion() {
+    let mlir = r#"
+module @roofline_demo {
+  func.func @mlp_block(
+    %x: tensor<16x64xf32>,
+    %w: tensor<64x64xf32>,
+    %b: tensor<16x64xf32>
+  ) -> tensor<16x64xf32> {
+    %zero = stablehlo.constant dense<0.0> : tensor<16x64xf32>
+    %mm = stablehlo.dot_general %x, %w : (tensor<16x64xf32>, tensor<64x64xf32>) -> tensor<16x64xf32>
+    %add = stablehlo.add %mm, %b : tensor<16x64xf32>
+    %relu = stablehlo.maximum %add, %zero : tensor<16x64xf32>
+    func.return %relu : tensor<16x64xf32>
+  }
+}
+"#;
+    let before_mod = parse_mlir(mlir).expect("parse roofline mlir");
+    let mut after_mod = before_mod.clone();
+    let registry = PassRegistry::with_builtin_passes();
+    let mut pm =
+        PassManager::from_pipeline_str(&registry, "fuse-matmul-epilogue,dce").expect("pipeline");
+    pm.run(&mut after_mod).expect("run fusion");
+
+    let roofline = HardwareRoofline::new(200.0, 50.0); // ridge point = 4.0 FLOP/Byte
+    let before_cost = analyze_module_cost_with_roofline(&before_mod, &roofline);
+    let after_cost = analyze_module_cost_with_roofline(&after_mod, &roofline);
+
+    assert_eq!(before_cost.total_flops, after_cost.total_flops);
+    assert!(after_cost.total_memory_traffic_bytes < before_cost.total_memory_traffic_bytes);
+    assert!(after_cost.arithmetic_intensity > before_cost.arithmetic_intensity);
+    assert_eq!(after_cost.overall_bottleneck, BottleneckKind::ComputeBound);
+    assert!(after_cost.estimated_latency_ns < before_cost.estimated_latency_ns);
+    assert!(
+        after_cost
+            .summary_table()
+            .contains("castforge.fused_matmul_epilogue")
+    );
 }
