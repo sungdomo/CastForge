@@ -1,6 +1,7 @@
 pub mod autotune;
 pub mod cost_model;
 pub mod eval;
+pub mod jit;
 pub mod liveness;
 pub mod memory_plan;
 pub mod target_c;
@@ -17,6 +18,7 @@ pub use crate::eval::{
     NumericVerificationReport, evaluate_function, evaluate_module, generate_synthetic_inputs,
     verify_module_numerics,
 };
+pub use crate::jit::{JitBenchmarkResult, autotune_module_jit, jit_execute_and_benchmark};
 pub use crate::liveness::{LiveInterval, compute_block_liveness, compute_module_liveness};
 pub use crate::memory_plan::{BufferAllocation, MemoryPlan, build_memory_plan};
 use crate::target_c::emit_c_module_with_config;
@@ -25,9 +27,10 @@ use crate::target_rust::emit_rust_module_with_config;
 use crate::target_wgsl::emit_wgsl_module_with_config;
 use anyhow::Result;
 use castforge_ir::{Dim, Module, TensorType, ValueId};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CodegenTarget {
     Rust,
     C,

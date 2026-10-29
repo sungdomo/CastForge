@@ -562,3 +562,147 @@ module @conv_model {
         llama_rep.max_abs_diff
     );
 }
+
+#[test]
+fn test_frontend_importers_autodiff_and_native_jit() {
+    use castforge_codegen::{autotune_module_jit, jit_execute_and_benchmark};
+    use castforge_mlir::{export_gguf_bytes, import_gguf_bytes, import_onnx_json};
+
+    // 1. Test ONNX-JSON Frontend Importer + GGUF v3 Binary Round-Trip
+    let onnx_json = r#"{
+      "name": "onnx_mlp",
+      "inputs": [{ "name": "x", "shape": [2, 4], "dtype": "f32" }],
+      "initializers": [
+        {
+          "name": "w1",
+          "shape": [4, 4],
+          "values": [
+            0.5, 0.1, -0.2, 0.3,
+            0.2, 0.4, 0.1, -0.1,
+            -0.3, 0.2, 0.6, 0.1,
+            0.1, -0.2, 0.2, 0.5
+          ]
+        },
+        {
+          "name": "b1",
+          "shape": [2, 4],
+          "values": [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+        }
+      ],
+      "nodes": [
+        {
+          "op_type": "Gemm",
+          "inputs": ["x", "w1", "b1"],
+          "outputs": ["h1"],
+          "output_shape": [2, 4]
+        },
+        {
+          "op_type": "Relu",
+          "inputs": ["h1"],
+          "outputs": ["y"],
+          "output_shape": [2, 4]
+        }
+      ],
+      "outputs": [{ "name": "y", "shape": [2, 4], "dtype": "f32" }]
+    }"#;
+
+    let onnx_mod = import_onnx_json(onnx_json).expect("import onnx json");
+    assert_eq!(onnx_mod.tensor_store.len(), 2);
+    let mut onnx_opt = onnx_mod.clone();
+    let registry = PassRegistry::with_builtin_passes();
+    let mut pm =
+        PassManager::from_pipeline_str(&registry, "fuse-matmul-epilogue,dce").expect("pipeline");
+    pm.run(&mut onnx_opt).expect("run fuse-matmul-epilogue");
+    assert!(print_mlir(&onnx_opt).contains("castforge.fused_matmul_epilogue"));
+
+    let gguf_bytes = export_gguf_bytes(&onnx_mod);
+    assert_eq!(&gguf_bytes[0..4], b"GGUF");
+    let gguf_mod = import_gguf_bytes(&gguf_bytes).expect("import gguf bytes");
+    assert_eq!(gguf_mod.tensor_store.len(), 2);
+    assert!(print_mlir(&gguf_mod).contains("stablehlo.dot_general"));
+
+    // 2. Test Reverse-Mode Automatic Differentiation (autodiff & autodiff(lr=0.1))
+    let grad_mlir = r#"
+module @autodiff_demo {
+  func.func @loss(%x: tensor<2x2xf32>, %w: tensor<2x2xf32>) -> tensor<2x2xf32> {
+    %mm = stablehlo.dot_general %x, %w, contracting_dims = [1] x [0]
+      : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+    %act = stablehlo.tanh %mm : tensor<2x2xf32>
+    func.return %act : tensor<2x2xf32>
+  }
+}
+"#;
+    let fwd_mod = parse_mlir(grad_mlir).expect("parse grad_mlir");
+    let mut vjp_mod = fwd_mod.clone();
+    let mut ad_pm = PassManager::from_pipeline_str(&registry, "autodiff").expect("autodiff");
+    let ad_res = ad_pm.run(&mut vjp_mod).expect("run autodiff");
+    assert!(ad_res[0].changed);
+    let vjp_ir = print_mlir(&vjp_mod);
+    assert!(vjp_ir.contains("autodiff_role = \"vjp_grad\""));
+
+    // Verify analytical VJP gradient dL/dW against finite-difference gradient
+    let x_in = vec![0.5_f32, -0.3, 0.2, 0.8];
+    let w_in = vec![0.4_f32, 0.1, -0.2, 0.6];
+    let vjp_out =
+        evaluate_module(&vjp_mod, &[x_in.clone(), w_in.clone()]).expect("eval vjp")[0].clone();
+    let eps = 1e-3_f32;
+    for i in 0..4 {
+        let mut w_plus = w_in.clone();
+        let mut w_minus = w_in.clone();
+        w_plus[i] += eps;
+        w_minus[i] -= eps;
+        let loss_p: f32 = evaluate_module(&fwd_mod, &[x_in.clone(), w_plus]).expect("p")[0]
+            .iter()
+            .sum();
+        let loss_m: f32 = evaluate_module(&fwd_mod, &[x_in.clone(), w_minus]).expect("m")[0]
+            .iter()
+            .sum();
+        let fd_grad = (loss_p - loss_m) / (2.0 * eps);
+        assert!(
+            (vjp_out[i] - fd_grad).abs() < 1e-3,
+            "grad mismatch at {i}: vjp={} vs fd={fd_grad}",
+            vjp_out[i]
+        );
+    }
+
+    // Verify SGD step via autodiff(lr=0.1)
+    let mut sgd_mod = fwd_mod.clone();
+    let mut sgd_pm =
+        PassManager::from_pipeline_str(&registry, "autodiff(lr=0.1)").expect("autodiff lr");
+    sgd_pm.run(&mut sgd_mod).expect("run sgd");
+    let w_updated =
+        evaluate_module(&sgd_mod, &[x_in.clone(), w_in.clone()]).expect("eval sgd")[0].clone();
+    for i in 0..4 {
+        let expected = w_in[i] - 0.1 * vjp_out[i];
+        assert!((w_updated[i] - expected).abs() < 1e-5);
+    }
+
+    // 3. Test Native CPU JIT Execution (Rust & C99) and Hardware-in-the-Loop Auto-Tuning
+    let rust_jit = jit_execute_and_benchmark(
+        &onnx_opt,
+        CodegenTarget::Rust,
+        &TargetConfig::default(),
+        2,
+        5,
+    )
+    .expect("rust jit benchmark");
+    assert!(
+        rust_jit.numerics_verified,
+        "rust jit max_abs_diff = {}",
+        rust_jit.max_abs_diff
+    );
+    assert!(rust_jit.min_latency_ns > 0.0);
+
+    let c_jit =
+        jit_execute_and_benchmark(&onnx_opt, CodegenTarget::C, &TargetConfig::default(), 2, 5)
+            .expect("c jit benchmark");
+    assert!(
+        c_jit.numerics_verified,
+        "c jit max_abs_diff = {}",
+        c_jit.max_abs_diff
+    );
+
+    let roofline = HardwareRoofline::new(1000.0, 100.0);
+    let jit_tune = autotune_module_jit(&onnx_opt, &roofline, 2).expect("autotune jit");
+    assert!(jit_tune.best.estimated_latency_ns > 0.0);
+}

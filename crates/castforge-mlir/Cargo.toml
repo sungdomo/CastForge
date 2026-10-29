@@ -6,7 +6,10 @@ license.workspace = true
 description = "Pure-Rust MLIR (Generic + StableHLO/Func) parser and printer for CastForge"
 
 [dependencies]
+anyhow.workspace = true
 castforge-ir.workspace = true
 indexmap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true

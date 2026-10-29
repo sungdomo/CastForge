@@ -1,10 +1,13 @@
 use anyhow::{Context, Result};
 use castforge_codegen::{
     CodegenTarget, GemmLoopOrder, HardwareRoofline, TargetConfig,
-    analyze_module_cost_with_roofline, autotune_module, build_memory_plan, evaluate_module,
-    generate_code_with_config, generate_synthetic_inputs, verify_module_numerics,
+    analyze_module_cost_with_roofline, autotune_module, autotune_module_jit, build_memory_plan,
+    evaluate_module, generate_code_with_config, generate_synthetic_inputs, verify_module_numerics,
 };
-use castforge_mlir::{PrintOptions, parse_mlir, print_mlir, print_mlir_with_options};
+use castforge_mlir::{
+    PrintOptions, import_gguf_file, import_onnx_file, parse_mlir, print_mlir,
+    print_mlir_with_options,
+};
 use castforge_passes::{PassManager, PassRegistry};
 use castforge_viz::{
     TimelineFrame, VizFormat, build_graph_json, render_module, render_timeline_html,
@@ -222,6 +225,32 @@ enum Commands {
         /// Number of top-ranked schedule candidates to display
         #[arg(long = "top-k", default_value_t = 5)]
         top_k: usize,
+
+        /// Compile and empirically benchmark top schedules via native JIT
+        #[arg(long = "bench-jit")]
+        bench_jit: bool,
+    },
+
+    /// Import an external model (GGUF v2/v3 binary or ONNX JSON) into StableHLO IR + TensorStore
+    Import {
+        /// Input model path (.gguf or .onnx.json)
+        input: PathBuf,
+
+        /// Frontend format: gguf or onnx (auto-detected from extension by default)
+        #[arg(short = 'f', long = "format")]
+        format: Option<String>,
+
+        /// Optional pass pipeline to run after importing
+        #[arg(short = 'p', long = "passes")]
+        passes: Option<String>,
+
+        /// Optional output MLIR file path
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
+
+        /// Optional output `.safetensors` file to save imported TensorStore weights
+        #[arg(long = "save-weights")]
+        save_weights: Option<PathBuf>,
     },
 
     /// List all registered transformation and optimization passes
@@ -573,6 +602,7 @@ fn main() -> Result<()> {
             peak_gflops,
             peak_bw_gbps,
             top_k,
+            bench_jit,
         } => {
             let src = fs::read_to_string(&input)
                 .with_context(|| format!("Failed to read {}", input.display()))?;
@@ -582,8 +612,46 @@ fn main() -> Result<()> {
                 pm.run(&mut module)?;
             }
             let roofline = HardwareRoofline::new(peak_gflops, peak_bw_gbps);
-            let report = autotune_module(&module, &roofline);
+            let report = if bench_jit {
+                autotune_module_jit(&module, &roofline, top_k)?
+            } else {
+                autotune_module(&module, &roofline)
+            };
             print!("{}", report.summary_table(top_k));
+        }
+
+        Commands::Import {
+            input,
+            format,
+            passes,
+            output,
+            save_weights,
+        } => {
+            let fmt = format.unwrap_or_else(|| {
+                let s = input.to_string_lossy().to_ascii_lowercase();
+                if s.ends_with(".gguf") {
+                    "gguf".to_string()
+                } else {
+                    "onnx".to_string()
+                }
+            });
+            let mut module = match fmt.to_ascii_lowercase().as_str() {
+                "gguf" => import_gguf_file(&input)?,
+                _ => import_onnx_file(&input)?,
+            };
+            if let Some(spec) = passes {
+                let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
+                pm.run(&mut module)?;
+            }
+            if let Some(sw_path) = save_weights {
+                module.tensor_store.save_safetensors_file(&sw_path)?;
+            }
+            let formatted = print_mlir(&module);
+            if let Some(out_path) = output {
+                fs::write(&out_path, formatted)?;
+            } else {
+                print!("{formatted}");
+            }
         }
 
         Commands::ListPasses => {

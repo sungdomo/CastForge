@@ -1,3 +1,4 @@
+pub mod autodiff;
 pub mod bake_lora;
 pub mod bufferize_inplace;
 pub mod canonicalize;
@@ -50,6 +51,7 @@ pub mod task_arithmetic;
 pub mod topological_sort;
 pub mod verify_shapes;
 
+pub use autodiff::AutodiffPass;
 pub use bake_lora::BakeLoraPass;
 pub use bufferize_inplace::BufferizeInplacePass;
 pub use canonicalize::CanonicalizePass;

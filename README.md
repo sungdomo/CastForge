@@ -16,23 +16,25 @@ support.
   shape verifiers.
 - [`crates/castforge-mlir`](crates/castforge-mlir): Zero-C++ MLIR parser & printer supporting both
   **MLIR Generic Form** (`"stablehlo.add"(...)`) and **Pretty/Custom Syntax**
-  (`stablehlo.add %0, %1 : tensor<...>`), including `!quant.uniform` quantized tensor types and
-  `dense_resource<key>` external weight references.
+  (`stablehlo.add %0, %1 : tensor<...>`), `!quant.uniform` quantized tensor types,
+  `dense_resource<key>` external weight references, plus **GGUF v2/v3** and **ONNX-JSON** model
+  importers.
 - [`crates/castforge-passes`](crates/castforge-passes): Unified `Pass`, `PassRegistry`, and
-  `PassManager` with **53 built-in compiler passes & presets** supporting static Rust construction,
+  `PassManager` with **54 built-in compiler passes & presets** supporting static Rust construction,
   CLI pipeline strings (`-p`), direct subcommand invocation, declarative TOML config files
   (`--config`), and step-by-step pass tracing.
 - [`crates/castforge-viz`](crates/castforge-viz): Computation graph exporter for **Mermaid**,
   **Graphviz DOT**, **JSON**, and a self-contained **Interactive HTML Pass Timeline, Roofline &
   Arena Memory Liveness Debugger**.
 - [`crates/castforge-codegen`](crates/castforge-codegen): Liveness analyzer (`LivenessAnalysis`),
-  greedy interval-coloring arena buffer planner (`MemoryPlan`), Roofline schedule auto-tuner
-  (`autotune_module`), in-memory reference IR interpreter & numerical verifier (`eval_module`), and
-  multi-target source code generator for **Rust**, **C99**, and **WebGPU WGSL**.
+  greedy interval-coloring arena buffer planner (`MemoryPlan`), Roofline & native JIT schedule
+  auto-tuner (`autotune_module`, `autotune_module_jit`), in-memory reference IR interpreter &
+  numerical verifier (`eval_module`), and multi-target source code generator for **Rust**, **C99**,
+  and **WebGPU WGSL**.
 - [`crates/castforge-cli`](crates/castforge-cli): The `castforge` command-line tool (`opt`, `viz`,
-  `codegen`, `autotune`, `profile`, `run`, `list-passes`, plus direct pass subcommands).
+  `codegen`, `autotune`, `import`, `profile`, `run`, `list-passes`, plus direct pass subcommands).
 
-## Built-in Transformation Passes & Presets (53 Passes)
+## Built-in Transformation Passes & Presets (54 Passes)
 
 | Pass Name | Category | Description |
 | :--- | :--- | :--- |
@@ -77,6 +79,7 @@ support.
 | `fuse-rope` | Fusion | Fuses Rotary Position Embedding (`RoPE`) into composite |
 | `fuse-attention` | Fusion | Fuses SDPA & GQA (`softmax(Q @ K^T * scale) @ V`) |
 | `lower-conv-to-gemm` | Lowering | Lowers 2D `convolution` (NHWC) to `im2col` + `dot_general` |
+| `autodiff` | Training | Synthesizes reverse-mode VJP gradients & optional SGD step |
 | `decompose-composites` | Lowering | Expands `stablehlo.composite` ops to primitive StableHLO |
 | `bufferize-inplace` | Lowering | Annotates elementwise ops for in-place arena buffer reuse |
 | `fold-norm-weights` | Weight Surgery | Absorbs RMSNorm/LayerNorm scale weights into MatMuls |
@@ -93,14 +96,14 @@ support.
 ## Quick Start
 
 ```bash
-# 1. List all 53 registered passes and pipeline presets
+# 1. List all 54 registered passes and pipeline presets
 cargo run --bin castforge -- list-passes
 
 # 2. Optimize an end-to-end LLaMA block with automatic numerical verification
 cargo run --bin castforge -- opt examples/llama_block.mlir -p "O3" --verify-numerics
 
-# 3. Auto-tune polyhedral/HPC loop schedules using the Roofline & cache model
-cargo run --bin castforge -- autotune examples/llama_block.mlir -p "O3"
+# 3. Auto-tune polyhedral/HPC loop schedules (analytical Roofline or native CPU JIT)
+cargo run --bin castforge -- autotune examples/llama_block.mlir -p "O3" --bench-jit
 
 # 4. End-to-End Weight Surgery + SafeTensors binary export
 cargo run --bin castforge -- opt examples/weight_surgery.mlir \

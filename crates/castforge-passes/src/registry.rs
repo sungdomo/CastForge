@@ -1,16 +1,16 @@
 use crate::{
-    BakeLoraPass, BufferizeInplacePass, CanonicalizePass, CommonSubexpressionEliminationPass,
-    DeadCodeEliminationPass, DecomposeCompositesPass, ExternalizeWeightsPass, FissionLoopsPass,
-    FoldBroadcastPass, FoldConstantsPass, FoldConvertPass, FoldNormWeightsPass, FoldReshapePass,
-    FoldSliceConcatPass, FoldTransposePass, FuseAttentionPass, FuseDequantMatmulPass,
-    FuseElementwisePass, FuseGatedMlpPass, FuseGeluPass, FuseHorizontalDotPass, FuseLayerNormPass,
-    FuseLogSoftmaxPass, FuseLoopsPass, FuseMapReducePass, FuseMatmulEpiloguePass,
-    FuseResidualNormPass, FuseRmsNormPass, FuseRopePass, FuseSoftmaxPass, FuseSwiGluPass,
-    HoistConstantsPass, InlinerPass, IrEditPass, LicmPass, LowerConvToGemmPass, MergeWeightsPass,
-    OptO1Pass, OptO2Pass, OptO3Pass, PackWeightsPass, Pass, PassOptions, PrintOpStatsPass,
-    QuantizeWeightsPass, SccpPass, SimplifyAlgebraicPass, SinkTransposePass, SpecializeShapesPass,
-    StripDebugInfoPass, StructuredPruningPass, SymbolDcePass, TaskArithmeticPass,
-    TopologicalSortPass, VerifyShapesPass,
+    AutodiffPass, BakeLoraPass, BufferizeInplacePass, CanonicalizePass,
+    CommonSubexpressionEliminationPass, DeadCodeEliminationPass, DecomposeCompositesPass,
+    ExternalizeWeightsPass, FissionLoopsPass, FoldBroadcastPass, FoldConstantsPass,
+    FoldConvertPass, FoldNormWeightsPass, FoldReshapePass, FoldSliceConcatPass, FoldTransposePass,
+    FuseAttentionPass, FuseDequantMatmulPass, FuseElementwisePass, FuseGatedMlpPass, FuseGeluPass,
+    FuseHorizontalDotPass, FuseLayerNormPass, FuseLogSoftmaxPass, FuseLoopsPass, FuseMapReducePass,
+    FuseMatmulEpiloguePass, FuseResidualNormPass, FuseRmsNormPass, FuseRopePass, FuseSoftmaxPass,
+    FuseSwiGluPass, HoistConstantsPass, InlinerPass, IrEditPass, LicmPass, LowerConvToGemmPass,
+    MergeWeightsPass, OptO1Pass, OptO2Pass, OptO3Pass, PackWeightsPass, Pass, PassOptions,
+    PrintOpStatsPass, QuantizeWeightsPass, SccpPass, SimplifyAlgebraicPass, SinkTransposePass,
+    SpecializeShapesPass, StripDebugInfoPass, StructuredPruningPass, SymbolDcePass,
+    TaskArithmeticPass, TopologicalSortPass, VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
 use castforge_ir::MergeMethod;
@@ -401,6 +401,18 @@ impl PassRegistry {
             "lower-conv-to-gemm",
             "Lowers stablehlo.convolution into im2col + stablehlo.dot_general GEMM",
             |_opts| Ok(Box::new(LowerConvToGemmPass)),
+        );
+        reg.register(
+            "autodiff",
+            "Synthesizes reverse-mode VJP gradient ops in StableHLO (optional SGD step via lr=...)",
+            |opts| {
+                let learning_rate = opts
+                    .get("lr")
+                    .or_else(|| opts.get("learning_rate"))
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(0.0);
+                Ok(Box::new(AutodiffPass { learning_rate }))
+            },
         );
         reg.register(
             "O1",
