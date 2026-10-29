@@ -20,7 +20,7 @@ support.
   `dense_resource<key>` external weight references, plus **GGUF v2/v3** and **ONNX-JSON** model
   importers.
 - [`crates/castforge-passes`](crates/castforge-passes): Unified `Pass`, `PassRegistry`, and
-  `PassManager` with **66 built-in A-to-B IR translator modules & presets** supporting static Rust
+  `PassManager` with **84 built-in A-to-B IR translator modules & presets** supporting static Rust
   construction, CLI pipeline strings (`-p`, comma- or `|`-separated), Unix pipe (`stdin -> stdout`)
   invocation, declarative TOML config files (`--config`), and step-by-step pass tracing.
 - [`crates/castforge-viz`](crates/castforge-viz): Computation graph exporter for **Mermaid**,
@@ -34,7 +34,7 @@ support.
 - [`crates/castforge-cli`](crates/castforge-cli): The `castforge` command-line tool (`opt`, `viz`,
   `codegen`, `autotune`, `import`, `profile`, `run`, `list-passes`, plus direct pass subcommands).
 
-## Built-in A-to-B Translator Modules & Presets (66 Passes)
+## Built-in A-to-B Translator Modules & Presets (84 Passes)
 
 | Pass Name | Category | Description |
 | :--- | :--- | :--- |
@@ -104,6 +104,12 @@ support.
 | `resize-batch` | IR Resizer | Rewrites leading batch dim while preserving 2D weights |
 | `dedup-functions` | IR Dedup | Merges structurally identical `func.func` definitions |
 | `normalize-ssa` | IR Canonical | Renames SSA values (`%arg0`, `%v0`) & sorts attributes |
+| `hash-ir` | IR Hashing | Stamps 64-bit FNV-1a structural hash (`castforge.ir_hash`) |
+| `verify-equiv` | IR Verifier | Verifies structural/signature invariants across chains |
+| `sparsify-2to4` | Weight Surgery | Applies NVIDIA Ampere/Hopper 2:4 structured sparsity |
+| `bucket-shapes` | IR Bucketing | Synthesizes multi-bucket shape-specialized functions |
+| `convert-layout` | Layout | Canonicalizes 4D `convolution` between `NCHW` and `NHWC` |
+| `offload-activations` | Memory | Inserts `castforge.host_offload` D2H/H2D on long-lived ops |
 | `decompose-composites` | Lowering | Expands `stablehlo.composite` ops to primitive StableHLO |
 | `bufferize-inplace` | Lowering | Annotates elementwise ops for in-place arena buffer reuse |
 | `fold-norm-weights` | Weight Surgery | Absorbs RMSNorm/LayerNorm scale weights into MatMuls |

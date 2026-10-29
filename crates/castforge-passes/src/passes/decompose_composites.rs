@@ -611,6 +611,7 @@ impl Pass for DecomposeCompositesPass {
                     "castforge.stream_wait"
                     | "castforge.static_quantize"
                     | "castforge.nan_guard"
+                    | "castforge.host_offload"
                         if !inputs.is_empty() =>
                     {
                         let op_mut = &mut module.ops[op_id];

@@ -1076,6 +1076,24 @@ fn emit_c_hlo_op(
                      fminf(fmaxf(v, -{cmax:.1}f), {cmax:.1}f);"
                 )?;
                 writeln!(out, "    }}")?;
+            } else if name == "castforge.host_offload" && !inputs.is_empty() {
+                let bytes = match op.attributes.get("bytes") {
+                    Some(Attribute::Int(b)) => *b,
+                    _ => (res_len * 4) as i64,
+                };
+                let dist = match op.attributes.get("distance") {
+                    Some(Attribute::Int(d)) => *d,
+                    _ => 1,
+                };
+                let src = value_ident(module, inputs[0], names, counter);
+                writeln!(
+                    out,
+                    "    /* [offload:d2h_h2d_pinned(bytes={bytes}, distance={dist})] */"
+                )?;
+                writeln!(
+                    out,
+                    "    for (int i = 0; i < {res_len}; ++i) {res_name}[i] = {src}[i];"
+                )?;
             } else {
                 let src = value_ident(module, inputs[0], names, counter);
                 writeln!(

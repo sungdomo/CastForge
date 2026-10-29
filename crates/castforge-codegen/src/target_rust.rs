@@ -1249,6 +1249,24 @@ fn emit_rust_hlo_op(
                      else {{ v.clamp(-{cmax:.1}_f32, {cmax:.1}_f32) }};"
                 )?;
                 writeln!(out, "    }}")?;
+            } else if name == "castforge.host_offload" && !inputs.is_empty() {
+                let bytes = match op.attributes.get("bytes") {
+                    Some(Attribute::Int(b)) => *b,
+                    _ => (res_len * 4) as i64,
+                };
+                let dist = match op.attributes.get("distance") {
+                    Some(Attribute::Int(d)) => *d,
+                    _ => 1,
+                };
+                let src = r_idx(module, plan, inputs[0], "i", names, counter);
+                let dst = r_idx(module, plan, res_val, "i", names, counter);
+                writeln!(
+                    out,
+                    "    // [offload:d2h_h2d_pinned(bytes={bytes}, distance={dist})]"
+                )?;
+                writeln!(out, "    for i in 0..{res_len} {{")?;
+                writeln!(out, "        {dst} = {src};")?;
+                writeln!(out, "    }}")?;
             } else {
                 let src = r_idx(module, plan, inputs[0], "i", names, counter);
                 let dst = r_idx(module, plan, res_val, "i", names, counter);

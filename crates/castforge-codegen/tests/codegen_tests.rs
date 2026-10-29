@@ -1441,3 +1441,85 @@ module @two_layer_gemm {
     assert!(norm_ir.contains("%t0 = stablehlo.dot_general"));
     assert!(norm_ir.contains("%t1 = stablehlo.dot_general"));
 }
+
+#[test]
+fn test_hash_verify_sparsify_2to4_bucket_shapes_convert_layout_and_offload() {
+    let mlir = r#"
+module @advanced_ir_tools {
+  func.func @main(%x: tensor<2x4xf32>) -> tensor<2x4xf32> {
+    %w1 = stablehlo.constant dense<[[0.1, 0.9, 0.2, 0.8],
+                                    [0.7, 0.1, 0.3, 0.9],
+                                    [0.4, 0.6, 0.1, 0.2],
+                                    [0.8, 0.5, 0.9, 0.3]]> : tensor<4x4xf32>
+    %h0 = stablehlo.tanh %x : tensor<2x4xf32>
+    %h1 = stablehlo.dot_general %h0, %w1, contracting_dims = [1] x [0]
+      : (tensor<2x4xf32>, tensor<4x4xf32>) -> tensor<2x4xf32>
+    %h2 = stablehlo.tanh %h1 : tensor<2x4xf32>
+    %out = stablehlo.add %h2, %h0 : tensor<2x4xf32>
+    func.return %out : tensor<2x4xf32>
+  }
+}
+"#;
+    let base = parse_mlir(mlir).expect("parse advanced_ir_tools");
+    let registry = PassRegistry::with_builtin_passes();
+
+    // 1. Structural Hashing (`hash-ir`) + Invariant Verification (`verify-equiv`)
+    let mut hashed = base.clone();
+    let mut hash_pm =
+        PassManager::from_pipeline_str(&registry, "hash-ir | verify-equiv").expect("hash+verify");
+    let hash_res = hash_pm
+        .run(&mut hashed)
+        .expect("run hash-ir | verify-equiv");
+    assert!(hash_res[0].changed);
+    assert!(hash_res[1].changed);
+    let hash_ir = print_mlir(&hashed);
+    assert!(hash_ir.contains("castforge.structural_hash"));
+    assert!(hash_ir.contains("castforge.verified_tol"));
+
+    // 2. NVIDIA Ampere/Hopper 2:4 Structured Sparsity (`sparsify-2to4`)
+    let mut sparse = base.clone();
+    let mut sp_pm =
+        PassManager::from_pipeline_str(&registry, "sparsify-2to4").expect("sparsify-2to4");
+    let sp_res = sp_pm.run(&mut sparse).expect("run sparsify-2to4");
+    assert!(sp_res[0].changed);
+    let sp_ir = print_mlir(&sparse);
+    assert!(sp_ir.contains("sparsity = \"2:4\""));
+
+    // 3. Multi-Bucket Dynamic Shape Dispatcher (`bucket-shapes`)
+    let mut bucketed = base.clone();
+    let mut bkt_pm = PassManager::from_pipeline_str(&registry, "bucket-shapes(buckets=1;4)")
+        .expect("bucket-shapes");
+    let bkt_res = bkt_pm.run(&mut bucketed).expect("run bucket-shapes");
+    assert!(bkt_res[0].changed);
+    assert_eq!(bkt_res[0].ops_created, 2);
+    let bkt_ir = print_mlir(&bucketed);
+    assert!(bkt_ir.contains("func.func @main_batch_1(%x: tensor<1x4xf32>)"));
+    assert!(bkt_ir.contains("func.func @main_batch_4(%x: tensor<4x4xf32>)"));
+
+    // 4. Host Memory Activation Offloader (`offload-activations`) + Decompose round-trip
+    let mut offloaded = base.clone();
+    let mut off_pm = PassManager::from_pipeline_str(&registry, "offload-activations(min_span=2)")
+        .expect("offload-activations");
+    let off_res = off_pm.run(&mut offloaded).expect("run offload-activations");
+    assert!(off_res[0].changed);
+    let off_ir = print_mlir(&offloaded);
+    assert!(off_ir.contains("castforge.host_offload"));
+    let off_rust = generate_code(&offloaded, CodegenTarget::Rust).expect("emit rust offloaded");
+    assert!(off_rust.contains("[offload:d2h_h2d_pinned("));
+    let off_c = generate_code(&offloaded, CodegenTarget::C).expect("emit c offloaded");
+    assert!(off_c.contains("[offload:d2h_h2d_pinned("));
+    let off_rep = verify_module_numerics(&base, &offloaded, 1e-5).expect("verify offloaded");
+    assert!(off_rep.passed);
+
+    // 5. Spatial & Matrix Layout Canonicalizer (`convert-layout`)
+    let mut layout_mod = base.clone();
+    let mut layout_pm = PassManager::from_pipeline_str(&registry, "convert-layout(layout=nhwc)")
+        .expect("convert-layout");
+    let layout_res = layout_pm.run(&mut layout_mod).expect("run convert-layout");
+    assert!(layout_res[0].changed);
+    let layout_ir = print_mlir(&layout_mod);
+    assert!(layout_ir.contains("data_layout = \"nhwc\""));
+    assert!(layout_ir.contains("dims = [1, 0]"));
+    let layout_rep = verify_module_numerics(&base, &layout_mod, 1e-5).expect("verify layout_mod");
+    assert!(layout_rep.passed);
+}

@@ -1,21 +1,23 @@
 use crate::{
-    AutodiffPass, BakeLoraPass, BisectPassesPass, BufferizeInplacePass, CalibrateQuantizePass,
-    CanonicalizePass, CommonSubexpressionEliminationPass, ComposeFuncsPass,
-    DeadCodeEliminationPass, DecomposeCompositesPass, DedupFunctionsPass, EgraphSimplifyPass,
-    ExternalizeWeightsPass, ExtractSubgraphPass, FissionLoopsPass, FoldBroadcastPass,
-    FoldConstantsPass, FoldConvertPass, FoldNormWeightsPass, FoldReshapePass, FoldSliceConcatPass,
-    FoldTransposePass, FreezeInputsPass, FuseAttentionPass, FuseDequantMatmulPass,
-    FuseElementwisePass, FuseGatedMlpPass, FuseGeluPass, FuseHorizontalDotPass, FuseLayerNormPass,
-    FuseLogSoftmaxPass, FuseLoopsPass, FuseMapReducePass, FuseMatmulEpiloguePass, FuseMoePass,
-    FuseResidualNormPass, FuseRmsNormPass, FuseRopePass, FuseSoftmaxPass, FuseSwiGluPass,
-    HoistConstantsPass, InjectKvCachePass, InlinerPass, IrEditPass, LicmPass, LowerConvToGemmPass,
-    MergeWeightsPass, MixedPrecisionPass, NormalizeSsaPass, OptO1Pass, OptO2Pass, OptO3Pass,
+    AutodiffPass, BakeLoraPass, BisectPassesPass, BucketShapesPass, BufferizeInplacePass,
+    CalibrateQuantizePass, CanonicalizePass, CommonSubexpressionEliminationPass, ComposeFuncsPass,
+    ConvertLayoutPass, DeadCodeEliminationPass, DecomposeCompositesPass, DedupFunctionsPass,
+    EgraphSimplifyPass, ExternalizeWeightsPass, ExtractSubgraphPass, FissionLoopsPass,
+    FoldBroadcastPass, FoldConstantsPass, FoldConvertPass, FoldNormWeightsPass, FoldReshapePass,
+    FoldSliceConcatPass, FoldTransposePass, FreezeInputsPass, FuseAttentionPass,
+    FuseDequantMatmulPass, FuseElementwisePass, FuseGatedMlpPass, FuseGeluPass,
+    FuseHorizontalDotPass, FuseLayerNormPass, FuseLogSoftmaxPass, FuseLoopsPass, FuseMapReducePass,
+    FuseMatmulEpiloguePass, FuseMoePass, FuseResidualNormPass, FuseRmsNormPass, FuseRopePass,
+    FuseSoftmaxPass, FuseSwiGluPass, HashIrPass, HoistConstantsPass, InjectKvCachePass,
+    InlinerPass, IrEditPass, LicmPass, LowerConvToGemmPass, MergeWeightsPass, MixedPrecisionPass,
+    NormalizeSsaPass, OffloadActivationsPass, OptO1Pass, OptO2Pass, OptO3Pass,
     OutlineSubgraphsPass, PackWeightsPass, ParameterizeConstantsPass, Pass, PassOptions,
     PermuteLoopsPass, PrintOpStatsPass, QuantizeWeightsPass, ReduceIrPass, RematerializePass,
     ResizeBatchPass, SanitizeNumericsPass, SccpPass, ScheduleStreamsPass, ShardSpmdPass,
-    SimplifyAlgebraicPass, SinkTransposePass, SpecializeShapesPass, StripDebugInfoPass,
-    StructuredPruningPass, SymbolDcePass, TapIntermediatesPass, TaskArithmeticPass, TileLoopsPass,
-    TopologicalSortPass, UnrollLoopsPass, VectorizeLoopsPass, VerifyShapesPass,
+    SimplifyAlgebraicPass, SinkTransposePass, Sparsify2To4Pass, SpecializeShapesPass,
+    StripDebugInfoPass, StructuredPruningPass, SymbolDcePass, TapIntermediatesPass,
+    TaskArithmeticPass, TileLoopsPass, TopologicalSortPass, UnrollLoopsPass, VectorizeLoopsPass,
+    VerifyEquivPass, VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
 use castforge_ir::{DType, MergeMethod};
@@ -783,6 +785,63 @@ impl PassRegistry {
                     .cloned()
                     .unwrap_or_else(|| "v".to_string());
                 Ok(Box::new(NormalizeSsaPass { prefix }))
+            },
+        );
+        reg.register(
+            "hash-ir",
+            "Computes FNV-1a 64-bit structural hash of functions and stamps castforge.ir_hash",
+            |_opts| Ok(Box::new(HashIrPass)),
+        );
+        reg.register(
+            "verify-equiv",
+            "Verifies structural/signature invariants across pass chains",
+            |opts| {
+                let tolerance = opts
+                    .get("tol")
+                    .or_else(|| opts.get("tolerance"))
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(1e-4);
+                Ok(Box::new(VerifyEquivPass { tolerance }))
+            },
+        );
+        reg.register(
+            "sparsify-2to4",
+            "Applies NVIDIA Ampere/Hopper 2:4 fine-grained structured sparsity to 2D GEMM weights",
+            |_opts| Ok(Box::new(Sparsify2To4Pass)),
+        );
+        reg.register(
+            "bucket-shapes",
+            "Synthesizes multi-bucket shape-specialized functions (buckets=1;4;8) for dispatch",
+            |opts| {
+                let buckets = opts
+                    .get("buckets")
+                    .cloned()
+                    .unwrap_or_else(|| "1;4;8".to_string());
+                Ok(Box::new(BucketShapesPass { buckets }))
+            },
+        );
+        reg.register(
+            "convert-layout",
+            "Inserts boundary layout-conversion transposes (NCHW<->NHWC / row<->col) on ops",
+            |opts| {
+                let layout = opts
+                    .get("layout")
+                    .or_else(|| opts.get("target"))
+                    .cloned()
+                    .unwrap_or_else(|| "nhwc".to_string());
+                Ok(Box::new(ConvertLayoutPass { layout }))
+            },
+        );
+        reg.register(
+            "offload-activations",
+            "Inserts castforge.host_offload (D2H/H2D pinned host memory) on long-lived tensors",
+            |opts| {
+                let min_span = opts
+                    .get("min_span")
+                    .or_else(|| opts.get("min_distance"))
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(2);
+                Ok(Box::new(OffloadActivationsPass { min_span }))
             },
         );
         reg.register(
