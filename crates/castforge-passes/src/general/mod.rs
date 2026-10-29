@@ -1,0 +1,27 @@
+pub mod canonicalize;
+pub mod cse;
+pub mod dce;
+pub mod egraph_simplify;
+pub mod fold_constants;
+pub mod hoist_constants;
+pub mod inliner;
+pub mod licm;
+pub mod sccp;
+pub mod simplify_algebraic;
+pub mod symbol_dce;
+pub mod topological_sort;
+pub mod verify_shapes;
+
+pub use canonicalize::CanonicalizePass;
+pub use cse::CommonSubexpressionEliminationPass;
+pub use dce::DeadCodeEliminationPass;
+pub use egraph_simplify::EgraphSimplifyPass;
+pub use fold_constants::FoldConstantsPass;
+pub use hoist_constants::HoistConstantsPass;
+pub use inliner::InlinerPass;
+pub use licm::LicmPass;
+pub use sccp::SccpPass;
+pub use simplify_algebraic::SimplifyAlgebraicPass;
+pub use symbol_dce::SymbolDcePass;
+pub use topological_sort::TopologicalSortPass;
+pub use verify_shapes::VerifyShapesPass;

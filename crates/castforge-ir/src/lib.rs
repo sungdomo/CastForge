@@ -14,9 +14,8 @@ pub mod verify;
 
 pub use attr::Attribute;
 pub use tensor_store::{
-    MergeMethod, TensorBacking, TensorEntry, TensorStore, format_dense_f32_literal,
-    format_dense_i8_literal, merge_f32_tensors, parse_dense_f32_literal, prune_2d_columns_by_l1,
-    quantize_symmetric_f32,
+    TensorBacking, TensorEntry, TensorStore, format_dense_f32_literal, format_dense_i8_literal,
+    parse_dense_f32_literal,
 };
 pub use translator::{Payload, Translator, TranslatorChain};
 pub use types::{DType, Dim, TensorType, Type};

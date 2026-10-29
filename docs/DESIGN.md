@@ -122,13 +122,12 @@ CastForge is built around three foundational design principles:
 - **$O(N)$ Reference Counting:** `Module::compute_use_counts()` computes operand reference counts
   across all active blocks in a single $O(N)$ sweep, enabling linear-time Dead Code Elimination.
 
-### 4.2 Weight Plane (`TensorStore`)
-- **Inline vs. External Storage:** Small constants remain inline in MLIR attributes, while large
-  weight matrices use `dense_resource<key>` handles pointing into `Module::tensor_store`.
-- **Zero-Copy SafeTensors Integration:** `crates/castforge-passes/src/safetensors_io.rs` loads and
-  saves `TensorStore` entries directly to/from HuggingFace `.safetensors` files and supports
-  symmetric model export (`.mlir` + `.safetensors` sidecar).
-- **Built-in Weight Kernels:**
+### 4.2 Weight Plane (`TensorStore`) & Weight Surgery (`castforge-passes/src/weights/`)
+- **Pure IR Storage (`castforge-ir`):** Small constants remain inline in MLIR attributes, while
+  large weight matrices use `dense_resource<key>` handles pointing into `Module::tensor_store`.
+  `crates/castforge-ir/src/safetensors_io.rs` loads and saves `TensorStore` entries directly to/from
+  HuggingFace `.safetensors` files.
+- **Weight Surgery Kernels (`crates/castforge-passes/src/weights/ops.rs`):**
   - `quantize_symmetric_f32`: Symmetric per-tensor `i8` (`[-128, 127]`) and `i4` (`[-8, 7]`)
     quantization emitting `!quant.uniform<i8:f32, scale:zp>`.
   - `prune_2d_columns_by_l1`: Structured output-column pruning by L1 norm with zero-dimension

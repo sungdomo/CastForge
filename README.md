@@ -19,8 +19,7 @@ support.
 
 - [`crates/castforge-ir`](crates/castforge-ir): Arena-allocated MLIR-compatible IR (`Module`,
   `Operation`, `Value`, `Block`, `Region`, `Type`, `Attribute`, `Location`), structural verifier,
-  binary `.safetensors` zero-copy reader/writer, and the `TensorStore` weight plane (Linear/SLERP/
-  TIES merging, L1 structured pruning, symmetric `i8`/`i4` quantization).
+  binary `.safetensors` zero-copy reader/writer, and the `TensorStore` weight plane.
 - [`crates/castforge-dialect-stablehlo`](crates/castforge-dialect-stablehlo): Strongly-typed
   `stablehlo` and `func` dialect views (`StableHloOp`, `DotDimensionNumbers`, `FuncView`) and
   shape verifiers.
@@ -30,9 +29,10 @@ support.
   `dense_resource<key>` external weight references, plus symmetric **GGUF v2/v3**, **ONNX-JSON**,
   and **SafeTensors** model importers & exporters.
 - [`crates/castforge-passes`](crates/castforge-passes): Unified `Pass`, `PassRegistry`, and
-  `PassManager` with **82 canonical A-to-B IR translator modules & presets** supporting static Rust
-  construction, CLI pipeline strings (`-p`, comma- or `|`-separated), Unix pipe (`stdin -> stdout`)
-  invocation, declarative TOML config files (`--config`), and step-by-step pass tracing.
+  `PassManager` with **82 canonical A-to-B IR translator modules & presets** organized into 8
+  domain subdirectories (`general/`, `views/`, `weights/`, `fusion/`, `memory/`, `distributed/`,
+  `loops/`, `tooling/`), supporting static Rust construction, CLI pipeline strings (`-p`), Unix
+  pipes (`stdin -> stdout`), declarative TOML config files (`--config`), and step-by-step tracing.
 - [`crates/castforge-viz`](crates/castforge-viz): Computation graph exporter for **Mermaid**,
   **Graphviz DOT**, **JSON**, unified **MLIR Snapshot Diffing**, and a self-contained **Interactive
   HTML Pass Timeline, Roofline & Arena Memory Liveness Debugger**.

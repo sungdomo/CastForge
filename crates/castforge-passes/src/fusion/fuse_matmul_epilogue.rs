@@ -1,5 +1,5 @@
-use crate::passes::fuse_gelu::match_gelu_op;
-use crate::passes::fuse_swiglu::match_silu_val;
+use crate::fusion::fuse_gelu::match_gelu_op;
+use crate::fusion::fuse_swiglu::match_silu_val;
 use crate::{DeadCodeEliminationPass, Pass, PassResult};
 use anyhow::Result;
 use castforge_dialect_stablehlo::StableHloOp;

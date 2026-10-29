@@ -1,9 +1,9 @@
-use crate::{Pass, PassResult};
+use crate::{Pass, PassResult, prune_2d_columns_by_l1};
 use anyhow::Result;
 use castforge_dialect_stablehlo::StableHloOp;
 use castforge_ir::{
     Attribute, BlockId, Dim, Module, TensorEntry, TensorType, Type, ValueDef,
-    format_dense_f32_literal, prune_2d_columns_by_l1,
+    format_dense_f32_literal,
 };
 
 /// Structured Channel Pruning Pass (`prune-structured`).

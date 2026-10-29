@@ -1,8 +1,8 @@
-use crate::{Pass, PassResult};
+use crate::{Pass, PassResult, quantize_symmetric_f32};
 use anyhow::Result;
 use castforge_ir::{
     Attribute, BlockId, DType, Location, Module, OpName, TensorBacking, TensorEntry, TensorType,
-    Type, format_dense_i8_literal, quantize_symmetric_f32,
+    Type, format_dense_i8_literal,
 };
 use indexmap::IndexMap;
 use smallvec::SmallVec;

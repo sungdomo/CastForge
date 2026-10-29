@@ -1,0 +1,23 @@
+pub mod bucket_shapes;
+pub mod convert_layout;
+pub mod fold_broadcast;
+pub mod fold_convert;
+pub mod fold_reshape;
+pub mod fold_slice_concat;
+pub mod fold_transpose;
+pub mod lower_conv;
+pub mod resize_batch;
+pub mod sink_transpose;
+pub mod specialize_shapes;
+
+pub use bucket_shapes::BucketShapesPass;
+pub use convert_layout::ConvertLayoutPass;
+pub use fold_broadcast::FoldBroadcastPass;
+pub use fold_convert::FoldConvertPass;
+pub use fold_reshape::FoldReshapePass;
+pub use fold_slice_concat::FoldSliceConcatPass;
+pub use fold_transpose::FoldTransposePass;
+pub use lower_conv::LowerConvToGemmPass;
+pub use resize_batch::ResizeBatchPass;
+pub use sink_transpose::SinkTransposePass;
+pub use specialize_shapes::SpecializeShapesPass;

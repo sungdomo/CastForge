@@ -8,8 +8,8 @@ use crate::{
     FuseLoopsPass, FuseMapReducePass, FuseMegakernelPass, FuseMoePass, FuseNormPass, FuseRopePass,
     FuseSoftmaxPass, GlobalValueNumberingPass, HashIrPass, HoistAllReducePass, HoistConstantsPass,
     InjectKvCachePass, InlinerPass, InstrumentProfilingPass, IrEditPass, LicmPass,
-    LowerConvToGemmPass, LowerPagedAttentionPass, MergeWeightsPass, MixedPrecisionPass,
-    NormalizeSsaPass, OffloadActivationsPass, OptO1Pass, OptO2Pass, OptO3Pass,
+    LowerConvToGemmPass, LowerPagedAttentionPass, MergeMethod, MergeWeightsPass,
+    MixedPrecisionPass, NormalizeSsaPass, OffloadActivationsPass, OptO1Pass, OptO2Pass, OptO3Pass,
     OutlineSubgraphsPass, PackWeightsPass, ParameterizeConstantsPass, Pass, PassOptions,
     PrintOpStatsPass, QuantizeFp8Pass, QuantizeGroupwisePass, QuantizeWeightsPass, ReduceIrPass,
     RematerializePass, ResizeBatchPass, SanitizeNumericsPass, ScheduleLoopsPass,
@@ -19,7 +19,7 @@ use crate::{
     TaskArithmeticPass, TopologicalSortPass, UnrollCallsPass, VerifyEquivPass, VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
-use castforge_ir::{DType, MergeMethod};
+use castforge_ir::DType;
 use indexmap::IndexMap;
 
 pub type PassFactory = Box<dyn Fn(&PassOptions) -> Result<Box<dyn Pass>> + Send + Sync>;

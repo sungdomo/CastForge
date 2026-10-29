@@ -1,8 +1,7 @@
-use crate::{DeadCodeEliminationPass, Pass, PassResult};
+use crate::{DeadCodeEliminationPass, MergeMethod, Pass, PassResult, merge_f32_tensors};
 use anyhow::Result;
 use castforge_ir::{
-    Attribute, BlockId, MergeMethod, Module, OpName, TensorEntry, ValueDef,
-    format_dense_f32_literal, merge_f32_tensors,
+    Attribute, BlockId, Module, OpName, TensorEntry, ValueDef, format_dense_f32_literal,
 };
 use indexmap::IndexMap;
 

@@ -1,10 +1,27 @@
-//! Unified [`Pass`], [`PassRegistry`], [`PassManager`], and **91 built-in A-to-B IR translator
-//! passes & presets** (`castforge-passes`).
+//! Unified [`Pass`], [`PassRegistry`], [`PassManager`], and **82 built-in A-to-B IR translator
+//! passes & presets** (`castforge-passes`), organized into 8 domain subgroups:
+//! [`general`], [`views`], [`weights`], [`fusion`], [`memory`], [`distributed`], [`loops`], and
+//! [`tooling`].
 
-pub mod passes;
+pub mod distributed;
+pub mod fusion;
+pub mod general;
+pub mod loops;
+pub mod memory;
 pub mod registry;
-pub use passes::*;
+pub mod tooling;
+pub mod views;
+pub mod weights;
+
+pub use distributed::*;
+pub use fusion::*;
+pub use general::*;
+pub use loops::*;
+pub use memory::*;
 pub use registry::{PassDescriptor, PassFactory, PassRegistry};
+pub use tooling::*;
+pub use views::*;
+pub use weights::*;
 
 use anyhow::{Result, anyhow};
 use castforge_ir::Module;

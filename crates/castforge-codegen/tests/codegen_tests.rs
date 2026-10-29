@@ -1718,7 +1718,7 @@ module @multi_arch_demo {
 
 #[test]
 fn test_sota_commutative_cse_refcount_dce_and_extended_eval() {
-    use castforge_ir::tensor_store::prune_2d_columns_by_l1;
+    use castforge_passes::prune_2d_columns_by_l1;
 
     // 1. Zero-dimension and short-slice safety in prune_2d_columns_by_l1
     let (pruned_empty, kept_empty) = prune_2d_columns_by_l1(&[], 0, 0, 4);
