@@ -1,5 +1,5 @@
 use castforge_codegen::{
-    BottleneckKind, CodegenTarget, GemmLoopOrder, HardwareRoofline, TargetConfig,
+    BottleneckKind, CodegenTarget, GemmLoopOrder, HardwareRoofline, SimdIsa, TargetConfig,
     analyze_module_cost_with_roofline, build_memory_plan, evaluate_module, generate_code,
     generate_code_with_config, verify_module_numerics,
 };
@@ -886,4 +886,72 @@ module @moe_block {
     assert!(rust_db.contains("[loop:double_buffer(stages=2, ping_pong"));
     let c_db = generate_code_with_config(&before, CodegenTarget::C, &cfg_db).expect("c db");
     assert!(c_db.contains("[loop:double_buffer(stages=2, ping_pong"));
+}
+
+#[test]
+fn test_simd_intrinsics_calibrate_quantize_and_schedule_streams() {
+    let mlir = r#"
+module @parallel_branches {
+  func.func @main(
+    %x: tensor<2x4xf32>,
+    %w0: tensor<4x4xf32>,
+    %w1: tensor<4x4xf32>
+  ) -> tensor<2x4xf32> {
+    %b0 = stablehlo.dot_general %x, %w0, contracting_dims = [1] x [0]
+      : (tensor<2x4xf32>, tensor<4x4xf32>) -> tensor<2x4xf32>
+    %b1 = stablehlo.dot_general %x, %w1, contracting_dims = [1] x [0]
+      : (tensor<2x4xf32>, tensor<4x4xf32>) -> tensor<2x4xf32>
+    %out = stablehlo.add %b0, %b1 : tensor<2x4xf32>
+    func.return %out : tensor<2x4xf32>
+  }
+}
+"#;
+    let before = parse_mlir(mlir).expect("parse parallel_branches");
+    let mut after = before.clone();
+    let registry = PassRegistry::with_builtin_passes();
+    let mut pm = PassManager::from_pipeline_str(
+        &registry,
+        "calibrate-quantize(bits=8,samples=4),schedule-streams(streams=2)",
+    )
+    .expect("calibrate + streams pipeline");
+    let res = pm.run(&mut after).expect("run calibrate + streams");
+    assert!(res[0].changed);
+    assert!(res[1].changed);
+
+    let ir = print_mlir(&after);
+    assert!(ir.contains("castforge.static_quantize"));
+    assert!(ir.contains("castforge.stream_wait"));
+
+    // Verify numerical accuracy within INT8 quantization error bound
+    let rep = verify_module_numerics(&before, &after, 2e-2).expect("verify w8a8 + streams");
+    assert!(rep.passed, "max_abs_diff = {}", rep.max_abs_diff);
+
+    // Verify AVX2 & NEON hardware intrinsic emission + stream/quant codegen
+    let cfg_avx2 = TargetConfig::default().with_simd_isa(SimdIsa::Avx2);
+    let rust_avx2 =
+        generate_code_with_config(&after, CodegenTarget::Rust, &cfg_avx2).expect("rust avx2");
+    assert!(rust_avx2.contains("_mm256_fmadd_ps"));
+    assert!(rust_avx2.contains("[stream:launch(stream_id=0)]"));
+    assert!(rust_avx2.contains("[stream:launch(stream_id=1)]"));
+    assert!(rust_avx2.contains("[stream:wait(wait_stream=1, target_stream=0)]"));
+    assert!(rust_avx2.contains("[quant:w8a8_static("));
+
+    let c_avx2 = generate_code_with_config(&after, CodegenTarget::C, &cfg_avx2).expect("c avx2");
+    assert!(c_avx2.contains("#include <immintrin.h>"));
+    assert!(c_avx2.contains("_mm256_fmadd_ps"));
+    assert!(c_avx2.contains("[stream:wait(wait_stream=1, target_stream=0)]"));
+    assert!(c_avx2.contains("[quant:w8a8_static("));
+
+    let cfg_neon = TargetConfig::default().with_simd_isa(SimdIsa::Neon);
+    let c_neon = generate_code_with_config(&after, CodegenTarget::C, &cfg_neon).expect("c neon");
+    assert!(c_neon.contains("#include <arm_neon.h>"));
+    assert!(c_neon.contains("vfmaq_f32"));
+
+    // Verify decompose-composites lowers static_quantize and stream_wait cleanly
+    let mut decomposed = after.clone();
+    let mut dec_pm =
+        PassManager::from_pipeline_str(&registry, "decompose-composites").expect("decompose");
+    dec_pm.run(&mut decomposed).expect("run decompose");
+    let dec_rep = verify_module_numerics(&before, &decomposed, 1e-5).expect("verify decomposed");
+    assert!(dec_rep.passed);
 }

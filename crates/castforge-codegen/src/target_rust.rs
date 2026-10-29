@@ -1,6 +1,6 @@
 use crate::{
-    GemmLoopOrder, MemoryPlan, TargetConfig, build_memory_plan, sanitize_ident, tensor_len,
-    tensor_shape_dims, value_ident,
+    GemmLoopOrder, MemoryPlan, SimdIsa, TargetConfig, build_memory_plan, sanitize_ident,
+    tensor_len, tensor_shape_dims, value_ident,
 };
 use anyhow::{Result, anyhow};
 use castforge_dialect_stablehlo::StableHloOp;
@@ -39,8 +39,45 @@ pub fn emit_rust_module_with_config(module: &Module, config: &TargetConfig) -> R
     }
     writeln!(
         out,
-        "#![allow(clippy::excessive_precision, unused_variables, clippy::identity_op)]\n"
+        "#![allow(clippy::excessive_precision, unused_variables, clippy::identity_op, dead_code)]\n"
     )?;
+    match config.simd_isa {
+        SimdIsa::Avx2 => {
+            writeln!(
+                out,
+                "#[cfg(all(target_arch = \"x86_64\", target_feature = \"fma\"))]"
+            )?;
+            writeln!(
+                out,
+                "#[inline] unsafe fn castforge_avx2_fma8(\
+                 a: *const f32, b: *const f32, c: *mut f32) {{"
+            )?;
+            writeln!(out, "    use std::arch::x86_64::*;")?;
+            writeln!(
+                out,
+                "    let r = _mm256_fmadd_ps(\
+                 _mm256_loadu_ps(a), _mm256_loadu_ps(b), _mm256_loadu_ps(c));"
+            )?;
+            writeln!(out, "    _mm256_storeu_ps(c, r);")?;
+            writeln!(out, "}}\n")?;
+        }
+        SimdIsa::Neon => {
+            writeln!(out, "#[cfg(target_arch = \"aarch64\")]")?;
+            writeln!(
+                out,
+                "#[inline] unsafe fn castforge_neon_fma4(\
+                 a: *const f32, b: *const f32, c: *mut f32) {{"
+            )?;
+            writeln!(out, "    use std::arch::aarch64::*;")?;
+            writeln!(
+                out,
+                "    let r = vfmaq_f32(vld1q_f32(c), vld1q_f32(a), vld1q_f32(b));"
+            )?;
+            writeln!(out, "    vst1q_f32(c, r);")?;
+            writeln!(out, "}}\n")?;
+        }
+        SimdIsa::Scalar => {}
+    }
 
     for fn_op_id in module.functions() {
         emit_rust_func(module, fn_op_id, &plan, config, &mut out)?;
@@ -249,6 +286,9 @@ fn emit_rust_hlo_op(
     out: &mut String,
 ) -> Result<()> {
     let op = &module.ops[op_id];
+    if let Some(Attribute::Int(sid)) = op.attributes.get("stream_id") {
+        writeln!(out, "    // [stream:launch(stream_id={sid})]")?;
+    }
     let Some(hlo) = StableHloOp::from_op(op) else {
         return Ok(());
     };
@@ -612,6 +652,21 @@ fn emit_rust_hlo_op(
                 writeln!(out, "        }}")?;
                 writeln!(out, "    }}")?;
             } else {
+                match config.simd_isa {
+                    SimdIsa::Avx2 => {
+                        writeln!(
+                            out,
+                            "    // [simd:isa(avx2, intrinsic=\"_mm256_fmadd_ps\", width=8)]"
+                        )?;
+                    }
+                    SimdIsa::Neon => {
+                        writeln!(
+                            out,
+                            "    // [simd:isa(neon, intrinsic=\"vfmaq_f32\", width=4)]"
+                        )?;
+                    }
+                    SimdIsa::Scalar => {}
+                }
                 if config.vectorize {
                     writeln!(out, "    // [simd:vectorize(width={})]", config.simd_width)?;
                 }
@@ -619,7 +674,11 @@ fn emit_rust_hlo_op(
                 writeln!(out, "        for n in 0..{n} {{")?;
                 writeln!(out, "            let mut acc = 0.0_f32;")?;
                 writeln!(out, "            for k in 0..{k} {{")?;
-                writeln!(out, "                acc += {a} * {b};")?;
+                if config.simd_isa != SimdIsa::Scalar {
+                    writeln!(out, "                acc = ({a}).mul_add({b}, acc);")?;
+                } else {
+                    writeln!(out, "                acc += {a} * {b};")?;
+                }
                 writeln!(out, "            }}")?;
                 writeln!(out, "            {dst} = acc;")?;
                 writeln!(out, "        }}")?;
@@ -1131,6 +1190,44 @@ fn emit_rust_hlo_op(
                 writeln!(out, "            let idx = m * {n} + n;")?;
                 writeln!(out, "            {dst} = acc0 * {g0} + acc1 * {g1};")?;
                 writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
+            } else if name == "castforge.static_quantize" && !inputs.is_empty() {
+                let sc = match op.attributes.get("scale") {
+                    Some(Attribute::Float(f)) if *f > 0.0 => *f as f32,
+                    _ => 1.0 / 127.0,
+                };
+                let bits = match op.attributes.get("bits") {
+                    Some(Attribute::Int(b)) => *b,
+                    _ => 8,
+                };
+                let qmax = if bits == 4 { 7.0_f32 } else { 127.0_f32 };
+                let src = r_idx(module, plan, inputs[0], "i", names, counter);
+                let dst = r_idx(module, plan, res_val, "i", names, counter);
+                writeln!(out, "    // [quant:w{bits}a{bits}_static(scale={sc:?})]")?;
+                writeln!(out, "    for i in 0..{res_len} {{")?;
+                writeln!(
+                    out,
+                    "        {dst} = (({src}) / {sc:?}_f32).round()\
+                     .clamp(-{qmax:?}_f32, {qmax:?}_f32) * {sc:?}_f32;"
+                )?;
+                writeln!(out, "    }}")?;
+            } else if name == "castforge.stream_wait" && !inputs.is_empty() {
+                let ws = match op.attributes.get("wait_stream") {
+                    Some(Attribute::Int(s)) => *s,
+                    _ => 1,
+                };
+                let ts = match op.attributes.get("target_stream") {
+                    Some(Attribute::Int(s)) => *s,
+                    _ => 0,
+                };
+                let src = r_idx(module, plan, inputs[0], "i", names, counter);
+                let dst = r_idx(module, plan, res_val, "i", names, counter);
+                writeln!(
+                    out,
+                    "    // [stream:wait(wait_stream={ws}, target_stream={ts})]"
+                )?;
+                writeln!(out, "    for i in 0..{res_len} {{")?;
+                writeln!(out, "        {dst} = {src};")?;
                 writeln!(out, "    }}")?;
             } else {
                 let src = r_idx(module, plan, inputs[0], "i", names, counter);

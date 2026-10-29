@@ -26,6 +26,29 @@ impl GemmLoopOrder {
     }
 }
 
+/// Hardware SIMD instruction set architecture for explicit intrinsic emission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SimdIsa {
+    /// Portable scalar / auto-vectorized loops (`#pragma omp simd`).
+    #[default]
+    Scalar,
+    /// x86_64 AVX2 + FMA 256-bit (`8 x f32`) hardware intrinsics (`_mm256_fmadd_ps`).
+    Avx2,
+    /// ARM64 NEON 128-bit (`4 x f32`) hardware intrinsics (`vfmaq_f32`).
+    Neon,
+}
+
+impl SimdIsa {
+    /// Parses a SIMD ISA identifier (`"scalar"`, `"avx2"`, `"neon"`).
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "avx2" | "fma" | "x86_64" => Self::Avx2,
+            "neon" | "aarch64" | "arm64" => Self::Neon,
+            _ => Self::Scalar,
+        }
+    }
+}
+
 /// Hardware target descriptor parameterizing cache tiling, loop permutation, unrolling,
 /// SIMD vectorization, and GPU workgroup dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +87,8 @@ pub struct TargetConfig {
     pub loop_skew: bool,
     /// Enable 2-stage software-pipelined ping-pong tile double-buffering across K tiles.
     pub double_buffer: bool,
+    /// Hardware SIMD ISA for explicit intrinsic codegen (`Scalar`, `Avx2`, `Neon`).
+    pub simd_isa: SimdIsa,
 }
 
 impl Default for TargetConfig {
@@ -86,6 +111,7 @@ impl Default for TargetConfig {
             split_k: 1,
             loop_skew: false,
             double_buffer: false,
+            simd_isa: SimdIsa::Scalar,
         }
     }
 }
@@ -176,6 +202,23 @@ impl TargetConfig {
     /// Enable or disable 2-stage software-pipelined ping-pong tile double-buffering.
     pub fn with_double_buffer(mut self, enabled: bool) -> Self {
         self.double_buffer = enabled;
+        self
+    }
+
+    /// Select the target hardware SIMD instruction set (`Scalar`, `Avx2`, `Neon`).
+    pub fn with_simd_isa(mut self, isa: SimdIsa) -> Self {
+        self.simd_isa = isa;
+        match isa {
+            SimdIsa::Avx2 => {
+                self.vectorize = true;
+                self.simd_width = 8;
+            }
+            SimdIsa::Neon => {
+                self.vectorize = true;
+                self.simd_width = 4;
+            }
+            SimdIsa::Scalar => {}
+        }
         self
     }
 

@@ -608,6 +608,13 @@ impl Pass for DecomposeCompositesPass {
                         created += 4;
                         modified += 1;
                     }
+                    "castforge.stream_wait" | "castforge.static_quantize" if !inputs.is_empty() => {
+                        let op_mut = &mut module.ops[op_id];
+                        op_mut.name = OpName::new("stablehlo", "convert");
+                        op_mut.operands = SmallVec::from_slice(&[inputs[0]]);
+                        op_mut.attributes.clear();
+                        modified += 1;
+                    }
                     _ => {}
                 }
             }

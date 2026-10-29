@@ -826,6 +826,20 @@ fn eval_stablehlo_op(
                 (0..res_len)
                     .map(|i| e0[i] * g0[i % g0.len()] + e1[i] * g1[i % g1.len()])
                     .collect()
+            } else if name == "castforge.static_quantize" && !inputs.is_empty() {
+                let sc = match op.attributes.get("scale") {
+                    Some(castforge_ir::Attribute::Float(f)) if *f > 0.0 => *f as f32,
+                    _ => 1.0 / 127.0,
+                };
+                let bits = match op.attributes.get("bits") {
+                    Some(castforge_ir::Attribute::Int(b)) => *b,
+                    _ => 8,
+                };
+                let qmax = if bits == 4 { 7.0_f32 } else { 127.0_f32 };
+                get_v(inputs[0])
+                    .into_iter()
+                    .map(|x| (x / sc).round().clamp(-qmax, qmax) * sc)
+                    .collect()
             } else {
                 get_v(inputs[0])
             }

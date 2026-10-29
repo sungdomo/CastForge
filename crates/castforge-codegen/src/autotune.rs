@@ -147,6 +147,7 @@ pub fn autotune_module(module: &Module, roofline: &HardwareRoofline) -> Autotune
                                         split_k: sk,
                                         loop_skew: false,
                                         double_buffer: l1 >= 16,
+                                        simd_isa: crate::SimdIsa::Scalar,
                                     };
                                     let cand = score_candidate(
                                         &cfg,

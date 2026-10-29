@@ -189,6 +189,10 @@ enum Commands {
         /// Enable 2-stage software-pipelined ping-pong tile double-buffering
         #[arg(long = "double-buffer")]
         double_buffer: bool,
+
+        /// Hardware SIMD ISA for explicit intrinsics: scalar, avx2, or neon
+        #[arg(long = "simd-isa", default_value = "scalar")]
+        simd_isa: String,
     },
 
     /// Analyze FLOPs, memory bandwidth traffic, arithmetic intensity, and Roofline bottlenecks
@@ -499,6 +503,7 @@ fn main() -> Result<()> {
             split_k,
             loop_skew,
             double_buffer,
+            simd_isa,
         } => {
             let src = fs::read_to_string(&input)
                 .with_context(|| format!("Failed to read {}", input.display()))?;
@@ -551,6 +556,7 @@ fn main() -> Result<()> {
                 split_k: split_k.max(1),
                 loop_skew,
                 double_buffer,
+                simd_isa: castforge_codegen::SimdIsa::parse(&simd_isa),
             };
             let code = generate_code_with_config(&module, tgt, &cfg)?;
             if let Some(out_path) = output {

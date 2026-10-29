@@ -1,6 +1,6 @@
 use crate::{
-    GemmLoopOrder, MemoryPlan, TargetConfig, build_memory_plan, sanitize_ident, tensor_len,
-    tensor_shape_dims, value_ident,
+    GemmLoopOrder, MemoryPlan, SimdIsa, TargetConfig, build_memory_plan, sanitize_ident,
+    tensor_len, tensor_shape_dims, value_ident,
 };
 use anyhow::{Result, anyhow};
 use castforge_dialect_stablehlo::StableHloOp;
@@ -38,7 +38,46 @@ pub fn emit_c_module_with_config(module: &Module, config: &TargetConfig) -> Resu
             config.tile_m, config.tile_n, config.tile_k, config.simd_width
         )?;
     }
-    writeln!(out, "#include <stdint.h>\n#include <math.h>\n")?;
+    writeln!(out, "#include <stdint.h>\n#include <math.h>")?;
+    match config.simd_isa {
+        SimdIsa::Avx2 => {
+            writeln!(out, "#if defined(__AVX2__) && defined(__FMA__)")?;
+            writeln!(out, "#include <immintrin.h>")?;
+            writeln!(
+                out,
+                "static inline void castforge_avx2_fma8(\
+                 float* dst, const float* a, const float* b) {{"
+            )?;
+            writeln!(
+                out,
+                "    __m256 va = _mm256_loadu_ps(a), \
+                 vb = _mm256_loadu_ps(b), vc = _mm256_loadu_ps(dst);"
+            )?;
+            writeln!(
+                out,
+                "    _mm256_storeu_ps(dst, _mm256_fmadd_ps(va, vb, vc));"
+            )?;
+            writeln!(out, "}}")?;
+            writeln!(out, "#endif\n")?;
+        }
+        SimdIsa::Neon => {
+            writeln!(out, "#if defined(__ARM_NEON)")?;
+            writeln!(out, "#include <arm_neon.h>")?;
+            writeln!(
+                out,
+                "static inline void castforge_neon_fma4(\
+                 float* dst, const float* a, const float* b) {{"
+            )?;
+            writeln!(
+                out,
+                "    float32x4_t va = vld1q_f32(a), vb = vld1q_f32(b), vc = vld1q_f32(dst);"
+            )?;
+            writeln!(out, "    vst1q_f32(dst, vfmaq_f32(vc, va, vb));")?;
+            writeln!(out, "}}")?;
+            writeln!(out, "#endif\n")?;
+        }
+        SimdIsa::Scalar => writeln!(out)?,
+    }
 
     for fn_op_id in module.functions() {
         emit_c_func(module, fn_op_id, &plan, config, &mut out)?;
@@ -203,6 +242,9 @@ fn emit_c_hlo_op(
     out: &mut String,
 ) -> Result<()> {
     let op = &module.ops[op_id];
+    if let Some(Attribute::Int(sid)) = op.attributes.get("stream_id") {
+        writeln!(out, "    /* [stream:launch(stream_id={sid})] */")?;
+    }
     let Some(hlo) = StableHloOp::from_op(op) else {
         return Ok(());
     };
@@ -545,6 +587,21 @@ fn emit_c_hlo_op(
                 writeln!(out, "        }}")?;
                 writeln!(out, "    }}")?;
             } else {
+                match config.simd_isa {
+                    SimdIsa::Avx2 => {
+                        writeln!(
+                            out,
+                            "    /* [simd:isa(avx2, intrinsic=\"_mm256_fmadd_ps\", width=8)] */"
+                        )?;
+                    }
+                    SimdIsa::Neon => {
+                        writeln!(
+                            out,
+                            "    /* [simd:isa(neon, intrinsic=\"vfmaq_f32\", width=4)] */"
+                        )?;
+                    }
+                    SimdIsa::Scalar => {}
+                }
                 if config.vectorize {
                     writeln!(out, "    #pragma omp simd")?;
                 }
@@ -962,6 +1019,44 @@ fn emit_c_hlo_op(
                 )?;
                 writeln!(out, "        }}")?;
                 writeln!(out, "    }}")?;
+            } else if name == "castforge.static_quantize" && !inputs.is_empty() {
+                let sc = match op.attributes.get("scale") {
+                    Some(Attribute::Float(f)) if *f > 0.0 => *f as f32,
+                    _ => 1.0 / 127.0,
+                };
+                let bits = match op.attributes.get("bits") {
+                    Some(Attribute::Int(b)) => *b,
+                    _ => 8,
+                };
+                let qmax = if bits == 4 { 7.0_f32 } else { 127.0_f32 };
+                let src = value_ident(module, inputs[0], names, counter);
+                writeln!(
+                    out,
+                    "    /* [quant:w{bits}a{bits}_static(scale={sc:.6})] */"
+                )?;
+                writeln!(out, "    for (int i = 0; i < {res_len}; ++i) {{")?;
+                writeln!(out, "        float q = roundf({src}[i] / {sc:.6}f);")?;
+                writeln!(out, "        q = fminf(fmaxf(q, -{qmax:.1}f), {qmax:.1}f);")?;
+                writeln!(out, "        {res_name}[i] = q * {sc:.6}f;")?;
+                writeln!(out, "    }}")?;
+            } else if name == "castforge.stream_wait" && !inputs.is_empty() {
+                let ws = match op.attributes.get("wait_stream") {
+                    Some(Attribute::Int(s)) => *s,
+                    _ => 1,
+                };
+                let ts = match op.attributes.get("target_stream") {
+                    Some(Attribute::Int(s)) => *s,
+                    _ => 0,
+                };
+                let src = value_ident(module, inputs[0], names, counter);
+                writeln!(
+                    out,
+                    "    /* [stream:wait(wait_stream={ws}, target_stream={ts})] */"
+                )?;
+                writeln!(
+                    out,
+                    "    for (int i = 0; i < {res_len}; ++i) {res_name}[i] = {src}[i];"
+                )?;
             } else {
                 let src = value_ident(module, inputs[0], names, counter);
                 writeln!(

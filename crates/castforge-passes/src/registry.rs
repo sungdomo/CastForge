@@ -1,5 +1,5 @@
 use crate::{
-    AutodiffPass, BakeLoraPass, BufferizeInplacePass, CanonicalizePass,
+    AutodiffPass, BakeLoraPass, BufferizeInplacePass, CalibrateQuantizePass, CanonicalizePass,
     CommonSubexpressionEliminationPass, DeadCodeEliminationPass, DecomposeCompositesPass,
     EgraphSimplifyPass, ExternalizeWeightsPass, FissionLoopsPass, FoldBroadcastPass,
     FoldConstantsPass, FoldConvertPass, FoldNormWeightsPass, FoldReshapePass, FoldSliceConcatPass,
@@ -9,10 +9,10 @@ use crate::{
     FuseRmsNormPass, FuseRopePass, FuseSoftmaxPass, FuseSwiGluPass, HoistConstantsPass,
     InjectKvCachePass, InlinerPass, IrEditPass, LicmPass, LowerConvToGemmPass, MergeWeightsPass,
     MixedPrecisionPass, OptO1Pass, OptO2Pass, OptO3Pass, PackWeightsPass, Pass, PassOptions,
-    PrintOpStatsPass, QuantizeWeightsPass, RematerializePass, SccpPass, ShardSpmdPass,
-    SimplifyAlgebraicPass, SinkTransposePass, SpecializeShapesPass, StripDebugInfoPass,
-    StructuredPruningPass, SymbolDcePass, TaskArithmeticPass, TopologicalSortPass,
-    VerifyShapesPass,
+    PrintOpStatsPass, QuantizeWeightsPass, RematerializePass, SccpPass, ScheduleStreamsPass,
+    ShardSpmdPass, SimplifyAlgebraicPass, SinkTransposePass, SpecializeShapesPass,
+    StripDebugInfoPass, StructuredPruningPass, SymbolDcePass, TaskArithmeticPass,
+    TopologicalSortPass, VerifyShapesPass,
 };
 use anyhow::{Result, anyhow};
 use castforge_ir::{DType, MergeMethod};
@@ -478,6 +478,34 @@ impl PassRegistry {
             "fuse-moe",
             "Fuses routed Mixture-of-Experts (MoE) expert GEMMs and gate combine into fused_moe",
             |_opts| Ok(Box::new(FuseMoePass)),
+        );
+        reg.register(
+            "calibrate-quantize",
+            "Calibrates activation dynamic ranges and inserts static W8A8 quantization scales",
+            |opts| {
+                let bits = opts
+                    .get("bits")
+                    .and_then(|s| s.parse::<u8>().ok())
+                    .unwrap_or(8);
+                let num_samples = opts
+                    .get("samples")
+                    .or_else(|| opts.get("num_samples"))
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(4);
+                Ok(Box::new(CalibrateQuantizePass { bits, num_samples }))
+            },
+        );
+        reg.register(
+            "schedule-streams",
+            "Assigns independent branches to concurrent streams with stream_wait barriers",
+            |opts| {
+                let num_streams = opts
+                    .get("streams")
+                    .or_else(|| opts.get("num_streams"))
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(2);
+                Ok(Box::new(ScheduleStreamsPass { num_streams }))
+            },
         );
         reg.register(
             "O1",
