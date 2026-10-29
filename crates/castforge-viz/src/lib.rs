@@ -1,6 +1,7 @@
 pub mod timeline;
 pub use timeline::render_timeline_html;
 
+use castforge_codegen::{MemoryPlan, build_memory_plan};
 use castforge_ir::{Module, OpId, ValueDef, ValueId};
 use castforge_mlir::print_mlir;
 use serde::Serialize;
@@ -51,6 +52,7 @@ pub struct TimelineFrame {
     pub ops_created: usize,
     pub mlir_text: String,
     pub graph: GraphJson,
+    pub memory_plan: MemoryPlan,
 }
 
 /// Render a single `Module` into Mermaid, Graphviz DOT, JSON, or standalone HTML.
@@ -69,6 +71,7 @@ pub fn render_module(module: &Module, format: VizFormat) -> String {
                 ops_created: 0,
                 mlir_text: print_mlir(module),
                 graph: build_graph_json(module),
+                memory_plan: build_memory_plan(module),
             };
             render_timeline_html(&[frame])
         }

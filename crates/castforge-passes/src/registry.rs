@@ -183,8 +183,16 @@ impl PassRegistry {
         );
         reg.register(
             "print-op-stats",
-            "Computes and prints operation counts, parameter sizes, and FLOP estimates",
-            |_opts| Ok(Box::new(PrintOpStatsPass)),
+            "Computes operation counts, parameter sizes, FLOPs, and Roofline arithmetic intensity",
+            |opts| {
+                let ridge = opts
+                    .get("ridge")
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(10.0);
+                Ok(Box::new(PrintOpStatsPass {
+                    ridge_flops_per_byte: ridge,
+                }))
+            },
         );
         reg.register(
             "externalize-weights",

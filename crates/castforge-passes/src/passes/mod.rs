@@ -44,7 +44,7 @@ pub use fuse_softmax::FuseSoftmaxPass;
 pub use inliner::InlinerPass;
 pub use ir_edit::IrEditPass;
 pub use merge_weights::MergeWeightsPass;
-pub use print_op_stats::PrintOpStatsPass;
+pub use print_op_stats::{PrintOpStatsPass, RooflineSummary, analyze_roofline};
 pub use prune_structured::StructuredPruningPass;
 pub use quantize_weights::QuantizeWeightsPass;
 pub use sccp::SccpPass;

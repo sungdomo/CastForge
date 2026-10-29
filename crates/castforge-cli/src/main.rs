@@ -333,6 +333,7 @@ fn main() -> Result<()> {
                             ops_created: creat,
                             mlir_text: print_mlir(&step.module),
                             graph: build_graph_json(&step.module),
+                            memory_plan: build_memory_plan(&step.module),
                         }
                     })
                     .collect();

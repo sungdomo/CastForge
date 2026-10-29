@@ -1,6 +1,6 @@
 use castforge_codegen::{CodegenTarget, generate_code, verify_module_numerics};
 use castforge_mlir::{parse_mlir, print_mlir};
-use castforge_passes::{PassManager, PassRegistry};
+use castforge_passes::{PassManager, PassRegistry, analyze_roofline};
 
 const SINK_TRANSPOSE_MLIR: &str = r#"
 module @sink_transpose_demo {
@@ -264,4 +264,9 @@ fn test_task_arithmetic_and_dare_pruning() {
     // w_task[0,0] = 1.0, w_task[0,1] = 2.0 + (2.0 + 1.0) = 5.0,
     // w_task[1,0] = 3.0 + (2.0 + 1.0) = 6.0, w_task[1,1] = 4.0
     assert!(printed.contains("[[1.0, 5.0], [6.0, 4.0]]"));
+
+    let roof = analyze_roofline(&module, 10.0);
+    assert!(roof.total_flops > 0);
+    assert!(roof.total_bytes_transferred > 0);
+    assert!(roof.arithmetic_intensity > 0.0);
 }

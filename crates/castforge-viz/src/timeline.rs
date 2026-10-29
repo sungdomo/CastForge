@@ -193,6 +193,8 @@ pub fn render_timeline_html(frames: &[TimelineFrame]) -> String {
   <div class="code-pane">
     <div class="pane-header">MLIR IR Snapshot</div>
     <pre id="mlirCode"></pre>
+    <div class="pane-header">Arena Memory & Liveness Summary</div>
+    <div id="arenaPanel" style="padding:10px 14px; font-size:12px;"></div>
     <div class="pane-header">Selected Operation Inspector</div>
     <div class="inspector" id="inspector">
       Click any node in the graph to inspect its tensor types and attributes.
@@ -240,6 +242,14 @@ function renderMain() {{
   const ind = document.getElementById('stepIndicator');
   ind.textContent = `Step ${{f.step_index}} / ${{total}}: ${{f.pass_name}}`;
   document.getElementById('mlirCode').textContent = f.mlir_text;
+  const mp = f.memory_plan || {{}};
+  const saved = (mp.naive_activation_bytes || 0) - (mp.total_activation_bytes || 0);
+  document.getElementById('arenaPanel').innerHTML = `
+    <div><b>Weights:</b> ${{mp.total_constant_bytes || 0}} B |
+    <b>Arena Workspace:</b> ${{mp.total_activation_bytes || 0}} B
+    (Naive: ${{mp.naive_activation_bytes || 0}} B, Saved: ${{saved}} B,
+    Slots: ${{mp.reusable_slot_count || 0}})</div>
+  `;
 
   const canvas = document.getElementById('canvasPane');
   canvas.innerHTML = '';

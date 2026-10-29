@@ -8,5 +8,6 @@ description = "Graph visualization exporter (Mermaid, DOT, JSON, HTML Debugger) 
 [dependencies]
 castforge-ir.workspace = true
 castforge-mlir.workspace = true
+castforge-codegen.workspace = true
 serde.workspace = true
 serde_json.workspace = true
