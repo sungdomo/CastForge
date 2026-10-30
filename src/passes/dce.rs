@@ -1,9 +1,10 @@
-use crate::ir::{BlockId, Module, OpId};
+use crate::ir::{BlockId, Module, OpId, ValueId};
 use crate::passes::{Pass, PassResult};
 use anyhow::Result;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-/// Dead Code Elimination Pass (`dce` — $O(N)$ reference-counted SSA DCE + optional Symbol DCE).
+/// Dead Code Elimination Pass (`dce` — $O(N)$ reference-counted SSA + Symbol DCE in a single
+/// reverse sweep with batch `retain` compaction).
 pub struct DeadCodeEliminationPass {
     pub include_symbols: bool,
 }
@@ -36,112 +37,98 @@ impl Pass for DeadCodeEliminationPass {
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let mut removed = 0usize;
         let blocks: Vec<BlockId> = module.blocks.keys().collect();
-        let mut use_counts = module.compute_use_counts();
+        let mut use_counts: HashMap<ValueId, usize> = HashMap::with_capacity(module.values.len());
+        let mut referenced_symbols: HashSet<String> = HashSet::new();
 
-        loop {
-            let mut pass_removed = 0usize;
-            for &block_id in &blocks {
-                let ops = module.block_ops(block_id);
-                let mut dead_in_block: Vec<OpId> = Vec::new();
-                for &op_id in ops.iter().rev() {
-                    let Some(op) = module.ops.get(op_id) else {
-                        continue;
-                    };
-                    if !op.is_pure() || op.results.is_empty() {
-                        continue;
+        for &block_id in &blocks {
+            for &op_id in &module.blocks[block_id].ops {
+                if let Some(op) = module.ops.get(op_id) {
+                    for &operand in &op.operands {
+                        *use_counts.entry(operand).or_insert(0) += 1;
                     }
-                    let all_unused = op
-                        .results
-                        .iter()
-                        .all(|res| use_counts.get(res).copied().unwrap_or(0) == 0);
-                    if all_unused {
-                        for &operand in &op.operands {
-                            if let Some(cnt) = use_counts.get_mut(&operand) {
-                                *cnt = cnt.saturating_sub(1);
-                            }
+                    if self.include_symbols {
+                        if op.is_op("func", "call")
+                            && let Some(c) = op.attributes.get("callee").and_then(|a| a.as_str())
+                        {
+                            referenced_symbols.insert(c.to_string());
                         }
-                        dead_in_block.push(op_id);
-                        pass_removed += 1;
+                        if op.is_op("stablehlo", "composite")
+                            && let Some(d) =
+                                op.attributes.get("decomposition").and_then(|a| a.as_str())
+                        {
+                            referenced_symbols.insert(d.to_string());
+                        }
                     }
-                }
-                for op_id in dead_in_block {
-                    module.remove_op(block_id, op_id);
                 }
             }
-            removed += pass_removed;
-            if pass_removed == 0 {
-                break;
+        }
+
+        for &block_id in blocks.iter().rev() {
+            let mut dead_in_block: HashSet<OpId> = HashSet::new();
+            for &op_id in module.blocks[block_id].ops.iter().rev() {
+                let Some(op) = module.ops.get(op_id) else {
+                    continue;
+                };
+                if !op.is_pure() || op.results.is_empty() {
+                    continue;
+                }
+                let all_unused = op
+                    .results
+                    .iter()
+                    .all(|res| use_counts.get(res).copied().unwrap_or(0) == 0);
+                if all_unused {
+                    for &operand in &op.operands {
+                        if let Some(cnt) = use_counts.get_mut(&operand) {
+                            *cnt = cnt.saturating_sub(1);
+                        }
+                    }
+                    dead_in_block.insert(op_id);
+                }
+            }
+            if !dead_in_block.is_empty() {
+                removed += dead_in_block.len();
+                module.blocks[block_id]
+                    .ops
+                    .retain(|id| !dead_in_block.contains(id));
+                for dead_id in dead_in_block {
+                    module.ops.remove(dead_id);
+                }
             }
         }
 
         if self.include_symbols {
-            let sym_res = SymbolDcePass.run(module)?;
-            removed += sym_res.ops_removed;
-        }
-
-        Ok(PassResult {
-            pass_name: self.name().to_string(),
-            changed: removed > 0,
-            ops_removed: removed,
-            ops_modified: 0,
-            ops_created: 0,
-        })
-    }
-}
-
-/// Symbol Dead Code Elimination Pass (`symbol-dce`).
-///
-/// Eliminates unreachable `private` functions from the module.
-pub struct SymbolDcePass;
-
-impl Pass for SymbolDcePass {
-    fn name(&self) -> &'static str {
-        "symbol-dce"
-    }
-
-    fn description(&self) -> &'static str {
-        "Symbol Dead Code Elimination (removes unreachable private func.func symbols)"
-    }
-
-    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let mut referenced_symbols = HashSet::new();
-        for (_, op) in &module.ops {
-            if op.is_op("func", "call")
-                && let Some(callee) = op.attributes.get("callee").and_then(|a| a.as_str())
-            {
-                referenced_symbols.insert(callee.to_string());
-            }
-            if op.is_op("stablehlo", "composite")
-                && let Some(decomp) = op.attributes.get("decomposition").and_then(|a| a.as_str())
-            {
-                referenced_symbols.insert(decomp.to_string());
-            }
-        }
-
-        let root_block = module.body_block();
-        let mut removed = 0usize;
-        for fn_op_id in module.functions() {
-            let op = &module.ops[fn_op_id];
-            let is_private =
-                op.attributes.get("sym_visibility").and_then(|a| a.as_str()) == Some("private");
-            let sym_name = op
-                .attributes
-                .get("sym_name")
-                .and_then(|a| a.as_str())
-                .unwrap_or("");
-            if is_private && !referenced_symbols.contains(sym_name) {
-                let regions = op.regions.clone();
-                for reg_id in regions {
-                    let blocks = module.regions[reg_id].blocks.clone();
-                    for blk_id in blocks {
-                        let inner_ops = module.block_ops(blk_id);
-                        for inner_op in inner_ops {
-                            module.remove_op(blk_id, inner_op);
+            let root_block = module.body_block();
+            let mut dead_fns: HashSet<OpId> = HashSet::new();
+            for fn_op_id in module.functions() {
+                let op = &module.ops[fn_op_id];
+                let is_private =
+                    op.attributes.get("sym_visibility").and_then(|a| a.as_str()) == Some("private");
+                let sym_name = op
+                    .attributes
+                    .get("sym_name")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("");
+                if is_private && !referenced_symbols.contains(sym_name) {
+                    let regions = op.regions.clone();
+                    for reg_id in regions {
+                        let fn_blocks = module.regions[reg_id].blocks.clone();
+                        for blk_id in fn_blocks {
+                            for inner_op in module.blocks[blk_id].ops.drain(..) {
+                                module.ops.remove(inner_op);
+                            }
                         }
                     }
+                    dead_fns.insert(fn_op_id);
                 }
-                module.remove_op(root_block, fn_op_id);
-                removed += 1;
+            }
+            if !dead_fns.is_empty() {
+                removed += dead_fns.len();
+                module.blocks[root_block]
+                    .ops
+                    .retain(|id| !dead_fns.contains(id));
+                for fn_id in dead_fns {
+                    module.ops.remove(fn_id);
+                }
             }
         }
 
