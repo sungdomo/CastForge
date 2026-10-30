@@ -31,8 +31,8 @@ pub use crate::codegen::eval::{
 };
 pub use crate::codegen::loop_ir::{
     CHeaderTranslator, LoopKernel, LoopModule, LoopPass, LoopStmt, OptimizeLoopIrPass,
-    SharedLibTranslator, TensorToLoopTranslator, compile_shared_lib, emit_c_header,
-    emit_cuda_module_with_config, emit_msl_module_with_config, lower_to_loop_ir,
+    OptimizeLoopIrTranslator, SharedLibTranslator, TensorToLoopTranslator, compile_shared_lib,
+    emit_c_header, emit_cuda_module_with_config, emit_msl_module_with_config, lower_to_loop_ir,
 };
 pub use crate::codegen::memory_plan::{
     BufferAllocation, LiveInterval, MemoryPlan, build_memory_plan, compute_block_liveness,

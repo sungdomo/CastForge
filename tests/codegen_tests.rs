@@ -1053,7 +1053,8 @@ module @chain_demo {
 fn test_symmetric_model_exports_loop_ir_gpu_backends_autotune_and_diff_translators() {
     use castforge::codegen::{
         AutotuneScheduleTranslator, CHeaderTranslator, CodegenTranslator, MemoryPlanTranslator,
-        RooflineReportTranslator, SharedLibTranslator, TensorToLoopTranslator,
+        OptimizeLoopIrTranslator, RooflineReportTranslator, SharedLibTranslator,
+        TensorToLoopTranslator,
     };
     use castforge::ir::{Payload, TranslatorChain};
     use castforge::mlir::{
@@ -1120,6 +1121,18 @@ module @export_and_gpu_demo {
         .expect("loop text");
     assert!(loop_txt.contains("kernel @forward("));
     assert!(loop_txt.contains("GEMM 2x4x4"));
+
+    let mut opt_loop_chain = TranslatorChain::new()
+        .then(MlirParseTranslator)
+        .then(OptimizeLoopIrTranslator::default());
+    let opt_loop_txt = opt_loop_chain
+        .execute(Payload::Text(mlir.to_string()))
+        .expect("optimize-loop-ir")
+        .into_text()
+        .expect("opt loop text");
+    assert!(opt_loop_txt.contains("kernel @forward("));
+    assert!(opt_loop_txt.contains("parallel"));
+    assert!(opt_loop_txt.contains("vectorize"));
 
     let mut cuda_chain = TranslatorChain::new()
         .then(MlirParseTranslator)

@@ -898,6 +898,35 @@ impl Translator for TensorToLoopTranslator {
     }
 }
 
+/// Progressive Lowering + Imperative Loop Optimization Translator
+/// (`Ir(Module) -> Text(Optimized LoopIR)`).
+#[derive(Default)]
+pub struct OptimizeLoopIrTranslator {
+    pub config: TargetConfig,
+    pub pass: OptimizeLoopIrPass,
+}
+
+impl Translator for OptimizeLoopIrTranslator {
+    fn name(&self) -> &str {
+        "optimize-loop-ir"
+    }
+
+    fn input_kind(&self) -> &'static str {
+        "ir"
+    }
+
+    fn output_kind(&self) -> &'static str {
+        "text"
+    }
+
+    fn translate(&mut self, input: Payload) -> Result<Payload> {
+        let module = input.into_ir()?;
+        let mut loop_mod = lower_to_loop_ir(&module, &self.config);
+        let _ = self.pass.run(&mut loop_mod);
+        Ok(Payload::Text(loop_mod.to_string()))
+    }
+}
+
 /// C/C++ Header Translator (`Ir(Module) -> Text(C Header)`).
 #[derive(Default)]
 pub struct CHeaderTranslator;

@@ -3,12 +3,15 @@
 
 use crate::codegen::{
     AutotuneScheduleTranslator, CHeaderTranslator, CodegenTarget, CodegenTranslator, GemmLoopOrder,
-    HardwareRoofline, MemoryPlanTranslator, RooflineReportTranslator, SharedLibTranslator,
-    TargetConfig, TensorToLoopTranslator, analyze_module_cost_with_roofline, autotune_module,
-    autotune_module_jit, build_memory_plan, evaluate_module, generate_code_with_config,
-    generate_synthetic_inputs, verify_module_numerics,
+    HardwareRoofline, MemoryPlanTranslator, OptimizeLoopIrTranslator, RooflineReportTranslator,
+    SharedLibTranslator, TargetConfig, TensorToLoopTranslator, analyze_module_cost_with_roofline,
+    autotune_module, autotune_module_jit, build_memory_plan, evaluate_module,
+    generate_code_with_config, generate_synthetic_inputs, verify_module_numerics,
 };
-use crate::ir::{Payload, TranslatorChain};
+use crate::ir::{
+    Payload, TranslatorChain, collect_module_tensors, export_gguf_file, export_onnx_file,
+    import_hf_model_dir,
+};
 use crate::mlir::{
     GgufExportTranslator, GgufImportTranslator, MlirParseTranslator, MlirPrintTranslator,
     OnnxExportTranslator, OnnxImportTranslator, PrintOptions, SafetensorsExportTranslator,
@@ -248,12 +251,12 @@ pub enum Commands {
         bench_jit: bool,
     },
 
-    /// Import an external model (GGUF v2/v3 binary or ONNX JSON) into StableHLO IR + TensorStore
+    /// Import an external model (GGUF v2/v3, ONNX JSON, or HuggingFace config.json) into IR
     Import {
-        /// Input model path (.gguf or .onnx.json)
+        /// Input model path (.gguf, .onnx.json, config.json, or HF model directory)
         input: PathBuf,
 
-        /// Frontend format: gguf or onnx (auto-detected from extension by default)
+        /// Frontend format: gguf, onnx, or hf (auto-detected from path by default)
         #[arg(short = 'f', long = "format")]
         format: Option<String>,
 
@@ -268,6 +271,28 @@ pub enum Commands {
         /// Optional output `.safetensors` file to save imported TensorStore weights
         #[arg(long = "save-weights")]
         save_weights: Option<PathBuf>,
+    },
+
+    /// Export a CastForge MLIR module to an external model format (ONNX JSON, GGUF v3, SafeTensors)
+    Export {
+        /// Input MLIR file path (reads from stdin if omitted or "-")
+        input: Option<PathBuf>,
+
+        /// Output model file path (.onnx.json, .gguf, or .safetensors)
+        #[arg(short = 'o', long = "output")]
+        output: PathBuf,
+
+        /// Export format: onnx, gguf, or safetensors (auto-detected from -o extension by default)
+        #[arg(short = 'f', long = "format")]
+        format: Option<String>,
+
+        /// Optional pass pipeline to run before exporting
+        #[arg(short = 'p', long = "passes")]
+        passes: Option<String>,
+
+        /// Optional input `.safetensors` file to load into TensorStore before passes/export
+        #[arg(short = 'w', long = "weights")]
+        weights: Option<PathBuf>,
     },
 
     /// Execute a concatenated sequence of modular A-to-B translators (Frontend -> IR -> Backend)
@@ -658,12 +683,15 @@ pub fn run() -> Result<()> {
                 let s = input.to_string_lossy().to_ascii_lowercase();
                 if s.ends_with(".gguf") {
                     "gguf".to_string()
+                } else if input.is_dir() || s.ends_with("config.json") {
+                    "hf".to_string()
                 } else {
                     "onnx".to_string()
                 }
             });
             let mut module = match fmt.to_ascii_lowercase().as_str() {
                 "gguf" => import_gguf_file(&input)?,
+                "hf" | "huggingface" | "config.json" => import_hf_model_dir(&input)?,
                 _ => import_onnx_file(&input)?,
             };
             if let Some(spec) = passes {
@@ -678,6 +706,42 @@ pub fn run() -> Result<()> {
                 fs::write(&out_path, formatted)?;
             } else {
                 print!("{formatted}");
+            }
+        }
+
+        Commands::Export {
+            input,
+            output,
+            format,
+            passes,
+            weights,
+        } => {
+            let src = read_input_text(input.as_ref())?;
+            let mut module = parse_mlir(&src)?;
+            if let Some(w_path) = weights {
+                module.tensor_store.load_safetensors_file(&w_path)?;
+            }
+            if let Some(spec) = passes {
+                let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
+                pm.run(&mut module)?;
+            }
+            let fmt = format.unwrap_or_else(|| {
+                let s = output.to_string_lossy().to_ascii_lowercase();
+                if s.ends_with(".gguf") {
+                    "gguf".to_string()
+                } else if s.ends_with(".safetensors") {
+                    "safetensors".to_string()
+                } else {
+                    "onnx".to_string()
+                }
+            });
+            match fmt.to_ascii_lowercase().as_str() {
+                "gguf" => export_gguf_file(&module, &output)?,
+                "safetensors" | "st" => {
+                    let store = collect_module_tensors(&module);
+                    store.save_safetensors_file(&output)?;
+                }
+                _ => export_onnx_file(&module, &output)?,
             }
         }
 
@@ -858,6 +922,10 @@ fn build_translator_chain(
             }
             "lower-to-loops" => {
                 chain.push(Box::new(TensorToLoopTranslator::default()));
+                last_out = "text";
+            }
+            "optimize-loop-ir" => {
+                chain.push(Box::new(OptimizeLoopIrTranslator::default()));
                 last_out = "text";
             }
             "codegen-header" => {
