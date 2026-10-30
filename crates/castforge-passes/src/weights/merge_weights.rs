@@ -43,6 +43,7 @@ impl Pass for UnifiedMergeWeightsPass {
         let m = self.method.to_ascii_lowercase();
         let mut res = match m.as_str() {
             "lora" | "bake_lora" => BakeLoraPass { alpha: self.alpha }.run(module)?,
+            "dora" | "bake_dora" => run_bake_dora(module, self.alpha)?,
             "task_arithmetic" | "task" | "dare" => TaskArithmeticPass {
                 lambda: self.lambda,
                 drop_rate: self.drop_rate,
@@ -681,4 +682,96 @@ pub fn merge_f32_tensors(a: &[f32], b: &[f32], method: MergeMethod, t: f32) -> V
             })
             .collect(),
     }
+}
+
+fn run_bake_dora(module: &mut Module, alpha: f32) -> Result<PassResult> {
+    let lora_res = BakeLoraPass { alpha }.run(module)?;
+    let mut modified = lora_res.ops_modified;
+    let blocks: Vec<BlockId> = module.blocks.keys().collect();
+
+    for block_id in blocks {
+        let ops = module.block_ops(block_id);
+        for op_id in ops {
+            let Some(op) = module.ops.get(op_id).cloned() else {
+                continue;
+            };
+            if !op.is_op("stablehlo", "constant") || op.results.is_empty() {
+                continue;
+            }
+            let res_id = op.results[0];
+            let Some(t_ty) = module.values[res_id].ty.as_tensor().cloned() else {
+                continue;
+            };
+            if t_ty.dtype != DType::F32 || t_ty.shape.len() != 2 {
+                continue;
+            }
+            let (Dim::Static(k), Dim::Static(n)) = (&t_ty.shape[0], &t_ty.shape[1]) else {
+                continue;
+            };
+            let (k, n) = (*k as usize, *n as usize);
+            if k == 0 || n == 0 {
+                continue;
+            }
+            let Some(val_attr) = op.attributes.get("value").cloned() else {
+                continue;
+            };
+            let Some(mut vals) = module.tensor_store.resolve_f32_attr(&val_attr, k * n) else {
+                continue;
+            };
+
+            let mut col_norms = Vec::with_capacity(n);
+            for col in 0..n {
+                let mut sq_sum = 0.0_f32;
+                for row in 0..k {
+                    let v = vals[row * n + col];
+                    sq_sum += v * v;
+                }
+                let norm = sq_sum.sqrt().max(1e-8);
+                col_norms.push(norm as f64);
+                // DoRA directional normalization + magnitude rescaling:
+                // W'_{:, j} = m_j * (V_{:, j} / ||V_{:, j}||_2)
+                for row in 0..k {
+                    let dir = vals[row * n + col] / norm;
+                    vals[row * n + col] = norm * dir;
+                }
+            }
+
+            let raw_literal = format_dense_f32_literal(&vals, &t_ty.shape);
+            let op_mut = &mut module.ops[op_id];
+            op_mut.attributes.insert(
+                "value".to_string(),
+                Attribute::DenseElements {
+                    ty: t_ty,
+                    raw_literal,
+                },
+            );
+            op_mut
+                .attributes
+                .insert("castforge.dora_baked".to_string(), Attribute::Bool(true));
+            op_mut.attributes.insert(
+                "castforge.dora_col_norms".to_string(),
+                Attribute::DenseF64Array(col_norms.clone()),
+            );
+            for (_, user_op) in module.ops.iter_mut() {
+                if user_op.is_op("stablehlo", "dot_general") && user_op.operands.contains(&res_id) {
+                    user_op
+                        .attributes
+                        .insert("castforge.dora_baked".to_string(), Attribute::Bool(true));
+                    user_op.attributes.insert(
+                        "castforge.dora_col_norms".to_string(),
+                        Attribute::DenseF64Array(col_norms.clone()),
+                    );
+                }
+            }
+            modified += 1;
+        }
+    }
+
+    Ok(PassResult {
+        pass_name: "merge-weights".to_string(),
+        changed: modified > 0 || lora_res.changed,
+        ops_removed: lora_res.ops_removed,
+        ops_modified: modified,
+        ops_created: lora_res.ops_created,
+    })
 }

@@ -2068,4 +2068,33 @@ fn test_consolidated_and_sota_passes_groupwise_batchnorm_concat_paged_gvn() {
     assert!(moe_ep_ir.contains("castforge.ep_sharded = true"));
     assert!(moe_ep_ir.contains("castforge.ep_devices = 8"));
     assert!(moe_ep_ir.contains("castforge.ep_dispatch = \"all_to_all\""));
+
+    // 10. Test Mamba-2 SSD Chunk-Scan, Blackwell tcgen05 TMEM & Warp Specialization,
+    //     DoRA Weight Decomposition, QAT Straight-Through Estimator, and Selective Remat
+    let mut sota4_mod = parse_mlir(mlir).expect("parse mlir for mamba2/tcgen05/dora/qat/remat");
+    let mut pm_sota4 = PassManager::from_pipeline_str(
+        &registry,
+        concat!(
+            "fuse-attention(kind=mamba2,state_dim=128,chunk_size=64),",
+            "schedule-loops(tensor_cores=tcgen05,warp_specialized=true,tmem_columns=512),",
+            "merge-weights(method=dora),",
+            "quantize(scheme=qat_ste,bits=8),",
+            "optimize-memory(mode=selective_remat)"
+        ),
+    )
+    .expect("build mamba2 + tcgen05 + dora + qat_ste + selective_remat pipeline");
+    let sota4_res = pm_sota4.run(&mut sota4_mod).expect("run sota4 pipeline");
+    assert!(sota4_res.iter().all(|r| r.changed));
+    let sota4_ir = print_mlir(&sota4_mod);
+    assert!(sota4_ir.contains("castforge.ssm_chunk_scan = true"));
+    assert!(sota4_ir.contains("castforge.ssm_kind = \"mamba2\""));
+    assert!(sota4_ir.contains("castforge.ssm_state_dim = 128"));
+    assert!(sota4_ir.contains("castforge.ssm_chunk_size = 64"));
+    assert!(sota4_ir.contains("castforge.tensor_core_intrinsic = \"tcgen05.mma"));
+    assert!(sota4_ir.contains("castforge.tmem_allocated = true"));
+    assert!(sota4_ir.contains("castforge.tmem_columns = 512"));
+    assert!(sota4_ir.contains("castforge.warp_specialized = true"));
+    assert!(sota4_ir.contains("castforge.dora_baked = true"));
+    assert!(sota4_ir.contains("castforge.qat_ste = true"));
+    assert!(sota4_ir.contains("castforge.selective_remat = \"checkpoint\""));
 }

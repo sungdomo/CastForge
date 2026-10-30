@@ -777,6 +777,8 @@ impl PassRegistry {
                             || opts.contains_key("rope_factor")
                         {
                             "rope".to_string()
+                        } else if opts.contains_key("state_dim") {
+                            "ssm".to_string()
                         } else {
                             "all".to_string()
                         }
@@ -839,6 +841,15 @@ impl PassRegistry {
                     .and_then(|s| s.parse::<f64>().ok());
                 let qk_norm = opts.get("qk_norm").is_some_and(|v| v == "true" || v == "1");
                 let kv_dtype = opts.get("kv_dtype").cloned();
+                let state_dim = opts
+                    .get("state_dim")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(128);
+                let ssm_chunk_size = opts
+                    .get("chunk_size")
+                    .or_else(|| opts.get("ssm_chunk_size"))
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(64);
                 Ok(Box::new(UnifiedFuseAttentionPass {
                     kind,
                     kv_lora_rank,
@@ -856,6 +867,8 @@ impl PassRegistry {
                     logit_softcap,
                     qk_norm,
                     kv_dtype,
+                    state_dim,
+                    ssm_chunk_size,
                 }))
             },
         );
@@ -1112,6 +1125,14 @@ impl PassRegistry {
                     .get("lower_conv")
                     .map(|s| s == "true" || s == "1")
                     .unwrap_or(false);
+                let warp_specialized = opts
+                    .get("warp_specialized")
+                    .map(|s| s == "true" || s == "1")
+                    .unwrap_or(false);
+                let tmem_columns = opts
+                    .get("tmem_columns")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(512);
                 Ok(Box::new(ScheduleLoopsPass {
                     tile_size,
                     l2_tile,
@@ -1131,6 +1152,8 @@ impl PassRegistry {
                     mma_tile,
                     max_n,
                     lower_conv,
+                    warp_specialized,
+                    tmem_columns,
                 }))
             },
         );

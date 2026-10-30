@@ -122,6 +122,7 @@ impl Pass for QuantizePass {
             "smoothquant" | "smooth" => {
                 run_smoothquant(module, self.bits, self.alpha, self.samples)?
             }
+            "qat" | "qat_ste" | "ste" => run_qat_ste(module, self.bits)?,
             _ => QuantizeWeightsPass {
                 bits: self.bits,
                 min_elements: self.min_elements,
@@ -1308,4 +1309,92 @@ pub fn quantize_symmetric_f32(
     };
 
     (q_data, scale, 0, q_dtype)
+}
+
+fn run_qat_ste(module: &mut Module, bits: u8) -> Result<PassResult> {
+    let eff_bits = if bits == 4 { 4 } else { 8 };
+    let qmax = if eff_bits == 4 { 7.0_f32 } else { 127.0_f32 };
+    let qmin = if eff_bits == 4 { -8.0_f32 } else { -128.0_f32 };
+    let mut modified = 0usize;
+    let blocks: Vec<BlockId> = module.blocks.keys().collect();
+
+    for block_id in blocks {
+        let ops = module.block_ops(block_id);
+        for op_id in ops {
+            let Some(op) = module.ops.get(op_id).cloned() else {
+                continue;
+            };
+            if !op.is_op("stablehlo", "constant") || op.results.is_empty() {
+                continue;
+            }
+            let res_id = op.results[0];
+            let Some(t_ty) = module.values[res_id].ty.as_tensor().cloned() else {
+                continue;
+            };
+            let Some(num_elems) = t_ty.num_elements().map(|n| n as usize) else {
+                continue;
+            };
+            if t_ty.dtype != DType::F32 || num_elems < 2 {
+                continue;
+            }
+            let Some(val_attr) = op.attributes.get("value").cloned() else {
+                continue;
+            };
+            let Some(vals) = module.tensor_store.resolve_f32_attr(&val_attr, num_elems) else {
+                continue;
+            };
+
+            let max_abs = vals.iter().fold(0.0_f32, |acc, &v| acc.max(v.abs()));
+            let scale = if max_abs < 1e-12 { 1.0 } else { max_abs / qmax };
+            let fake_quant: Vec<f32> = vals
+                .iter()
+                .map(|&v| (v / scale).round().clamp(qmin, qmax) * scale)
+                .collect();
+
+            let raw_literal = format_dense_f32_literal(&fake_quant, &t_ty.shape);
+            let op_mut = &mut module.ops[op_id];
+            op_mut.attributes.insert(
+                "value".to_string(),
+                Attribute::DenseElements {
+                    ty: t_ty,
+                    raw_literal,
+                },
+            );
+            op_mut
+                .attributes
+                .insert("castforge.qat_ste".to_string(), Attribute::Bool(true));
+            op_mut.attributes.insert(
+                "castforge.qat_bits".to_string(),
+                Attribute::Int(eff_bits as i64),
+            );
+            op_mut.attributes.insert(
+                "castforge.qat_scale".to_string(),
+                Attribute::Float(scale as f64),
+            );
+            for (_, user_op) in module.ops.iter_mut() {
+                if user_op.is_op("stablehlo", "dot_general") && user_op.operands.contains(&res_id) {
+                    user_op
+                        .attributes
+                        .insert("castforge.qat_ste".to_string(), Attribute::Bool(true));
+                    user_op.attributes.insert(
+                        "castforge.qat_bits".to_string(),
+                        Attribute::Int(eff_bits as i64),
+                    );
+                    user_op.attributes.insert(
+                        "castforge.qat_scale".to_string(),
+                        Attribute::Float(scale as f64),
+                    );
+                }
+            }
+            modified += 1;
+        }
+    }
+
+    Ok(PassResult {
+        pass_name: "quantize".to_string(),
+        changed: modified > 0,
+        ops_removed: 0,
+        ops_modified: modified,
+        ops_created: 0,
+    })
 }

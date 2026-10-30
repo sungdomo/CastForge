@@ -38,6 +38,8 @@ pub struct UnifiedFuseAttentionPass {
     pub logit_softcap: Option<f64>,
     pub qk_norm: bool,
     pub kv_dtype: Option<String>,
+    pub state_dim: usize,
+    pub ssm_chunk_size: usize,
 }
 
 impl Default for UnifiedFuseAttentionPass {
@@ -59,6 +61,8 @@ impl Default for UnifiedFuseAttentionPass {
             logit_softcap: None,
             qk_norm: false,
             kv_dtype: None,
+            state_dim: 128,
+            ssm_chunk_size: 64,
         }
     }
 }
@@ -164,6 +168,17 @@ impl Pass for UnifiedFuseAttentionPass {
         }
         if matches!(k.as_str(), "kv_sharing" | "yoco" | "cla") {
             steps.push(run_kv_sharing(module, self.share_every)?);
+        }
+        if matches!(
+            k.as_str(),
+            "ssm" | "mamba2" | "linear_attn" | "deltanet" | "rwkv6"
+        ) {
+            steps.push(run_ssm_chunk_scan_fusion(
+                module,
+                &k,
+                self.state_dim,
+                self.ssm_chunk_size,
+            )?);
         }
         Ok(PassResult {
             pass_name: self.name().to_string(),
@@ -1149,6 +1164,52 @@ fn run_kv_cache_quantization(module: &mut Module, kv_dtype: &str) -> Result<Pass
             op.attributes.insert(
                 "castforge.kv_per_head_scale".to_string(),
                 Attribute::Bool(true),
+            );
+            modified += 1;
+        }
+    }
+    Ok(PassResult {
+        pass_name: "fuse-attention".to_string(),
+        changed: modified > 0,
+        ops_removed: 0,
+        ops_modified: modified,
+        ops_created: 0,
+    })
+}
+
+fn run_ssm_chunk_scan_fusion(
+    module: &mut Module,
+    ssm_kind: &str,
+    state_dim: usize,
+    chunk_size: usize,
+) -> Result<PassResult> {
+    let mut modified = 0usize;
+    let state_dim = state_dim.max(16) as i64;
+    let chunk_size = chunk_size.max(8) as i64;
+    for (_, op) in module.ops.iter_mut() {
+        let is_target = op.is_op("stablehlo", "dot_general")
+            || (op.is_op("stablehlo", "composite")
+                && op
+                    .attributes
+                    .get("name")
+                    .and_then(|a| a.as_str())
+                    .is_some_and(|n| n.contains("attention") || n.contains("matmul")));
+        if is_target {
+            op.attributes.insert(
+                "castforge.ssm_chunk_scan".to_string(),
+                Attribute::Bool(true),
+            );
+            op.attributes.insert(
+                "castforge.ssm_kind".to_string(),
+                Attribute::String(ssm_kind.to_string()),
+            );
+            op.attributes.insert(
+                "castforge.ssm_state_dim".to_string(),
+                Attribute::Int(state_dim),
+            );
+            op.attributes.insert(
+                "castforge.ssm_chunk_size".to_string(),
+                Attribute::Int(chunk_size),
             );
             modified += 1;
         }

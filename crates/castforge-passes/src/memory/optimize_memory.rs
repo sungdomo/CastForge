@@ -59,6 +59,9 @@ impl Pass for OptimizeMemoryPass {
                 .run(module)?,
             );
         }
+        if m == "selective_remat" || m == "selective" {
+            steps.push(run_selective_remat(module, self.min_distance)?);
+        }
         if m == "offload" {
             steps.push(
                 OffloadActivationsPass {
@@ -567,4 +570,44 @@ impl Pass for OffloadActivationsPass {
             ops_created: created,
         })
     }
+}
+
+fn run_selective_remat(module: &mut Module, min_distance: usize) -> Result<PassResult> {
+    let remat_res = RematerializePass { min_distance }.run(module)?;
+    let mut modified = remat_res.ops_modified;
+
+    for (_, op) in module.ops.iter_mut() {
+        if op.is_op("stablehlo", "constant")
+            || op.is_op("func", "func")
+            || op.is_op("func", "return")
+        {
+            continue;
+        }
+        let is_compute_heavy = op.is_op("stablehlo", "dot_general")
+            || op.is_op("stablehlo", "convolution")
+            || (op.is_op("stablehlo", "composite")
+                && op
+                    .attributes
+                    .get("name")
+                    .and_then(|a| a.as_str())
+                    .is_some_and(|n| n.contains("matmul") || n.contains("qmatmul")));
+        let policy = if is_compute_heavy {
+            "checkpoint"
+        } else {
+            "recompute"
+        };
+        op.attributes.insert(
+            "castforge.selective_remat".to_string(),
+            Attribute::String(policy.to_string()),
+        );
+        modified += 1;
+    }
+
+    Ok(PassResult {
+        pass_name: "optimize-memory".to_string(),
+        changed: modified > 0 || remat_res.changed,
+        ops_removed: remat_res.ops_removed,
+        ops_modified: modified,
+        ops_created: remat_res.ops_created,
+    })
 }

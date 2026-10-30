@@ -35,6 +35,8 @@ pub struct ScheduleLoopsPass {
     pub mma_tile: (i64, i64, i64),
     pub max_n: Option<i64>,
     pub lower_conv: bool,
+    pub warp_specialized: bool,
+    pub tmem_columns: usize,
 }
 
 impl Default for ScheduleLoopsPass {
@@ -58,6 +60,8 @@ impl Default for ScheduleLoopsPass {
             mma_tile: (16, 16, 16),
             max_n: None,
             lower_conv: false,
+            warp_specialized: false,
+            tmem_columns: 512,
         }
     }
 }
@@ -123,6 +127,8 @@ impl Pass for ScheduleLoopsPass {
                     mma_m: self.mma_tile.0,
                     mma_n: self.mma_tile.1,
                     mma_k: self.mma_tile.2,
+                    warp_specialized: self.warp_specialized,
+                    tmem_columns: self.tmem_columns,
                 }
                 .run(module)?,
             );
@@ -143,6 +149,8 @@ pub struct LowerTensorCoresPass {
     pub mma_m: i64,
     pub mma_n: i64,
     pub mma_k: i64,
+    pub warp_specialized: bool,
+    pub tmem_columns: usize,
 }
 
 impl Default for LowerTensorCoresPass {
@@ -152,6 +160,8 @@ impl Default for LowerTensorCoresPass {
             mma_m: 16,
             mma_n: 16,
             mma_k: 16,
+            warp_specialized: false,
+            tmem_columns: 512,
         }
     }
 }
@@ -162,12 +172,15 @@ impl Pass for LowerTensorCoresPass {
     }
 
     fn description(&self) -> &'static str {
-        "Lowers GEMMs to GPU Tensor Core / Matrix Core instructions (WMMA, WGMMA, MFMA, Simdgroup)"
+        "Lowers GEMMs to GPU Tensor Core / Matrix Core instructions (WMMA, WGMMA, tcgen05, MFMA)"
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let mut modified = 0usize;
-        let instr = match self.arch.to_ascii_lowercase().as_str() {
+        let arch_low = self.arch.to_ascii_lowercase();
+        let is_blackwell = matches!(arch_low.as_str(), "tcgen05" | "blackwell" | "sm100");
+        let instr = match arch_low.as_str() {
+            "tcgen05" | "blackwell" | "sm100" => "tcgen05.mma.cta_group::2.kind::f8f6f4",
             "cdna3" | "mfma" | "rocm" | "mi300x" => "v_mfma_f32_16x16x16_f16",
             "apple" | "metal" | "simdgroup" => "simdgroup_multiply_accumulate",
             "ampere" | "wmma" => "nvcuda::wmma::mma_sync",
@@ -194,6 +207,24 @@ impl Pass for LowerTensorCoresPass {
                     "castforge.mma_shape".to_string(),
                     Attribute::DenseIntArray(vec![self.mma_m, self.mma_n, self.mma_k]),
                 );
+                if is_blackwell {
+                    op.attributes.insert(
+                        "castforge.tmem_allocated".to_string(),
+                        Attribute::Bool(true),
+                    );
+                    op.attributes.insert(
+                        "castforge.tmem_columns".to_string(),
+                        Attribute::Int(self.tmem_columns.max(64) as i64),
+                    );
+                }
+                if self.warp_specialized || is_blackwell {
+                    op.attributes.insert(
+                        "castforge.warp_specialized".to_string(),
+                        Attribute::Bool(true),
+                    );
+                    op.attributes
+                        .insert("castforge.tma_multicast".to_string(), Attribute::Bool(true));
+                }
                 modified += 1;
             }
         }

@@ -11,15 +11,16 @@ support.
   CastForge's Dual-Plane IR (`Module` + `TensorStore`), modular A-to-B `Translator` architecture,
   static arena memory planning, polyhedral `LoopModule` IR, multi-architecture SIMD profiles, and
   pluggable `CodegenBackend` registry.
-- [**Complete Reference of All 25 Passes (`docs/PASSES.md`)**](docs/PASSES.md):
-  Detailed explanation, CLI options, and IR transformation rules for all 25 Graph IR passes/presets
-  (`22 passes + 3 presets O1/O2/O3`) and unified `OptimizeLoopIrPass` (`optimize-loop-ir`).
+- [**Complete Reference of All 21 Passes (`docs/PASSES.md`)**](docs/PASSES.md):
+  Detailed explanation, CLI options, and IR transformation rules for all 21 Graph IR passes/presets
+  (`18 passes + 3 presets O1/O2/O3`) and unified `OptimizeLoopIrPass` (`optimize-loop-ir`).
 
 ## Workspace Architecture
 
 - [`crates/castforge-ir`](crates/castforge-ir): Arena-allocated MLIR-compatible IR (`Module`,
   `Operation`, `Value`, `Block`, `Region`, `Type`, `Attribute`, `Location`), structural verifier,
-  binary `.safetensors` zero-copy reader/writer, and the `TensorStore` weight plane.
+  binary `.safetensors` zero-copy reader/writer, and the `TensorStore` weight plane (`2` `.rs`
+  files: `lib.rs` and `tensor_store.rs`).
 - [`crates/castforge-dialect-stablehlo`](crates/castforge-dialect-stablehlo): Strongly-typed
   `stablehlo` and `func` dialect views (`StableHloOp`, `DotDimensionNumbers`, `FuncView`) and
   shape verifiers.
@@ -29,11 +30,12 @@ support.
   `dense_resource<key>` external weight references, plus symmetric **GGUF v2/v3**, **ONNX-JSON**,
   and **SafeTensors** model importers & exporters.
 - [`crates/castforge-passes`](crates/castforge-passes): Unified `Pass`, `PassRegistry`, and
-  `PassManager` with **25 canonical A-to-B IR translator modules & presets** (`22 passes + 3
-  presets`) organized with **100% 1-to-1 pass-to-file mapping** (`22` `.rs` files) into 8 domain
-  subdirectories (`general/`, `views/`, `weights/`, `fusion/`, `memory/`, `distributed/`, `loops/`,
-  `tooling/`), supporting static Rust construction, CLI pipeline strings (`-p`), Unix pipes
-  (`stdin -> stdout`), declarative TOML config files (`--config`), and step-by-step tracing.
+  `PassManager` with **21 canonical A-to-B IR translator modules & presets** (`18 passes + 3
+  presets`) organized with **100% 1-to-1 pass-to-file mapping** (`18` pass `.rs` files + `lib.rs`)
+  into 8 domain subdirectories (`general/`, `views/`, `weights/`, `fusion/`, `memory/`,
+  `distributed/`, `loops/`, `tooling/`), supporting static Rust construction, CLI pipeline strings
+  (`-p`), Unix pipes (`stdin -> stdout`), declarative TOML config files (`--config`), and
+  step-by-step tracing.
 - [`crates/castforge-viz`](crates/castforge-viz): Computation graph exporter for **Mermaid**,
   **Graphviz DOT**, **JSON**, unified **MLIR Snapshot Diffing**, and a self-contained **Interactive
   HTML Pass Timeline, Roofline & Arena Memory Liveness Debugger**.
@@ -49,7 +51,7 @@ support.
   `opt`, `viz`, `codegen`, `autotune`, `import`, `profile`, `run`, `list-passes`, plus direct pass
   subcommands).
 
-## Built-in A-to-B Translator Modules & Presets (25 Canonical Entries)
+## Built-in A-to-B Translator Modules & Presets (21 Canonical Entries)
 
 | Pass Name | Category | Description |
 | :--- | :--- | :--- |
@@ -59,21 +61,17 @@ support.
 | `simplify-algebraic` | General IR | Identities, constant folding, SCCP, reassociation & FMA |
 | `fold-views` | Views & Shapes | Folds `transpose`, `reshape`, `broadcast`, `slice` & layout |
 | `specialize-shapes` | Views & Shapes | Symbolic shape bind, batch resize, buckets & token prune |
-| `quantize` | Weights | Quantize (`weight\|awq\|fp8\|nvfp4\|f16\|bf16\|w8a8\|smooth\|hadamard`) |
-| `prune-weights` | Weights | Unified structured L1, `2:4` & dynamic `activation_sparse` pruning |
-| `merge-weights` | Weights | Unified model merging & adapters (`linear\|slerp\|ties\|dare\|lora`) |
-| `fold-weights` | Weights | Norm/BatchNorm folding, `[N,K]` SIMD packing & `externalize` |
-| `fuse-elementwise` | Fusion | Composites, map-reduce, megakernel, loop chains & `decompose` |
+| `quantize` | Weights | Quantize (`weight\|awq\|fp8\|nvfp4\|f16\|bf16\|w8a8\|smooth\|qat_ste`) |
+| `merge-weights` | Weights | Model merging & adapters (`linear\|slerp\|ties\|dare\|lora\|dora`) |
+| `fold-weights` | Weights | Norm/BatchNorm folding, `[N,K]` pack, `externalize` & `prune\|2to4` |
+| `fuse-elementwise` | Fusion | Composites, activations/MoE, map-reduce, loops & `decompose` |
 | `fuse-gemm` | Fusion | Unified GEMM (`horizontal\|dequant\|epilogue` + constant weight concat) |
 | `fuse-norm` | Fusion | Norm & Softmax (`rmsnorm\|residual_rmsnorm\|layernorm\|softmax\|ce`) |
-| `fuse-activations` | Fusion | Unified Activation, Gated-MLP & routed/shared-expert MoE fusion |
-| `fuse-attention` | Fusion | Attn (`sdpa\|rope\|mla\|kv_cache\|paged\|flash\|sliding\|share`) |
-| `optimize-memory` | Memory | Unified memory (`mode=all\|inplace\|zero_copy\|remat\|offload`) |
-| `shard-distributed` | Distributed | Unified SPMD TP, Ring CP, EP, ZeRO-3/FSDP, 1F1B PP & streams |
-| `autodiff` | Distributed | Synthesizes reverse-mode VJP gradients & optional SGD step |
-| `schedule-loops` | Loops | Unified tiling, permutation, unrolling, SIMD, conv & TensorCore |
-| `ir-edit` | Tooling | Op rename/annotate, freeze/unfreeze, tap, SSA normalize & strip |
-| `outline-subgraphs` | Tooling | Outlining, inlining, slice extract, delta reduce, dedup & unroll |
+| `fuse-attention` | Fusion | Attn (`sdpa\|rope\|mla\|ssm\|kv_cache\|paged\|flash\|sliding`) |
+| `optimize-memory` | Memory | Unified memory (`all\|inplace\|zero_copy\|remat\|selective_remat`) |
+| `shard-distributed` | Distributed | TP, Ring CP, EP, ZeRO-3/FSDP, 1F1B PP, streams & `autodiff` |
+| `schedule-loops` | Loops | Unified tiling, permutation, unrolling, SIMD, conv & `wgmma\|tcgen05` |
+| `ir-edit` | Tooling | Op rename/annotate, freeze/unfreeze, tap, SSA normalize, outline & inline |
 | `verify-ir` | Tooling | Shape/equiv verifier, FNV-1a hasher, NaN sanitizer, bisector & profiler |
 | `O1` | Preset | Inlining, SCCP, LICM, view/algebraic canonicalization, DCE |
 | `O2` | Preset | `O1` + LoRA/BatchNorm folding + Transformer/GEMM fusions |
@@ -128,7 +126,7 @@ cargo run --bin castforge -- opt examples/weight_surgery.mlir \
 
 # 7. Generate an Interactive HTML Pass Timeline, Roofline & Arena Memory Debugger
 cargo run --bin castforge -- viz examples/weight_surgery.mlir \
-  -p "merge-weights(method=slerp,t=0.5),prune-weights(sparsity=0.5),quantize(bits=8)" \
+  -p "merge-weights(method=slerp,t=0.5),fold-weights(mode=prune,sparsity=0.5),quantize(bits=8)" \
   --format html -o examples/weight_surgery_trace.html
 
 # 8. Lower the optimized model to standalone Rust, C99, WGSL, CUDA, or Metal
