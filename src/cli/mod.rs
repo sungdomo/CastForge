@@ -12,6 +12,7 @@ pub use chain::{
 };
 pub use commands::run;
 pub use inspect::{
-    ArchProfileInfo, FunctionSummary, ModuleInspectionReport, TargetBackendInfo,
-    TranslatorStageInfo, WeightTensorSummary, inspect_module, run_inspect, run_list_targets,
+    ArchProfileInfo, ArchProfileSpec, FunctionSummary, ModuleInspectionReport, TargetBackendInfo,
+    TargetCatalog, TranslatorStageInfo, WeightTensorSummary, inspect_module, run_inspect,
+    run_list_targets, target_catalog,
 };

@@ -1,0 +1,283 @@
+# Declarative catalog of CastForge codegen backends, hardware architecture Roofline/SIMD
+# profiles, and composable A-to-B translator stages (`config/targets.toml`).
+
+[[target]]
+target = "rust"
+aliases = ["rs"]
+output_kind = "text (.rs)"
+description = "Standalone zero-dependency Rust source with arena memory & SIMD loops"
+
+[[target]]
+target = "c"
+aliases = ["c99"]
+output_kind = "text (.c)"
+description = "Standalone ANSI C99 source with OpenMP & hardware SIMD intrinsics"
+
+[[target]]
+target = "wgsl"
+aliases = ["webgpu"]
+output_kind = "text (.wgsl)"
+description = "WebGPU compute shader with @workgroup_size & shared tile memory"
+
+[[target]]
+target = "cuda"
+aliases = ["cu", "nvptx"]
+output_kind = "text (.cu)"
+description = "NVIDIA CUDA C++ __global__ kernels with __shared__ memory tiling"
+
+[[target]]
+target = "msl"
+aliases = ["metal"]
+output_kind = "text (.metal)"
+description = "Apple Metal Shading Language compute kernels with threadgroup memory"
+
+[[target]]
+target = "hip"
+aliases = ["rocm"]
+output_kind = "text (.hip.cpp)"
+description = "AMD ROCm HIP __global__ compute kernels"
+
+[[target]]
+target = "opencl"
+aliases = ["cl"]
+output_kind = "text (.cl)"
+description = "Khronos OpenCL C __kernel compute shaders"
+
+[[target]]
+target = "header"
+aliases = ["c-header"]
+output_kind = "text (.h)"
+description = "C/C++ extern \"C\" FFI header matching generated C99 symbols"
+
+[[target]]
+target = "loop-ir"
+aliases = ["loops"]
+output_kind = "text"
+description = "Imperative LoopIR middle-end dump after progressive lowering"
+
+[[target]]
+target = "lib"
+aliases = ["shared-lib", "so", "dylib"]
+output_kind = "bytes (.so/.dylib)"
+description = "Compiled native shared library via host C compiler (`cc -O3 -shared`)"
+
+[[arch_profile]]
+arch = "x86_64-avx2"
+aliases = ["x86_64", "avx2"]
+peak_gflops = 1024.0
+peak_bandwidth_gbps = 100.0
+simd_isa = "avx2"
+simd_lanes = 8
+default_tile = 32
+reg_tile = 2
+unroll_factor = 4
+
+[[arch_profile]]
+arch = "x86_64-avx512"
+aliases = ["avx512", "avx-512"]
+peak_gflops = 2048.0
+peak_bandwidth_gbps = 200.0
+simd_isa = "avx512"
+simd_lanes = 16
+default_tile = 64
+reg_tile = 4
+unroll_factor = 4
+
+[[arch_profile]]
+arch = "aarch64-neon"
+aliases = ["aarch64", "arm64", "neon"]
+peak_gflops = 768.0
+peak_bandwidth_gbps = 100.0
+simd_isa = "neon"
+simd_lanes = 4
+default_tile = 32
+reg_tile = 2
+unroll_factor = 4
+
+[[arch_profile]]
+arch = "aarch64-sve"
+aliases = ["sve", "sve2", "armv9"]
+peak_gflops = 1536.0
+peak_bandwidth_gbps = 160.0
+simd_isa = "sve"
+simd_lanes = 8
+default_tile = 32
+reg_tile = 4
+unroll_factor = 4
+
+[[arch_profile]]
+arch = "apple-m-series"
+aliases = ["metal-apple", "metal", "msl"]
+peak_gflops = 14000.0
+peak_bandwidth_gbps = 400.0
+simd_isa = "neon"
+simd_lanes = 4
+default_tile = 32
+reg_tile = 4
+unroll_factor = 4
+
+[[arch_profile]]
+arch = "cuda-sm80"
+aliases = ["nvidia-ampere", "cuda"]
+peak_gflops = 19500.0
+peak_bandwidth_gbps = 1555.0
+simd_isa = "scalar"
+simd_lanes = 16
+default_tile = 16
+reg_tile = 2
+unroll_factor = 4
+
+[[arch_profile]]
+arch = "nvidia-hopper"
+aliases = ["hopper", "sm90"]
+peak_gflops = 67000.0
+peak_bandwidth_gbps = 3350.0
+simd_isa = "scalar"
+simd_lanes = 16
+default_tile = 32
+reg_tile = 4
+unroll_factor = 4
+
+[[arch_profile]]
+arch = "nvidia-blackwell"
+aliases = ["blackwell", "sm100"]
+peak_gflops = 140000.0
+peak_bandwidth_gbps = 8000.0
+simd_isa = "scalar"
+simd_lanes = 16
+default_tile = 64
+reg_tile = 4
+unroll_factor = 8
+
+[[arch_profile]]
+arch = "rocm-gfx90a"
+aliases = ["amd-cdna3", "hip", "rocm"]
+peak_gflops = 45000.0
+peak_bandwidth_gbps = 3200.0
+simd_isa = "scalar"
+simd_lanes = 16
+default_tile = 32
+reg_tile = 4
+unroll_factor = 4
+
+[[arch_profile]]
+arch = "riscv64-rvv"
+aliases = ["riscv64", "rvv"]
+peak_gflops = 512.0
+peak_bandwidth_gbps = 64.0
+simd_isa = "rvv"
+simd_lanes = 8
+default_tile = 16
+reg_tile = 2
+unroll_factor = 4
+
+[[arch_profile]]
+arch = "wasm32-simd128"
+aliases = ["wasm32", "wasm"]
+peak_gflops = 256.0
+peak_bandwidth_gbps = 32.0
+simd_isa = "wasm_simd128"
+simd_lanes = 4
+default_tile = 16
+reg_tile = 2
+unroll_factor = 2
+
+[[translator]]
+stage = "parse-mlir"
+signature = "text -> ir"
+description = "Parse StableHLO/Func/Quant MLIR text into a Dual-Plane Module"
+
+[[translator]]
+stage = "import-onnx"
+signature = "text -> ir"
+description = "Import ONNX JSON graph into StableHLO Module"
+
+[[translator]]
+stage = "import-gguf"
+signature = "bytes -> ir"
+description = "Import GGUF v2/v3 binary model into StableHLO Module + TensorStore"
+
+[[translator]]
+stage = "import-hf-config"
+signature = "text -> ir"
+description = "Synthesize Transformer architecture from HuggingFace config.json"
+
+[[translator]]
+stage = "load-weights(path=...)"
+signature = "ir -> ir"
+description = "Load external .safetensors weights into Module::tensor_store"
+
+[[translator]]
+stage = "<any-pass-name>"
+signature = "ir -> ir"
+description = "Run any of the registered IR transformation/optimization passes"
+
+[[translator]]
+stage = "autotune-schedule"
+signature = "ir -> ir"
+description = "Search Roofline-optimal schedule and stamp loop attributes onto IR"
+
+[[translator]]
+stage = "snapshot-ir"
+signature = "ir -> ir"
+description = "Capture baseline IR snapshot for downstream ir-diff comparison"
+
+[[translator]]
+stage = "ir-diff"
+signature = "ir -> text"
+description = "Emit unified MLIR diff against upstream snapshot-ir state"
+
+[[translator]]
+stage = "print-mlir"
+signature = "ir -> text"
+description = "Format Module as pretty or canonical generic MLIR text"
+
+[[translator]]
+stage = "lower-to-loops"
+signature = "ir -> text"
+description = "Lower tensor IR to imperative LoopIR statements"
+
+[[translator]]
+stage = "optimize-loop-ir"
+signature = "ir -> text"
+description = "Lower and run imperative loop fusion, interchange, unroll & SIMD"
+
+[[translator]]
+stage = "codegen-<target>"
+signature = "ir -> text"
+description = "Emit target code (rust, c, wgsl, cuda, msl, hip, opencl, header)"
+
+[[translator]]
+stage = "compile-lib"
+signature = "ir -> bytes"
+description = "Compile Module into a native shared library (.so/.dylib)"
+
+[[translator]]
+stage = "export-onnx"
+signature = "ir -> text"
+description = "Export Module and weights to ONNX JSON format"
+
+[[translator]]
+stage = "export-gguf"
+signature = "ir -> bytes"
+description = "Export Module and weights to GGUF v3 binary format"
+
+[[translator]]
+stage = "export-safetensors"
+signature = "ir -> bytes"
+description = "Export Module weights to SafeTensors binary format"
+
+[[translator]]
+stage = "roofline-report"
+signature = "ir -> text"
+description = "Emit Roofline FLOPs, bandwidth, and bottleneck JSON report"
+
+[[translator]]
+stage = "memory-plan"
+signature = "ir -> text"
+description = "Emit interval-colored static activation arena JSON plan"
+
+[[translator]]
+stage = "viz-<format>"
+signature = "ir -> text"
+description = "Render computation graph as mermaid, dot, json, or html"

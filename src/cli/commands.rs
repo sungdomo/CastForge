@@ -832,16 +832,30 @@ pub fn run() -> Result<()> {
             write_text_output(output.as_ref(), &formatted)?;
         }
 
-        Commands::ListPasses { filter, tree, json } => {
+        Commands::ListPasses {
+            filter,
+            tree,
+            options,
+            json,
+        } => {
             let registry = PassRegistry::with_builtin_passes();
             let q = filter.as_deref().unwrap_or("").to_ascii_lowercase();
             let entries: Vec<(&str, &str)> = registry
                 .list()
-                .into_iter()
                 .filter(|(n, d)| {
-                    q.is_empty()
-                        || n.to_ascii_lowercase().contains(&q)
+                    if q.is_empty() {
+                        return true;
+                    }
+                    let in_meta = registry.catalog_entry(n).is_some_and(|cat| {
+                        cat.family.to_ascii_lowercase().contains(&q)
+                            || cat
+                                .options
+                                .iter()
+                                .any(|o| o.name.to_ascii_lowercase().contains(&q))
+                    });
+                    n.to_ascii_lowercase().contains(&q)
                         || d.to_ascii_lowercase().contains(&q)
+                        || in_meta
                 })
                 .collect();
 
@@ -849,31 +863,51 @@ pub fn run() -> Result<()> {
                 let items: Vec<serde_json::Value> = entries
                     .iter()
                     .map(|&(name, desc)| {
-                        let children: Vec<&str> = registry
-                            .create_pass(name, &Default::default())
-                            .ok()
-                            .map(|p| p.child_passes().to_vec())
-                            .unwrap_or_default();
+                        let cat = registry.catalog_entry(name);
+                        let children: Vec<String> = cat
+                            .map(|c| c.child_passes.clone())
+                            .unwrap_or_else(|| {
+                                registry
+                                    .create_pass(name, &Default::default())
+                                    .ok()
+                                    .map(|p| {
+                                        p.child_passes().iter().map(|s| (*s).to_string()).collect()
+                                    })
+                                    .unwrap_or_default()
+                            });
+                        let family = cat.map(|c| c.family.as_str()).unwrap_or("custom");
+                        let pass_opts = cat.map(|c| c.options.as_slice()).unwrap_or(&[]);
                         serde_json::json!({
                             "name": name,
+                            "family": family,
                             "description": desc,
                             "is_composite": !children.is_empty(),
                             "child_passes": children,
+                            "options": pass_opts,
                         })
                     })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&items)?);
             } else {
                 println!("Available CastForge Passes ({} matched):", entries.len());
-                println!("{:<28} DESCRIPTION", "PASS NAME");
-                println!("{}", "-".repeat(86));
+                println!("{:<28} {:<18} DESCRIPTION", "PASS NAME", "FAMILY");
+                println!("{}", "-".repeat(96));
                 for (name, desc) in entries {
-                    println!("{:<28} {}", name, desc);
-                    if tree
-                        && let Ok(instance) = registry.create_pass(name, &Default::default())
-                        && instance.is_composite()
-                    {
-                        let children = instance.child_passes();
+                    let cat = registry.catalog_entry(name);
+                    let family = cat.map(|c| c.family.as_str()).unwrap_or("custom");
+                    println!("{:<28} {:<18} {}", name, family, desc);
+                    if tree {
+                        let children: Vec<String> = cat
+                            .map(|c| c.child_passes.clone())
+                            .unwrap_or_else(|| {
+                                registry
+                                    .create_pass(name, &Default::default())
+                                    .ok()
+                                    .map(|p| {
+                                        p.child_passes().iter().map(|s| (*s).to_string()).collect()
+                                    })
+                                    .unwrap_or_default()
+                            });
                         for (idx, child) in children.iter().enumerate() {
                             let branch = if idx + 1 == children.len() {
                                 "└─"
@@ -881,6 +915,22 @@ pub fn run() -> Result<()> {
                                 "├─"
                             };
                             println!("  {branch} {child}");
+                        }
+                    }
+                    if options
+                        && let Some(cat_entry) = cat
+                        && !cat_entry.options.is_empty()
+                    {
+                        for opt in &cat_entry.options {
+                            let def = if opt.default.is_empty() {
+                                "\"\"".to_string()
+                            } else {
+                                opt.default.clone()
+                            };
+                            println!(
+                                "      arg: {}=<val> (default: {}) — {}",
+                                opt.name, def, opt.desc
+                            );
                         }
                     }
                 }

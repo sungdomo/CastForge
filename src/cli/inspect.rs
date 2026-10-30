@@ -11,11 +11,12 @@ use crate::mlir::parse_mlir;
 use crate::passes::{PassManager, PassRegistry};
 use anyhow::{Context, Result};
 use indexmap::IndexMap;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 /// Summary of a single `func.func` inside an inspected [`Module`].
 #[derive(Debug, Clone, Serialize)]
@@ -52,35 +53,73 @@ pub struct ModuleInspectionReport {
     pub total_flops: u64,
 }
 
-/// Hardware architecture profile entry for `castforge list-targets`.
-#[derive(Debug, Clone, Serialize)]
-pub struct ArchProfileInfo {
-    pub arch: &'static str,
+/// Declarative hardware architecture profile entry from `config/targets.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchProfileSpec {
+    pub arch: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
     pub peak_gflops: f64,
     pub peak_bandwidth_gbps: f64,
-    pub ridge_point_flops_per_byte: f64,
-    pub simd_isa: &'static str,
+    pub simd_isa: String,
     pub simd_lanes: usize,
     pub default_tile: usize,
     pub reg_tile: usize,
     pub unroll_factor: usize,
 }
 
-/// Codegen backend entry for `castforge list-targets`.
+/// Hardware architecture profile entry for `castforge list-targets`.
 #[derive(Debug, Clone, Serialize)]
-pub struct TargetBackendInfo {
-    pub target: &'static str,
-    pub aliases: &'static [&'static str],
-    pub output_kind: &'static str,
-    pub description: &'static str,
+pub struct ArchProfileInfo {
+    pub arch: String,
+    pub aliases: Vec<String>,
+    pub peak_gflops: f64,
+    pub peak_bandwidth_gbps: f64,
+    pub ridge_point_flops_per_byte: f64,
+    pub simd_isa: String,
+    pub simd_lanes: usize,
+    pub default_tile: usize,
+    pub reg_tile: usize,
+    pub unroll_factor: usize,
 }
 
-/// Translator stage entry for `castforge list-targets`.
-#[derive(Debug, Clone, Serialize)]
+/// Codegen backend entry parsed from `config/targets.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetBackendInfo {
+    pub target: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    pub output_kind: String,
+    pub description: String,
+}
+
+/// Translator stage entry parsed from `config/targets.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranslatorStageInfo {
-    pub stage: &'static str,
-    pub signature: &'static str,
-    pub description: &'static str,
+    pub stage: String,
+    pub signature: String,
+    pub description: String,
+}
+
+/// Top-level catalog of targets, hardware profiles, and translator stages parsed from
+/// `config/targets.toml`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TargetCatalog {
+    #[serde(default)]
+    pub target: Vec<TargetBackendInfo>,
+    #[serde(default)]
+    pub arch_profile: Vec<ArchProfileSpec>,
+    #[serde(default)]
+    pub translator: Vec<TranslatorStageInfo>,
+}
+
+/// Returns the compile-time embedded [`TargetCatalog`] parsed from `config/targets.toml`.
+pub fn target_catalog() -> &'static TargetCatalog {
+    static CATALOG: OnceLock<TargetCatalog> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        toml::from_str(include_str!("../../config/targets.toml"))
+            .expect("config/targets.toml must be valid TOML matching TargetCatalog")
+    })
 }
 
 /// Inspects an input model (`.mlir`, `.gguf`, `.onnx.json`, `config.json`, or `.safetensors`).
@@ -341,203 +380,29 @@ fn load_any_module(input: Option<&PathBuf>) -> Result<Module> {
 
 /// Lists all codegen targets, hardware `--arch` profiles, and composable translator stages.
 pub fn run_list_targets(json: bool, output: Option<&PathBuf>) -> Result<()> {
-    let targets = vec![
-        TargetBackendInfo {
-            target: "rust",
-            aliases: &["rs"],
-            output_kind: "text (.rs)",
-            description: "Standalone zero-dependency Rust source with arena memory & SIMD loops",
-        },
-        TargetBackendInfo {
-            target: "c",
-            aliases: &["c99"],
-            output_kind: "text (.c)",
-            description: "Standalone ANSI C99 source with OpenMP & hardware SIMD intrinsics",
-        },
-        TargetBackendInfo {
-            target: "wgsl",
-            aliases: &["webgpu"],
-            output_kind: "text (.wgsl)",
-            description: "WebGPU compute shader with @workgroup_size & shared tile memory",
-        },
-        TargetBackendInfo {
-            target: "cuda",
-            aliases: &["cu", "nvptx"],
-            output_kind: "text (.cu)",
-            description: "NVIDIA CUDA C++ __global__ kernels with __shared__ memory tiling",
-        },
-        TargetBackendInfo {
-            target: "msl",
-            aliases: &["metal"],
-            output_kind: "text (.metal)",
-            description: "Apple Metal Shading Language compute kernels with threadgroup memory",
-        },
-        TargetBackendInfo {
-            target: "hip",
-            aliases: &["rocm"],
-            output_kind: "text (.hip.cpp)",
-            description: "AMD ROCm HIP __global__ compute kernels",
-        },
-        TargetBackendInfo {
-            target: "opencl",
-            aliases: &["cl"],
-            output_kind: "text (.cl)",
-            description: "Khronos OpenCL C __kernel compute shaders",
-        },
-        TargetBackendInfo {
-            target: "header",
-            aliases: &["c-header"],
-            output_kind: "text (.h)",
-            description: "C/C++ extern \"C\" FFI header matching generated C99 symbols",
-        },
-        TargetBackendInfo {
-            target: "loop-ir",
-            aliases: &["loops"],
-            output_kind: "text",
-            description: "Imperative LoopIR middle-end dump after progressive lowering",
-        },
-        TargetBackendInfo {
-            target: "lib",
-            aliases: &["shared-lib", "so", "dylib"],
-            output_kind: "bytes (.so/.dylib)",
-            description: "Compiled native shared library via host C compiler (`cc -O3 -shared`)",
-        },
-    ];
-
-    let arch_names = [
-        "x86_64-avx2",
-        "x86_64-avx512",
-        "aarch64-neon",
-        "aarch64-sve",
-        "apple-m-series",
-        "cuda-sm80",
-        "nvidia-hopper",
-        "nvidia-blackwell",
-        "rocm-gfx90a",
-        "riscv64-rvv",
-        "wasm32-simd128",
-    ];
-    let arch_profiles: Vec<ArchProfileInfo> = arch_names
+    let catalog = target_catalog();
+    let targets = &catalog.target;
+    let arch_profiles: Vec<ArchProfileInfo> = catalog
+        .arch_profile
         .iter()
-        .map(|&arch| {
-            let rf = HardwareRoofline::for_arch(arch);
-            let cfg = TargetConfig::for_arch(arch);
+        .map(|spec| {
+            let rf = HardwareRoofline::for_arch(&spec.arch);
+            let _ = TargetConfig::for_arch(&spec.arch);
             ArchProfileInfo {
-                arch,
-                peak_gflops: rf.peak_gflops,
-                peak_bandwidth_gbps: rf.peak_bandwidth_gbps,
+                arch: spec.arch.clone(),
+                aliases: spec.aliases.clone(),
+                peak_gflops: spec.peak_gflops,
+                peak_bandwidth_gbps: spec.peak_bandwidth_gbps,
                 ridge_point_flops_per_byte: rf.ridge_point(),
-                simd_isa: cfg.simd_isa.as_str(),
-                simd_lanes: cfg.simd_width,
-                default_tile: cfg.tile_m,
-                reg_tile: cfg.reg_tile_m,
-                unroll_factor: cfg.unroll_factor,
+                simd_isa: spec.simd_isa.clone(),
+                simd_lanes: spec.simd_lanes,
+                default_tile: spec.default_tile,
+                reg_tile: spec.reg_tile,
+                unroll_factor: spec.unroll_factor,
             }
         })
         .collect();
-
-    let translators = vec![
-        TranslatorStageInfo {
-            stage: "parse-mlir",
-            signature: "text -> ir",
-            description: "Parse StableHLO/Func/Quant MLIR text into a Dual-Plane Module",
-        },
-        TranslatorStageInfo {
-            stage: "import-onnx",
-            signature: "text -> ir",
-            description: "Import ONNX JSON graph into StableHLO Module",
-        },
-        TranslatorStageInfo {
-            stage: "import-gguf",
-            signature: "bytes -> ir",
-            description: "Import GGUF v2/v3 binary model into StableHLO Module + TensorStore",
-        },
-        TranslatorStageInfo {
-            stage: "import-hf-config",
-            signature: "text -> ir",
-            description: "Synthesize Transformer architecture from HuggingFace config.json",
-        },
-        TranslatorStageInfo {
-            stage: "load-weights(path=...)",
-            signature: "ir -> ir",
-            description: "Load external .safetensors weights into Module::tensor_store",
-        },
-        TranslatorStageInfo {
-            stage: "<any-pass-name>",
-            signature: "ir -> ir",
-            description: "Run any of the 115 registered IR transformation/optimization passes",
-        },
-        TranslatorStageInfo {
-            stage: "autotune-schedule",
-            signature: "ir -> ir",
-            description: "Search Roofline-optimal schedule and stamp loop attributes onto IR",
-        },
-        TranslatorStageInfo {
-            stage: "snapshot-ir",
-            signature: "ir -> ir",
-            description: "Capture baseline IR snapshot for downstream ir-diff comparison",
-        },
-        TranslatorStageInfo {
-            stage: "ir-diff",
-            signature: "ir -> text",
-            description: "Emit unified MLIR diff against upstream snapshot-ir state",
-        },
-        TranslatorStageInfo {
-            stage: "print-mlir",
-            signature: "ir -> text",
-            description: "Format Module as pretty or canonical generic MLIR text",
-        },
-        TranslatorStageInfo {
-            stage: "lower-to-loops",
-            signature: "ir -> text",
-            description: "Lower tensor IR to imperative LoopIR statements",
-        },
-        TranslatorStageInfo {
-            stage: "optimize-loop-ir",
-            signature: "ir -> text",
-            description: "Lower and run imperative loop fusion, interchange, unroll & SIMD",
-        },
-        TranslatorStageInfo {
-            stage: "codegen-<target>",
-            signature: "ir -> text",
-            description: "Emit target code (rust, c, wgsl, cuda, msl, hip, opencl, header)",
-        },
-        TranslatorStageInfo {
-            stage: "compile-lib",
-            signature: "ir -> bytes",
-            description: "Compile Module into a native shared library (.so/.dylib)",
-        },
-        TranslatorStageInfo {
-            stage: "export-onnx",
-            signature: "ir -> text",
-            description: "Export Module and weights to ONNX JSON format",
-        },
-        TranslatorStageInfo {
-            stage: "export-gguf",
-            signature: "ir -> bytes",
-            description: "Export Module and weights to GGUF v3 binary format",
-        },
-        TranslatorStageInfo {
-            stage: "export-safetensors",
-            signature: "ir -> bytes",
-            description: "Export Module weights to SafeTensors binary format",
-        },
-        TranslatorStageInfo {
-            stage: "roofline-report",
-            signature: "ir -> text",
-            description: "Emit Roofline FLOPs, bandwidth, and bottleneck JSON report",
-        },
-        TranslatorStageInfo {
-            stage: "memory-plan",
-            signature: "ir -> text",
-            description: "Emit interval-colored static activation arena JSON plan",
-        },
-        TranslatorStageInfo {
-            stage: "viz-<format>",
-            signature: "ir -> text",
-            description: "Render computation graph as mermaid, dot, json, or html",
-        },
-    ];
+    let translators = &catalog.translator;
 
     let text = if json {
         let payload = serde_json::json!({
@@ -555,7 +420,7 @@ pub fn run_list_targets(json: bool, output: Option<&PathBuf>) -> Result<()> {
             "TARGET", "ALIASES", "OUTPUT"
         );
         let _ = writeln!(out, "{}", "-".repeat(92));
-        for t in &targets {
+        for t in targets {
             let _ = writeln!(
                 out,
                 "{:<12} {:<18} {:<18} {}",
@@ -595,7 +460,7 @@ pub fn run_list_targets(json: bool, output: Option<&PathBuf>) -> Result<()> {
             "STAGE", "SIGNATURE"
         );
         let _ = writeln!(out, "{}", "-".repeat(92));
-        for tr in &translators {
+        for tr in translators {
             let _ = writeln!(
                 out,
                 "{:<24} {:<14} {}",

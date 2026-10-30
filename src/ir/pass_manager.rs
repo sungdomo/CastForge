@@ -5,6 +5,44 @@ use crate::ir::{Module, Payload, Translator, TranslatorChain};
 use anyhow::{Result, anyhow};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
+
+/// Declarative specification of a single `key=value` option accepted by a pass in
+/// `config/passes.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PassOptionSpec {
+    pub name: String,
+    pub default: String,
+    pub desc: String,
+}
+
+/// Declarative metadata entry for a single pass in `config/passes.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PassCatalogEntry {
+    pub name: String,
+    pub family: String,
+    pub description: String,
+    #[serde(default)]
+    pub child_passes: Vec<String>,
+    #[serde(default)]
+    pub options: Vec<PassOptionSpec>,
+}
+
+/// Top-level declarative pass catalog parsed from `config/passes.toml`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PassCatalog {
+    #[serde(default)]
+    pub pass: Vec<PassCatalogEntry>,
+}
+
+/// Returns the compile-time embedded [`PassCatalog`] parsed from `config/passes.toml`.
+pub fn pass_catalog() -> &'static PassCatalog {
+    static CATALOG: OnceLock<PassCatalog> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        toml::from_str(include_str!("../../config/passes.toml"))
+            .expect("config/passes.toml must be valid TOML matching PassCatalog")
+    })
+}
 
 /// Statistics and change status returned by a single pass execution.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -379,19 +417,31 @@ impl PassRegistry {
         }
     }
 
-    /// Registers a pass factory under `name`.
+    /// Registers a pass factory under `name`. If `name` is present in `config/passes.toml`, its
+    /// authoritative catalog description is used automatically.
     pub fn register<F>(&mut self, name: &'static str, description: &'static str, factory: F)
     where
         F: Fn(&PassOptions) -> Result<Box<dyn Pass>> + Send + Sync + 'static,
     {
+        let resolved_desc = pass_catalog()
+            .pass
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| e.description.as_str())
+            .unwrap_or(description);
         self.passes.insert(
             name,
             PassDescriptor {
                 name,
-                description,
+                description: resolved_desc,
                 factory: Box::new(factory),
             },
         );
+    }
+
+    /// Looks up the declarative [`PassCatalogEntry`] for `name` from `config/passes.toml`.
+    pub fn catalog_entry(&self, name: &str) -> Option<&'static PassCatalogEntry> {
+        pass_catalog().pass.iter().find(|e| e.name == name)
     }
 
     /// Instantiates a registered pass by `name` with `opts`.

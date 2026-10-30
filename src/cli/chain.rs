@@ -518,5 +518,28 @@ mod tests {
         assert_eq!(rep.functions.len(), 1);
         assert_eq!(rep.total_ops, 1);
         assert_eq!(rep.op_histogram.get("stablehlo.add"), Some(&1));
+
+        let pcat = crate::ir::pass_catalog();
+        assert_eq!(pcat.pass.len(), reg.list().count());
+        for (name, desc) in reg.list() {
+            let entry = reg
+                .catalog_entry(name)
+                .unwrap_or_else(|| panic!("missing pass `{name}` in config/passes.toml"));
+            assert_eq!(entry.description, desc);
+            let instance = reg
+                .create_pass(name, &Default::default())
+                .unwrap_or_else(|e| panic!("failed to instantiate `{name}`: {e}"));
+            let expected_children: Vec<String> =
+                instance.child_passes().iter().map(|s| (*s).to_string()).collect();
+            assert_eq!(
+                entry.child_passes, expected_children,
+                "child_passes mismatch for `{name}` in config/passes.toml"
+            );
+        }
+
+        let tcat = crate::cli::target_catalog();
+        assert_eq!(tcat.target.len(), 10);
+        assert_eq!(tcat.arch_profile.len(), 11);
+        assert_eq!(tcat.translator.len(), 20);
     }
 }

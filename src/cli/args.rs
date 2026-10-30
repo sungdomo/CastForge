@@ -503,16 +503,20 @@ pub enum Commands {
         output: Option<PathBuf>,
     },
 
-    /// List all registered transformation and optimization passes
+    /// List all registered transformation and optimization passes (from `config/passes.toml`)
     ListPasses {
-        /// Optional substring filter to match pass names or descriptions
+        /// Optional substring filter to match pass names, families, options, or descriptions
         filter: Option<String>,
 
         /// Display composite pass hierarchy (`child_passes`) as a tree
         #[arg(short = 't', long = "tree")]
         tree: bool,
 
-        /// Emit registered passes as formatted JSON
+        /// Display accepted `key=val` command-line options and defaults for each pass
+        #[arg(short = 'a', long = "options", visible_alias = "args")]
+        options: bool,
+
+        /// Emit registered passes (including family, hierarchy, and options) as formatted JSON
         #[arg(long = "json")]
         json: bool,
     },

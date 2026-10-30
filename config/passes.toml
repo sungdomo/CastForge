@@ -1,0 +1,1189 @@
+# Declarative catalog of all CastForge IR transformation, optimization, lowering, surgery, and
+# verification passes (`config/passes.toml`).
+#
+# Embedded into the binary at compile time via `include_str!("../../config/passes.toml")`.
+
+[[pass]]
+name = "dce"
+family = "dce"
+description = "Dead Code Elimination (removes unused pure SSA ops and dead private symbols)"
+child_passes = []
+options = [
+  { name = "symbols", default = "true", desc = "Eliminate dead private func.func symbols" },
+]
+
+[[pass]]
+name = "cse"
+family = "cse"
+description = "Unified CSE, dominator-aware GVN, LICM, and entry constant hoisting"
+child_passes = ["hoist-loop-invariants", "hoist-constants"]
+options = [
+  { name = "gvn", default = "true", desc = "Enable dominator-tree Global Value Numbering" },
+  { name = "licm", default = "true", desc = "Hoist loop-invariant operations" },
+  { name = "hoist_constants", default = "false", desc = "Hoist constants to function entry" },
+]
+
+[[pass]]
+name = "fold-views"
+family = "fold_views"
+description = "Unified folding of transpose, reshape, broadcast, slice/concat, convert, and layout"
+child_passes = ["convert-layout"]
+options = [
+  { name = "layout", default = "", desc = "Optional layout target (nhwc, nchw, col_major)" },
+  { name = "propagate", default = "false", desc = "Propagate layout across operations" },
+]
+
+[[pass]]
+name = "simplify-algebraic"
+family = "simplify_algebraic"
+description = "Unified constant folding, SCCP, algebraic identities, e-graph factoring & FMA"
+child_passes = ["fold-constants", "fuse-fma"]
+options = [
+  { name = "fold_constants", default = "true", desc = "Evaluate constant subexpressions" },
+  { name = "conditional", default = "true", desc = "Enable conditional constant propagation" },
+  { name = "egraph", default = "true", desc = "Enable e-graph distributive factoring" },
+  { name = "fuse_fma", default = "true", desc = "Extract castforge.fma from a*b + c" },
+]
+
+[[pass]]
+name = "quantize"
+family = "quantize"
+description = "Unified quantization (weight|awq|fp8|nvfp4|f16|bf16|w8a8|smooth|hadamard)"
+child_passes = [
+  "rotate-hadamard",
+  "quantize-weights",
+  "quantize-groupwise",
+  "quantize-fp8",
+  "quantize-fp4",
+  "calibrate-quantize",
+  "smooth-quantize",
+  "insert-qat-ste",
+  "lower-mixed-precision",
+]
+options = [
+  { name = "scheme", default = "weight", desc = "Scheme (weight|awq|fp8|nvfp4|w8a8|f16|bf16)" },
+  { name = "bits", default = "8", desc = "Bit-width (4 or 8)" },
+  { name = "group_size", default = "32", desc = "Group size for groupwise/AWQ quantization" },
+  { name = "salient_ratio", default = "0.01", desc = "Fraction of salient channels for AWQ" },
+  { name = "format", default = "e4m3", desc = "FP8 format (e4m3 or e5m2)" },
+  { name = "block_size", default = "32", desc = "Microscaling/Hadamard block size" },
+  { name = "alpha", default = "0.5", desc = "SmoothQuant migration exponent" },
+]
+
+[[pass]]
+name = "merge-weights"
+family = "merge_weights"
+description = "Unified model merging & adapter baking (method=linear|slerp|ties|dare|lora)"
+child_passes = ["bake-lora", "bake-dora", "merge-task-vectors"]
+options = [
+  { name = "method", default = "linear", desc = "Method (linear|slerp|ties|dare|lora|dora)" },
+  { name = "t", default = "0.5", desc = "Interpolation factor for linear/slerp/ties" },
+  { name = "alpha", default = "1.0", desc = "LoRA/DoRA scaling factor" },
+  { name = "lambda", default = "1.0", desc = "Task vector scaling factor" },
+  { name = "drop_rate", default = "0.0", desc = "DARE random drop rate" },
+]
+
+[[pass]]
+name = "fold-weights"
+family = "fold_weights"
+description = "Unified weight folding, SIMD pre-packing, SafeTensors externalization & pruning"
+child_passes = [
+  "fold-norm-weights",
+  "fold-batchnorm",
+  "pack-weights",
+  "externalize-weights",
+  "prune-weights",
+]
+options = [
+  { name = "mode", default = "batchnorm", desc = "Mode (all|norm|batchnorm|pack|externalize)" },
+  { name = "min_elements", default = "2", desc = "Minimum tensor elements to externalize" },
+  { name = "sparsity", default = "0.5", desc = "Target sparsity ratio for pruning modes" },
+]
+
+[[pass]]
+name = "prune-weights"
+family = "fold_weights"
+description = "Compile-time weight pruning (mode=structured|2to4|activation_sparse, sparsity)"
+child_passes = ["prune-structured", "prune-2to4", "prune-activations"]
+options = [
+  { name = "mode", default = "structured", desc = "Mode (structured|2to4|activation_sparse)" },
+  { name = "sparsity", default = "0.5", desc = "Target sparsity fraction [0.0, 1.0]" },
+]
+
+[[pass]]
+name = "externalize-weights"
+family = "fold_weights"
+description = "Externalize or inline weight constants between IR and SafeTensors TensorStore"
+child_passes = []
+options = [
+  { name = "min_elements", default = "2", desc = "Minimum tensor elements to externalize" },
+  { name = "inline", default = "false", desc = "Inline TensorStore refs into dense<> literals" },
+]
+
+[[pass]]
+name = "fuse-elementwise"
+family = "fuse_elementwise"
+description = "Unified elementwise, activation (SwiGLU/GELU/GeGLU/MoE), map-reduce & loop fusion"
+child_passes = [
+  "fuse-activations",
+  "fuse-swiglu",
+  "fuse-gelu",
+  "fuse-gated-mlp",
+  "fuse-moe",
+  "fuse-map-reduce",
+  "fuse-loops",
+  "split-loops",
+  "fuse-megakernel",
+  "decompose-composites",
+]
+options = [
+  { name = "mode", default = "composites", desc = "Mode (composites|loops|activations|moe)" },
+  { name = "max_steps", default = "0", desc = "Max ops per fused elementwise chain (0 = all)" },
+  { name = "top_k", default = "2", desc = "Top-K experts for MoE fusion" },
+]
+
+[[pass]]
+name = "decompose-composites"
+family = "fuse_elementwise"
+description = "Expands castforge.* composite operations into primitive StableHLO ops"
+child_passes = []
+options = []
+
+[[pass]]
+name = "fuse-loops"
+family = "fuse_elementwise"
+description = "Fuses multi-step elementwise chains into castforge.fused_elementwise_chain"
+child_passes = []
+options = []
+
+[[pass]]
+name = "split-loops"
+family = "fuse_elementwise"
+description = "Splits oversized fused_elementwise_chain ops at max_steps register-pressure limits"
+child_passes = []
+options = [
+  { name = "max_steps", default = "3", desc = "Maximum elementwise steps per fused loop" },
+]
+
+[[pass]]
+name = "fuse-gemm"
+family = "fuse_gemm"
+description = "Unified GEMM fusion (horizontal QKV/MLP dot, dequant+GEMM, and GEMM+bias/act/res)"
+child_passes = [
+  "fuse-horizontal-dot",
+  "fuse-dequant-matmul",
+  "fuse-matmul-epilogue",
+]
+options = [
+  { name = "kind", default = "all", desc = "Fusion kind (all, horizontal, dequant, epilogue)" },
+]
+
+[[pass]]
+name = "fuse-norm"
+family = "fuse_norm"
+description = "Unified normalization & softmax fusion (RMSNorm, LayerNorm, Softmax, Cross-Entropy)"
+child_passes = [
+  "fuse-rmsnorm",
+  "fuse-residual-norm",
+  "fuse-layernorm",
+  "fuse-softmax",
+  "fuse-linear-cross-entropy",
+]
+options = [
+  { name = "kind", default = "all", desc = "Kind (all|rmsnorm|layernorm|softmax|cross_entropy)" },
+  { name = "chunk_size", default = "1024", desc = "Vocabulary chunk size for cross_entropy" },
+]
+
+[[pass]]
+name = "fuse-attention"
+family = "fuse_attention"
+description = "Unified attention & serving (SDPA/RoPE/MLA/KV-cache/Paged/Flash/Sliding/Share)"
+child_passes = [
+  "fuse-rope",
+  "fuse-mla",
+  "inject-kv-cache",
+  "lower-paged-attention",
+  "lower-flash-decoding",
+  "lower-tree-attention",
+]
+options = [
+  { name = "kind", default = "all", desc = "Mode (all|sdpa|rope|mla|kv_cache|paged|flash|tree)" },
+  { name = "kv_lora_rank", default = "512", desc = "Latent KV compression rank for MLA" },
+  { name = "max_seq_len", default = "2048", desc = "Maximum sequence length for KV cache" },
+  { name = "page_block_size", default = "16", desc = "Tokens per page block for PagedAttention" },
+  { name = "split_kv", default = "4", desc = "Parallel KV splits for Flash-Decoding" },
+]
+
+[[pass]]
+name = "canonicalize"
+family = "canonicalize"
+description = "Composite canonicalization & topological/peak-memory scheduler (mode=all|min_memory)"
+child_passes = [
+  "cse",
+  "simplify-algebraic",
+  "fold-views",
+  "dce",
+  "topological-sort",
+]
+options = [
+  { name = "mode", default = "all", desc = "Canonicalization mode (all or min_memory)" },
+  { name = "toposort", default = "false", desc = "Run topological sort after canonicalization" },
+]
+
+[[pass]]
+name = "specialize-shapes"
+family = "specialize_shapes"
+description = "Unified shape specialization, static batch resizing, bucketing, and token pruning"
+child_passes = ["resize-batch", "bucket-shapes", "prune-tokens"]
+options = [
+  { name = "default", default = "1", desc = "Replacement dimension for unbound dynamic `?` dims" },
+  { name = "batch", default = "", desc = "Static batch size to rewrite leading dimension" },
+  { name = "buckets", default = "", desc = "Semicolon-separated batch bucket sizes (e.g. 1;4;8)" },
+  { name = "token_prune_ratio", default = "", desc = "ToMe/FastV token pruning ratio" },
+]
+
+[[pass]]
+name = "optimize-memory"
+family = "optimize_memory"
+description = "Unified memory pass (mode=all|inplace|zero_copy|remat|offload, min_distance)"
+child_passes = [
+  "bufferize-inplace",
+  "eliminate-concat-copies",
+  "rematerialize",
+  "offload-activations",
+]
+options = [
+  { name = "mode", default = "all", desc = "Mode (all|inplace|zero_copy|remat|offload)" },
+  { name = "min_distance", default = "3", desc = "Minimum liveness span for rematerialization" },
+  { name = "min_span", default = "2", desc = "Minimum liveness span for DRAM offloading" },
+]
+
+[[pass]]
+name = "rematerialize"
+family = "optimize_memory"
+description = "Activation rematerialization / checkpointing for long-lived intermediates"
+child_passes = []
+options = [
+  { name = "min_distance", default = "3", desc = "Minimum use distance to trigger recomputation" },
+]
+
+[[pass]]
+name = "offload-activations"
+family = "optimize_memory"
+description = "Inserts host-device DRAM offload markers on long-lived activations"
+child_passes = []
+options = [
+  { name = "min_span", default = "2", desc = "Minimum liveness span for host-device offload" },
+]
+
+[[pass]]
+name = "shard-distributed"
+family = "shard_distributed"
+description = "Unified distributed parallelism (TP, Ring-CP, PP, FSDP, EP, streams, & reverse VJP)"
+child_passes = [
+  "shard-spmd",
+  "shard-ring-attention",
+  "shard-pipeline-parallel",
+  "shard-fsdp",
+  "shard-experts",
+  "coalesce-all-reduce",
+  "schedule-streams",
+  "autodiff",
+]
+options = [
+  { name = "mode", default = "tp", desc = "Mode (tp|ring_cp|pp|fsdp|ep|streams|autodiff)" },
+  { name = "devices", default = "2", desc = "Number of SPMD / FSDP / EP devices" },
+  { name = "ring_size", default = "4", desc = "Ring size for Ring-Attention context parallelism" },
+  { name = "stages", default = "2", desc = "Pipeline stages for PP" },
+  { name = "lr", default = "0.0", desc = "Learning rate for reverse-mode autodiff SGD" },
+]
+
+[[pass]]
+name = "autodiff"
+family = "shard_distributed"
+description = "Reverse-mode automatic differentiation (VJP backward graph + SGD/AdamW update)"
+child_passes = []
+options = [
+  { name = "lr", default = "0.0", desc = "Learning rate for in-graph parameter update" },
+  { name = "optimizer", default = "sgd", desc = "Optimizer rule (sgd or adamw)" },
+  { name = "weight_decay", default = "0.01", desc = "Weight decay coefficient for AdamW" },
+]
+
+[[pass]]
+name = "coalesce-all-reduce"
+family = "shard_distributed"
+description = "Coalesces adjacent all_reduce ops and annotates compute-communication overlap"
+child_passes = []
+options = []
+
+[[pass]]
+name = "schedule-loops"
+family = "schedule_loops"
+description = "Unified loop schedule, conv-to-gemm & tensor-core pass (tile, permute, unroll)"
+child_passes = [
+  "lower-conv-to-gemm",
+  "split-large-gemm",
+  "pad-for-tiling",
+  "tile-loops",
+  "permute-loops",
+  "unroll-loops",
+  "vectorize-loops",
+  "lower-tensor-cores",
+]
+options = [
+  { name = "size", default = "16", desc = "L1 cache tile size (M, N, K)" },
+  { name = "l2_size", default = "0", desc = "Outer L2 cache tile size" },
+  { name = "reg_tile", default = "0", desc = "Register micro-kernel blocking factor" },
+  { name = "order", default = "mkn", desc = "GEMM loop order (mnk, mkn, nkm)" },
+  { name = "unroll", default = "4", desc = "Inner reduction loop unroll factor" },
+  { name = "isa", default = "avx2", desc = "Target SIMD ISA (avx2, avx512, neon, sve, rvv, wasm)" },
+  { name = "tensor_cores", default = "none", desc = "Tensor Core ISA (wmma|hopper_wgmma|tcgen05)" },
+]
+
+[[pass]]
+name = "lower-conv-to-gemm"
+family = "schedule_loops"
+description = "Lowers 1x1 NHWC 2D convolutions into reshape + dot_general GEMMs"
+child_passes = []
+options = []
+
+[[pass]]
+name = "split-large-gemm"
+family = "schedule_loops"
+description = "Splits wide dot_general RHS weights along N into cache-friendly chunks"
+child_passes = []
+options = [
+  { name = "max_n", default = "2", desc = "Maximum output columns N per split GEMM chunk" },
+]
+
+[[pass]]
+name = "normalize-ir"
+family = "normalize_ir"
+description = "Unified IR normalization, subgraph outlining/inlining/extraction, freezing & tapping"
+child_passes = [
+  "outline-subgraphs",
+  "parameterize-constants",
+  "freeze-inputs",
+  "tap-intermediates",
+  "strip-debuginfo",
+  "strip-attributes",
+  "normalize-ssa",
+]
+options = [
+  { name = "mode", default = "", desc = "Sub-mode (inline, outline, extract, reduce, compose)" },
+  { name = "ssa", default = "false", desc = "Normalize SSA value names in topological order" },
+  { name = "debuginfo", default = "false", desc = "Strip source location metadata" },
+  { name = "attributes", default = "false", desc = "Strip transient castforge.* attributes" },
+]
+
+[[pass]]
+name = "inline-calls"
+family = "normalize_ir"
+description = "Inlines func.call sites by cloning callee body operations into the caller"
+child_passes = []
+options = []
+
+[[pass]]
+name = "outline-subgraphs"
+family = "normalize_ir"
+description = "Outlines composite/GEMM ops into reusable private functions and deduplicates"
+child_passes = [
+  "outline-kernels",
+  "inline-calls",
+  "extract-subgraph",
+  "reduce-ir",
+  "dedup-functions",
+  "compose-functions",
+  "unroll-calls",
+]
+options = [
+  { name = "mode", default = "all", desc = "Outlining mode (all, composites, gemm, dedup)" },
+  { name = "dedup", default = "true", desc = "Deduplicate identical outlined functions" },
+]
+
+[[pass]]
+name = "extract-subgraph"
+family = "normalize_ir"
+description = "Slices the backward dependency cone of target SSA values"
+child_passes = []
+options = [
+  { name = "target", default = "", desc = "Target SSA value name(s) to slice" },
+  { name = "stop_at", default = "", desc = "Boundary SSA value(s) to turn into function inputs" },
+]
+
+[[pass]]
+name = "reduce-ir"
+family = "normalize_ir"
+description = "Delta-debugging IR reducer (truncates function body to max_ops or keep_op)"
+child_passes = []
+options = [
+  { name = "max_ops", default = "2", desc = "Maximum number of operations to retain" },
+  { name = "keep_op", default = "", desc = "Substring of operation name to preserve" },
+]
+
+[[pass]]
+name = "verify-ir"
+family = "verify_ir"
+description = "Unified IR verifier, structural hasher, equivalence, sanitizer & profiling"
+child_passes = [
+  "sanitize-numerics",
+  "instrument-profiling",
+  "verify-shapes",
+  "verify-equiv",
+  "hash-ir",
+  "bisect-passes",
+  "print-op-stats",
+]
+options = [
+  { name = "shapes", default = "true", desc = "Verify StableHLO tensor shapes and dtypes" },
+  { name = "equiv", default = "true", desc = "Verify structural SSA and signature invariants" },
+  { name = "hash", default = "true", desc = "Stamp 64-bit structural hash onto entry function" },
+  { name = "sanitize", default = "false", desc = "Insert FP16/BF16 clamps and div-by-zero guards" },
+  { name = "instrument", default = "false", desc = "Wrap ops in castforge.profile_region markers" },
+]
+
+[[pass]]
+name = "sanitize-numerics"
+family = "verify_ir"
+description = "Inserts FP16/BF16 finite clamps and non-zero division guards"
+child_passes = []
+options = [
+  { name = "clamp_max", default = "65504.0", desc = "Symmetric finite clamp bound" },
+  { name = "eps", default = "1e-6", desc = "Minimum denominator guard for division/rsqrt" },
+]
+
+[[pass]]
+name = "instrument-profiling"
+family = "verify_ir"
+description = "Wraps target ops in castforge.profile_region timing markers"
+child_passes = []
+options = [
+  { name = "filter", default = "gemm", desc = "Target op filter (all, gemm, attention)" },
+]
+
+[[pass]]
+name = "O1"
+family = "presets"
+description = "Preset O1: Inlining, simplify-algebraic, LICM, GVN, fold-views, canonicalize, dce"
+child_passes = [
+  "inline-calls",
+  "simplify-algebraic",
+  "cse",
+  "fold-views",
+  "canonicalize",
+  "dce",
+  "topological-sort",
+]
+options = []
+
+[[pass]]
+name = "O2"
+family = "presets"
+description = "Preset O2: O1 + LoRA/BatchNorm weight folding + unified Transformer/GEMM fusions"
+child_passes = [
+  "O1",
+  "fold-views",
+  "merge-weights",
+  "fold-weights",
+  "fuse-norm",
+  "fuse-attention",
+  "fuse-activations",
+  "fuse-softmax",
+  "fuse-gemm",
+  "fuse-elementwise",
+  "canonicalize",
+  "dce",
+]
+options = []
+
+[[pass]]
+name = "O3"
+family = "presets"
+description = "Preset O3: Shape specialization + O2 + MoE/FMA/zero-copy + weight packing + arena"
+child_passes = [
+  "specialize-shapes",
+  "O2",
+  "fuse-activations",
+  "simplify-algebraic",
+  "shard-distributed",
+  "fold-weights",
+  "optimize-memory",
+  "topological-sort",
+]
+options = [
+  { name = "default", default = "1", desc = "Default static dimension for dynamic `?` shapes" },
+]
+
+[[pass]]
+name = "topological-sort"
+family = "canonicalize"
+description = "Reorders operations for SSA def-before-use and optional peak-memory minimization"
+child_passes = []
+options = [
+  { name = "mode", default = "standard", desc = "Ordering mode (standard or min_memory)" },
+]
+
+[[pass]]
+name = "hoist-loop-invariants"
+family = "cse"
+description = "Hoists loop- and region-invariant pure operations out of nested regions (LICM)"
+child_passes = []
+options = []
+
+[[pass]]
+name = "hoist-constants"
+family = "cse"
+description = "Hoists stablehlo.constant ops to block entry and deduplicates identical constants"
+child_passes = []
+options = []
+
+[[pass]]
+name = "fold-constants"
+family = "simplify_algebraic"
+description = "Evaluates pure operations on constant inputs at compile time (including SCCP)"
+child_passes = []
+options = []
+
+[[pass]]
+name = "fuse-fma"
+family = "simplify_algebraic"
+description = "Applies e-graph distributive factoring (a*b+a*c -> a*(b+c)) and extracts fma"
+child_passes = []
+options = []
+
+[[pass]]
+name = "convert-layout"
+family = "fold_views"
+description = "Converts spatial/matrix layouts (nhwc/nchw/col_major) and propagates layouts"
+child_passes = []
+options = [
+  { name = "layout", default = "nhwc", desc = "Target layout (nhwc, nchw, col_major)" },
+  { name = "propagate", default = "false", desc = "Propagate layout across downstream ops" },
+]
+
+[[pass]]
+name = "resize-batch"
+family = "specialize_shapes"
+description = "Rewrites leading batch dim across activations while preserving 2D GEMM weights"
+child_passes = []
+options = [
+  { name = "batch", default = "4", desc = "Target static batch size" },
+]
+
+[[pass]]
+name = "bucket-shapes"
+family = "specialize_shapes"
+description = "Clones the entry function into batch-specialized bucket variants (@fn_batch_B)"
+child_passes = []
+options = [
+  { name = "buckets", default = "1;4;8", desc = "Semicolon-separated batch sizes" },
+]
+
+[[pass]]
+name = "prune-tokens"
+family = "specialize_shapes"
+description = "Applies ToMe/FastV dynamic sequence token pruning and bipartite token merging"
+child_passes = []
+options = [
+  { name = "ratio", default = "0.5", desc = "Fraction of tokens to prune per layer" },
+]
+
+[[pass]]
+name = "quantize-weights"
+family = "quantize"
+description = "Per-tensor symmetric INT8/INT4 weight quantization with uniform_dequantize"
+child_passes = []
+options = [
+  { name = "bits", default = "8", desc = "Quantization bit-width (4 or 8)" },
+  { name = "min_elements", default = "2", desc = "Minimum tensor elements to quantize" },
+]
+
+[[pass]]
+name = "quantize-groupwise"
+family = "quantize"
+description = "Group-wise INT4/INT8 weight quantization with AWQ salient-channel protection"
+child_passes = []
+options = [
+  { name = "bits", default = "4", desc = "Quantization bit-width (4 or 8)" },
+  { name = "group_size", default = "32", desc = "Channel group size" },
+  { name = "awq_salient", default = "true", desc = "Enable AWQ salient-channel scaling" },
+  { name = "salient_ratio", default = "0.01", desc = "Salient channel fraction" },
+]
+
+[[pass]]
+name = "quantize-fp8"
+family = "quantize"
+description = "FP8 (E4M3FN/E5M2) and OCP Microscaling MXFP8 block-scaled quantization"
+child_passes = []
+options = [
+  { name = "format", default = "e4m3", desc = "FP8 format (e4m3 or e5m2)" },
+  { name = "mxfp8", default = "true", desc = "Enable OCP MXFP8 shared E8M0 block scales" },
+  { name = "block_size", default = "32", desc = "MXFP8 microscaling block size" },
+]
+
+[[pass]]
+name = "quantize-fp4"
+family = "quantize"
+description = "Quantizes weights to Blackwell NVFP4 / OCP MXFP4 E2M1 4-bit float blocks"
+child_passes = []
+options = [
+  { name = "scheme", default = "nvfp4", desc = "4-bit float scheme (nvfp4 or mxfp4)" },
+  { name = "block_size", default = "16", desc = "Microscaling block size (16 or 32)" },
+]
+
+[[pass]]
+name = "calibrate-quantize"
+family = "quantize"
+description = "Profile-guided static W8A8/W4A8 calibration and quantization"
+child_passes = []
+options = [
+  { name = "bits", default = "8", desc = "Quantization bit-width (4 or 8)" },
+  { name = "samples", default = "4", desc = "Number of synthetic calibration samples" },
+]
+
+[[pass]]
+name = "smooth-quantize"
+family = "quantize"
+description = "Migrates activation outlier difficulty into weights via SmoothQuant alpha scaling"
+child_passes = []
+options = [
+  { name = "bits", default = "8", desc = "Target quantization bit-width" },
+  { name = "alpha", default = "0.5", desc = "Migration strength alpha in [0, 1]" },
+  { name = "samples", default = "4", desc = "Number of calibration samples" },
+]
+
+[[pass]]
+name = "insert-qat-ste"
+family = "quantize"
+description = "Applies fake-quantization with Straight-Through Estimator (QAT-STE) for training"
+child_passes = []
+options = [
+  { name = "bits", default = "8", desc = "Simulated quantization bit-width" },
+]
+
+[[pass]]
+name = "rotate-hadamard"
+family = "quantize"
+description = "Applies orthogonal Walsh-Hadamard rotation (QuaRot/SpinQuant) to suppress outliers"
+child_passes = []
+options = [
+  { name = "block_size", default = "4", desc = "Power-of-two Hadamard block size" },
+]
+
+[[pass]]
+name = "lower-mixed-precision"
+family = "quantize"
+description = "Lowers heavy GEMM/Conv ops to F16/BF16 while keeping reductions and norms in F32"
+child_passes = []
+options = [
+  { name = "dtype", default = "f16", desc = "Target reduced precision dtype (f16 or bf16)" },
+]
+
+[[pass]]
+name = "bake-lora"
+family = "merge_weights"
+description = "Folds low-rank LoRA adapters (W + alpha * A @ B) into base weight constants"
+child_passes = []
+options = [
+  { name = "alpha", default = "1.0", desc = "LoRA adapter scaling factor" },
+]
+
+[[pass]]
+name = "bake-dora"
+family = "merge_weights"
+description = "Bakes DoRA adapters via column-wise directional normalization and magnitude scale"
+child_passes = []
+options = [
+  { name = "alpha", default = "1.0", desc = "DoRA adapter scaling factor" },
+]
+
+[[pass]]
+name = "merge-task-vectors"
+family = "merge_weights"
+description = "Merges fine-tuned task vectors into base weights via Task Arithmetic and DARE"
+child_passes = []
+options = [
+  { name = "lambda", default = "1.0", desc = "Task vector scaling coefficient" },
+  { name = "drop_rate", default = "0.0", desc = "DARE random drop rate in [0, 1)" },
+]
+
+[[pass]]
+name = "fold-norm-weights"
+family = "fold_weights"
+description = "Absorbs constant RMSNorm/LayerNorm scale multiply into adjacent dot_general weights"
+child_passes = []
+options = []
+
+[[pass]]
+name = "fold-batchnorm"
+family = "fold_weights"
+description = "Absorbs BatchNorm / channel scale into preceding convolution or dot_general weights"
+child_passes = []
+options = []
+
+[[pass]]
+name = "pack-weights"
+family = "fold_weights"
+description = "Pre-packs 2D constant RHS weights from [K, N] to [N, K] for unit-stride SIMD MatMul"
+child_passes = []
+options = []
+
+[[pass]]
+name = "prune-structured"
+family = "fold_weights"
+description = "Structured L1 channel pruning on 2D weight matrices in dot_general (sparsity=0.5)"
+child_passes = []
+options = [
+  { name = "sparsity", default = "0.5", desc = "Fraction of lowest-L1 output channels to zero" },
+]
+
+[[pass]]
+name = "prune-2to4"
+family = "fold_weights"
+description = "Prunes 2D weight matrices to NVIDIA 2:4 semi-structured sparsity (2 non-zeros per 4)"
+child_passes = []
+options = []
+
+[[pass]]
+name = "prune-activations"
+family = "fold_weights"
+description = "Applies TEAL/CATS dynamic top-k magnitude activation sparsity to GEMM inputs"
+child_passes = []
+options = [
+  { name = "sparsity", default = "0.5", desc = "Target dynamic activation sparsity ratio" },
+]
+
+[[pass]]
+name = "fuse-map-reduce"
+family = "fuse_elementwise"
+description = "Fuses elementwise map producers directly into stablehlo.reduce (fused_map_reduce)"
+child_passes = []
+options = []
+
+[[pass]]
+name = "fuse-megakernel"
+family = "fuse_elementwise"
+description = "Fuses sequential ops into a single persistent grid-synced megakernel launch"
+child_passes = []
+options = []
+
+[[pass]]
+name = "fuse-activations"
+family = "fuse_elementwise"
+description = "Unified activation, gated-MLP & MoE fusion (SwiGLU, GELU, GeGLU, GatedMLP, MoE)"
+child_passes = ["fuse-swiglu", "fuse-gelu", "fuse-gated-mlp", "fuse-moe"]
+options = [
+  { name = "kind", default = "all", desc = "Activation kind (all, swiglu, gelu, gated_mlp, moe)" },
+  { name = "top_k", default = "2", desc = "Top-K experts for MoE routing" },
+  { name = "shared_expert", default = "false", desc = "Include shared expert branch in MoE" },
+]
+
+[[pass]]
+name = "fuse-swiglu"
+family = "fuse_elementwise"
+description = "Fuses SwiGLU (gate / (1 + exp(-gate)) * up) into stablehlo.composite (fused_swiglu)"
+child_passes = []
+options = []
+
+[[pass]]
+name = "fuse-gelu"
+family = "fuse_elementwise"
+description = "Fuses GELU and GeGLU subgraphs into stablehlo.composite (fused_gelu / fused_geglu)"
+child_passes = []
+options = []
+
+[[pass]]
+name = "fuse-gated-mlp"
+family = "fuse_elementwise"
+description = "Fuses gate/up projections + SwiGLU/GeGLU + down projection into fused_gated_mlp"
+child_passes = []
+options = []
+
+[[pass]]
+name = "fuse-moe"
+family = "fuse_elementwise"
+description = "Fuses Top-K router + expert gated MLPs into castforge.fused_moe"
+child_passes = []
+options = [
+  { name = "top_k", default = "2", desc = "Number of active experts per token" },
+  { name = "capacity_factor", default = "1.25", desc = "Expert token buffer capacity factor" },
+  { name = "shared_expert", default = "false", desc = "Enable DeepSeek-style shared expert" },
+]
+
+[[pass]]
+name = "fuse-horizontal-dot"
+family = "fuse_gemm"
+description = "Horizontally fuses parallel dot_general ops sharing an LHS input (Q/K/V projections)"
+child_passes = []
+options = []
+
+[[pass]]
+name = "fuse-dequant-matmul"
+family = "fuse_gemm"
+description = "Fuses uniform_dequantize + dot_general into on-the-fly quantized GEMM"
+child_passes = []
+options = []
+
+[[pass]]
+name = "fuse-matmul-epilogue"
+family = "fuse_gemm"
+description = "Fuses dot_general + bias add (+ relu/tanh/silu/scale epilogue) into composite"
+child_passes = []
+options = []
+
+[[pass]]
+name = "fuse-residual-norm"
+family = "fuse_norm"
+description = "Fuses add(x, residual) + RMSNorm into stablehlo.composite (fused_residual_rmsnorm)"
+child_passes = []
+options = []
+
+[[pass]]
+name = "fuse-rmsnorm"
+family = "fuse_norm"
+description = "Fuses x * rsqrt(mean(x^2) + eps) * weight into stablehlo.composite (fused_rmsnorm)"
+child_passes = []
+options = []
+
+[[pass]]
+name = "fuse-layernorm"
+family = "fuse_norm"
+description = "Fuses (x - mean(x)) * rsqrt(var(x) + eps) * gamma + beta into fused_layernorm"
+child_passes = []
+options = []
+
+[[pass]]
+name = "fuse-softmax"
+family = "fuse_norm"
+description = "Unified Softmax, LogSoftmax, and chunked Linear Cross-Entropy fusion"
+child_passes = []
+options = [
+  { name = "kind", default = "all", desc = "Kind (all|softmax|log_softmax|cross_entropy)" },
+  { name = "chunk_size", default = "1024", desc = "Logit tile size for cross_entropy" },
+]
+
+[[pass]]
+name = "fuse-linear-cross-entropy"
+family = "fuse_norm"
+description = "Fuses classifier GEMM + online log-sum-exp Cross-Entropy without full logits"
+child_passes = []
+options = [
+  { name = "chunk_size", default = "1024", desc = "Vocabulary chunk size for online LSE" },
+]
+
+[[pass]]
+name = "fuse-rope"
+family = "fuse_attention"
+description = "Fuses decomposed Rotary Position Embedding (RoPE) subgraphs into stablehlo.composite"
+child_passes = []
+options = []
+
+[[pass]]
+name = "fuse-mla"
+family = "fuse_attention"
+description = "Fuses Multi-Head Latent Attention (MLA) by absorbing KV up-proj into Q/O weights"
+child_passes = []
+options = [
+  { name = "latent_rank", default = "512", desc = "Compressed KV latent rank" },
+]
+
+[[pass]]
+name = "inject-kv-cache"
+family = "fuse_attention"
+description = "Injects autoregressive KV-cache state updates (castforge.kv_cache_update)"
+child_passes = []
+options = [
+  { name = "max_seq_len", default = "2048", desc = "Maximum sequence capacity of KV cache" },
+]
+
+[[pass]]
+name = "lower-paged-attention"
+family = "fuse_attention"
+description = "Lowers fused_attention to vLLM-style PagedAttention with block-table KV addressing"
+child_passes = []
+options = [
+  { name = "page_block_size", default = "16", desc = "Number of tokens per physical KV page" },
+  { name = "max_blocks", default = "64", desc = "Maximum page blocks per sequence" },
+]
+
+[[pass]]
+name = "lower-flash-decoding"
+family = "fuse_attention"
+description = "Partitions KV sequence across parallel splits with LSE reduction for LLM decoding"
+child_passes = []
+options = [
+  { name = "split_kv", default = "4", desc = "Number of parallel KV sequence partitions" },
+]
+
+[[pass]]
+name = "lower-tree-attention"
+family = "fuse_attention"
+description = "Configures Medusa/EAGLE speculative decoding tree-attention verification masks"
+child_passes = []
+options = [
+  { name = "draft_tokens", default = "4", desc = "Number of speculative draft tokens" },
+  { name = "tree_depth", default = "2", desc = "Depth of speculative verification tree" },
+]
+
+[[pass]]
+name = "bufferize-inplace"
+family = "optimize_memory"
+description = "Annotates elementwise ops whose input buffer is on its last use for in-place reuse"
+child_passes = []
+options = []
+
+[[pass]]
+name = "eliminate-concat-copies"
+family = "optimize_memory"
+description = "Eliminates intermediate concatenate copies via zero-copy destination subviews"
+child_passes = []
+options = []
+
+[[pass]]
+name = "shard-spmd"
+family = "shard_distributed"
+description = "Partitions GEMM ops for Megatron-style SPMD tensor parallelism with all_reduce"
+child_passes = []
+options = [
+  { name = "devices", default = "2", desc = "Number of tensor-parallel SPMD ranks" },
+]
+
+[[pass]]
+name = "shard-ring-attention"
+family = "shard_distributed"
+description = "Shards sequence context across a device ring with overlapped P2P KV send/recv"
+child_passes = []
+options = [
+  { name = "ring_size", default = "4", desc = "Number of devices in the context-parallel ring" },
+]
+
+[[pass]]
+name = "shard-pipeline-parallel"
+family = "shard_distributed"
+description = "Partitions ops across pipeline stages with 1F1B / Zero-Bubble microbatch schedules"
+child_passes = []
+options = [
+  { name = "stages", default = "2", desc = "Number of pipeline stages" },
+  { name = "microbatches", default = "4", desc = "Number of pipeline microbatches" },
+  { name = "schedule", default = "1f1b", desc = "Pipeline schedule (1f1b or zero_bubble)" },
+]
+
+[[pass]]
+name = "shard-fsdp"
+family = "shard_distributed"
+description = "Shards GEMM weights with ZeRO-3/FSDP all_gather prefetch and reduce_scatter sync"
+child_passes = []
+options = [
+  { name = "devices", default = "2", desc = "Number of FSDP data-parallel ranks" },
+]
+
+[[pass]]
+name = "shard-experts"
+family = "shard_distributed"
+description = "Shards MoE/MLP experts across devices with all_to_all token dispatch and combine"
+child_passes = []
+options = [
+  { name = "devices", default = "2", desc = "Number of expert-parallel devices" },
+]
+
+[[pass]]
+name = "schedule-streams"
+family = "shard_distributed"
+description = "Assigns independent branches to concurrent execution streams with stream barriers"
+child_passes = []
+options = [
+  { name = "streams", default = "2", desc = "Number of concurrent execution streams" },
+]
+
+[[pass]]
+name = "pad-for-tiling"
+family = "schedule_loops"
+description = "Computes tile-aligned (M, K, N) multiples for GEMM ops to eliminate remainder tails"
+child_passes = []
+options = [
+  { name = "align", default = "8", desc = "Dimension alignment multiple" },
+]
+
+[[pass]]
+name = "tile-loops"
+family = "schedule_loops"
+description = "Translates GEMM ops by attaching L1/L2 cache and register tiling schedule attributes"
+child_passes = []
+options = [
+  { name = "size", default = "16", desc = "Uniform L1 tile size across M, N, K" },
+  { name = "l2_tile", default = "0", desc = "Outer L2 cache tile size" },
+  { name = "reg_tile", default = "0", desc = "Register micro-kernel tile size" },
+]
+
+[[pass]]
+name = "permute-loops"
+family = "schedule_loops"
+description = "Translates loop nests by attaching permutation (mnk/mkn/nkm), collapse, or skew"
+child_passes = []
+options = [
+  { name = "order", default = "mkn", desc = "Loop nest order (mnk, mkn, nkm)" },
+  { name = "collapse", default = "false", desc = "Collapse nested 2D loops into 1D" },
+  { name = "skew", default = "false", desc = "Enable polyhedral wavefront loop skewing" },
+]
+
+[[pass]]
+name = "unroll-loops"
+family = "schedule_loops"
+description = "Translates reduction loops by attaching unroll, prefetch, split-k, and double-buffer"
+child_passes = []
+options = [
+  { name = "factor", default = "4", desc = "Inner loop unroll factor" },
+  { name = "prefetch", default = "0", desc = "Software prefetch distance in iterations" },
+  { name = "split_k", default = "1", desc = "Split-K reduction partitioning factor" },
+  { name = "double_buffer", default = "false", desc = "Enable 2-stage shared-memory buffering" },
+]
+
+[[pass]]
+name = "vectorize-loops"
+family = "schedule_loops"
+description = "Translates compute ops by attaching SIMD vectorization, ISA, and parallel attrs"
+child_passes = []
+options = [
+  { name = "isa", default = "avx2", desc = "Target SIMD ISA (avx2, avx512, neon, sve, rvv, wasm)" },
+  { name = "width", default = "8", desc = "Vector lane width" },
+  { name = "parallel", default = "true", desc = "Enable multicore outer-loop parallelism" },
+]
+
+[[pass]]
+name = "lower-tensor-cores"
+family = "schedule_loops"
+description = "Lowers GEMMs to GPU Tensor/Matrix Core instructions (WMMA, WGMMA, tcgen05, MFMA)"
+child_passes = []
+options = [
+  { name = "arch", default = "hopper_wgmma", desc = "ISA (wmma|hopper_wgmma|tcgen05|rocm_mfma)" },
+  { name = "warp_specialized", default = "false", desc = "Enable producer/consumer warp split" },
+  { name = "tmem_columns", default = "512", desc = "Blackwell TMEM column allocation" },
+]
+
+[[pass]]
+name = "freeze-inputs"
+family = "normalize_ir"
+description = "Freezes function input arguments into inline constant tensors"
+child_passes = []
+options = [
+  { name = "args", default = "", desc = "Comma-separated argument names/indices to freeze" },
+  { name = "value", default = "0.5", desc = "Constant fill value for frozen inputs" },
+]
+
+[[pass]]
+name = "parameterize-constants"
+family = "normalize_ir"
+description = "Hoists inline weight constants into explicit function arguments"
+child_passes = []
+options = [
+  { name = "min_elements", default = "2", desc = "Minimum tensor elements to hoist to argument" },
+]
+
+[[pass]]
+name = "tap-intermediates"
+family = "normalize_ir"
+description = "Exposes intermediate SSA values as additional function return outputs"
+child_passes = []
+options = [
+  { name = "values", default = "", desc = "Comma-separated SSA value names to append to return" },
+]
+
+[[pass]]
+name = "normalize-ssa"
+family = "normalize_ir"
+description = "Renames SSA values in canonical topological order and sorts operation attributes"
+child_passes = []
+options = [
+  { name = "prefix", default = "v", desc = "Prefix for renumbered SSA value identifiers" },
+]
+
+[[pass]]
+name = "strip-debuginfo"
+family = "normalize_ir"
+description = "Strips source location metadata (loc(...)) from all operations in the module"
+child_passes = []
+options = []
+
+[[pass]]
+name = "strip-attributes"
+family = "normalize_ir"
+description = "Strips transient castforge.* and schedule attributes for portable StableHLO export"
+child_passes = []
+options = []
+
+[[pass]]
+name = "outline-kernels"
+family = "normalize_ir"
+description = "Outlines GEMM and composite subgraphs into private func.func kernels + func.call"
+child_passes = []
+options = [
+  { name = "mode", default = "all", desc = "Outlining target (all, composites, gemm)" },
+]
+
+[[pass]]
+name = "dedup-functions"
+family = "normalize_ir"
+description = "Deduplicates structurally identical private functions and rewrites call sites"
+child_passes = []
+options = []
+
+[[pass]]
+name = "compose-functions"
+family = "normalize_ir"
+description = "Chains two functions (@first -> @second) into a composed entry pipeline function"
+child_passes = []
+options = [
+  { name = "first", default = "", desc = "First function symbol name" },
+  { name = "second", default = "", desc = "Second function symbol name" },
+  { name = "entry", default = "composed_main", desc = "Name of synthesized composed function" },
+]
+
+[[pass]]
+name = "unroll-calls"
+family = "normalize_ir"
+description = "Unrolls repeated func.call chains or self-recurrent blocks by a static repeat factor"
+child_passes = []
+options = [
+  { name = "repeat", default = "2", desc = "Unroll repetition count" },
+]
+
+[[pass]]
+name = "verify-shapes"
+family = "verify_ir"
+description = "Verifies StableHLO static/dynamic tensor shape and element-type invariants"
+child_passes = []
+options = []
+
+[[pass]]
+name = "hash-ir"
+family = "verify_ir"
+description = "Computes a 64-bit SSA-invariant structural hash and stamps it onto entry function"
+child_passes = []
+options = []
+
+[[pass]]
+name = "verify-equiv"
+family = "verify_ir"
+description = "Verifies structural SSA integrity and function I/O signature consistency"
+child_passes = []
+options = [
+  { name = "tol", default = "1e-4", desc = "Numerical tolerance attribute stamped on function" },
+]
+
+[[pass]]
+name = "bisect-passes"
+family = "verify_ir"
+description = "Verifies IR invariants and stamps a numbered bisection checkpoint on entry function"
+child_passes = []
+options = [
+  { name = "limit", default = "1", desc = "Bisection step limit" },
+]
+
+[[pass]]
+name = "print-op-stats"
+family = "verify_ir"
+description = "Computes operation counts, parameter sizes, FLOPs, and Roofline arithmetic intensity"
+child_passes = []
+options = [
+  { name = "ridge", default = "10.0", desc = "Roofline ridge point in FLOPs/Byte" },
+]
