@@ -2262,4 +2262,42 @@ module @gather_scatter_mod {
             .expect("emit_from_loop_ir");
         assert!(loop_src.contains("forward"));
     }
+
+    // Verify 3D batched dot_general, 3D transpose, and N-D broadcast_in_dim evaluation + shapes
+    let bmm_mlir = concat!(
+        "module @bmm_3d {\n",
+        "  func.func @forward(%q: tensor<2x2x3xf32>, %k: tensor<2x2x3xf32>, ",
+        "%bias: tensor<2xf32>) -> tensor<2x2x2xf32> {\n",
+        "    %kt = stablehlo.transpose %k, dims = [0, 2, 1] ",
+        ": (tensor<2x2x3xf32>) -> tensor<2x3x2xf32>\n",
+        "    %scores = \"stablehlo.dot_general\"(%q, %kt) ",
+        "{lhs_batching_dimensions = [0], rhs_batching_dimensions = [0], ",
+        "lhs_contracting_dimensions = [2], rhs_contracting_dimensions = [1]} ",
+        ": (tensor<2x2x3xf32>, tensor<2x3x2xf32>) -> tensor<2x2x2xf32>\n",
+        "    %b_exp = \"stablehlo.broadcast_in_dim\"(%bias) ",
+        "{broadcast_dimensions = [2]} : (tensor<2xf32>) -> tensor<2x2x2xf32>\n",
+        "    %out = stablehlo.add %scores, %b_exp : tensor<2x2x2xf32>\n",
+        "    func.return %out : tensor<2x2x2xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut bmm_mod = parse_mlir(bmm_mlir).expect("parse bmm_3d");
+    PassManager::from_pipeline_str(&registry, "verify-shapes")
+        .unwrap()
+        .run(&mut bmm_mod)
+        .expect("verify-shapes on 3D bmm");
+    let q_in = vec![
+        1.0, 0.0, 2.0, 0.0, 1.0, 1.0, // batch 0: 2x3
+        2.0, 1.0, 0.0, 1.0, 2.0, 1.0, // batch 1: 2x3
+    ];
+    let k_in = q_in.clone();
+    let bias_in = vec![0.5, -0.5];
+    let bmm_outs = evaluate_module(&bmm_mod, &[q_in, k_in, bias_in]).expect("eval 3D bmm");
+    assert_eq!(bmm_outs[0].len(), 8);
+    // Batch 0, row 0 dot row 0 = 1^2 + 0 + 2^2 = 5.0; + bias[0] (0.5) = 5.5
+    assert!((bmm_outs[0][0] - 5.5).abs() < 1e-5);
+    // Batch 0, row 0 dot row 1 = 0 + 0 + 2*1 = 2.0; + bias[1] (-0.5) = 1.5
+    assert!((bmm_outs[0][1] - 1.5).abs() < 1e-5);
+    // Batch 1, row 1 dot row 1 = 1^2 + 2^2 + 1^2 = 6.0; + bias[1] (-0.5) = 5.5
+    assert!((bmm_outs[0][7] - 5.5).abs() < 1e-5);
 }

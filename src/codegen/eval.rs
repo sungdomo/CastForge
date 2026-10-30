@@ -655,25 +655,90 @@ fn eval_stablehlo_op(
                 .as_tensor()
                 .map(tensor_shape_dims)
                 .unwrap_or_else(|| vec![res_len]);
-            if in_dims.len() == 2 && permutation == vec![1, 0] {
-                let (r, c) = (in_dims[0], in_dims[1]);
+            let out_dims = module.values[res_val]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![res_len]);
+            let rank = in_dims.len();
+            if rank >= 2 && permutation.len() == rank && out_dims.len() == rank {
+                let mut in_strides = vec![1usize; rank];
+                let mut out_strides = vec![1usize; rank];
+                for d in (0..rank - 1).rev() {
+                    in_strides[d] = in_strides[d + 1] * in_dims[d + 1].max(1);
+                    out_strides[d] = out_strides[d + 1] * out_dims[d + 1].max(1);
+                }
                 let mut t = vec![0.0_f32; res_len];
-                for row in 0..r {
-                    for col in 0..c {
-                        t[col * r + row] = x[row * c + col];
+                for (out_idx, dst) in t.iter_mut().enumerate() {
+                    let mut rem = out_idx;
+                    let mut in_idx = 0usize;
+                    for (out_axis, &in_axis) in permutation.iter().enumerate() {
+                        let coord = rem / out_strides[out_axis];
+                        rem %= out_strides[out_axis];
+                        if let Some(&st) = in_strides.get(in_axis as usize) {
+                            in_idx += coord * st;
+                        }
                     }
+                    *dst = *x.get(in_idx).unwrap_or(&0.0);
                 }
                 t
             } else {
                 x
             }
         }
-        StableHloOp::BroadcastInDim { operand, .. } => {
+        StableHloOp::BroadcastInDim {
+            operand,
+            broadcast_dimensions,
+            ..
+        } => {
             let x = get_v(operand);
-            let in_len = x.len().max(1);
-            (0..res_len)
-                .map(|i| x[i / (res_len / in_len).max(1) % in_len])
-                .collect()
+            let in_dims = module.values[operand]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![x.len().max(1)]);
+            let out_dims = module.values[res_val]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![res_len]);
+            if !broadcast_dimensions.is_empty()
+                && broadcast_dimensions.len() == in_dims.len()
+                && out_dims.len() >= in_dims.len()
+            {
+                let out_rank = out_dims.len();
+                let in_rank = in_dims.len();
+                let mut out_strides = vec![1usize; out_rank];
+                for d in (0..out_rank.saturating_sub(1)).rev() {
+                    out_strides[d] = out_strides[d + 1] * out_dims[d + 1].max(1);
+                }
+                let mut in_strides = vec![1usize; in_rank];
+                for d in (0..in_rank.saturating_sub(1)).rev() {
+                    in_strides[d] = in_strides[d + 1] * in_dims[d + 1].max(1);
+                }
+                (0..res_len)
+                    .map(|out_idx| {
+                        let mut rem = out_idx;
+                        let mut out_coords = vec![0usize; out_rank];
+                        for d in 0..out_rank {
+                            out_coords[d] = rem / out_strides[d];
+                            rem %= out_strides[d];
+                        }
+                        let mut in_idx = 0usize;
+                        for (in_axis, &out_axis) in broadcast_dimensions.iter().enumerate() {
+                            let c = out_coords.get(out_axis as usize).copied().unwrap_or(0);
+                            let in_c = if in_dims[in_axis] <= 1 { 0 } else { c };
+                            in_idx += in_c * in_strides[in_axis];
+                        }
+                        *x.get(in_idx).unwrap_or(&0.0)
+                    })
+                    .collect()
+            } else {
+                let in_len = x.len().max(1);
+                (0..res_len)
+                    .map(|i| x[i / (res_len / in_len).max(1) % in_len])
+                    .collect()
+            }
         }
         StableHloOp::Slice {
             operand,
@@ -809,8 +874,19 @@ fn eval_stablehlo_op(
             dimension_numbers: dims,
             ..
         } => {
-            let packed = dims.rhs_contracting_dimensions == [1];
-            eval_matmul_2d(module, lhs, rhs, packed, &get_v)
+            let packed = dims
+                .rhs_contracting_dimensions
+                .last()
+                .copied()
+                .is_some_and(|d| {
+                    let rank = module.values[rhs]
+                        .ty
+                        .as_tensor()
+                        .map(|t| t.rank())
+                        .unwrap_or(2);
+                    d as usize == rank.saturating_sub(1) && rank == 2
+                });
+            eval_dot_general(module, lhs, rhs, res_val, &dims, packed, &get_v)
         }
         StableHloOp::Convolution { lhs, rhs, .. } => {
             eval_conv_2d(module, lhs, rhs, res_len, &get_v)
@@ -1319,6 +1395,103 @@ fn eval_matmul_2d(
                 acc += a[row * k + kk] * b_val;
             }
             out[row * n + col] = acc;
+        }
+    }
+    out
+}
+
+fn eval_dot_general(
+    module: &Module,
+    lhs: ValueId,
+    rhs: ValueId,
+    res_val: ValueId,
+    dims: &crate::stablehlo::DotDimensionNumbers,
+    packed_rhs_2d: bool,
+    get_v: &dyn Fn(ValueId) -> Vec<f32>,
+) -> Vec<f32> {
+    if dims.lhs_batching_dimensions.is_empty() && dims.rhs_batching_dimensions.is_empty() {
+        let lhs_rank = module.values[lhs]
+            .ty
+            .as_tensor()
+            .map(|t| t.rank())
+            .unwrap_or(2);
+        let rhs_rank = module.values[rhs]
+            .ty
+            .as_tensor()
+            .map(|t| t.rank())
+            .unwrap_or(2);
+        if lhs_rank <= 2 && rhs_rank <= 2 {
+            return eval_matmul_2d(module, lhs, rhs, packed_rhs_2d, get_v);
+        }
+    }
+
+    let a = get_v(lhs);
+    let b = get_v(rhs);
+    let lhs_dims = module.values[lhs]
+        .ty
+        .as_tensor()
+        .map(tensor_shape_dims)
+        .unwrap_or_else(|| vec![1, 1]);
+    let rhs_dims = module.values[rhs]
+        .ty
+        .as_tensor()
+        .map(tensor_shape_dims)
+        .unwrap_or_else(|| vec![1, 1]);
+    let out_dims = module.values[res_val]
+        .ty
+        .as_tensor()
+        .map(tensor_shape_dims)
+        .unwrap_or_else(|| vec![1, 1]);
+
+    let batch_count: usize = dims
+        .lhs_batching_dimensions
+        .iter()
+        .filter_map(|&ax| lhs_dims.get(ax as usize).copied())
+        .product::<usize>()
+        .max(1);
+    let k: usize = dims
+        .lhs_contracting_dimensions
+        .iter()
+        .filter_map(|&ax| lhs_dims.get(ax as usize).copied())
+        .product::<usize>()
+        .max(1);
+    let lhs_total: usize = lhs_dims.iter().product::<usize>().max(1);
+    let rhs_total: usize = rhs_dims.iter().product::<usize>().max(1);
+    let m = (lhs_total / (batch_count * k).max(1)).max(1);
+    let n = (rhs_total / (batch_count * k).max(1)).max(1);
+    let rhs_contract_last = dims
+        .rhs_contracting_dimensions
+        .last()
+        .copied()
+        .is_some_and(|d| (d as usize) + 1 == rhs_dims.len());
+
+    let out_len: usize = out_dims.iter().product::<usize>().max(batch_count * m * n);
+    let mut out = vec![0.0_f32; out_len];
+    let a_batch_stride = m * k;
+    let b_batch_stride = k * n;
+    let c_batch_stride = m * n;
+
+    for batch in 0..batch_count {
+        let a_base = batch * a_batch_stride;
+        let b_base = batch * b_batch_stride;
+        let c_base = batch * c_batch_stride;
+        for row in 0..m {
+            for col in 0..n {
+                let mut acc = 0.0_f32;
+                for kk in 0..k {
+                    let a_val = *a.get(a_base + row * k + kk).unwrap_or(&0.0);
+                    let b_idx = if rhs_contract_last {
+                        b_base + col * k + kk
+                    } else {
+                        b_base + kk * n + col
+                    };
+                    let b_val = *b.get(b_idx).unwrap_or(&0.0);
+                    acc += a_val * b_val;
+                }
+                if let Some(dst) = out.get_mut(c_base + row * n + col) {
+                    *dst = acc;
+                }
+            }
         }
     }
     out

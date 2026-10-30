@@ -713,6 +713,111 @@ pub fn verify_stablehlo_shapes(module: &Module, op_id: OpId) -> Result<(), Strin
                 ));
             }
         }
+        StableHloOp::DotGeneral {
+            lhs,
+            rhs,
+            dimension_numbers,
+            ..
+        } => {
+            let Some(lhs_ty) = module.values[lhs].ty.as_tensor() else {
+                return Ok(());
+            };
+            let Some(rhs_ty) = module.values[rhs].ty.as_tensor() else {
+                return Ok(());
+            };
+            if dimension_numbers.lhs_batching_dimensions.len()
+                != dimension_numbers.rhs_batching_dimensions.len()
+            {
+                return Err("stablehlo.dot_general batching dimension count mismatch".to_string());
+            }
+            for (&lb, &rb) in dimension_numbers
+                .lhs_batching_dimensions
+                .iter()
+                .zip(dimension_numbers.rhs_batching_dimensions.iter())
+            {
+                if let (Some(Dim::Static(a)), Some(Dim::Static(b))) =
+                    (lhs_ty.shape.get(lb as usize), rhs_ty.shape.get(rb as usize))
+                    && a != b
+                {
+                    return Err(format!(
+                        "stablehlo.dot_general batching dim mismatch: \
+                         lhs[{lb}]={a} vs rhs[{rb}]={b}"
+                    ));
+                }
+            }
+            for (&lc, &rc) in dimension_numbers
+                .lhs_contracting_dimensions
+                .iter()
+                .zip(dimension_numbers.rhs_contracting_dimensions.iter())
+            {
+                if let (Some(Dim::Static(a)), Some(Dim::Static(b))) =
+                    (lhs_ty.shape.get(lc as usize), rhs_ty.shape.get(rc as usize))
+                    && a != b
+                {
+                    return Err(format!(
+                        "stablehlo.dot_general contracting dim mismatch: \
+                         lhs[{lc}]={a} vs rhs[{rc}]={b}"
+                    ));
+                }
+            }
+        }
+        StableHloOp::Concatenate {
+            inputs,
+            dimension,
+            result,
+        } => {
+            let Some(out_ty) = module.values[result].ty.as_tensor() else {
+                return Ok(());
+            };
+            let axis = dimension as usize;
+            let mut sum_axis = 0i64;
+            let mut all_static = true;
+            for &inp in &inputs {
+                let Some(in_ty) = module.values[inp].ty.as_tensor() else {
+                    continue;
+                };
+                if in_ty.rank() != out_ty.rank() {
+                    return Err(format!(
+                        "stablehlo.concatenate input rank {} != result rank {}",
+                        in_ty.rank(),
+                        out_ty.rank()
+                    ));
+                }
+                match in_ty.shape.get(axis) {
+                    Some(Dim::Static(n)) => sum_axis += *n,
+                    _ => all_static = false,
+                }
+            }
+            if all_static
+                && let Some(Dim::Static(out_n)) = out_ty.shape.get(axis)
+                && *out_n != sum_axis
+            {
+                return Err(format!(
+                    "stablehlo.concatenate axis {axis} sum {sum_axis} != result dim {out_n}"
+                ));
+            }
+        }
+        StableHloOp::BroadcastInDim {
+            operand,
+            broadcast_dimensions,
+            result,
+        } => {
+            let Some(in_ty) = module.values[operand].ty.as_tensor() else {
+                return Ok(());
+            };
+            let Some(out_ty) = module.values[result].ty.as_tensor() else {
+                return Ok(());
+            };
+            for &bdim in &broadcast_dimensions {
+                if (bdim as usize) >= out_ty.rank() {
+                    return Err(format!(
+                        "stablehlo.broadcast_in_dim axis {bdim} out of bounds for rank {}",
+                        out_ty.rank()
+                    ));
+                }
+            }
+            let _ = in_ty;
+        }
         _ => {}
     }
 
