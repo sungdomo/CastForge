@@ -138,6 +138,7 @@ fn fmt_stmt(f: &mut fmt::Formatter<'_>, stmt: &LoopStmt, indent: usize) -> fmt::
 /// Lowers a tensor-level CastForge [`Module`] into a progressive [`LoopModule`].
 pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModule {
     let mod_config = base_config.with_module_attributes(module);
+    let mem_plan = crate::codegen::memory_plan::build_memory_plan(module);
     let mod_name = module
         .name
         .clone()
@@ -171,6 +172,13 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
         }
 
         let mut body = Vec::new();
+        body.push(LoopStmt::Comment(format!(
+            "MemoryPlan: arena_workspace_bytes={} (f32_len={}, slots={}, saved_bytes={})",
+            mem_plan.arena_workspace_bytes,
+            mem_plan.arena_f32_len(),
+            mem_plan.reusable_slot_count,
+            mem_plan.saved_activation_bytes()
+        )));
         let mut output = ("out".to_string(), 1usize);
 
         for &op_id in &block.ops {
@@ -188,7 +196,26 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
             };
             let dst = value_ident(module, res_val, &mut names, &mut counter);
             let len = tensor_len(module, res_val);
+            let res_dims = module.values[res_val]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![len]);
             let cfg = mod_config.with_op_attributes(op);
+
+            if let Some(alloc) = mem_plan.allocation_for(res_val) {
+                if let (Some(slot), Some(off)) = (alloc.arena_slot, alloc.arena_offset) {
+                    body.push(LoopStmt::Comment(format!(
+                        "Arena bind {dst} -> slot #{slot} (byte_offset={off}, f32_offset={})",
+                        off / 4
+                    )));
+                } else if let Some(inpl) = alloc.inplace_from {
+                    let inpl_name = value_ident(module, inpl, &mut names, &mut counter);
+                    body.push(LoopStmt::Comment(format!(
+                        "In-place buffer alias {dst} -> {inpl_name}"
+                    )));
+                }
+            }
 
             body.push(LoopStmt::Alloc {
                 name: dst.clone(),
@@ -227,7 +254,14 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                 )));
             }
 
-            if op.is_op("stablehlo", "dot_general") && op.operands.len() >= 2 {
+            let dialect = op.name.dialect.as_str();
+            let op_name = op.name.name.as_str();
+
+            if (dialect == "stablehlo" && op_name == "dot_general"
+                || dialect == "castforge"
+                    && matches!(op_name, "fused_matmul_epilogue" | "fused_dequant_matmul"))
+                && op.operands.len() >= 2
+            {
                 let lhs = value_ident(module, op.operands[0], &mut names, &mut counter);
                 let rhs = value_ident(module, op.operands[1], &mut names, &mut counter);
                 let lhs_dims = module.values[op.operands[0]]
@@ -247,13 +281,19 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                 let tn = cfg.tile_n.max(1).min(n.max(1));
                 let tk = cfg.tile_k.max(1).min(k.max(1));
                 body.push(LoopStmt::Comment(format!(
-                    "GEMM {m}x{k}x{n} tiles=({tm},{tn},{tk}) order={}",
+                    "GEMM {m}x{k}x{n} ({op_name}) tiles=({tm},{tn},{tk}) order={}",
                     cfg.loop_order.as_str()
                 )));
+                let rhs_term = if op_name == "fused_dequant_matmul" && op.operands.len() >= 3 {
+                    let sc = value_ident(module, op.operands[2], &mut names, &mut counter);
+                    format!("({rhs}[p * {n} + j] * {sc}[j])")
+                } else {
+                    format!("{rhs}[p * {n} + j]")
+                };
                 let fma = LoopStmt::Assign {
                     dst: dst.clone(),
                     index: format!("i * {n} + j"),
-                    expr: format!("{dst}[i * {n} + j] + {lhs}[i * {k} + p] * {rhs}[p * {n} + j]"),
+                    expr: format!("{dst}[i * {n} + j] + {lhs}[i * {k} + p] * {rhs_term}"),
                 };
                 let j_loop = LoopStmt::For {
                     var: "j".to_string(),
@@ -275,7 +315,37 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                     unroll: 1,
                     body: vec![j_loop],
                 };
-                let i_loop = LoopStmt::For {
+                let mut i_body = vec![p_loop];
+                if op_name == "fused_matmul_epilogue" && op.operands.len() >= 3 {
+                    let bias = value_ident(module, op.operands[2], &mut names, &mut counter);
+                    let act = op
+                        .attributes
+                        .get("activation")
+                        .and_then(|a| a.as_str())
+                        .unwrap_or("none");
+                    let base = format!("({dst}[i * {n} + j] + {bias}[j])");
+                    let ep_expr = match act {
+                        "relu" => format!("fmaxf({base}, 0.0f)"),
+                        "silu" => format!("({base} / (1.0f + expf(-{base})))"),
+                        "gelu" => format!("(0.5f * {base} * (1.0f + tanhf(0.79788456f * {base})))"),
+                        _ => base,
+                    };
+                    i_body.push(LoopStmt::For {
+                        var: "j".to_string(),
+                        lower: 0,
+                        upper: n,
+                        step: 1,
+                        parallel: false,
+                        vectorized: cfg.vectorize,
+                        unroll: cfg.unroll_factor,
+                        body: vec![LoopStmt::Assign {
+                            dst: dst.clone(),
+                            index: format!("i * {n} + j"),
+                            expr: ep_expr,
+                        }],
+                    });
+                }
+                body.push(LoopStmt::For {
                     var: "i".to_string(),
                     lower: 0,
                     upper: m,
@@ -283,9 +353,218 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                     parallel: cfg.parallel,
                     vectorized: false,
                     unroll: 1,
-                    body: vec![p_loop],
+                    body: i_body,
+                });
+            } else if dialect == "castforge"
+                && matches!(
+                    op_name,
+                    "fused_rmsnorm"
+                        | "fused_layernorm"
+                        | "fused_residual_rmsnorm"
+                        | "fused_softmax"
+                        | "fused_log_softmax"
+                )
+                && !op.operands.is_empty()
+            {
+                let x = value_ident(module, op.operands[0], &mut names, &mut counter);
+                let cols = (*res_dims.last().unwrap_or(&len)).max(1);
+                let rows = (len / cols).max(1);
+                body.push(LoopStmt::Comment(format!(
+                    "Row-wise reduction + normalization ({op_name}) rows={rows} cols={cols}"
+                )));
+                let norm_expr = match op_name {
+                    "fused_softmax" => format!("expf({x}[row * {cols} + col])"),
+                    "fused_log_softmax" => format!("{x}[row * {cols} + col]"),
+                    _ => {
+                        if let Some(&w_id) = op.operands.last()
+                            && op.operands.len() >= 2
+                        {
+                            let w = value_ident(module, w_id, &mut names, &mut counter);
+                            format!(
+                                "({x}[row * {cols} + col] * rsqrtf({x}[row * {cols} + col] * \
+                                 {x}[row * {cols} + col] + 1e-5f)) * {w}[col]"
+                            )
+                        } else {
+                            format!("{x}[row * {cols} + col]")
+                        }
+                    }
                 };
-                body.push(i_loop);
+                let col_loop = LoopStmt::For {
+                    var: "col".to_string(),
+                    lower: 0,
+                    upper: cols,
+                    step: 1,
+                    parallel: false,
+                    vectorized: cfg.vectorize,
+                    unroll: cfg.unroll_factor,
+                    body: vec![LoopStmt::Assign {
+                        dst: dst.clone(),
+                        index: format!("row * {cols} + col"),
+                        expr: norm_expr,
+                    }],
+                };
+                body.push(LoopStmt::For {
+                    var: "row".to_string(),
+                    lower: 0,
+                    upper: rows,
+                    step: 1,
+                    parallel: cfg.parallel,
+                    vectorized: false,
+                    unroll: 1,
+                    body: vec![col_loop],
+                });
+            } else if dialect == "castforge"
+                && matches!(op_name, "fused_attention" | "flash_attention")
+                && op.operands.len() >= 3
+            {
+                let q = value_ident(module, op.operands[0], &mut names, &mut counter);
+                let k_t = value_ident(module, op.operands[1], &mut names, &mut counter);
+                let v_t = value_ident(module, op.operands[2], &mut names, &mut counter);
+                let d_head = (*res_dims.last().unwrap_or(&1)).max(1);
+                let seq = (len / d_head).max(1);
+                let scale = 1.0f32 / (d_head as f32).sqrt();
+                body.push(LoopStmt::Comment(format!(
+                    "Fused scaled dot-product attention ({op_name}) seq={seq} d_head={d_head}"
+                )));
+                let d_loop = LoopStmt::For {
+                    var: "d".to_string(),
+                    lower: 0,
+                    upper: d_head,
+                    step: 1,
+                    parallel: false,
+                    vectorized: cfg.vectorize,
+                    unroll: cfg.unroll_factor,
+                    body: vec![LoopStmt::Assign {
+                        dst: dst.clone(),
+                        index: format!("qi * {d_head} + d"),
+                        expr: format!(
+                            "{dst}[qi * {d_head} + d] + ({q}[qi * {d_head} + d] * \
+                             {k_t}[kj * {d_head} + d] * {scale:.6}f) * {v_t}[kj * {d_head} + d]"
+                        ),
+                    }],
+                };
+                let kj_loop = LoopStmt::For {
+                    var: "kj".to_string(),
+                    lower: 0,
+                    upper: seq,
+                    step: 1,
+                    parallel: false,
+                    vectorized: false,
+                    unroll: 1,
+                    body: vec![d_loop],
+                };
+                body.push(LoopStmt::For {
+                    var: "qi".to_string(),
+                    lower: 0,
+                    upper: seq,
+                    step: 1,
+                    parallel: cfg.parallel,
+                    vectorized: false,
+                    unroll: 1,
+                    body: vec![kj_loop],
+                });
+            } else if dialect == "stablehlo" && op_name == "reduce" && !op.operands.is_empty() {
+                let src = value_ident(module, op.operands[0], &mut names, &mut counter);
+                let src_len = tensor_len(module, op.operands[0]);
+                let red_extent = (src_len / len.max(1)).max(1);
+                let r_loop = LoopStmt::For {
+                    var: "r".to_string(),
+                    lower: 0,
+                    upper: red_extent,
+                    step: 1,
+                    parallel: false,
+                    vectorized: cfg.vectorize,
+                    unroll: cfg.unroll_factor,
+                    body: vec![LoopStmt::Assign {
+                        dst: dst.clone(),
+                        index: "row".to_string(),
+                        expr: format!("{dst}[row] + {src}[row * {red_extent} + r]"),
+                    }],
+                };
+                body.push(LoopStmt::For {
+                    var: "row".to_string(),
+                    lower: 0,
+                    upper: len,
+                    step: 1,
+                    parallel: cfg.parallel,
+                    vectorized: false,
+                    unroll: 1,
+                    body: vec![r_loop],
+                });
+            } else if dialect == "stablehlo" && op_name == "gather" && op.operands.len() >= 2 {
+                let tbl = value_ident(module, op.operands[0], &mut names, &mut counter);
+                let idx_buf = value_ident(module, op.operands[1], &mut names, &mut counter);
+                let n_idx = tensor_len(module, op.operands[1]).max(1);
+                let cols = (len / n_idx).max(1);
+                let col_loop = LoopStmt::For {
+                    var: "col".to_string(),
+                    lower: 0,
+                    upper: cols,
+                    step: 1,
+                    parallel: false,
+                    vectorized: cfg.vectorize,
+                    unroll: cfg.unroll_factor,
+                    body: vec![LoopStmt::Assign {
+                        dst: dst.clone(),
+                        index: format!("row * {cols} + col"),
+                        expr: format!("{tbl}[((int){idx_buf}[row]) * {cols} + col]"),
+                    }],
+                };
+                body.push(LoopStmt::For {
+                    var: "row".to_string(),
+                    lower: 0,
+                    upper: n_idx,
+                    step: 1,
+                    parallel: cfg.parallel,
+                    vectorized: false,
+                    unroll: 1,
+                    body: vec![col_loop],
+                });
+            } else if dialect == "stablehlo" && op_name == "scatter" && op.operands.len() >= 3 {
+                let input_buf = value_ident(module, op.operands[0], &mut names, &mut counter);
+                let idx_buf = value_ident(module, op.operands[1], &mut names, &mut counter);
+                let upd_buf = value_ident(module, op.operands[2], &mut names, &mut counter);
+                let n_idx = tensor_len(module, op.operands[1]).max(1);
+                let upd_len = tensor_len(module, op.operands[2]);
+                let cols = (upd_len / n_idx).max(1);
+                body.push(LoopStmt::For {
+                    var: "idx".to_string(),
+                    lower: 0,
+                    upper: len,
+                    step: 1,
+                    parallel: cfg.parallel,
+                    vectorized: cfg.vectorize,
+                    unroll: cfg.unroll_factor,
+                    body: vec![LoopStmt::Assign {
+                        dst: dst.clone(),
+                        index: "idx".to_string(),
+                        expr: format!("{input_buf}[idx]"),
+                    }],
+                });
+                let col_loop = LoopStmt::For {
+                    var: "col".to_string(),
+                    lower: 0,
+                    upper: cols,
+                    step: 1,
+                    parallel: false,
+                    vectorized: cfg.vectorize,
+                    unroll: cfg.unroll_factor,
+                    body: vec![LoopStmt::Assign {
+                        dst: dst.clone(),
+                        index: format!("((int){idx_buf}[row]) * {cols} + col"),
+                        expr: format!("{upd_buf}[row * {cols} + col]"),
+                    }],
+                };
+                body.push(LoopStmt::For {
+                    var: "row".to_string(),
+                    lower: 0,
+                    upper: n_idx,
+                    step: 1,
+                    parallel: false,
+                    vectorized: false,
+                    unroll: 1,
+                    body: vec![col_loop],
+                });
             } else {
                 let op_str = op.name.to_string();
                 let ops_str: Vec<String> = op
@@ -293,12 +572,37 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                     .iter()
                     .map(|&v| format!("{}[idx]", value_ident(module, v, &mut names, &mut counter)))
                     .collect();
-                let expr = match (op.name.name.as_str(), ops_str.as_slice()) {
+                let expr = match (op_name, ops_str.as_slice()) {
                     ("add", [a, b]) => format!("{a} + {b}"),
                     ("subtract", [a, b]) => format!("{a} - {b}"),
                     ("multiply", [a, b]) => format!("{a} * {b}"),
                     ("divide", [a, b]) => format!("{a} / {b}"),
-                    ("maximum", [a, b]) => format!("max({a}, {b})"),
+                    ("maximum", [a, b]) => format!("fmaxf({a}, {b})"),
+                    ("minimum", [a, b]) => format!("fminf({a}, {b})"),
+                    ("power", [a, b]) => format!("powf({a}, {b})"),
+                    ("clamp", [lo, x, hi]) => format!("fminf(fmaxf({x}, {lo}), {hi})"),
+                    ("exponential", [a]) => format!("expf({a})"),
+                    ("log", [a]) => format!("logf({a})"),
+                    ("tanh", [a]) => format!("tanhf({a})"),
+                    ("sqrt", [a]) => format!("sqrtf({a})"),
+                    ("rsqrt", [a]) => format!("(1.0f / sqrtf({a}))"),
+                    ("sine", [a]) => format!("sinf({a})"),
+                    ("cosine", [a]) => format!("cosf({a})"),
+                    ("abs", [a]) => format!("fabsf({a})"),
+                    ("negate", [a]) => format!("-({a})"),
+                    ("logistic", [a]) => format!("(1.0f / (1.0f + expf(-({a}))))"),
+                    ("fused_gelu", [a]) => {
+                        format!(
+                            "(0.5f * {a} * (1.0f + tanhf(0.79788456f * \
+                             ({a} + 0.044715f * {a} * {a} * {a}))))"
+                        )
+                    }
+                    ("fused_swiglu" | "fused_gated_mlp", [g, u]) => {
+                        format!("(({g} / (1.0f + expf(-({g})))) * {u})")
+                    }
+                    ("fused_swiglu" | "fused_gated_mlp", [x, wg, wu]) => {
+                        format!("((({x} * {wg}) / (1.0f + expf(-({x} * {wg})))) * ({x} * {wu}))")
+                    }
                     _ => format!("{op_str}({})", ops_str.join(", ")),
                 };
                 body.push(LoopStmt::For {
@@ -688,6 +992,7 @@ impl LoopPass for OptimizeLoopIrPass {
                     self.parallel,
                     self.vectorize,
                     self.unroll_factor.max(1),
+                    self.interchange,
                     true,
                 );
             }
@@ -743,10 +1048,12 @@ fn optimize_loop_stmt(
     parallel: bool,
     vectorize: bool,
     unroll_factor: usize,
+    interchange: bool,
     is_outer: bool,
 ) -> usize {
     let mut count = 0usize;
     if let LoopStmt::For {
+        var,
         parallel: p,
         vectorized: v,
         unroll: u,
@@ -754,6 +1061,33 @@ fn optimize_loop_stmt(
         ..
     } = stmt
     {
+        if interchange && var == "i" && body.len() == 1 {
+            if let LoopStmt::For {
+                var: v_mid,
+                lower: l_mid,
+                upper: u_mid,
+                step: s_mid,
+                body: mid_body,
+                ..
+            } = &mut body[0]
+                && v_mid == "j"
+                && mid_body.len() == 1
+                && let LoopStmt::For {
+                    var: v_in,
+                    lower: l_in,
+                    upper: u_in,
+                    step: s_in,
+                    ..
+                } = &mut mid_body[0]
+                && v_in == "p"
+            {
+                std::mem::swap(v_mid, v_in);
+                std::mem::swap(l_mid, l_in);
+                std::mem::swap(u_mid, u_in);
+                std::mem::swap(s_mid, s_in);
+                count += 1;
+            }
+        }
         let has_nested_for = body.iter().any(|s| matches!(s, LoopStmt::For { .. }));
         if is_outer && parallel && !*p {
             *p = true;
@@ -770,7 +1104,14 @@ fn optimize_loop_stmt(
             }
         }
         for inner in body {
-            count += optimize_loop_stmt(inner, parallel, vectorize, unroll_factor, false);
+            count += optimize_loop_stmt(
+                inner,
+                parallel,
+                vectorize,
+                unroll_factor,
+                interchange,
+                false,
+            );
         }
     }
     count

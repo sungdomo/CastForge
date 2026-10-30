@@ -2164,4 +2164,33 @@ module @gather_scatter_mod {
     let mut pm = PassManager::from_pipeline_str(&registry, "O2").expect("O2 on hf_mod");
     let res = pm.run(&mut hf_mod).expect("run O2 on hf_mod");
     assert!(res[0].changed);
+
+    // Verify LoopModule lowering of fused composites + MemoryPlan arena bindings
+    let fused_mlir = concat!(
+        "module @fused_loop_mod {\n",
+        "  func.func @forward(%x: tensor<2x4xf32>, %w: tensor<4xf32>, ",
+        "%k: tensor<2x4xf32>, %v: tensor<2x4xf32>) -> tensor<2x4xf32> {\n",
+        "    %norm = \"castforge.fused_rmsnorm\"(%x, %w) ",
+        ": (tensor<2x4xf32>, tensor<4xf32>) -> tensor<2x4xf32>\n",
+        "    %attn = \"castforge.fused_attention\"(%norm, %k, %v) ",
+        ": (tensor<2x4xf32>, tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>\n",
+        "    %mlp = \"castforge.fused_swiglu\"(%attn, %norm) ",
+        ": (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>\n",
+        "    func.return %mlp : tensor<2x4xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let fused_mod = parse_mlir(fused_mlir).expect("parse fused_loop_mod");
+    let mut loop_mod = castforge::codegen::lower_to_loop_ir(
+        &fused_mod,
+        &castforge::codegen::TargetConfig::default(),
+    );
+    let mut loop_opt = castforge::codegen::OptimizeLoopIrPass::default();
+    let loop_changes = castforge::codegen::LoopPass::run(&mut loop_opt, &mut loop_mod);
+    assert!(loop_changes > 0);
+    let loop_txt = loop_mod.to_string();
+    assert!(loop_txt.contains("MemoryPlan: arena_workspace_bytes="));
+    assert!(loop_txt.contains("Arena bind"));
+    assert!(loop_txt.contains("Fused scaled dot-product attention"));
+    assert!(loop_txt.contains("Row-wise reduction + normalization"));
 }
