@@ -104,34 +104,6 @@ impl Pass for IrEditPass {
             removed += r.ops_removed;
         }
 
-        if let Some(rule) = &self.rename_op
-            && let Some((from, to)) = rule.split_once(':')
-        {
-            let from_name = OpName::parse(from.trim());
-            let to_name = OpName::parse(to.trim());
-            for (_, op) in &mut module.ops {
-                if op.name == from_name {
-                    op.name = to_name.clone();
-                    modified += 1;
-                }
-            }
-        }
-
-        if let Some(rule) = &self.annotate_op {
-            let parts: Vec<&str> = rule.splitn(3, ':').collect();
-            if parts.len() == 3 {
-                let target_op = OpName::parse(parts[0].trim());
-                let attr_key = parts[1].trim().to_string();
-                let attr_val = Attribute::String(parts[2].trim().to_string());
-                for (_, op) in &mut module.ops {
-                    if op.name == target_op {
-                        op.attributes.insert(attr_key.clone(), attr_val.clone());
-                        modified += 1;
-                    }
-                }
-            }
-        }
-
         if self.unfreeze {
             let r = ParameterizeConstantsPass {
                 min_elements: self.min_elements.max(1),
@@ -161,26 +133,13 @@ impl Pass for IrEditPass {
             removed += r.ops_removed;
         }
 
-        if self.ssa {
-            let r = NormalizeSsaPass {
-                prefix: self.prefix.clone(),
-            }
-            .run(module)?;
-            modified += r.ops_modified;
-            created += r.ops_created;
-            removed += r.ops_removed;
-        }
-        if self.debuginfo {
-            let r = StripDebugInfoPass.run(module)?;
-            modified += r.ops_modified;
-            created += r.ops_created;
-            removed += r.ops_removed;
-        }
-        if self.attributes {
-            let r = StripAttributesPass.run(module)?;
-            modified += r.ops_modified;
-            created += r.ops_created;
-            removed += r.ops_removed;
+        if self.rename_op.is_some()
+            || self.annotate_op.is_some()
+            || self.ssa
+            || self.debuginfo
+            || self.attributes
+        {
+            modified += self.apply_metadata_and_ssa_edits_single_traversal(module);
         }
 
         Ok(PassResult {
@@ -190,6 +149,108 @@ impl Pass for IrEditPass {
             ops_modified: modified,
             ops_created: created,
         })
+    }
+}
+
+impl IrEditPass {
+    fn apply_metadata_and_ssa_edits_single_traversal(&self, module: &mut Module) -> usize {
+        let mut modified = 0usize;
+        let rename_pair = self
+            .rename_op
+            .as_ref()
+            .and_then(|r| r.split_once(':'))
+            .map(|(f, t)| (OpName::parse(f.trim()), OpName::parse(t.trim())));
+        let annotate_triple = self.annotate_op.as_ref().and_then(|r| {
+            let parts: Vec<&str> = r.splitn(3, ':').collect();
+            (parts.len() == 3).then(|| {
+                (
+                    OpName::parse(parts[0].trim()),
+                    parts[1].trim().to_string(),
+                    Attribute::String(parts[2].trim().to_string()),
+                )
+            })
+        });
+        let pfx = if self.prefix.trim().is_empty() {
+            "v"
+        } else {
+            self.prefix.trim()
+        };
+
+        for fn_id in module.functions() {
+            if self.debuginfo && module.ops[fn_id].location != Location::Unknown {
+                module.ops[fn_id].location = Location::Unknown;
+                modified += 1;
+            }
+            if self.attributes {
+                let before = module.ops[fn_id].attributes.len();
+                module.ops[fn_id]
+                    .attributes
+                    .retain(|k, _| !is_transient_attribute(k));
+                if module.ops[fn_id].attributes.len() < before {
+                    modified += 1;
+                }
+            }
+            let reg_id = module.ops[fn_id].regions[0];
+            let blk_id = module.regions[reg_id].blocks[0];
+            if self.ssa {
+                let args = module.blocks[blk_id].arguments.clone();
+                for (idx, arg_id) in args.into_iter().enumerate() {
+                    let target_name = format!("arg{idx}");
+                    if module.values[arg_id].ssa_name.as_deref() != Some(&target_name) {
+                        module.values[arg_id].ssa_name = Some(target_name);
+                        modified += 1;
+                    }
+                }
+            }
+
+            let ops = module.blocks[blk_id].ops.clone();
+            let mut val_counter = 0usize;
+            for op_id in ops {
+                if let Some((ref from_name, ref to_name)) = rename_pair
+                    && module.ops[op_id].name == *from_name
+                {
+                    module.ops[op_id].name = to_name.clone();
+                    modified += 1;
+                }
+                if let Some((ref target_op, ref attr_key, ref attr_val)) = annotate_triple
+                    && module.ops[op_id].name == *target_op
+                {
+                    module.ops[op_id]
+                        .attributes
+                        .insert(attr_key.clone(), attr_val.clone());
+                    modified += 1;
+                }
+                if self.debuginfo && module.ops[op_id].location != Location::Unknown {
+                    module.ops[op_id].location = Location::Unknown;
+                    modified += 1;
+                }
+                if self.attributes {
+                    let before = module.ops[op_id].attributes.len();
+                    module.ops[op_id]
+                        .attributes
+                        .retain(|k, _| !is_transient_attribute(k));
+                    if module.ops[op_id].attributes.len() < before {
+                        modified += 1;
+                    }
+                }
+                if self.ssa {
+                    let results: Vec<ValueId> = module.ops[op_id].results.to_vec();
+                    for res_id in results {
+                        let target_name = format!("{pfx}{val_counter}");
+                        val_counter += 1;
+                        if module.values[res_id].ssa_name.as_deref() != Some(&target_name) {
+                            module.values[res_id].ssa_name = Some(target_name);
+                            modified += 1;
+                        }
+                    }
+                    let mut pairs: Vec<(String, Attribute)> =
+                        module.ops[op_id].attributes.drain(..).collect();
+                    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                    module.ops[op_id].attributes = pairs.into_iter().collect();
+                }
+            }
+        }
+        modified
     }
 }
 
@@ -612,43 +673,10 @@ impl Pass for StripAttributesPass {
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        const TRANSIENT_KEYS: &[&str] = &[
-            "tile_m",
-            "tile_n",
-            "tile_k",
-            "tile_size",
-            "l2_tile",
-            "reg_tile_m",
-            "reg_tile_n",
-            "loop_order",
-            "collapse_loops",
-            "skew_loops",
-            "unroll_factor",
-            "prefetch_distance",
-            "split_k",
-            "double_buffer",
-            "vector_width",
-            "simd_isa",
-            "parallel_m",
-            "inplace_operand",
-            "sparsity",
-            "data_layout",
-            "pad_align",
-            "padded_mnk",
-            "spmd_sharding",
-            "num_devices",
-            "async_overlap",
-            "coalesced_collectives",
-            "stream_id",
-            "unroll_step",
-        ];
-
         let mut modified = 0usize;
         for (_, op) in module.ops.iter_mut() {
             let before = op.attributes.len();
-            op.attributes.retain(|k, _| {
-                !k.starts_with("castforge.") && !TRANSIENT_KEYS.contains(&k.as_str())
-            });
+            op.attributes.retain(|k, _| !is_transient_attribute(k));
             if op.attributes.len() < before {
                 modified += 1;
             }
@@ -662,4 +690,38 @@ impl Pass for StripAttributesPass {
             ops_created: 0,
         })
     }
+}
+
+fn is_transient_attribute(k: &str) -> bool {
+    const TRANSIENT_KEYS: &[&str] = &[
+        "tile_m",
+        "tile_n",
+        "tile_k",
+        "tile_size",
+        "l2_tile",
+        "reg_tile_m",
+        "reg_tile_n",
+        "loop_order",
+        "collapse_loops",
+        "skew_loops",
+        "unroll_factor",
+        "prefetch_distance",
+        "split_k",
+        "double_buffer",
+        "vector_width",
+        "simd_isa",
+        "parallel_m",
+        "inplace_operand",
+        "sparsity",
+        "data_layout",
+        "pad_align",
+        "padded_mnk",
+        "spmd_sharding",
+        "num_devices",
+        "async_overlap",
+        "coalesced_collectives",
+        "stream_id",
+        "unroll_step",
+    ];
+    k.starts_with("castforge.") || TRANSIENT_KEYS.contains(&k)
 }

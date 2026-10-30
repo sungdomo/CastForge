@@ -135,80 +135,66 @@ fn annotate_block_inplace_and_concat(
     do_zero_copy: bool,
 ) -> usize {
     let op_ids = module.blocks[block_id].ops.clone();
-    let num_ops = op_ids.len();
-    let mut first_def: HashMap<ValueId, usize> = HashMap::new();
-    let mut last_use: HashMap<ValueId, usize> = HashMap::new();
-    let mut is_candidate_donor: HashMap<ValueId, bool> = HashMap::new();
+    let mut seen_later_use: std::collections::HashSet<ValueId> =
+        std::collections::HashSet::with_capacity(op_ids.len());
+    let mut modified = 0usize;
 
-    for (idx, &op_id) in op_ids.iter().enumerate() {
-        let step = idx + 1;
+    for op_id in op_ids.into_iter().rev() {
         let Some(op) = module.ops.get(op_id) else {
             continue;
         };
-        let is_const = op.is_op("stablehlo", "constant");
-        let is_ret = op.is_op("func", "return") || op.is_op("stablehlo", "return");
-
-        for &res_id in &op.results {
-            if module.values[res_id].ty.as_tensor().is_some() {
-                first_def.insert(res_id, step);
-                last_use.insert(res_id, step);
-                let is_arg = matches!(module.values[res_id].def, ValueDef::BlockArgument { .. });
-                is_candidate_donor.insert(res_id, !is_const && !is_arg);
+        if op.is_op("func", "return") || op.is_op("stablehlo", "return") {
+            for &operand_id in &op.operands {
+                seen_later_use.insert(operand_id);
             }
+            continue;
         }
 
-        for &operand_id in &op.operands {
-            if let Some(lu) = last_use.get_mut(&operand_id) {
-                *lu = (*lu).max(step);
-                if is_ret {
-                    *lu = num_ops + 1;
-                }
-            }
-        }
-    }
-
-    let mut modified = 0usize;
-    for (idx, &op_id) in op_ids.iter().enumerate() {
-        let step = idx + 1;
         if do_zero_copy {
             modified += try_eliminate_concat_copy_at_op(module, op_id);
         }
-        if !is_inplace_eligible_op(module, op_id) {
-            continue;
-        }
-        let Some(&res_id) = module.ops[op_id].results.first() else {
-            continue;
-        };
-        let Some(res_bytes) = tensor_byte_size(module, res_id) else {
-            continue;
-        };
 
-        let operands = module.ops[op_id].operands.clone();
-        let mut chosen_idx: Option<usize> = None;
-        for (op_idx, &cand_id) in operands.iter().enumerate() {
-            if !is_candidate_donor.get(&cand_id).copied().unwrap_or(false) {
-                continue;
+        if is_inplace_eligible_op(module, op_id)
+            && let Some(&res_id) = module.ops[op_id].results.first()
+            && let Some(res_bytes) = tensor_byte_size(module, res_id)
+        {
+            let operands = module.ops[op_id].operands.clone();
+            let mut chosen_idx: Option<usize> = None;
+            for (op_idx, &cand_id) in operands.iter().enumerate() {
+                if seen_later_use.contains(&cand_id) {
+                    continue;
+                }
+                let ValueDef::OpResult { op: def_op_id, .. } = module.values[cand_id].def else {
+                    continue;
+                };
+                if def_op_id == op_id
+                    || module
+                        .ops
+                        .get(def_op_id)
+                        .is_none_or(|d| d.is_op("stablehlo", "constant"))
+                {
+                    continue;
+                }
+                if tensor_byte_size(module, cand_id) == Some(res_bytes) {
+                    chosen_idx = Some(op_idx);
+                    break;
+                }
             }
-            let def_step = first_def.get(&cand_id).copied().unwrap_or(step);
-            let use_step = last_use.get(&cand_id).copied().unwrap_or(0);
-            if def_step < step
-                && use_step == step
-                && tensor_byte_size(module, cand_id) == Some(res_bytes)
-            {
-                chosen_idx = Some(op_idx);
-                break;
+
+            if let Some(op_idx) = chosen_idx {
+                let attr_val = Attribute::Int(op_idx as i64);
+                let op_mut = &mut module.ops[op_id];
+                if op_mut.attributes.get("inplace_operand") != Some(&attr_val) {
+                    op_mut
+                        .attributes
+                        .insert("inplace_operand".to_string(), attr_val);
+                    modified += 1;
+                }
             }
         }
 
-        if let Some(op_idx) = chosen_idx {
-            let attr_val = Attribute::Int(op_idx as i64);
-            let op_mut = &mut module.ops[op_id];
-            if op_mut.attributes.get("inplace_operand") != Some(&attr_val) {
-                op_mut
-                    .attributes
-                    .insert("inplace_operand".to_string(), attr_val);
-                modified += 1;
-            }
+        for &operand_id in &module.ops[op_id].operands {
+            seen_later_use.insert(operand_id);
         }
     }
 

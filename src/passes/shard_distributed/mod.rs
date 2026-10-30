@@ -69,22 +69,21 @@ impl Pass for ShardDistributedPass {
                 .run(module)?,
             );
         }
-        if m == "tp" || m == "spmd" || m == "all" {
-            steps.push(
-                ShardSpmdPass {
-                    num_devices: self.devices,
-                }
-                .run(module)?,
-            );
+
+        let do_tp = m == "tp" || m == "spmd" || m == "all";
+        let do_ring = m == "ring_cp" || m == "ring" || m == "all";
+        let do_coalesce = m == "coalesce" || m == "hoist" || m == "all" || self.coalesce;
+        if do_tp || do_ring || do_coalesce {
+            steps.push(shard_tp_ring_and_coalesce_single_traversal(
+                module,
+                do_tp,
+                do_ring,
+                do_coalesce,
+                self.devices,
+                self.ring_size,
+            )?);
         }
-        if m == "ring_cp" || m == "ring" || m == "all" {
-            steps.push(
-                ShardRingAttentionPass {
-                    ring_size: self.ring_size,
-                }
-                .run(module)?,
-            );
-        }
+
         if m == "pp" || m == "pipeline" {
             steps.push(
                 ShardPipelineParallelPass {
@@ -109,9 +108,6 @@ impl Pass for ShardDistributedPass {
                 .run(module)?,
             );
         }
-        if m == "coalesce" || m == "hoist" || m == "all" || self.coalesce {
-            steps.push(HoistAllReducePass.run(module)?);
-        }
         Ok(PassResult {
             pass_name: self.name().to_string(),
             changed: steps.iter().any(|r| r.changed),
@@ -122,305 +118,105 @@ impl Pass for ShardDistributedPass {
     }
 }
 
-/// Megatron-Style 1D SPMD Tensor Parallelism Pass (`shard-spmd`).
-pub struct ShardSpmdPass {
-    pub num_devices: usize,
+fn is_unsharded_gemm(module: &Module, id: OpId) -> bool {
+    module.ops.get(id).is_some_and(|op| {
+        !op.attributes.contains_key("spmd_sharding")
+            && (op.is_op("stablehlo", "dot_general")
+                || (op.is_op("stablehlo", "composite")
+                    && op
+                        .attributes
+                        .get("name")
+                        .and_then(|a| a.as_str())
+                        .is_some_and(|n| {
+                            n == "castforge.fused_matmul_epilogue"
+                                || n == "castforge.fused_gated_mlp"
+                                || n == "castforge.fused_qmatmul"
+                        })))
+    })
 }
 
-impl Default for ShardSpmdPass {
-    fn default() -> Self {
-        Self { num_devices: 2 }
-    }
-}
+fn shard_tp_ring_and_coalesce_single_traversal(
+    module: &mut Module,
+    do_tp: bool,
+    do_ring: bool,
+    do_coalesce: bool,
+    num_devices: usize,
+    ring_size: usize,
+) -> Result<PassResult> {
+    let devices = num_devices.max(2) as i64;
+    let ring = ring_size.max(2) as i64;
+    let mut created = 0usize;
+    let mut modified = 0usize;
+    let mut removed = 0usize;
+    let blocks: Vec<BlockId> = module.blocks.keys().collect();
 
-impl Pass for ShardSpmdPass {
-    fn name(&self) -> &'static str {
-        "shard-spmd"
-    }
+    for block_id in blocks {
+        let ops = module.block_ops(block_id);
+        let mut gemm_idx = 0usize;
 
-    fn description(&self) -> &'static str {
-        "Partitions GEMM ops for Megatron-style SPMD tensor parallelism and inserts all_reduce"
-    }
+        for (pos_idx, &op_id) in ops.iter().enumerate() {
+            let Some(op) = module.ops.get(op_id).cloned() else {
+                continue;
+            };
 
-    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let devices = self.num_devices.max(2) as i64;
-        let mut created = 0usize;
-        let mut modified = 0usize;
-        let blocks: Vec<BlockId> = module.blocks.keys().collect();
-
-        for block_id in blocks {
-            let ops = module.block_ops(block_id);
-            let gemm_ops: Vec<OpId> = ops
-                .into_iter()
-                .filter(|&id| {
-                    module.ops.get(id).is_some_and(|op| {
-                        !op.attributes.contains_key("spmd_sharding")
-                            && (op.is_op("stablehlo", "dot_general")
-                                || (op.is_op("stablehlo", "composite")
-                                    && op
-                                        .attributes
-                                        .get("name")
-                                        .and_then(|a| a.as_str())
-                                        .is_some_and(|n| {
-                                            n == "castforge.fused_matmul_epilogue"
-                                                || n == "castforge.fused_gated_mlp"
-                                                || n == "castforge.fused_qmatmul"
-                                        })))
-                    })
-                })
-                .collect();
-
-            let total_gemms = gemm_ops.len();
-            for (idx, op_id) in gemm_ops.into_iter().enumerate() {
-                let is_row_parallel = (idx % 2 == 1) || (total_gemms == 1);
+            if do_tp && is_unsharded_gemm(module, op_id) {
+                let is_only_gemm = gemm_idx == 0
+                    && !ops[pos_idx + 1..]
+                        .iter()
+                        .any(|&id| is_unsharded_gemm(module, id));
+                let is_row_parallel = (gemm_idx % 2 == 1) || is_only_gemm;
+                gemm_idx += 1;
                 let role = if is_row_parallel {
                     "row_parallel"
                 } else {
                     "column_parallel"
                 };
+                if let Some(out_val) = op.results.first().copied() {
+                    module.ops[op_id]
+                        .attributes
+                        .insert("spmd_sharding".to_string(), Attribute::String(role.into()));
+                    module.ops[op_id]
+                        .attributes
+                        .insert("num_devices".to_string(), Attribute::Int(devices));
+                    modified += 1;
 
-                let Some(out_val) = module.ops[op_id].results.first().copied() else {
-                    continue;
-                };
-                module.ops[op_id]
-                    .attributes
-                    .insert("spmd_sharding".to_string(), Attribute::String(role.into()));
-                module.ops[op_id]
-                    .attributes
-                    .insert("num_devices".to_string(), Attribute::Int(devices));
-                modified += 1;
-
-                if is_row_parallel {
-                    insert_all_reduce_after(module, block_id, op_id, out_val, devices);
-                    created += 1;
+                    if is_row_parallel {
+                        let ar_id =
+                            insert_all_reduce_after(module, block_id, op_id, out_val, devices);
+                        created += 1;
+                        if do_coalesce {
+                            module.ops[ar_id]
+                                .attributes
+                                .insert("async_overlap".to_string(), Attribute::Bool(true));
+                            modified += 1;
+                        }
+                    }
                 }
+                continue;
             }
-        }
 
-        Ok(PassResult {
-            pass_name: self.name().to_string(),
-            changed: created > 0 || modified > 0,
-            ops_removed: 0,
-            ops_modified: modified,
-            ops_created: created,
-        })
-    }
-}
-
-fn insert_all_reduce_after(
-    module: &mut Module,
-    block_id: BlockId,
-    after_op: OpId,
-    src_val: ValueId,
-    devices: i64,
-) {
-    let out_ty = module.values[src_val].ty.clone();
-    let mut attrs = IndexMap::new();
-    attrs.insert(
-        "name".to_string(),
-        Attribute::String("castforge.all_reduce".to_string()),
-    );
-    attrs.insert(
-        "decomposition".to_string(),
-        Attribute::SymbolRef("all_reduce_impl".to_string()),
-    );
-    attrs.insert(
-        "reduction".to_string(),
-        Attribute::String("sum".to_string()),
-    );
-    attrs.insert("num_devices".to_string(), Attribute::Int(devices));
-
-    let ar_op_id = module.ops.insert_with_key(|id| Operation {
-        id,
-        name: OpName::new("stablehlo", "composite"),
-        operands: SmallVec::from_slice(&[src_val]),
-        results: SmallVec::new(),
-        attributes: attrs,
-        regions: Vec::new(),
-        custom_syntax: true,
-        location: Location::Unknown,
-    });
-    let ar_val = module.values.insert_with_key(|id| Value {
-        id,
-        ssa_name: None,
-        ty: out_ty,
-        def: ValueDef::OpResult {
-            op: ar_op_id,
-            index: 0,
-        },
-    });
-    module.ops[ar_op_id].results.push(ar_val);
-
-    let block_ops = &mut module.blocks[block_id].ops;
-    if let Some(pos) = block_ops.iter().position(|&id| id == after_op) {
-        block_ops.insert(pos + 1, ar_op_id);
-    } else {
-        block_ops.push(ar_op_id);
-    }
-
-    let all_ops: Vec<OpId> = module.blocks[block_id].ops.clone();
-    for op_id in all_ops {
-        if op_id != after_op && op_id != ar_op_id {
-            for opnd in &mut module.ops[op_id].operands {
-                if *opnd == src_val {
-                    *opnd = ar_val;
-                }
-            }
-        }
-    }
-}
-
-/// RingAttention / Context Parallelism Pass (`shard-ring-attention`).
-pub struct ShardRingAttentionPass {
-    pub ring_size: usize,
-}
-
-impl Default for ShardRingAttentionPass {
-    fn default() -> Self {
-        Self { ring_size: 4 }
-    }
-}
-
-impl Pass for ShardRingAttentionPass {
-    fn name(&self) -> &'static str {
-        "shard-ring-attention"
-    }
-
-    fn description(&self) -> &'static str {
-        "Shards sequence context across a device ring with overlapped P2P KV send/recv"
-    }
-
-    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let mut modified = 0usize;
-        for (_, op) in module.ops.iter_mut() {
-            let is_attn = op.is_op("stablehlo", "composite")
+            if do_ring
+                && op.is_op("stablehlo", "composite")
                 && op
                     .attributes
                     .get("name")
                     .and_then(|a| a.as_str())
-                    .is_some_and(|n| n == "castforge.fused_attention");
-            if is_attn {
-                op.attributes.insert(
+                    .is_some_and(|n| n == "castforge.fused_attention")
+            {
+                let attrs = &mut module.ops[op_id].attributes;
+                attrs.insert(
                     "castforge.ring_attention".to_string(),
                     Attribute::Bool(true),
                 );
-                op.attributes.insert(
-                    "castforge.ring_size".to_string(),
-                    Attribute::Int(self.ring_size.max(2) as i64),
-                );
-                op.attributes.insert(
+                attrs.insert("castforge.ring_size".to_string(), Attribute::Int(ring));
+                attrs.insert(
                     "castforge.p2p_overlap".to_string(),
                     Attribute::String("send_recv_kv".to_string()),
                 );
                 modified += 1;
             }
-        }
-        Ok(PassResult {
-            pass_name: self.name().to_string(),
-            changed: modified > 0,
-            ops_removed: 0,
-            ops_modified: modified,
-            ops_created: 0,
-        })
-    }
-}
 
-/// 1F1B / Zero-Bubble Pipeline Parallelism Pass (`shard-pipeline-parallel`).
-pub struct ShardPipelineParallelPass {
-    pub stages: usize,
-    pub microbatches: usize,
-    pub schedule: String,
-}
-
-impl Default for ShardPipelineParallelPass {
-    fn default() -> Self {
-        Self {
-            stages: 2,
-            microbatches: 4,
-            schedule: "zero_bubble_1f1b".to_string(),
-        }
-    }
-}
-
-impl Pass for ShardPipelineParallelPass {
-    fn name(&self) -> &'static str {
-        "shard-pipeline-parallel"
-    }
-
-    fn description(&self) -> &'static str {
-        "Partitions compute ops across pipeline-parallel stages with 1F1B / Zero-Bubble scheduling"
-    }
-
-    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let mut modified = 0usize;
-        let num_stages = self.stages.max(2);
-        let mb = self.microbatches.max(1) as i64;
-        let blocks: Vec<BlockId> = module.blocks.keys().collect();
-        for block_id in blocks {
-            let compute_ops: Vec<_> = module
-                .block_ops(block_id)
-                .into_iter()
-                .filter(|&op_id| {
-                    module.ops.get(op_id).is_some_and(|op| {
-                        op.name.dialect == "stablehlo" && op.name.name != "constant"
-                    })
-                })
-                .collect();
-            let total = compute_ops.len().max(1);
-            for (idx, op_id) in compute_ops.into_iter().enumerate() {
-                let stage = (idx * num_stages) / total;
-                if let Some(op) = module.ops.get_mut(op_id) {
-                    op.attributes.insert(
-                        "castforge.pp_stage".to_string(),
-                        Attribute::Int(stage as i64),
-                    );
-                    op.attributes.insert(
-                        "castforge.pp_schedule".to_string(),
-                        Attribute::String(self.schedule.clone()),
-                    );
-                    op.attributes
-                        .insert("castforge.pp_microbatches".to_string(), Attribute::Int(mb));
-                    modified += 1;
-                }
-            }
-        }
-        Ok(PassResult {
-            pass_name: self.name().to_string(),
-            changed: modified > 0,
-            ops_removed: 0,
-            ops_modified: modified,
-            ops_created: 0,
-        })
-    }
-}
-
-/// Collective All-Reduce Coalescer & Async Overlap Pass (`hoist-all-reduce`).
-#[derive(Debug, Clone, Default)]
-pub struct HoistAllReducePass;
-
-impl Pass for HoistAllReducePass {
-    fn name(&self) -> &'static str {
-        "hoist-all-reduce"
-    }
-
-    fn description(&self) -> &'static str {
-        "Coalesces linear all_reduce sums, eliminates redundant collectives, and enables overlap"
-    }
-
-    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let mut modified = 0usize;
-        let mut removed = 0usize;
-
-        for fn_id in module.functions() {
-            let reg_id = module.ops[fn_id].regions[0];
-            let block_id = module.regions[reg_id].blocks[0];
-            let ops = module.blocks[block_id].ops.clone();
-
-            for op_id in ops {
-                let Some(op) = module.ops.get(op_id).cloned() else {
-                    continue;
-                };
-
+            if do_coalesce {
                 if is_all_reduce(&op) {
                     if op.attributes.get("async_overlap") != Some(&Attribute::Bool(true)) {
                         module.ops[op_id]
@@ -511,14 +307,236 @@ impl Pass for HoistAllReducePass {
                 }
             }
         }
+    }
 
+    Ok(PassResult {
+        pass_name: "shard-distributed".to_string(),
+        changed: created > 0 || modified > 0 || removed > 0,
+        ops_removed: removed,
+        ops_modified: modified,
+        ops_created: created,
+    })
+}
+
+/// Megatron-Style 1D SPMD Tensor Parallelism Pass (`shard-spmd`).
+pub struct ShardSpmdPass {
+    pub num_devices: usize,
+}
+
+impl Default for ShardSpmdPass {
+    fn default() -> Self {
+        Self { num_devices: 2 }
+    }
+}
+
+impl Pass for ShardSpmdPass {
+    fn name(&self) -> &'static str {
+        "shard-spmd"
+    }
+
+    fn description(&self) -> &'static str {
+        "Partitions GEMM ops for Megatron-style SPMD tensor parallelism and inserts all_reduce"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let mut res = shard_tp_ring_and_coalesce_single_traversal(
+            module,
+            true,
+            false,
+            false,
+            self.num_devices,
+            0,
+        )?;
+        res.pass_name = self.name().to_string();
+        Ok(res)
+    }
+}
+
+fn insert_all_reduce_after(
+    module: &mut Module,
+    block_id: BlockId,
+    after_op: OpId,
+    src_val: ValueId,
+    devices: i64,
+) -> OpId {
+    let out_ty = module.values[src_val].ty.clone();
+    let mut attrs = IndexMap::new();
+    attrs.insert(
+        "name".to_string(),
+        Attribute::String("castforge.all_reduce".to_string()),
+    );
+    attrs.insert(
+        "decomposition".to_string(),
+        Attribute::SymbolRef("all_reduce_impl".to_string()),
+    );
+    attrs.insert(
+        "reduction".to_string(),
+        Attribute::String("sum".to_string()),
+    );
+    attrs.insert("num_devices".to_string(), Attribute::Int(devices));
+
+    let ar_op_id = module.ops.insert_with_key(|id| Operation {
+        id,
+        name: OpName::new("stablehlo", "composite"),
+        operands: SmallVec::from_slice(&[src_val]),
+        results: SmallVec::new(),
+        attributes: attrs,
+        regions: Vec::new(),
+        custom_syntax: true,
+        location: Location::Unknown,
+    });
+    let ar_val = module.values.insert_with_key(|id| Value {
+        id,
+        ssa_name: None,
+        ty: out_ty,
+        def: ValueDef::OpResult {
+            op: ar_op_id,
+            index: 0,
+        },
+    });
+    module.ops[ar_op_id].results.push(ar_val);
+
+    let block_ops = &mut module.blocks[block_id].ops;
+    if let Some(pos) = block_ops.iter().position(|&id| id == after_op) {
+        block_ops.insert(pos + 1, ar_op_id);
+    } else {
+        block_ops.push(ar_op_id);
+    }
+
+    let all_ops: Vec<OpId> = module.blocks[block_id].ops.clone();
+    for op_id in all_ops {
+        if op_id != after_op && op_id != ar_op_id {
+            for opnd in &mut module.ops[op_id].operands {
+                if *opnd == src_val {
+                    *opnd = ar_val;
+                }
+            }
+        }
+    }
+    ar_op_id
+}
+
+/// RingAttention / Context Parallelism Pass (`shard-ring-attention`).
+pub struct ShardRingAttentionPass {
+    pub ring_size: usize,
+}
+
+impl Default for ShardRingAttentionPass {
+    fn default() -> Self {
+        Self { ring_size: 4 }
+    }
+}
+
+impl Pass for ShardRingAttentionPass {
+    fn name(&self) -> &'static str {
+        "shard-ring-attention"
+    }
+
+    fn description(&self) -> &'static str {
+        "Shards sequence context across a device ring with overlapped P2P KV send/recv"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let mut res = shard_tp_ring_and_coalesce_single_traversal(
+            module,
+            false,
+            true,
+            false,
+            2,
+            self.ring_size,
+        )?;
+        res.pass_name = self.name().to_string();
+        Ok(res)
+    }
+}
+
+/// 1F1B / Zero-Bubble Pipeline Parallelism Pass (`shard-pipeline-parallel`).
+pub struct ShardPipelineParallelPass {
+    pub stages: usize,
+    pub microbatches: usize,
+    pub schedule: String,
+}
+
+impl Default for ShardPipelineParallelPass {
+    fn default() -> Self {
+        Self {
+            stages: 2,
+            microbatches: 4,
+            schedule: "zero_bubble_1f1b".to_string(),
+        }
+    }
+}
+
+impl Pass for ShardPipelineParallelPass {
+    fn name(&self) -> &'static str {
+        "shard-pipeline-parallel"
+    }
+
+    fn description(&self) -> &'static str {
+        "Partitions compute ops across pipeline-parallel stages with 1F1B / Zero-Bubble scheduling"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let mut modified = 0usize;
+        let num_stages = self.stages.max(2);
+        let mb = self.microbatches.max(1) as i64;
+        let blocks: Vec<BlockId> = module.blocks.keys().collect();
+        for block_id in blocks {
+            let compute_ops: Vec<_> = module
+                .block_ops(block_id)
+                .into_iter()
+                .filter(|&op_id| {
+                    module.ops.get(op_id).is_some_and(|op| {
+                        op.name.dialect == "stablehlo" && op.name.name != "constant"
+                    })
+                })
+                .collect();
+            let total = compute_ops.len().max(1);
+            for (idx, op_id) in compute_ops.into_iter().enumerate() {
+                let stage = (idx * num_stages) / total;
+                if let Some(op) = module.ops.get_mut(op_id) {
+                    op.attributes.insert(
+                        "castforge.pp_stage".to_string(),
+                        Attribute::Int(stage as i64),
+                    );
+                    op.attributes.insert(
+                        "castforge.pp_schedule".to_string(),
+                        Attribute::String(self.schedule.clone()),
+                    );
+                    op.attributes
+                        .insert("castforge.pp_microbatches".to_string(), Attribute::Int(mb));
+                    modified += 1;
+                }
+            }
+        }
         Ok(PassResult {
             pass_name: self.name().to_string(),
-            changed: modified > 0 || removed > 0,
-            ops_removed: removed,
+            changed: modified > 0,
+            ops_removed: 0,
             ops_modified: modified,
             ops_created: 0,
         })
+    }
+}
+
+/// Collective All-Reduce Coalescer & Async Overlap Pass (`hoist-all-reduce`).
+#[derive(Debug, Clone, Default)]
+pub struct HoistAllReducePass;
+
+impl Pass for HoistAllReducePass {
+    fn name(&self) -> &'static str {
+        "hoist-all-reduce"
+    }
+
+    fn description(&self) -> &'static str {
+        "Coalesces linear all_reduce sums, eliminates redundant collectives, and enables overlap"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let mut res =
+            shard_tp_ring_and_coalesce_single_traversal(module, false, false, true, 2, 0)?;
+        res.pass_name = self.name().to_string();
+        Ok(res)
     }
 }
 

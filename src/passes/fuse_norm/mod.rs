@@ -43,24 +43,16 @@ impl Pass for FuseNormPass {
         let do_sm = k == "all" || k == "softmax" || k == "log_softmax";
         let do_ce = k == "cross_entropy" || k == "ce" || k == "linear_cross_entropy";
 
-        let mut created = 0usize;
-        let mut modified = 0usize;
+        let (created, modified) = fuse_norm_single_traversal(
+            module,
+            do_rms,
+            do_res_rms,
+            do_ln,
+            do_sm,
+            do_ce,
+            self.chunk_size,
+        );
         let mut removed = 0usize;
-
-        if do_rms || do_ln || do_sm {
-            let (c, m) = fuse_norm_single_traversal(module, do_rms, do_res_rms, do_ln, do_sm);
-            created += c;
-            modified += m;
-        }
-
-        if do_ce {
-            let ce_res = FuseLinearCrossEntropyPass {
-                chunk_size: self.chunk_size,
-            }
-            .run(module)?;
-            modified += ce_res.ops_modified;
-        }
-
         if created > 0 || modified > 0 {
             let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
             removed += dce_res.ops_removed;
@@ -82,6 +74,8 @@ pub(super) fn fuse_norm_single_traversal(
     do_res_rms: bool,
     do_ln: bool,
     do_sm: bool,
+    do_ce: bool,
+    ce_chunk_size: i64,
 ) -> (usize, usize) {
     let mut created = 0usize;
     let mut modified = 0usize;
@@ -89,78 +83,120 @@ pub(super) fn fuse_norm_single_traversal(
 
     for block_id in blocks {
         let ops = module.block_ops(block_id);
-        let mut rms_in_block = 0usize;
-        let mut ln_in_block = 0usize;
 
         for &op_id in &ops {
             let Some(op) = module.ops.get(op_id).cloned() else {
                 continue;
             };
 
-            if do_rms
-                && let Some(StableHloOp::Multiply { lhs, rhs, .. }) = StableHloOp::from_op(&op)
-                && let Some((x_val, weight_val, eps_f64)) = match_scaled_rmsnorm(module, lhs, rhs)
-                    .or_else(|| match_scaled_rmsnorm(module, rhs, lhs))
+            if do_res_rms
+                && let Some(StableHloOp::Composite { name, inputs, .. }) = StableHloOp::from_op(&op)
+                && name == "castforge.fused_rmsnorm"
+                && !inputs.is_empty()
+                && let ValueDef::OpResult { op: add_op_id, .. } = module.values[inputs[0]].def
+                && let Some(add_op) = module.ops.get(add_op_id)
+                && let Some(StableHloOp::Add {
+                    lhs: x, rhs: res, ..
+                }) = StableHloOp::from_op(add_op)
             {
-                let (m_res, c_res) = rewrite_rmsnorm_or_residual(
-                    module,
-                    op_id,
-                    x_val,
-                    Some(weight_val),
-                    eps_f64,
-                    do_res_rms,
+                let mut new_operands = SmallVec::from_slice(&[x, res]);
+                for &extra in inputs.iter().skip(1) {
+                    new_operands.push(extra);
+                }
+                let op_mut = &mut module.ops[op_id];
+                op_mut.operands = new_operands;
+                op_mut.attributes.insert(
+                    "name".to_string(),
+                    Attribute::String("castforge.fused_residual_rmsnorm".to_string()),
                 );
-                modified += m_res;
-                created += c_res;
-                rms_in_block += 1;
+                op_mut.attributes.insert(
+                    "decomposition".to_string(),
+                    Attribute::SymbolRef("fused_residual_rmsnorm_impl".to_string()),
+                );
+                modified += 1;
+                created += 1;
                 continue;
             }
 
-            if do_ln
-                && let Some(StableHloOp::Add { lhs, rhs, .. }) = StableHloOp::from_op(&op)
-                && let Some((x_val, gamma_opt, beta_opt, eps)) = match_scaled_layernorm(module, lhs)
-                    .map(|(x, g, eps)| (x, Some(g), Some(rhs), eps))
-                    .or_else(|| {
-                        match_scaled_layernorm(module, rhs)
-                            .map(|(x, g, eps)| (x, Some(g), Some(lhs), eps))
-                    })
+            if do_rms
+                && let Some(StableHloOp::Multiply { lhs, rhs, .. }) = StableHloOp::from_op(&op)
             {
-                rewrite_to_layernorm(module, op_id, x_val, gamma_opt, beta_opt, eps);
-                created += 1;
-                ln_in_block += 1;
-                continue;
+                if try_upgrade_unscaled_rmsnorm(module, op_id, lhs, rhs)
+                    || try_upgrade_unscaled_rmsnorm(module, op_id, rhs, lhs)
+                {
+                    continue;
+                }
+                if let Some((x_val, weight_val, eps_f64)) = match_scaled_rmsnorm(module, lhs, rhs)
+                    .or_else(|| match_scaled_rmsnorm(module, rhs, lhs))
+                {
+                    let (m_res, c_res) = rewrite_rmsnorm_or_residual(
+                        module,
+                        op_id,
+                        x_val,
+                        Some(weight_val),
+                        eps_f64,
+                        do_res_rms,
+                    );
+                    modified += m_res;
+                    created += c_res;
+                    continue;
+                }
+                if let Some((x_val, eps_f64)) = match_x_and_rsqrt(module, lhs, rhs)
+                    .or_else(|| match_x_and_rsqrt(module, rhs, lhs))
+                {
+                    let (m_res, c_res) = rewrite_rmsnorm_or_residual(
+                        module, op_id, x_val, None, eps_f64, do_res_rms,
+                    );
+                    modified += m_res;
+                    created += c_res;
+                    continue;
+                }
+            }
+
+            if do_ln {
+                if let Some(StableHloOp::Add { lhs, rhs, .. }) = StableHloOp::from_op(&op) {
+                    if try_upgrade_layernorm_beta(module, op_id, lhs, rhs)
+                        || try_upgrade_layernorm_beta(module, op_id, rhs, lhs)
+                    {
+                        continue;
+                    }
+                    if let Some((x_val, gamma_opt, beta_opt, eps)) =
+                        match_scaled_layernorm(module, lhs)
+                            .map(|(x, g, eps)| (x, Some(g), Some(rhs), eps))
+                            .or_else(|| {
+                                match_scaled_layernorm(module, rhs)
+                                    .map(|(x, g, eps)| (x, Some(g), Some(lhs), eps))
+                            })
+                    {
+                        rewrite_to_layernorm(module, op_id, x_val, gamma_opt, beta_opt, eps);
+                        created += 1;
+                        continue;
+                    }
+                }
+                if let Some(StableHloOp::Multiply { lhs, rhs, .. }) = StableHloOp::from_op(&op) {
+                    if try_upgrade_layernorm_gamma(module, op_id, lhs, rhs)
+                        || try_upgrade_layernorm_gamma(module, op_id, rhs, lhs)
+                    {
+                        continue;
+                    }
+                    if let Some((x_val, gamma_val, eps)) = match_core_layernorm_val(module, lhs)
+                        .map(|(x, e)| (x, rhs, e))
+                        .or_else(|| match_core_layernorm_val(module, rhs).map(|(x, e)| (x, lhs, e)))
+                    {
+                        rewrite_to_layernorm(module, op_id, x_val, Some(gamma_val), None, eps);
+                        created += 1;
+                        continue;
+                    }
+                    if let Some((x_val, eps)) = match_core_layernorm_op(module, &op) {
+                        rewrite_to_layernorm(module, op_id, x_val, None, None, eps);
+                        created += 1;
+                        continue;
+                    }
+                }
             }
 
             if do_sm {
-                if let Some(StableHloOp::Divide {
-                    lhs: exp_val,
-                    rhs: denom_val,
-                    ..
-                }) = StableHloOp::from_op(&op)
-                    && let ValueDef::OpResult { op: exp_op_id, .. } = module.values[exp_val].def
-                    && let Some(exp_op) = module.ops.get(exp_op_id)
-                    && let Some(StableHloOp::Exp {
-                        operand: exp_in, ..
-                    }) = StableHloOp::from_op(exp_op)
-                    && let Some((reduce_axis, _, _)) =
-                        match_broadcast_reduce_of_exp(module, denom_val, exp_val)
-                {
-                    let x_input = unwrap_optional_max_sub(module, exp_in).unwrap_or(exp_in);
-                    let mut attrs = IndexMap::new();
-                    attrs.insert(
-                        "name".to_string(),
-                        Attribute::String("castforge.fused_softmax".to_string()),
-                    );
-                    attrs.insert(
-                        "decomposition".to_string(),
-                        Attribute::SymbolRef("fused_softmax_impl".to_string()),
-                    );
-                    attrs.insert("axis".to_string(), Attribute::Int(reduce_axis));
-
-                    let op_mut = &mut module.ops[op_id];
-                    op_mut.name = OpName::new("stablehlo", "composite");
-                    op_mut.operands = SmallVec::from_slice(&[x_input]);
-                    op_mut.attributes = attrs;
+                if try_fuse_softmax_at_op(module, op_id, &op) {
                     created += 1;
                     continue;
                 }
@@ -193,53 +229,118 @@ pub(super) fn fuse_norm_single_traversal(
                     continue;
                 }
             }
-        }
 
-        if (do_rms && rms_in_block == 0) || (do_ln && ln_in_block == 0) {
-            for &op_id in &ops {
-                let Some(op) = module.ops.get(op_id).cloned() else {
-                    continue;
-                };
-
-                if do_rms
-                    && rms_in_block == 0
-                    && let Some(StableHloOp::Multiply { lhs, rhs, .. }) = StableHloOp::from_op(&op)
-                    && let Some((x_val, eps_f64)) = match_x_and_rsqrt(module, lhs, rhs)
-                        .or_else(|| match_x_and_rsqrt(module, rhs, lhs))
-                {
-                    let (m_res, c_res) = rewrite_rmsnorm_or_residual(
-                        module, op_id, x_val, None, eps_f64, do_res_rms,
+            if do_ce {
+                let is_ce_target = op.is_op("stablehlo", "dot_general")
+                    || (op.is_op("stablehlo", "composite")
+                        && op
+                            .attributes
+                            .get("name")
+                            .and_then(|a| a.as_str())
+                            .is_some_and(|n| n.contains("log_softmax") || n.contains("matmul")));
+                if is_ce_target && let Some(op_mut) = module.ops.get_mut(op_id) {
+                    op_mut.attributes.insert(
+                        "castforge.fused_linear_cross_entropy".to_string(),
+                        Attribute::Bool(true),
                     );
-                    modified += m_res;
-                    created += c_res;
-                    rms_in_block += 1;
-                    continue;
-                }
-
-                if do_ln && ln_in_block == 0 {
-                    if let Some(StableHloOp::Multiply { lhs, rhs, .. }) = StableHloOp::from_op(&op)
-                        && let Some((x_val, gamma_val, eps)) = match_core_layernorm_val(module, lhs)
-                            .map(|(x, e)| (x, rhs, e))
-                            .or_else(|| {
-                                match_core_layernorm_val(module, rhs).map(|(x, e)| (x, lhs, e))
-                            })
-                    {
-                        rewrite_to_layernorm(module, op_id, x_val, Some(gamma_val), None, eps);
-                        created += 1;
-                        ln_in_block += 1;
-                        continue;
-                    }
-                    if let Some((x_val, eps)) = match_core_layernorm_op(module, &op) {
-                        rewrite_to_layernorm(module, op_id, x_val, None, None, eps);
-                        created += 1;
-                        ln_in_block += 1;
-                    }
+                    op_mut.attributes.insert(
+                        "castforge.ce_chunk_size".to_string(),
+                        Attribute::Int(ce_chunk_size.max(64)),
+                    );
+                    op_mut.attributes.insert(
+                        "castforge.materialize_logits".to_string(),
+                        Attribute::Bool(false),
+                    );
+                    modified += 1;
                 }
             }
         }
     }
 
     (created, modified)
+}
+
+fn try_upgrade_unscaled_rmsnorm(
+    module: &mut Module,
+    op_id: crate::ir::OpId,
+    norm_cand: ValueId,
+    weight_val: ValueId,
+) -> bool {
+    let ValueDef::OpResult { op: norm_op_id, .. } = module.values[norm_cand].def else {
+        return false;
+    };
+    let Some(norm_op) = module.ops.get(norm_op_id).cloned() else {
+        return false;
+    };
+    let Some(StableHloOp::Composite { name, inputs, .. }) = StableHloOp::from_op(&norm_op) else {
+        return false;
+    };
+    let is_unscaled_rms = name == "castforge.fused_rmsnorm" && inputs.len() == 1;
+    let is_unscaled_res_rms = name == "castforge.fused_residual_rmsnorm" && inputs.len() == 2;
+    if !is_unscaled_rms && !is_unscaled_res_rms {
+        return false;
+    }
+    let mut new_operands = norm_op.operands.clone();
+    new_operands.push(weight_val);
+    let op_mut = &mut module.ops[op_id];
+    op_mut.name = OpName::new("stablehlo", "composite");
+    op_mut.operands = new_operands;
+    op_mut.attributes = norm_op.attributes;
+    true
+}
+
+fn try_upgrade_layernorm_gamma(
+    module: &mut Module,
+    op_id: crate::ir::OpId,
+    ln_cand: ValueId,
+    gamma_val: ValueId,
+) -> bool {
+    let ValueDef::OpResult { op: ln_op_id, .. } = module.values[ln_cand].def else {
+        return false;
+    };
+    let Some(ln_op) = module.ops.get(ln_op_id).cloned() else {
+        return false;
+    };
+    let Some(StableHloOp::Composite { name, inputs, .. }) = StableHloOp::from_op(&ln_op) else {
+        return false;
+    };
+    if name != "castforge.fused_layernorm" || inputs.len() != 1 {
+        return false;
+    }
+    let mut new_operands = ln_op.operands.clone();
+    new_operands.push(gamma_val);
+    let op_mut = &mut module.ops[op_id];
+    op_mut.name = OpName::new("stablehlo", "composite");
+    op_mut.operands = new_operands;
+    op_mut.attributes = ln_op.attributes;
+    true
+}
+
+fn try_upgrade_layernorm_beta(
+    module: &mut Module,
+    op_id: crate::ir::OpId,
+    ln_cand: ValueId,
+    beta_val: ValueId,
+) -> bool {
+    let ValueDef::OpResult { op: ln_op_id, .. } = module.values[ln_cand].def else {
+        return false;
+    };
+    let Some(ln_op) = module.ops.get(ln_op_id).cloned() else {
+        return false;
+    };
+    let Some(StableHloOp::Composite { name, inputs, .. }) = StableHloOp::from_op(&ln_op) else {
+        return false;
+    };
+    if name != "castforge.fused_layernorm" || inputs.len() != 2 {
+        return false;
+    }
+    let mut new_operands = ln_op.operands.clone();
+    new_operands.push(beta_val);
+    let op_mut = &mut module.ops[op_id];
+    op_mut.name = OpName::new("stablehlo", "composite");
+    op_mut.operands = new_operands;
+    op_mut.attributes = ln_op.attributes;
+    true
 }
 
 fn rewrite_rmsnorm_or_residual(
@@ -313,65 +414,13 @@ impl Pass for FuseResidualNormPass {
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let rms_res = FuseRmsNormPass.run(module)?;
-        let mut created = rms_res.ops_created;
-        let mut removed = rms_res.ops_removed;
-        let mut modified = 0usize;
-        let blocks: Vec<BlockId> = module.blocks.keys().collect();
-
-        for block_id in blocks {
-            let ops = module.block_ops(block_id);
-            for op_id in ops {
-                let Some(op) = module.ops.get(op_id).cloned() else {
-                    continue;
-                };
-                let Some(StableHloOp::Composite { name, inputs, .. }) = StableHloOp::from_op(&op)
-                else {
-                    continue;
-                };
-                if name != "castforge.fused_rmsnorm" || inputs.is_empty() {
-                    continue;
-                }
-
-                let h_val = inputs[0];
-                let ValueDef::OpResult { op: add_op_id, .. } = module.values[h_val].def else {
-                    continue;
-                };
-                let Some(add_op) = module.ops.get(add_op_id) else {
-                    continue;
-                };
-                let Some(StableHloOp::Add {
-                    lhs: x, rhs: res, ..
-                }) = StableHloOp::from_op(add_op)
-                else {
-                    continue;
-                };
-
-                let mut new_operands = SmallVec::from_slice(&[x, res]);
-                for &extra in inputs.iter().skip(1) {
-                    new_operands.push(extra);
-                }
-
-                let op_mut = &mut module.ops[op_id];
-                op_mut.operands = new_operands;
-                op_mut.attributes.insert(
-                    "name".to_string(),
-                    Attribute::String("castforge.fused_residual_rmsnorm".to_string()),
-                );
-                op_mut.attributes.insert(
-                    "decomposition".to_string(),
-                    Attribute::SymbolRef("fused_residual_rmsnorm_impl".to_string()),
-                );
-                modified += 1;
-            }
-        }
-
-        if modified > 0 {
+        let (created, modified) =
+            fuse_norm_single_traversal(module, true, true, false, false, false, 0);
+        let mut removed = 0usize;
+        if created > 0 || modified > 0 {
             let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
             removed += dce_res.ops_removed;
-            created += modified;
         }
-
         Ok(PassResult {
             pass_name: self.name().to_string(),
             changed: created > 0 || modified > 0,
@@ -395,90 +444,18 @@ impl Pass for FuseRmsNormPass {
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let mut created = 0usize;
+        let (created, modified) =
+            fuse_norm_single_traversal(module, true, false, false, false, false, 0);
         let mut removed = 0usize;
-        let blocks: Vec<BlockId> = module.blocks.keys().collect();
-
-        for block_id in blocks {
-            let ops = module.block_ops(block_id);
-            for op_id in ops {
-                let Some(op) = module.ops.get(op_id) else {
-                    continue;
-                };
-                let Some(StableHloOp::Multiply { lhs, rhs, .. }) = StableHloOp::from_op(op) else {
-                    continue;
-                };
-
-                let matched = match_scaled_rmsnorm(module, lhs, rhs)
-                    .or_else(|| match_scaled_rmsnorm(module, rhs, lhs));
-                let Some((x_val, weight_val, eps_f64)) = matched else {
-                    continue;
-                };
-
-                let mut attrs = IndexMap::new();
-                attrs.insert(
-                    "name".to_string(),
-                    Attribute::String("castforge.fused_rmsnorm".to_string()),
-                );
-                attrs.insert(
-                    "decomposition".to_string(),
-                    Attribute::SymbolRef("fused_rmsnorm_impl".to_string()),
-                );
-                attrs.insert("eps".to_string(), Attribute::Float(eps_f64));
-
-                let op_mut = &mut module.ops[op_id];
-                op_mut.name = OpName::new("stablehlo", "composite");
-                op_mut.operands = SmallVec::from_slice(&[x_val, weight_val]);
-                op_mut.attributes = attrs;
-                created += 1;
-            }
-
-            if created == 0 {
-                let ops2 = module.block_ops(block_id);
-                for op_id in ops2 {
-                    let Some(op) = module.ops.get(op_id) else {
-                        continue;
-                    };
-                    let Some(StableHloOp::Multiply { lhs, rhs, .. }) = StableHloOp::from_op(op)
-                    else {
-                        continue;
-                    };
-                    let matched = match_x_and_rsqrt(module, lhs, rhs)
-                        .or_else(|| match_x_and_rsqrt(module, rhs, lhs));
-                    let Some((x_val, eps_f64)) = matched else {
-                        continue;
-                    };
-
-                    let mut attrs = IndexMap::new();
-                    attrs.insert(
-                        "name".to_string(),
-                        Attribute::String("castforge.fused_rmsnorm".to_string()),
-                    );
-                    attrs.insert(
-                        "decomposition".to_string(),
-                        Attribute::SymbolRef("fused_rmsnorm_impl".to_string()),
-                    );
-                    attrs.insert("eps".to_string(), Attribute::Float(eps_f64));
-
-                    let op_mut = &mut module.ops[op_id];
-                    op_mut.name = OpName::new("stablehlo", "composite");
-                    op_mut.operands = SmallVec::from_slice(&[x_val]);
-                    op_mut.attributes = attrs;
-                    created += 1;
-                }
-            }
-        }
-
-        if created > 0 {
+        if created > 0 || modified > 0 {
             let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
             removed += dce_res.ops_removed;
         }
-
         Ok(PassResult {
             pass_name: self.name().to_string(),
-            changed: created > 0,
+            changed: created > 0 || modified > 0,
             ops_removed: removed,
-            ops_modified: 0,
+            ops_modified: modified,
             ops_created: created,
         })
     }

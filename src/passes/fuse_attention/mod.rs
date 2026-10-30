@@ -81,126 +81,369 @@ impl Pass for UnifiedFuseAttentionPass {
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let k = self.kind.to_ascii_lowercase();
-        let mut steps = Vec::new();
         let do_rope = k == "all" || k == "rope";
-        let do_sdpa = matches!(
-            k.as_str(),
-            "all"
-                | "sdpa"
-                | "gqa"
-                | "mla"
-                | "paged"
-                | "flash_decoding"
-                | "flash"
-                | "tree"
-                | "speculative_tree"
-                | "sliding_window"
-                | "window"
-                | "sink"
-                | "kv_sharing"
-                | "yoco"
-                | "cla"
-                | "serving"
-        );
-        if do_rope || do_sdpa {
-            let (rope_c, sdpa_c) = fuse_rope_and_sdpa_single_traversal(module, do_rope, do_sdpa);
-            let created = rope_c + sdpa_c;
-            let mut removed = 0usize;
-            if created > 0 {
-                let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
-                removed += dce_res.ops_removed;
-            }
-            steps.push(PassResult {
-                pass_name: self.name().to_string(),
-                changed: created > 0,
-                ops_removed: removed,
-                ops_modified: 0,
-                ops_created: created,
-            });
-        }
-        if self.rope_scaling.is_some() || self.rope_factor > 1.0 {
-            let scaling = self.rope_scaling.as_deref().unwrap_or("yarn");
-            steps.push(run_rope_scaling(module, scaling, self.rope_factor)?);
-        }
-        if self.logit_softcap.is_some() || self.qk_norm {
-            steps.push(run_attention_softcap_and_qk_norm(
-                module,
-                self.logit_softcap,
-                self.qk_norm,
-            )?);
-        }
-        if k == "mla" {
-            steps.push(
-                FuseMlaPass {
-                    latent_rank: self.kv_lora_rank,
-                }
-                .run(module)?,
-            );
-        }
-        if matches!(k.as_str(), "kv_cache" | "kv") || self.kv_dtype.is_some() {
-            steps.push(
-                InjectKvCachePass {
-                    max_seq_len: self.max_seq_len,
-                }
-                .run(module)?,
-            );
-            if let Some(ref dtype) = self.kv_dtype {
-                steps.push(run_kv_cache_quantization(module, dtype)?);
-            }
-        }
-        if matches!(k.as_str(), "paged" | "serving") {
-            steps.push(
-                LowerPagedAttentionPass {
-                    page_block_size: self.page_block_size,
-                    max_blocks: self.max_blocks,
-                }
-                .run(module)?,
-            );
-        }
-        if matches!(k.as_str(), "flash_decoding" | "flash" | "serving") {
-            steps.push(
-                FlashDecodingPass {
-                    split_kv: self.split_kv,
-                }
-                .run(module)?,
-            );
-        }
-        if matches!(k.as_str(), "speculative_tree" | "tree" | "serving") {
-            steps.push(
-                SpeculativeTreeAttentionPass {
-                    draft_tokens: self.draft_tokens,
-                    tree_depth: self.tree_depth,
-                }
-                .run(module)?,
-            );
-        }
-        if matches!(k.as_str(), "sliding_window" | "window" | "sink") {
-            steps.push(run_sliding_window_attention(
-                module,
-                self.window_size,
-                self.sink_tokens,
-            )?);
-        }
-        if matches!(k.as_str(), "kv_sharing" | "yoco" | "cla") {
-            steps.push(run_kv_sharing(module, self.share_every)?);
-        }
-        if matches!(
+        let do_kv_cache = matches!(k.as_str(), "kv_cache" | "kv") || self.kv_dtype.is_some();
+        let do_mla = k == "mla";
+        let do_paged = matches!(k.as_str(), "paged" | "serving");
+        let do_flash = matches!(k.as_str(), "flash_decoding" | "flash" | "serving");
+        let do_tree = matches!(k.as_str(), "speculative_tree" | "tree" | "serving");
+        let do_window = matches!(k.as_str(), "sliding_window" | "window" | "sink");
+        let do_kv_share = matches!(k.as_str(), "kv_sharing" | "yoco" | "cla");
+        let do_ssm = matches!(
             k.as_str(),
             "ssm" | "mamba2" | "linear_attn" | "deltanet" | "rwkv6"
-        ) {
-            steps.push(run_ssm_chunk_scan_fusion(
-                module,
-                &k,
-                self.state_dim,
-                self.ssm_chunk_size,
-            )?);
+        );
+        let do_sdpa = do_kv_cache
+            || do_mla
+            || do_paged
+            || do_flash
+            || do_tree
+            || do_window
+            || do_kv_share
+            || matches!(k.as_str(), "all" | "sdpa" | "gqa" | "serving");
+        let has_rope_scaling = self.rope_scaling.is_some() || self.rope_factor > 1.0;
+        let rope_scaling_kind = self
+            .rope_scaling
+            .as_deref()
+            .unwrap_or("yarn")
+            .to_ascii_lowercase();
+        let eff_rope_factor = self.rope_factor.max(1.0);
+        let rope_mscale = if rope_scaling_kind == "yarn" && eff_rope_factor > 1.0 {
+            0.1 * eff_rope_factor.ln() + 1.0
+        } else {
+            1.0
+        };
+        let kv_dt_low = self.kv_dtype.as_ref().map(|s| s.to_ascii_lowercase());
+        let share_stride = self.share_every.max(2);
+
+        let mut created = 0usize;
+        let mut modified = 0usize;
+        let blocks: Vec<BlockId> = module.blocks.keys().collect();
+
+        for block_id in blocks {
+            let ops = module.block_ops(block_id);
+            let mut donor_kv: Option<(ValueId, ValueId)> = None;
+            let mut attn_idx = 0usize;
+
+            for op_id in ops {
+                let Some(op) = module.ops.get(op_id).cloned() else {
+                    continue;
+                };
+
+                if do_rope
+                    && let Some(StableHloOp::Add { lhs, rhs, .. }) = StableHloOp::from_op(&op)
+                    && let Some(RopeMatch { x, cos, sin }) = match_rope_pair(module, lhs, rhs)
+                        .or_else(|| match_rope_pair(module, rhs, lhs))
+                {
+                    let mut attrs = IndexMap::new();
+                    attrs.insert(
+                        "name".to_string(),
+                        Attribute::String("castforge.fused_rope".to_string()),
+                    );
+                    attrs.insert(
+                        "decomposition".to_string(),
+                        Attribute::SymbolRef("fused_rope_impl".to_string()),
+                    );
+                    let op_mut = &mut module.ops[op_id];
+                    op_mut.name = OpName::new("stablehlo", "composite");
+                    op_mut.operands = SmallVec::from_slice(&[x, cos, sin]);
+                    op_mut.attributes = attrs;
+                    created += 1;
+                } else if do_sdpa {
+                    if try_fuse_softmax_at_op(module, op_id, &op) {
+                        continue;
+                    }
+                    if let Some(StableHloOp::DotGeneral {
+                        lhs: probs_val,
+                        rhs: v_val,
+                        ..
+                    }) = StableHloOp::from_op(&op)
+                        && let Some(AttentionMatch {
+                            q,
+                            k: k_in,
+                            v: v_in,
+                            mask,
+                            scale,
+                            k_transposed,
+                            is_gqa,
+                        }) = match_sdpa_chain(module, probs_val, v_val)
+                    {
+                        let mut attrs = IndexMap::new();
+                        attrs.insert(
+                            "name".to_string(),
+                            Attribute::String("castforge.fused_attention".to_string()),
+                        );
+                        attrs.insert(
+                            "decomposition".to_string(),
+                            Attribute::SymbolRef("fused_attention_impl".to_string()),
+                        );
+                        attrs.insert("scale".to_string(), Attribute::Float(scale));
+                        if k_transposed {
+                            attrs.insert("k_transposed".to_string(), Attribute::Bool(true));
+                        }
+                        if is_gqa {
+                            attrs.insert("gqa".to_string(), Attribute::Bool(true));
+                        }
+                        if mask.is_some() {
+                            attrs.insert("masked".to_string(), Attribute::Bool(true));
+                        }
+                        let mut operands = SmallVec::from_slice(&[q, k_in, v_in]);
+                        if let Some(m_val) = mask {
+                            operands.push(m_val);
+                        }
+                        let op_mut = &mut module.ops[op_id];
+                        op_mut.name = OpName::new("stablehlo", "composite");
+                        op_mut.operands = operands;
+                        op_mut.attributes = attrs;
+                        created += 1;
+                    }
+                }
+
+                // Single-traversal post-fusion serving & hardware attribute lowering on `op_id`
+                let is_dot = module.ops[op_id].is_op("stablehlo", "dot_general");
+                let comp_name = if module.ops[op_id].is_op("stablehlo", "composite") {
+                    module.ops[op_id]
+                        .attributes
+                        .get("name")
+                        .and_then(|a| a.as_str())
+                        .map(str::to_string)
+                } else {
+                    None
+                };
+                let is_fused_attn = comp_name.as_deref() == Some("castforge.fused_attention");
+                let is_fused_rope = comp_name.as_deref() == Some("castforge.fused_rope");
+                let is_kv_update = comp_name.as_deref() == Some("castforge.kv_cache_update");
+
+                if has_rope_scaling && (is_dot || is_fused_rope || is_fused_attn) {
+                    let attrs = &mut module.ops[op_id].attributes;
+                    attrs.insert(
+                        "castforge.rope_scaling".to_string(),
+                        Attribute::String(rope_scaling_kind.clone()),
+                    );
+                    attrs.insert(
+                        "castforge.rope_factor".to_string(),
+                        Attribute::Float(eff_rope_factor),
+                    );
+                    attrs.insert(
+                        "castforge.rope_mscale".to_string(),
+                        Attribute::Float(rope_mscale),
+                    );
+                    modified += 1;
+                }
+
+                if (self.logit_softcap.is_some() || self.qk_norm) && (is_dot || is_fused_attn) {
+                    let attrs = &mut module.ops[op_id].attributes;
+                    if let Some(cap) = self.logit_softcap {
+                        attrs.insert(
+                            "castforge.logit_softcap".to_string(),
+                            Attribute::Float(cap.max(1.0)),
+                        );
+                    }
+                    if self.qk_norm {
+                        attrs.insert("castforge.qk_norm".to_string(), Attribute::Bool(true));
+                    }
+                    modified += 1;
+                }
+
+                if do_mla && (is_dot || is_fused_attn) {
+                    let attrs = &mut module.ops[op_id].attributes;
+                    attrs.insert(
+                        "castforge.mla_compressed_kv".to_string(),
+                        Attribute::Bool(true),
+                    );
+                    attrs.insert(
+                        "castforge.mla_latent_rank".to_string(),
+                        Attribute::Int(self.kv_lora_rank.max(16)),
+                    );
+                    attrs.insert(
+                        "castforge.mla_w_uk_absorbed".to_string(),
+                        Attribute::Bool(true),
+                    );
+                    modified += 1;
+                }
+
+                if do_kv_cache
+                    && is_fused_attn
+                    && module.ops[op_id].operands.len() >= 3
+                    && !module.ops[op_id].attributes.contains_key("kv_cached")
+                {
+                    let max_seq = self.max_seq_len.max(1) as i64;
+                    let k_val = module.ops[op_id].operands[1];
+                    let v_val = module.ops[op_id].operands[2];
+                    let k_cached =
+                        insert_kv_cache_op(module, block_id, op_id, k_val, "key", max_seq);
+                    let v_cached =
+                        insert_kv_cache_op(module, block_id, op_id, v_val, "value", max_seq);
+                    if let Some(ref dt) = kv_dt_low {
+                        for &kv_val in &[k_cached, v_cached] {
+                            if let ValueDef::OpResult { op: kv_op_id, .. } =
+                                module.values[kv_val].def
+                            {
+                                let kv_attrs = &mut module.ops[kv_op_id].attributes;
+                                kv_attrs.insert(
+                                    "castforge.kv_cache_dtype".to_string(),
+                                    Attribute::String(dt.clone()),
+                                );
+                                kv_attrs.insert(
+                                    "castforge.kv_per_head_scale".to_string(),
+                                    Attribute::Bool(true),
+                                );
+                                modified += 1;
+                            }
+                        }
+                    }
+                    let op_mut = &mut module.ops[op_id];
+                    op_mut.operands[1] = k_cached;
+                    op_mut.operands[2] = v_cached;
+                    op_mut
+                        .attributes
+                        .insert("kv_cached".to_string(), Attribute::Bool(true));
+                    created += 2;
+                    modified += 1;
+                }
+
+                if let Some(ref dt) = kv_dt_low
+                    && (is_kv_update || is_fused_attn)
+                {
+                    let attrs = &mut module.ops[op_id].attributes;
+                    attrs.insert(
+                        "castforge.kv_cache_dtype".to_string(),
+                        Attribute::String(dt.clone()),
+                    );
+                    attrs.insert(
+                        "castforge.kv_per_head_scale".to_string(),
+                        Attribute::Bool(true),
+                    );
+                    modified += 1;
+                }
+
+                if do_paged && is_fused_attn {
+                    let attrs = &mut module.ops[op_id].attributes;
+                    attrs.insert(
+                        "castforge.paged_attention".to_string(),
+                        Attribute::Bool(true),
+                    );
+                    attrs.insert(
+                        "castforge.page_block_size".to_string(),
+                        Attribute::Int(self.page_block_size.max(4) as i64),
+                    );
+                    attrs.insert(
+                        "castforge.max_blocks".to_string(),
+                        Attribute::Int(self.max_blocks.max(1) as i64),
+                    );
+                    modified += 1;
+                }
+
+                if do_flash && is_fused_attn {
+                    let attrs = &mut module.ops[op_id].attributes;
+                    attrs.insert(
+                        "castforge.flash_decoding".to_string(),
+                        Attribute::Bool(true),
+                    );
+                    attrs.insert(
+                        "castforge.split_kv".to_string(),
+                        Attribute::Int(self.split_kv.max(2) as i64),
+                    );
+                    attrs.insert(
+                        "castforge.partial_lse_reduce".to_string(),
+                        Attribute::Bool(true),
+                    );
+                    modified += 1;
+                }
+
+                if do_tree && is_fused_attn {
+                    let attrs = &mut module.ops[op_id].attributes;
+                    attrs.insert(
+                        "castforge.speculative_tree".to_string(),
+                        Attribute::Bool(true),
+                    );
+                    attrs.insert(
+                        "castforge.draft_tokens".to_string(),
+                        Attribute::Int(self.draft_tokens.max(1) as i64),
+                    );
+                    attrs.insert(
+                        "castforge.tree_depth".to_string(),
+                        Attribute::Int(self.tree_depth.max(1) as i64),
+                    );
+                    modified += 1;
+                }
+
+                if do_window && (is_dot || is_fused_attn) {
+                    let attrs = &mut module.ops[op_id].attributes;
+                    attrs.insert(
+                        "castforge.sliding_window".to_string(),
+                        Attribute::Int(self.window_size.max(16) as i64),
+                    );
+                    attrs.insert(
+                        "castforge.attention_sinks".to_string(),
+                        Attribute::Int(self.sink_tokens as i64),
+                    );
+                    modified += 1;
+                }
+
+                if do_kv_share && (is_dot || is_fused_attn) {
+                    let is_comp = is_fused_attn && module.ops[op_id].operands.len() >= 3;
+                    if attn_idx.is_multiple_of(share_stride) {
+                        if is_comp {
+                            donor_kv = Some((
+                                module.ops[op_id].operands[1],
+                                module.ops[op_id].operands[2],
+                            ));
+                        }
+                    } else if is_comp && let Some((dk, dv)) = donor_kv {
+                        module.ops[op_id].operands[1] = dk;
+                        module.ops[op_id].operands[2] = dv;
+                    }
+                    let attrs = &mut module.ops[op_id].attributes;
+                    attrs.insert("castforge.kv_shared".to_string(), Attribute::Bool(true));
+                    attrs.insert(
+                        "castforge.kv_share_stride".to_string(),
+                        Attribute::Int(share_stride as i64),
+                    );
+                    attn_idx += 1;
+                    modified += 1;
+                }
+
+                if do_ssm
+                    && (is_dot
+                        || comp_name
+                            .as_deref()
+                            .is_some_and(|n| n.contains("attention") || n.contains("matmul")))
+                {
+                    let attrs = &mut module.ops[op_id].attributes;
+                    attrs.insert(
+                        "castforge.ssm_chunk_scan".to_string(),
+                        Attribute::Bool(true),
+                    );
+                    attrs.insert(
+                        "castforge.ssm_kind".to_string(),
+                        Attribute::String(k.clone()),
+                    );
+                    attrs.insert(
+                        "castforge.ssm_state_dim".to_string(),
+                        Attribute::Int(self.state_dim.max(16) as i64),
+                    );
+                    attrs.insert(
+                        "castforge.ssm_chunk_size".to_string(),
+                        Attribute::Int(self.ssm_chunk_size.max(8) as i64),
+                    );
+                    modified += 1;
+                }
+            }
         }
+
+        let mut removed = 0usize;
+        if created > 0 || (do_kv_share && modified > 0) {
+            let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
+            removed += dce_res.ops_removed;
+        }
+
         Ok(PassResult {
             pass_name: self.name().to_string(),
-            changed: steps.iter().any(|r| r.changed),
-            ops_removed: steps.iter().map(|r| r.ops_removed).sum(),
-            ops_modified: steps.iter().map(|r| r.ops_modified).sum(),
-            ops_created: steps.iter().map(|r| r.ops_created).sum(),
+            changed: created > 0 || modified > 0 || removed > 0,
+            ops_removed: removed,
+            ops_modified: modified,
+            ops_created: created,
         })
     }
 }

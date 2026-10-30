@@ -31,9 +31,10 @@ pass modules and sub-packages (`src/passes/<pass>/`) under `src/passes/`.
 
 ### 1.1 `dce` (`DeadCodeEliminationPass` — `dce.rs`)
 - **Options:** `symbols=true|false` (default: `true`)
-- **Explanation:** Single-pass $O(N)$ reference-counted Dead Code Elimination
-  (`Module::compute_use_counts`) that removes unused side-effect-free operations in reverse
-  topological order and eliminates unreachable private `func.func` symbols when `symbols=true`.
+- **Explanation:** Single-traversal $O(N)$ liveness-driven Dead Code Elimination that sweeps
+  operations in reverse topological order (marking operands of live ops on the fly without a
+  separate forward use-counting pass) and eliminates unreachable private `func.func` symbols when
+  `symbols=true`.
 
 ### 1.2 `cse` (`UnifiedCsePass` — `cse.rs`)
 - **Options:** `gvn=true|false` (default: `true`), `licm=true|false` (default: `true`),

@@ -21,79 +21,19 @@ impl Pass for FuseLayerNormPass {
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let mut created = 0usize;
+        let (created, modified) =
+            fuse_norm_single_traversal(module, false, false, true, false, false, 0);
         let mut removed = 0usize;
-        let blocks: Vec<BlockId> = module.blocks.keys().collect();
-
-        for block_id in blocks {
-            let ops = module.block_ops(block_id);
-            for op_id in ops {
-                let Some(op) = module.ops.get(op_id) else {
-                    continue;
-                };
-                let Some(StableHloOp::Add { lhs, rhs, .. }) = StableHloOp::from_op(op) else {
-                    continue;
-                };
-                let matched = match_scaled_layernorm(module, lhs)
-                    .map(|(x, g, eps)| (x, Some(g), Some(rhs), eps))
-                    .or_else(|| {
-                        match_scaled_layernorm(module, rhs)
-                            .map(|(x, g, eps)| (x, Some(g), Some(lhs), eps))
-                    });
-                let Some((x_val, gamma_opt, beta_opt, eps)) = matched else {
-                    continue;
-                };
-                rewrite_to_layernorm(module, op_id, x_val, gamma_opt, beta_opt, eps);
-                created += 1;
-            }
-
-            if created == 0 {
-                let ops2 = module.block_ops(block_id);
-                for op_id in ops2 {
-                    let Some((x_val, gamma_val, eps)) = module.ops.get(op_id).and_then(|op| {
-                        let StableHloOp::Multiply { lhs, rhs, .. } = StableHloOp::from_op(op)?
-                        else {
-                            return None;
-                        };
-                        match_core_layernorm_val(module, lhs)
-                            .map(|(x, e)| (x, rhs, e))
-                            .or_else(|| {
-                                match_core_layernorm_val(module, rhs).map(|(x, e)| (x, lhs, e))
-                            })
-                    }) else {
-                        continue;
-                    };
-                    rewrite_to_layernorm(module, op_id, x_val, Some(gamma_val), None, eps);
-                    created += 1;
-                }
-            }
-
-            if created == 0 {
-                let ops3 = module.block_ops(block_id);
-                for op_id in ops3 {
-                    let Some((x_val, eps)) = module
-                        .ops
-                        .get(op_id)
-                        .and_then(|op| match_core_layernorm_op(module, op))
-                    else {
-                        continue;
-                    };
-                    rewrite_to_layernorm(module, op_id, x_val, None, None, eps);
-                    created += 1;
-                }
-            }
-        }
-
-        if created > 0 {
+        if created > 0 || modified > 0 {
             let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
             removed += dce_res.ops_removed;
         }
 
         Ok(PassResult {
             pass_name: self.name().to_string(),
-            changed: created > 0,
+            changed: created > 0 || modified > 0,
             ops_removed: removed,
-            ops_modified: 0,
+            ops_modified: modified,
             ops_created: created,
         })
     }
@@ -295,27 +235,22 @@ impl Pass for FuseSoftmaxPass {
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let k = self.kind.to_ascii_lowercase();
-        if k == "cross_entropy" || k == "ce" || k == "linear_cross_entropy" {
-            let mut res = FuseLinearCrossEntropyPass {
-                chunk_size: self.chunk_size,
-            }
-            .run(module)?;
-            res.pass_name = self.name().to_string();
-            return Ok(res);
-        }
+        let do_ce = k == "cross_entropy" || k == "ce" || k == "linear_cross_entropy";
+        let do_sm = !do_ce;
 
-        let (created, _) = fuse_norm_single_traversal(module, false, false, false, true);
+        let (created, modified) =
+            fuse_norm_single_traversal(module, false, false, false, do_sm, do_ce, self.chunk_size);
         let mut removed = 0usize;
-        if created > 0 {
+        if created > 0 || modified > 0 {
             let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
             removed += dce_res.ops_removed;
         }
 
         Ok(PassResult {
             pass_name: self.name().to_string(),
-            changed: created > 0,
+            changed: created > 0 || modified > 0,
             ops_removed: removed,
-            ops_modified: 0,
+            ops_modified: modified,
             ops_created: created,
         })
     }

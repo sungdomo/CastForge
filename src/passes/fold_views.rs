@@ -60,11 +60,6 @@ fn fold_all_views_single_pass(module: &mut Module) -> Result<(usize, usize, usiz
     let blocks: Vec<BlockId> = module.blocks.keys().collect();
 
     for block_id in blocks {
-        let (sink_c, sink_m, sink_r) = sink_transposes_in_block(module, block_id);
-        created += sink_c;
-        modified += sink_m;
-        removed += sink_r;
-
         let ops = module.block_ops(block_id);
         let mut dead_ops: HashSet<OpId> = HashSet::new();
 
@@ -82,6 +77,21 @@ fn fold_all_views_single_pass(module: &mut Module) -> Result<(usize, usize, usiz
                     permutation: perm2,
                     result,
                 } => {
+                    if try_sink_transpose_through_elementwise(
+                        module,
+                        block_id,
+                        op_id,
+                        operand,
+                        &perm2,
+                        result,
+                        &mut dead_ops,
+                        &mut created,
+                        &mut modified,
+                        &mut removed,
+                    ) {
+                        continue;
+                    }
+
                     let mut current_operand = operand;
                     let mut current_perm = perm2;
 
@@ -441,110 +451,121 @@ fn fold_all_views_single_pass(module: &mut Module) -> Result<(usize, usize, usiz
     Ok((created, modified, removed))
 }
 
-fn sink_transposes_in_block(module: &mut Module, block_id: BlockId) -> (usize, usize, usize) {
-    let mut created = 0usize;
-    let mut modified = 0usize;
-    let mut removed = 0usize;
+fn try_sink_transpose_through_elementwise(
+    module: &mut Module,
+    block_id: BlockId,
+    op_id: OpId,
+    elem_val: ValueId,
+    perm: &[i64],
+    trans_res: ValueId,
+    dead_ops: &mut HashSet<OpId>,
+    created: &mut usize,
+    modified: &mut usize,
+    removed: &mut usize,
+) -> bool {
+    let ValueDef::OpResult { op: prod_op_id, .. } = module.values[elem_val].def else {
+        return false;
+    };
+    if dead_ops.contains(&prod_op_id) || module.use_count(elem_val) != 1 {
+        return false;
+    }
+    let Some(prod_op) = module.ops.get(prod_op_id).cloned() else {
+        return false;
+    };
+    let Some(prod_hlo) = StableHloOp::from_op(&prod_op) else {
+        return false;
+    };
 
-    loop {
-        let mut iter_changed = false;
-        let ops = module.block_ops(block_id);
+    let trans_ty = module.values[trans_res].ty.clone();
 
-        for op_id in ops {
-            let Some(op) = module.ops.get(op_id) else {
-                continue;
-            };
-            let Some(StableHloOp::Transpose {
-                operand: elem_val,
-                permutation: perm,
-                result: trans_res,
-            }) = StableHloOp::from_op(op)
-            else {
-                continue;
-            };
-
-            let ValueDef::OpResult { op: prod_op_id, .. } = module.values[elem_val].def else {
-                continue;
-            };
-            if module.use_count(elem_val) != 1 {
-                continue;
-            }
-            let Some(prod_op) = module.ops.get(prod_op_id).cloned() else {
-                continue;
-            };
-            let Some(prod_hlo) = StableHloOp::from_op(&prod_op) else {
-                continue;
-            };
-
-            let trans_ty = module.values[trans_res].ty.clone();
-
-            match prod_hlo {
-                StableHloOp::Exp { operand: x, .. }
-                | StableHloOp::Tanh { operand: x, .. }
-                | StableHloOp::Rsqrt { operand: x, .. }
-                | StableHloOp::Convert { operand: x, .. } => {
-                    let tx = insert_transpose_before(
-                        module,
-                        block_id,
-                        op_id,
-                        x,
-                        &perm,
-                        trans_ty.clone(),
-                    );
-                    let op_mut = &mut module.ops[op_id];
-                    op_mut.name = prod_op.name.clone();
-                    op_mut.operands = SmallVec::from_slice(&[tx]);
-                    op_mut.attributes = prod_op.attributes.clone();
-                    module.remove_op(block_id, prod_op_id);
-                    created += 1;
-                    modified += 1;
-                    removed += 1;
-                    iter_changed = true;
-                    break;
-                }
-                StableHloOp::Add { lhs, rhs, .. }
-                | StableHloOp::Subtract { lhs, rhs, .. }
-                | StableHloOp::Multiply { lhs, rhs, .. }
-                | StableHloOp::Divide { lhs, rhs, .. }
-                | StableHloOp::Maximum { lhs, rhs, .. }
-                | StableHloOp::Minimum { lhs, rhs, .. } => {
-                    let tlhs = insert_transpose_before(
-                        module,
-                        block_id,
-                        op_id,
-                        lhs,
-                        &perm,
-                        trans_ty.clone(),
-                    );
-                    let trhs = insert_transpose_before(
-                        module,
-                        block_id,
-                        op_id,
-                        rhs,
-                        &perm,
-                        trans_ty.clone(),
-                    );
-                    let op_mut = &mut module.ops[op_id];
-                    op_mut.name = prod_op.name.clone();
-                    op_mut.operands = SmallVec::from_slice(&[tlhs, trhs]);
-                    op_mut.attributes = prod_op.attributes.clone();
-                    module.remove_op(block_id, prod_op_id);
-                    created += 2;
-                    modified += 1;
-                    removed += 1;
-                    iter_changed = true;
-                    break;
-                }
-                _ => {}
-            }
+    match prod_hlo {
+        StableHloOp::Exp { operand: x, .. }
+        | StableHloOp::Tanh { operand: x, .. }
+        | StableHloOp::Rsqrt { operand: x, .. }
+        | StableHloOp::Convert { operand: x, .. } => {
+            let tx = insert_folded_transpose_before(
+                module, block_id, op_id, x, perm, trans_ty, dead_ops, created, modified,
+            );
+            let op_mut = &mut module.ops[op_id];
+            op_mut.name = prod_op.name;
+            op_mut.operands = SmallVec::from_slice(&[tx]);
+            op_mut.attributes = prod_op.attributes;
+            dead_ops.insert(prod_op_id);
+            *modified += 1;
+            *removed += 1;
+            true
         }
-
-        if !iter_changed {
-            break;
+        StableHloOp::Add { lhs, rhs, .. }
+        | StableHloOp::Subtract { lhs, rhs, .. }
+        | StableHloOp::Multiply { lhs, rhs, .. }
+        | StableHloOp::Divide { lhs, rhs, .. }
+        | StableHloOp::Maximum { lhs, rhs, .. }
+        | StableHloOp::Minimum { lhs, rhs, .. } => {
+            let tlhs = insert_folded_transpose_before(
+                module,
+                block_id,
+                op_id,
+                lhs,
+                perm,
+                trans_ty.clone(),
+                dead_ops,
+                created,
+                modified,
+            );
+            let trhs = insert_folded_transpose_before(
+                module, block_id, op_id, rhs, perm, trans_ty, dead_ops, created, modified,
+            );
+            let op_mut = &mut module.ops[op_id];
+            op_mut.name = prod_op.name;
+            op_mut.operands = SmallVec::from_slice(&[tlhs, trhs]);
+            op_mut.attributes = prod_op.attributes;
+            dead_ops.insert(prod_op_id);
+            *modified += 1;
+            *removed += 1;
+            true
         }
+        _ => false,
+    }
+}
+
+fn insert_folded_transpose_before(
+    module: &mut Module,
+    block_id: BlockId,
+    before_op: OpId,
+    input: ValueId,
+    perm: &[i64],
+    out_ty: crate::ir::Type,
+    dead_ops: &HashSet<OpId>,
+    created: &mut usize,
+    modified: &mut usize,
+) -> ValueId {
+    let mut cur_input = input;
+    let mut cur_perm: Vec<i64> = perm.to_vec();
+
+    if let ValueDef::OpResult { op: prod_op_id, .. } = module.values[input].def
+        && !dead_ops.contains(&prod_op_id)
+        && let Some(prod_op) = module.ops.get(prod_op_id)
+        && let Some(StableHloOp::Transpose {
+            operand: base_input,
+            permutation: perm1,
+            ..
+        }) = StableHloOp::from_op(prod_op)
+        && perm1.len() == cur_perm.len()
+    {
+        cur_perm = cur_perm.iter().map(|&idx| perm1[idx as usize]).collect();
+        cur_input = base_input;
+        *modified += 1;
     }
 
-    (created, modified, removed)
+    let is_identity = !cur_perm.is_empty()
+        && cur_perm.iter().enumerate().all(|(i, &p)| p == i as i64)
+        && module.values[cur_input].ty == out_ty;
+    if is_identity {
+        return cur_input;
+    }
+
+    *created += 1;
+    insert_transpose_before(module, block_id, before_op, cur_input, &cur_perm, out_ty)
 }
 
 fn is_float_dtype(dt: &DType) -> bool {
