@@ -5,8 +5,10 @@
 //! `permute-loops`, `unroll-loops`, `vectorize-loops`, and `lower-tensor-cores`
 //! (`tensor_cores=wgmma|wmma|mfma|simdgroup`) into [`ScheduleLoopsPass`].
 
+pub mod loop_opt;
 pub mod lowering;
 
+pub use loop_opt::*;
 pub use lowering::*;
 
 use crate::ir::{Attribute, BlockId, Module};

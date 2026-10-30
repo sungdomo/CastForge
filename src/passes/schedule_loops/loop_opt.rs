@@ -1,144 +1,18 @@
-//! Progressive Loop IR (`Ir(Module) -> LoopModule -> Target Source`) and modular
-//! GPU/Native backend translators (`lower-to-loops`, `codegen-cuda`, `codegen-msl`,
-//! `codegen-header`, `compile-lib`).
+//! Tensor-to-Loop IR Lowering (`lower_to_loop_ir`), Imperative Loop IR Optimization Passes
+//! (`LoopPass`, `OptimizeLoopIrPass`), and Progressive Lowering Translators
+//! (`TensorToLoopTranslator`, `OptimizeLoopIrTranslator`).
 
 use crate::codegen::{
-    CodegenTarget, TargetConfig, generate_code_with_config, sanitize_ident, tensor_len,
-    tensor_shape_dims, value_ident,
+    TargetConfig, build_memory_plan, sanitize_ident, tensor_len, tensor_shape_dims, value_ident,
 };
-use crate::ir::{Module, Payload, Translator, ValueId};
-use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use crate::ir::{LoopKernel, LoopModule, LoopStmt, Module, Payload, Translator, ValueId};
+use anyhow::Result;
 use std::collections::HashMap;
-use std::fmt::{self, Write as _};
-use std::fs;
-use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-static SHLIB_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-/// Statement in the progressive Loop IR (`LoopModule`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LoopStmt {
-    /// Comment annotation (`// ...`).
-    Comment(String),
-    /// Static buffer declaration (`float buf[N];`).
-    Alloc { name: String, len: usize },
-    /// Bounded affine loop (`for var in (0..upper).step_by(step)`).
-    For {
-        var: String,
-        lower: usize,
-        upper: usize,
-        step: usize,
-        parallel: bool,
-        vectorized: bool,
-        unroll: usize,
-        body: Vec<LoopStmt>,
-    },
-    /// Indexed scalar assignment (`dst[idx] = expr;`).
-    Assign {
-        dst: String,
-        index: String,
-        expr: String,
-    },
-}
-
-/// Lowered function kernel in [`LoopModule`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LoopKernel {
-    /// Sanitized function symbol name.
-    pub name: String,
-    /// Input buffer parameters `(name, num_elements)`.
-    pub params: Vec<(String, usize)>,
-    /// Output buffer parameter `(name, num_elements)`.
-    pub output: (String, usize),
-    /// Sequence of loop and buffer statements.
-    pub body: Vec<LoopStmt>,
-}
-
-/// Progressive Loop IR module lowered from a Tensor-level [`Module`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LoopModule {
-    /// Module name.
-    pub name: String,
-    /// Lowered kernel functions.
-    pub kernels: Vec<LoopKernel>,
-}
-
-impl fmt::Display for LoopModule {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(
-            f,
-            "// CastForge Progressive Loop IR (module: {})",
-            self.name
-        )?;
-        for kernel in &self.kernels {
-            let params_str = kernel
-                .params
-                .iter()
-                .map(|(n, len)| format!("{n}: &f32[{len}]"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            writeln!(
-                f,
-                "kernel @{}({}) -> {}: &mut f32[{}] {{",
-                kernel.name, params_str, kernel.output.0, kernel.output.1
-            )?;
-            for stmt in &kernel.body {
-                fmt_stmt(f, stmt, 1)?;
-            }
-            writeln!(f, "}}")?;
-        }
-        Ok(())
-    }
-}
-
-fn fmt_stmt(f: &mut fmt::Formatter<'_>, stmt: &LoopStmt, indent: usize) -> fmt::Result {
-    let pad = "  ".repeat(indent);
-    match stmt {
-        LoopStmt::Comment(c) => writeln!(f, "{pad}// {c}"),
-        LoopStmt::Alloc { name, len } => writeln!(f, "{pad}alloc {name}: f32[{len}]"),
-        LoopStmt::For {
-            var,
-            lower,
-            upper,
-            step,
-            parallel,
-            vectorized,
-            unroll,
-            body,
-        } => {
-            let mut tags = Vec::new();
-            if *parallel {
-                tags.push("parallel".to_string());
-            }
-            if *vectorized {
-                tags.push("vectorize".to_string());
-            }
-            if *unroll > 1 {
-                tags.push(format!("unroll({unroll})"));
-            }
-            let attr = if tags.is_empty() {
-                String::new()
-            } else {
-                format!(" #[{}]", tags.join(", "))
-            };
-            writeln!(f, "{pad}for {var} in {lower}..{upper} step {step}{attr} {{")?;
-            for inner in body {
-                fmt_stmt(f, inner, indent + 1)?;
-            }
-            writeln!(f, "{pad}}}")
-        }
-        LoopStmt::Assign { dst, index, expr } => {
-            writeln!(f, "{pad}{dst}[{index}] = {expr}")
-        }
-    }
-}
 
 /// Lowers a tensor-level CastForge [`Module`] into a progressive [`LoopModule`].
 pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModule {
     let mod_config = base_config.with_module_attributes(module);
-    let mem_plan = crate::codegen::memory_plan::build_memory_plan(module);
+    let mem_plan = build_memory_plan(module);
     let mod_name = module
         .name
         .clone()
@@ -254,12 +128,27 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                 )));
             }
 
-            let dialect = op.name.dialect.as_str();
-            let op_name = op.name.name.as_str();
+            let (dialect, op_name) = if op.is_op("stablehlo", "composite") {
+                if let Some((d, n)) = op
+                    .attributes
+                    .get("name")
+                    .and_then(|a| a.as_str())
+                    .and_then(|s| s.split_once('.'))
+                {
+                    (d, n)
+                } else {
+                    (op.name.dialect.as_str(), op.name.name.as_str())
+                }
+            } else {
+                (op.name.dialect.as_str(), op.name.name.as_str())
+            };
 
             if (dialect == "stablehlo" && op_name == "dot_general"
                 || dialect == "castforge"
-                    && matches!(op_name, "fused_matmul_epilogue" | "fused_dequant_matmul"))
+                    && matches!(
+                        op_name,
+                        "fused_matmul_epilogue" | "fused_dequant_matmul" | "fused_qmatmul"
+                    ))
                 && op.operands.len() >= 2
             {
                 let lhs = value_ident(module, op.operands[0], &mut names, &mut counter);
@@ -309,7 +198,7 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                     var: "p".to_string(),
                     lower: 0,
                     upper: k,
-                    step: tk.min(1),
+                    step: 1,
                     parallel: false,
                     vectorized: false,
                     unroll: 1,
@@ -320,14 +209,18 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                     let bias = value_ident(module, op.operands[2], &mut names, &mut counter);
                     let act = op
                         .attributes
-                        .get("activation")
+                        .get("epilogue")
+                        .or_else(|| op.attributes.get("activation"))
                         .and_then(|a| a.as_str())
                         .unwrap_or("none");
                     let base = format!("({dst}[i * {n} + j] + {bias}[j])");
                     let ep_expr = match act {
-                        "relu" => format!("fmaxf({base}, 0.0f)"),
-                        "silu" => format!("({base} / (1.0f + expf(-{base})))"),
-                        "gelu" => format!("(0.5f * {base} * (1.0f + tanhf(0.79788456f * {base})))"),
+                        "relu" | "bias_relu" => format!("fmaxf({base}, 0.0f)"),
+                        "silu" | "bias_silu" => format!("({base} / (1.0f + expf(-{base})))"),
+                        "gelu" | "bias_gelu" => {
+                            format!("(0.5f * {base} * (1.0f + tanhf(0.79788456f * {base})))")
+                        }
+                        "tanh" | "bias_tanh" => format!("tanhf({base})"),
                         _ => base,
                     };
                     i_body.push(LoopStmt::For {
@@ -636,242 +529,6 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
     }
 }
 
-/// Emits CUDA C++ (`.cu`) GPU kernels (`__global__ void`) for `module`.
-pub fn emit_cuda_module_with_config(module: &Module, base_config: &TargetConfig) -> Result<String> {
-    let loop_mod = lower_to_loop_ir(module, base_config);
-    let cfg = base_config.with_module_attributes(module);
-    emit_cuda_from_loop_ir(&loop_mod, &cfg)
-}
-
-/// Emits CUDA C++ (`.cu`) GPU kernels (`__global__ void`) from a lowered [`LoopModule`].
-pub fn emit_cuda_from_loop_ir(loop_mod: &LoopModule, cfg: &TargetConfig) -> Result<String> {
-    let mut out = String::new();
-    writeln!(out, "// Auto-generated by CastForge CUDA Backend")?;
-    writeln!(out, "#include <cuda_runtime.h>")?;
-    writeln!(out, "#include <math.h>\n")?;
-
-    for kernel in &loop_mod.kernels {
-        let mut sig_params: Vec<String> = kernel
-            .params
-            .iter()
-            .map(|(n, _)| format!("const float* __restrict__ {n}"))
-            .collect();
-        sig_params.push(format!("float* __restrict__ {}", kernel.output.0));
-        writeln!(
-            out,
-            "extern \"C\" __global__ void {}_cuda_kernel({}) {{",
-            kernel.name,
-            sig_params.join(", ")
-        )?;
-        writeln!(
-            out,
-            "    const int tid = blockIdx.x * blockDim.x + threadIdx.x;"
-        )?;
-        writeln!(
-            out,
-            "    __shared__ float shared_tile[{}];",
-            cfg.wgsl_workgroup_size.max(64)
-        )?;
-        writeln!(out, "    (void)shared_tile;")?;
-        for stmt in &kernel.body {
-            emit_cuda_stmt(&mut out, stmt, &kernel.output.0)?;
-        }
-        writeln!(out, "}}\n")?;
-    }
-    Ok(out)
-}
-
-fn emit_cuda_stmt(out: &mut String, stmt: &LoopStmt, ret_name: &str) -> Result<()> {
-    match stmt {
-        LoopStmt::Comment(c) => writeln!(out, "    // {c}")?,
-        LoopStmt::Alloc { name, len } if name != ret_name => {
-            writeln!(out, "    float {name}[{len}];")?;
-        }
-        LoopStmt::Alloc { .. } => {}
-        LoopStmt::For {
-            var,
-            upper,
-            unroll,
-            body,
-            ..
-        } => {
-            if *unroll > 1 {
-                writeln!(out, "    #pragma unroll {unroll}")?;
-            }
-            writeln!(
-                out,
-                "    for (int {var} = tid; {var} < {upper}; {var} += blockDim.x * gridDim.x) {{"
-            )?;
-            for inner in body {
-                emit_cuda_stmt_seq(out, inner, 2)?;
-            }
-            writeln!(out, "    }}")?;
-        }
-        LoopStmt::Assign { dst, index, expr } => {
-            writeln!(out, "    {dst}[{index}] = {expr};")?;
-        }
-    }
-    Ok(())
-}
-
-fn emit_cuda_stmt_seq(out: &mut String, stmt: &LoopStmt, indent: usize) -> Result<()> {
-    let pad = "    ".repeat(indent);
-    match stmt {
-        LoopStmt::Comment(c) => writeln!(out, "{pad}// {c}")?,
-        LoopStmt::Alloc { name, len } => writeln!(out, "{pad}float {name}[{len}];")?,
-        LoopStmt::For {
-            var,
-            lower,
-            upper,
-            step,
-            unroll,
-            body,
-            ..
-        } => {
-            if *unroll > 1 {
-                writeln!(out, "{pad}#pragma unroll {unroll}")?;
-            }
-            writeln!(
-                out,
-                "{pad}for (int {var} = {lower}; {var} < {upper}; {var} += {step}) {{"
-            )?;
-            for inner in body {
-                emit_cuda_stmt_seq(out, inner, indent + 1)?;
-            }
-            writeln!(out, "{pad}}}")?;
-        }
-        LoopStmt::Assign { dst, index, expr } => {
-            writeln!(out, "{pad}{dst}[{index}] = {expr};")?;
-        }
-    }
-    Ok(())
-}
-
-/// Emits Apple Metal Shading Language (`.metal`) GPU compute kernels for `module`.
-pub fn emit_msl_module_with_config(module: &Module, base_config: &TargetConfig) -> Result<String> {
-    let loop_mod = lower_to_loop_ir(module, base_config);
-    emit_msl_from_loop_ir(&loop_mod)
-}
-
-/// Emits Apple Metal Shading Language (`.metal`) GPU compute kernels from a [`LoopModule`].
-pub fn emit_msl_from_loop_ir(loop_mod: &LoopModule) -> Result<String> {
-    let mut out = String::new();
-    writeln!(out, "// Auto-generated by CastForge Metal (MSL) Backend")?;
-    writeln!(out, "#include <metal_stdlib>")?;
-    writeln!(out, "using namespace metal;\n")?;
-
-    for kernel in &loop_mod.kernels {
-        let mut sig_params = Vec::new();
-        for (idx, (n, _)) in kernel.params.iter().enumerate() {
-            sig_params.push(format!("device const float* {n} [[buffer({idx})]]"));
-        }
-        let out_idx = kernel.params.len();
-        sig_params.push(format!(
-            "device float* {} [[buffer({out_idx})]]",
-            kernel.output.0
-        ));
-        sig_params.push("uint gid [[thread_position_in_grid]]".to_string());
-        writeln!(
-            out,
-            "kernel void {}_msl_kernel({}) {{",
-            kernel.name,
-            sig_params.join(", ")
-        )?;
-        for stmt in &kernel.body {
-            emit_msl_stmt(&mut out, stmt, &kernel.output.0)?;
-        }
-        writeln!(out, "}}\n")?;
-    }
-    Ok(out)
-}
-
-fn emit_msl_stmt(out: &mut String, stmt: &LoopStmt, ret_name: &str) -> Result<()> {
-    match stmt {
-        LoopStmt::Comment(c) => writeln!(out, "    // {c}")?,
-        LoopStmt::Alloc { name, len } if name != ret_name => {
-            writeln!(out, "    float {name}[{len}];")?;
-        }
-        LoopStmt::Alloc { .. } => {}
-        LoopStmt::For {
-            var, upper, body, ..
-        } => {
-            writeln!(out, "    if (gid < {upper}u) {{")?;
-            writeln!(out, "        uint {var} = gid;")?;
-            for inner in body {
-                emit_cuda_stmt_seq(out, inner, 2)?;
-            }
-            writeln!(out, "    }}")?;
-        }
-        LoopStmt::Assign { dst, index, expr } => {
-            writeln!(out, "    {dst}[{index}] = {expr};")?;
-        }
-    }
-    Ok(())
-}
-
-/// Generates a C/C++ FFI header (`.h`) matching the C99 symbols emitted by `codegen-c`.
-pub fn emit_c_header(module: &Module) -> Result<String> {
-    let loop_mod = lower_to_loop_ir(module, &TargetConfig::default());
-    let guard = format!(
-        "CASTFORGE_{}_H",
-        sanitize_ident(&loop_mod.name).to_uppercase()
-    );
-    let mut out = String::new();
-    writeln!(out, "/* Auto-generated C/C++ FFI Header by CastForge */")?;
-    writeln!(out, "#ifndef {guard}")?;
-    writeln!(out, "#define {guard}\n")?;
-    writeln!(out, "#include <stddef.h>\n")?;
-    writeln!(out, "#ifdef __cplusplus")?;
-    writeln!(out, "extern \"C\" {{")?;
-    writeln!(out, "#endif\n")?;
-
-    for kernel in &loop_mod.kernels {
-        let mut args: Vec<String> = kernel
-            .params
-            .iter()
-            .map(|(n, len)| format!("const float {n}[{len}]"))
-            .collect();
-        args.push(format!("float {}[{}]", kernel.output.0, kernel.output.1));
-        writeln!(out, "void {}({});", kernel.name, args.join(", "))?;
-    }
-
-    writeln!(out, "\n#ifdef __cplusplus")?;
-    writeln!(out, "}}")?;
-    writeln!(out, "#endif\n")?;
-    writeln!(out, "#endif /* {guard} */")?;
-    Ok(out)
-}
-
-/// Compiles `module` into a native shared library (`.so` / `.dylib`) byte vector.
-pub fn compile_shared_lib(module: &Module, config: &TargetConfig) -> Result<Vec<u8>> {
-    let c_src = generate_code_with_config(module, CodegenTarget::C, config)?;
-    let seq = SHLIB_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    let tmp_dir = std::env::temp_dir().join(format!("castforge_shlib_{pid}_{seq}"));
-    fs::create_dir_all(&tmp_dir)?;
-    let src_path = tmp_dir.join("kernel.c");
-    let lib_path = tmp_dir.join("libcastforge_kernel.so");
-    fs::write(&src_path, &c_src)?;
-
-    let status = Command::new("cc")
-        .arg("-O3")
-        .arg("-shared")
-        .arg("-fPIC")
-        .arg(&src_path)
-        .arg("-lm")
-        .arg("-o")
-        .arg(&lib_path)
-        .status()
-        .context("Failed to invoke `cc` for shared library compilation")?;
-    if !status.success() {
-        let _ = fs::remove_dir_all(&tmp_dir);
-        bail!("`cc -shared` exited with non-zero status: {status}");
-    }
-    let bytes = fs::read(&lib_path).context("Failed to read compiled shared library")?;
-    let _ = fs::remove_dir_all(&tmp_dir);
-    Ok(bytes)
-}
-
 /// Progressive Lowering Translator (`Ir(Module) -> Text(LoopIR)`).
 #[derive(Default)]
 pub struct TensorToLoopTranslator {
@@ -924,54 +581,6 @@ impl Translator for OptimizeLoopIrTranslator {
         let mut loop_mod = lower_to_loop_ir(&module, &self.config);
         let _ = self.pass.run(&mut loop_mod);
         Ok(Payload::Text(loop_mod.to_string()))
-    }
-}
-
-/// C/C++ Header Translator (`Ir(Module) -> Text(C Header)`).
-#[derive(Default)]
-pub struct CHeaderTranslator;
-
-impl Translator for CHeaderTranslator {
-    fn name(&self) -> &str {
-        "codegen-header"
-    }
-
-    fn input_kind(&self) -> &'static str {
-        "ir"
-    }
-
-    fn output_kind(&self) -> &'static str {
-        "text"
-    }
-
-    fn translate(&mut self, input: Payload) -> Result<Payload> {
-        let module = input.into_ir()?;
-        Ok(Payload::Text(emit_c_header(&module)?))
-    }
-}
-
-/// Native Shared Library Translator (`Ir(Module) -> Bytes(.so/.dylib)`).
-#[derive(Default)]
-pub struct SharedLibTranslator {
-    pub config: TargetConfig,
-}
-
-impl Translator for SharedLibTranslator {
-    fn name(&self) -> &str {
-        "compile-lib"
-    }
-
-    fn input_kind(&self) -> &'static str {
-        "ir"
-    }
-
-    fn output_kind(&self) -> &'static str {
-        "bytes"
-    }
-
-    fn translate(&mut self, input: Payload) -> Result<Payload> {
-        let module = input.into_ir()?;
-        Ok(Payload::Bytes(compile_shared_lib(&module, &self.config)?))
     }
 }
 
@@ -1044,35 +653,54 @@ fn fuse_adjacent_for_loops(stmts: &mut Vec<LoopStmt>) -> usize {
     let mut fused = 0usize;
     let mut i = 0usize;
     while i + 1 < stmts.len() {
-        let can_fuse = match (&stmts[i], &stmts[i + 1]) {
-            (
-                LoopStmt::For {
-                    var: v1,
-                    lower: l1,
-                    upper: u1,
-                    step: s1,
-                    ..
-                },
-                LoopStmt::For {
-                    var: v2,
-                    lower: l2,
-                    upper: u2,
-                    step: s2,
-                    ..
-                },
-            ) => v1 == v2 && l1 == l2 && u1 == u2 && s1 == s2 && v1 == "idx",
-            _ => false,
+        let mut next_for_idx = i + 1;
+        while next_for_idx < stmts.len()
+            && matches!(
+                stmts[next_for_idx],
+                LoopStmt::Alloc { .. } | LoopStmt::Comment(_)
+            )
+        {
+            next_for_idx += 1;
+        }
+        let can_fuse = if next_for_idx < stmts.len() {
+            match (&stmts[i], &stmts[next_for_idx]) {
+                (
+                    LoopStmt::For {
+                        var: v1,
+                        lower: l1,
+                        upper: u1,
+                        step: s1,
+                        ..
+                    },
+                    LoopStmt::For {
+                        var: v2,
+                        lower: l2,
+                        upper: u2,
+                        step: s2,
+                        ..
+                    },
+                ) => v1 == v2 && l1 == l2 && u1 == u2 && s1 == s2 && v1 == "idx",
+                _ => false,
+            }
+        } else {
+            false
         };
         if can_fuse {
             let LoopStmt::For {
                 body: mut next_body,
                 ..
-            } = stmts.remove(i + 1)
+            } = stmts.remove(next_for_idx)
             else {
                 unreachable!()
             };
             if let LoopStmt::For { body, .. } = &mut stmts[i] {
                 body.append(&mut next_body);
+            }
+            while next_for_idx > i + 1 {
+                let hoisted = stmts.remove(i + 1);
+                stmts.insert(i, hoisted);
+                i += 1;
+                next_for_idx -= 1;
             }
             fused += 1;
         } else {

@@ -7,10 +7,12 @@ pub mod autotune;
 pub mod backend;
 pub mod cost_model;
 pub mod eval;
-pub mod loop_ir;
 pub mod memory_plan;
 pub mod target_c;
+pub mod target_cuda;
+pub mod target_msl;
 pub mod target_rust;
+pub mod target_wgsl;
 
 pub use crate::codegen::autotune::{
     AutotuneCandidate, AutotuneReport, AutotuneScheduleTranslator, JitBenchmarkResult,
@@ -18,8 +20,7 @@ pub use crate::codegen::autotune::{
 };
 pub use crate::codegen::backend::{
     BackendRegistry, C99Backend, CodegenBackend, CudaBackend, CustomBackendTranslator, HipBackend,
-    MslBackend, OpenClBackend, RustBackend, WgslBackend, emit_c_like_loop_stmt, emit_wgsl_module,
-    emit_wgsl_module_with_config,
+    MslBackend, OpenClBackend, RustBackend, WgslBackend, emit_c_like_loop_stmt,
 };
 pub use crate::codegen::cost_model::{
     BottleneckKind, GemmLoopOrder, HardwareRoofline, ModuleCostReport, OpCostProfile, SimdIsa,
@@ -30,16 +31,24 @@ pub use crate::codegen::eval::{
     compare_output_tensors, evaluate_function, evaluate_module, generate_synthetic_inputs,
     verify_module_numerics,
 };
-pub use crate::codegen::loop_ir::{
-    CHeaderTranslator, LoopKernel, LoopModule, LoopPass, LoopStmt, OptimizeLoopIrPass,
-    OptimizeLoopIrTranslator, SharedLibTranslator, TensorToLoopTranslator, compile_shared_lib,
-    emit_c_header, emit_cuda_module_with_config, emit_msl_module_with_config, lower_to_loop_ir,
-};
 pub use crate::codegen::memory_plan::{
     BufferAllocation, LiveInterval, MemoryPlan, build_memory_plan, compute_block_liveness,
     compute_module_liveness,
 };
+pub use crate::codegen::target_c::{
+    CHeaderTranslator, SharedLibTranslator, compile_shared_lib, emit_c_header, emit_c_module,
+    emit_c_module_with_config,
+};
+pub use crate::codegen::target_cuda::{emit_cuda_from_loop_ir, emit_cuda_module_with_config};
+pub use crate::codegen::target_msl::{emit_msl_from_loop_ir, emit_msl_module_with_config};
+pub use crate::codegen::target_rust::{emit_rust_module, emit_rust_module_with_config};
+pub use crate::codegen::target_wgsl::{emit_wgsl_module, emit_wgsl_module_with_config};
+pub use crate::ir::loop_ir::{LoopKernel, LoopModule, LoopStmt};
 use crate::ir::{Dim, Module, TensorType, ValueId};
+pub use crate::passes::schedule_loops::loop_opt::{
+    LoopPass, OptimizeLoopIrPass, OptimizeLoopIrTranslator, TensorToLoopTranslator,
+    lower_to_loop_ir,
+};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -256,4 +265,100 @@ pub(crate) fn tensor_shape_dims(t: &TensorType) -> Vec<usize> {
             _ => 1,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::parse_mlir;
+
+    #[test]
+    fn test_codegen_liveness_dead_values_loop_ir_and_targets() {
+        // 1. Dead/orphaned values after DCE should not inflate build_memory_plan
+        let src = concat!(
+            "module @dead_val_test {\n",
+            "  func.func @forward(%x: tensor<4xf32>) -> tensor<4xf32> {\n",
+            "    %dead_c = stablehlo.constant dense<[1.0, 2.0, 3.0, 4.0]> : tensor<4xf32>\n",
+            "    %dead_op = stablehlo.exponential %dead_c : tensor<4xf32>\n",
+            "    %y = stablehlo.tanh %x : tensor<4xf32>\n",
+            "    func.return %y : tensor<4xf32>\n",
+            "  }\n",
+            "}\n",
+        );
+        let mut module = parse_mlir(src).unwrap();
+        let fn_op = module.functions()[0];
+        let reg_id = module.ops[fn_op].regions[0];
+        let blk_id = module.regions[reg_id].blocks[0];
+        module.blocks[blk_id].ops.drain(0..2);
+        let plan = build_memory_plan(&module);
+        assert_eq!(plan.total_constant_bytes, 0);
+        assert_eq!(plan.naive_activation_bytes, 32);
+
+        // 2. OptimizeLoopIrPass fuses consecutive elementwise idx loops across Alloc stmts
+        let chain_src = concat!(
+            "module @loop_fuse_test {\n",
+            "  func.func @forward(%x: tensor<8xf32>) -> tensor<8xf32> {\n",
+            "    %a = stablehlo.exponential %x : tensor<8xf32>\n",
+            "    %b = stablehlo.tanh %a : tensor<8xf32>\n",
+            "    %c = stablehlo.cosine %b : tensor<8xf32>\n",
+            "    func.return %c : tensor<8xf32>\n",
+            "  }\n",
+            "}\n",
+        );
+        let chain_mod = parse_mlir(chain_src).unwrap();
+        let mut loop_mod = lower_to_loop_ir(&chain_mod, &TargetConfig::default());
+        let mut opt = OptimizeLoopIrPass::default();
+        assert!(opt.run(&mut loop_mod) > 0);
+        let for_count = loop_mod.kernels[0]
+            .body
+            .iter()
+            .filter(|s| matches!(s, LoopStmt::For { .. }))
+            .count();
+        assert_eq!(for_count, 1);
+
+        // 3. Reduce with reducer_op = "stablehlo.maximum" across eval, Rust, C99, WGSL
+        let red_src = concat!(
+            "module @reduce_max_test {\n",
+            "  func.func @forward(%x: tensor<2x2xf32>) -> tensor<2xf32> {\n",
+            "    %init = stablehlo.constant dense<-100.0> : tensor<f32>\n",
+            "    %r = stablehlo.reduce %x, %init\n",
+            "      {dimensions = [1], reducer = \"stablehlo.maximum\"}\n",
+            "      : (tensor<2x2xf32>, tensor<f32>) -> tensor<2xf32>\n",
+            "    func.return %r : tensor<2xf32>\n",
+            "  }\n",
+            "}\n",
+        );
+        let red_mod = parse_mlir(red_src).unwrap();
+        let out = evaluate_module(&red_mod, &[vec![1.0, 5.0, -3.0, 2.0]]).unwrap();
+        assert_eq!(out, vec![vec![5.0, 2.0]]);
+        let r_code = emit_rust_module(&red_mod).unwrap();
+        assert!(r_code.contains("acc = acc.max("));
+        let c_code = emit_c_module(&red_mod).unwrap();
+        assert!(c_code.contains("fmaxf(acc,"));
+        let w_code = emit_wgsl_module(&red_mod).unwrap();
+        assert!(w_code.contains("max(acc,"));
+
+        // 4. WGSL fused_log_softmax and register-tiled GEMM tail cleanup
+        let lsm_src = concat!(
+            "module @wgsl_lsm {\n",
+            "  func.func @forward(%x: tensor<2x3xf32>, %w: tensor<3x3xf32>) -> tensor<2x3xf32> {\n",
+            "    %mm = stablehlo.dot_general %x, %w, contracting_dims = [1] x [0]\n",
+            "      : (tensor<2x3xf32>, tensor<3x3xf32>) -> tensor<2x3xf32>\n",
+            "    %y = stablehlo.composite %mm {name = \"castforge.fused_log_softmax\"}\n",
+            "      : (tensor<2x3xf32>) -> tensor<2x3xf32>\n",
+            "    func.return %y : tensor<2x3xf32>\n",
+            "  }\n",
+            "}\n",
+        );
+        let lsm_mod = parse_mlir(lsm_src).unwrap();
+        let wgsl_lsm = emit_wgsl_module(&lsm_mod).unwrap();
+        assert!(wgsl_lsm.contains("let lse: f32 = max_v + log(sum_exp);"));
+        let mut reg_cfg = TargetConfig::default();
+        reg_cfg.reg_tile_m = 2;
+        reg_cfg.reg_tile_n = 2;
+        let rust_tiled = emit_rust_module_with_config(&lsm_mod, &reg_cfg).unwrap();
+        assert!(rust_tiled.contains("for n in 2..3"));
+        let c_tiled = emit_c_module_with_config(&lsm_mod, &reg_cfg).unwrap();
+        assert!(c_tiled.contains("for (int n = 2; n < 3; ++n)"));
+    }
 }

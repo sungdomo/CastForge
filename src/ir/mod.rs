@@ -7,6 +7,7 @@
 //! [`TranslatorChain`] A-to-B pipeline abstraction.
 
 pub mod formats;
+pub mod loop_ir;
 pub mod mlir;
 pub mod parser;
 pub mod pass_manager;
@@ -23,6 +24,7 @@ pub use formats::{
     export_gguf_file, export_onnx_file, export_onnx_json, import_gguf_bytes, import_gguf_file,
     import_hf_config_json, import_hf_model_dir, import_onnx_file, import_onnx_json,
 };
+pub use loop_ir::{LoopKernel, LoopModule, LoopStmt};
 pub use mlir::*;
 pub use parser::{MlirParseTranslator, MlirParser, ParseError, parse_mlir, parse_type};
 pub use pass_manager::*;
@@ -164,7 +166,10 @@ impl TranslatorChain {
                 ));
             }
             current = stage.translate(current).map_err(|e| {
-                anyhow!("TranslatorChain stage {idx} (`{}`) failed: {e}", stage.name())
+                anyhow!(
+                    "TranslatorChain stage {idx} (`{}`) failed: {e}",
+                    stage.name()
+                )
             })?;
         }
         Ok(current)
@@ -298,7 +303,10 @@ mod tests {
         let dg_fn = dg_mod.functions()[0];
         let dg_blk = dg_mod.regions[dg_mod.ops[dg_fn].regions[0]].blocks[0];
         let iota_op = &dg_mod.ops[dg_mod.blocks[dg_blk].ops[0]];
-        assert_eq!(iota_op.attributes.get("iota_dimension"), Some(&Attribute::Int(1)));
+        assert_eq!(
+            iota_op.attributes.get("iota_dimension"),
+            Some(&Attribute::Int(1))
+        );
         let dot_op = &dg_mod.ops[dg_mod.blocks[dg_blk].ops[1]];
         assert_eq!(
             dot_op.attributes.get("lhs_batching_dimensions"),

@@ -1,3 +1,6 @@
+//! Reference IR interpreter (`evaluate_module`, `evaluate_function`) and numerical verification /
+//! pass bisection engine (`verify_module_numerics`, `bisect_module_snapshots`).
+
 use crate::codegen::{tensor_len, tensor_shape_dims};
 use crate::ir::{DType, Module, OpId, ValueId};
 use crate::stablehlo::StableHloOp;
@@ -365,42 +368,46 @@ fn eval_stablehlo_op(
         env.insert(res_val, out);
         return Ok(());
     }
-    let Some(hlo) = StableHloOp::from_op(op) else {
+    let hlo_opt = StableHloOp::from_op(op).or_else(|| {
+        if op.name.dialect == "castforge" {
+            Some(StableHloOp::Composite {
+                name: format!("castforge.{}", op.name.name),
+                decomposition: String::new(),
+                inputs: op.operands.to_vec(),
+                results: op.results.to_vec(),
+            })
+        } else {
+            None
+        }
+    });
+    let Some(hlo) = hlo_opt else {
         env.insert(res_val, vec![0.0; res_len]);
         return Ok(());
     };
 
+    let eval_bin = |lhs: ValueId, rhs: ValueId, f: fn(f32, f32) -> f32| -> Vec<f32> {
+        let va = get_v(lhs);
+        let vb = get_v(rhs);
+        let la = va.len().max(1);
+        let lb = vb.len().max(1);
+        (0..res_len)
+            .map(|i| {
+                let a = va.get(i % la).copied().unwrap_or(0.0);
+                let b = vb.get(i % lb).copied().unwrap_or(0.0);
+                f(a, b)
+            })
+            .collect()
+    };
+
     let out: Vec<f32> = match hlo {
-        StableHloOp::Add { lhs, rhs, .. } => get_v(lhs)
-            .iter()
-            .zip(get_v(rhs).iter())
-            .map(|(a, b)| a + b)
-            .collect(),
-        StableHloOp::Subtract { lhs, rhs, .. } => get_v(lhs)
-            .iter()
-            .zip(get_v(rhs).iter())
-            .map(|(a, b)| a - b)
-            .collect(),
-        StableHloOp::Multiply { lhs, rhs, .. } => get_v(lhs)
-            .iter()
-            .zip(get_v(rhs).iter())
-            .map(|(a, b)| a * b)
-            .collect(),
-        StableHloOp::Divide { lhs, rhs, .. } => get_v(lhs)
-            .iter()
-            .zip(get_v(rhs).iter())
-            .map(|(a, b)| if b.abs() > 1e-12 { a / b } else { 0.0 })
-            .collect(),
-        StableHloOp::Maximum { lhs, rhs, .. } => get_v(lhs)
-            .iter()
-            .zip(get_v(rhs).iter())
-            .map(|(a, b)| a.max(*b))
-            .collect(),
-        StableHloOp::Minimum { lhs, rhs, .. } => get_v(lhs)
-            .iter()
-            .zip(get_v(rhs).iter())
-            .map(|(a, b)| a.min(*b))
-            .collect(),
+        StableHloOp::Add { lhs, rhs, .. } => eval_bin(lhs, rhs, |a, b| a + b),
+        StableHloOp::Subtract { lhs, rhs, .. } => eval_bin(lhs, rhs, |a, b| a - b),
+        StableHloOp::Multiply { lhs, rhs, .. } => eval_bin(lhs, rhs, |a, b| a * b),
+        StableHloOp::Divide { lhs, rhs, .. } => {
+            eval_bin(lhs, rhs, |a, b| if b.abs() > 1e-12 { a / b } else { 0.0 })
+        }
+        StableHloOp::Maximum { lhs, rhs, .. } => eval_bin(lhs, rhs, f32::max),
+        StableHloOp::Minimum { lhs, rhs, .. } => eval_bin(lhs, rhs, f32::min),
         StableHloOp::Exp { operand, .. } => get_v(operand).into_iter().map(|x| x.exp()).collect(),
         StableHloOp::Tanh { operand, .. } => get_v(operand).into_iter().map(|x| x.tanh()).collect(),
         StableHloOp::Rsqrt { operand, .. } => {
@@ -418,11 +425,7 @@ fn eval_stablehlo_op(
             .into_iter()
             .map(|x| 1.0 / (1.0 + (-x).exp()))
             .collect(),
-        StableHloOp::Power { lhs, rhs, .. } => get_v(lhs)
-            .iter()
-            .zip(get_v(rhs).iter())
-            .map(|(&a, &b)| a.powf(b))
-            .collect(),
+        StableHloOp::Power { lhs, rhs, .. } => eval_bin(lhs, rhs, f32::powf),
         StableHloOp::Clamp {
             min, operand, max, ..
         } => {
@@ -854,16 +857,30 @@ fn eval_stablehlo_op(
         StableHloOp::Reduce {
             inputs,
             init_values,
+            reducer_op,
             ..
         } => {
             let inp = get_v(inputs[0]);
-            let init = get_v(init_values[0]).first().copied().unwrap_or(0.0);
+            let init = init_values
+                .first()
+                .and_then(|&v| get_v(v).first().copied())
+                .unwrap_or(0.0);
             let inner = (inp.len() / res_len.max(1)).max(1);
+            let red_op = reducer_op.as_deref().unwrap_or("add");
             (0..res_len)
                 .map(|o| {
                     let mut acc = init;
                     for k in 0..inner {
-                        acc += inp[o * inner + k];
+                        let v = inp[o * inner + k];
+                        if red_op.contains("maximum") {
+                            acc = acc.max(v);
+                        } else if red_op.contains("minimum") {
+                            acc = acc.min(v);
+                        } else if red_op.contains("multiply") {
+                            acc *= v;
+                        } else {
+                            acc += v;
+                        }
                     }
                     acc
                 })
@@ -912,15 +929,17 @@ fn eval_stablehlo_op(
                     .get(3)
                     .map(|&v| get_v(v))
                     .unwrap_or_else(|| vec![0.0; res_len]);
+                let b_len = bias.len().max(1);
+                let z_len = z.len().max(1);
                 (0..res_len)
                     .map(|i| {
-                        let val = mm[i] + bias[i];
+                        let val = mm[i] + bias[i % b_len];
                         match epilogue {
-                            "bias_relu" => val.max(z[i]),
-                            "bias_tanh" => val.tanh(),
-                            "bias_silu" => val / (1.0 + (-val).exp()),
-                            "bias_gelu" => eval_gelu_scalar(val),
-                            "bias_scale" => val * z[i],
+                            "bias_relu" | "relu" => val.max(z[i % z_len]),
+                            "bias_tanh" | "tanh" => val.tanh(),
+                            "bias_silu" | "silu" => val / (1.0 + (-val).exp()),
+                            "bias_gelu" | "gelu" => eval_gelu_scalar(val),
+                            "bias_scale" => val * z[i % z_len],
                             _ => val,
                         }
                     })
@@ -1053,15 +1072,17 @@ fn eval_stablehlo_op(
                         .get(3)
                         .map(|&v| get_v(v))
                         .unwrap_or_else(|| vec![0.0; res_len]);
+                    let b_len = bias.len().max(1);
+                    let z_len = z.len().max(1);
                     (0..res_len)
                         .map(|i| {
-                            let val = mm[i] + bias[i];
+                            let val = mm[i] + bias[i % b_len];
                             match epilogue {
-                                "bias_relu" => val.max(z[i]),
-                                "bias_tanh" => val.tanh(),
-                                "bias_silu" => val / (1.0 + (-val).exp()),
-                                "bias_gelu" => eval_gelu_scalar(val),
-                                "bias_scale" => val * z[i],
+                                "bias_relu" | "relu" => val.max(z[i % z_len]),
+                                "bias_tanh" | "tanh" => val.tanh(),
+                                "bias_silu" | "silu" => val / (1.0 + (-val).exp()),
+                                "bias_gelu" | "gelu" => eval_gelu_scalar(val),
+                                "bias_scale" => val * z[i % z_len],
                                 _ => val,
                             }
                         })

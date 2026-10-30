@@ -697,9 +697,9 @@ pub fn run() -> Result<()> {
                 "gguf" => import_gguf_file(&input)?,
                 "hf" | "huggingface" | "config.json" => import_hf_model_dir(&input)?,
                 "onnx" | "onnx.json" | "json" => import_onnx_file(&input)?,
-                other => anyhow::bail!(
-                    "Unknown import format `{other}` (expected: gguf, onnx, or hf)"
-                ),
+                other => {
+                    anyhow::bail!("Unknown import format `{other}` (expected: gguf, onnx, or hf)")
+                }
             };
             if let Some(spec) = passes {
                 let registry = PassRegistry::with_builtin_passes();
@@ -876,9 +876,8 @@ pub fn run() -> Result<()> {
                     .iter()
                     .map(|&(name, desc)| {
                         let cat = registry.catalog_entry(name);
-                        let children: Vec<String> = cat
-                            .map(|c| c.child_passes.clone())
-                            .unwrap_or_else(|| {
+                        let children: Vec<String> =
+                            cat.map(|c| c.child_passes.clone()).unwrap_or_else(|| {
                                 registry
                                     .create_pass(name, &Default::default())
                                     .ok()
@@ -902,7 +901,11 @@ pub fn run() -> Result<()> {
                 format!("{}\n", serde_json::to_string_pretty(&items)?)
             } else {
                 let mut out = String::new();
-                let _ = writeln!(out, "Available CastForge Passes ({} matched):", entries.len());
+                let _ = writeln!(
+                    out,
+                    "Available CastForge Passes ({} matched):",
+                    entries.len()
+                );
                 let _ = writeln!(out, "{:<28} {:<18} DESCRIPTION", "PASS NAME", "FAMILY");
                 let _ = writeln!(out, "{}", "-".repeat(96));
                 for (name, desc) in entries {
@@ -910,9 +913,8 @@ pub fn run() -> Result<()> {
                     let family = cat.map(|c| c.family.as_str()).unwrap_or("custom");
                     let _ = writeln!(out, "{:<28} {:<18} {}", name, family, desc);
                     if tree {
-                        let children: Vec<String> = cat
-                            .map(|c| c.child_passes.clone())
-                            .unwrap_or_else(|| {
+                        let children: Vec<String> =
+                            cat.map(|c| c.child_passes.clone()).unwrap_or_else(|| {
                                 registry
                                     .create_pass(name, &Default::default())
                                     .ok()
@@ -1040,7 +1042,9 @@ fn run_direct_pass(registry: &PassRegistry, args: &[String]) -> Result<()> {
             "--bisect" => {
                 bisect = true;
             }
-            kv if !kv.starts_with('-') && kv.contains('=') && !std::path::Path::new(kv).exists() =>
+            kv if !kv.starts_with('-')
+                && kv.contains('=')
+                && !std::path::Path::new(kv).exists() =>
             {
                 extra_opts.push(kv.to_string());
             }

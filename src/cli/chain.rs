@@ -598,8 +598,11 @@ mod tests {
             let instance = reg
                 .create_pass(name, &Default::default())
                 .unwrap_or_else(|e| panic!("failed to instantiate `{name}`: {e}"));
-            let expected_children: Vec<String> =
-                instance.child_passes().iter().map(|s| (*s).to_string()).collect();
+            let expected_children: Vec<String> = instance
+                .child_passes()
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
             assert_eq!(
                 entry.child_passes, expected_children,
                 "child_passes mismatch for `{name}` in config/passes.toml"

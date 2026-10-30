@@ -1,9 +1,7 @@
 //! Model, IR, weight (`TensorStore`), and hardware target inspection (`castforge inspect` &
 //! `castforge list-targets`).
 
-use crate::codegen::{
-    HardwareRoofline, TargetConfig, analyze_module_cost, build_memory_plan,
-};
+use crate::codegen::{HardwareRoofline, TargetConfig, analyze_module_cost, build_memory_plan};
 use crate::ir::{
     Attribute, BlockId, Module, TensorStore, import_gguf_file, import_hf_model_dir,
     import_onnx_file, parse_mlir,
@@ -268,7 +266,10 @@ fn inspect_block_ops(
         *op_counts.entry(op_key).or_insert(0) += 1;
 
         if op.is_op("stablehlo", "constant")
-            && !matches!(op.attributes.get("value"), Some(Attribute::TensorRef { .. }))
+            && !matches!(
+                op.attributes.get("value"),
+                Some(Attribute::TensorRef { .. })
+            )
             && let Some(&res_id) = op.results.first()
             && let Some(tt) = module.values[res_id].ty.as_tensor()
         {
@@ -412,8 +413,8 @@ fn load_any_module(input: Option<&PathBuf>) -> Result<Module> {
         } else if lower.ends_with(".onnx") || lower.ends_with(".onnx.json") {
             return import_onnx_file(path);
         }
-        let src =
-            fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+        let src = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
         return Ok(parse_mlir(&src)?);
     }
     let mut buf = String::new();
@@ -424,11 +425,7 @@ fn load_any_module(input: Option<&PathBuf>) -> Result<Module> {
 }
 
 /// Lists all codegen targets, hardware `--arch` profiles, and composable translator stages.
-pub fn run_list_targets(
-    filter: Option<&str>,
-    json: bool,
-    output: Option<&PathBuf>,
-) -> Result<()> {
+pub fn run_list_targets(filter: Option<&str>, json: bool, output: Option<&PathBuf>) -> Result<()> {
     let catalog = target_catalog();
     let q = filter.unwrap_or("").trim().to_ascii_lowercase();
     let targets: Vec<&TargetBackendInfo> = catalog
@@ -437,7 +434,9 @@ pub fn run_list_targets(
         .filter(|t| {
             q.is_empty()
                 || t.target.to_ascii_lowercase().contains(&q)
-                || t.aliases.iter().any(|a| a.to_ascii_lowercase().contains(&q))
+                || t.aliases
+                    .iter()
+                    .any(|a| a.to_ascii_lowercase().contains(&q))
                 || t.description.to_ascii_lowercase().contains(&q)
         })
         .collect();
@@ -529,12 +528,11 @@ pub fn run_list_targets(
             );
         }
 
-        let _ = writeln!(out, "\n=== Translator Chain Stages (castforge chain -s) ===");
         let _ = writeln!(
             out,
-            "{:<24} {:<14} DESCRIPTION",
-            "STAGE", "SIGNATURE"
+            "\n=== Translator Chain Stages (castforge chain -s) ==="
         );
+        let _ = writeln!(out, "{:<24} {:<14} DESCRIPTION", "STAGE", "SIGNATURE");
         let _ = writeln!(out, "{}", "-".repeat(92));
         for tr in translators {
             let _ = writeln!(

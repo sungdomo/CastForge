@@ -465,16 +465,36 @@ fn profile_single_op(module: &Module, op_id: OpId, roofline: &HardwareRoofline) 
         | "logistic"
         | "tanh"
         | "exp"
+        | "exponential"
         | "log"
+        | "sine"
+        | "cosine"
         | "rsqrt"
         | "sqrt"
         | "rms_norm"
         | "fused_rmsnorm"
         | "fused_residual_rmsnorm"
-        | "fused_softmax" => 4 * out_elems,
-        "fma" => 2 * out_elems,
+        | "fused_softmax"
+        | "fused_log_softmax" => 4 * out_elems,
+        "fma" | "fused_add_max" => 2 * out_elems,
+        "fused_moe" => {
+            let lhs_dims = op
+                .operands
+                .first()
+                .map(|&v| static_dims(module, v))
+                .unwrap_or_default();
+            let k = lhs_dims.last().copied().unwrap_or(1);
+            4 * out_elems * k + 3 * out_elems
+        }
+        "fused_map_reduce" => {
+            2 * op
+                .operands
+                .first()
+                .map(|&v| value_elems(module, v))
+                .unwrap_or(out_elems)
+        }
         "add" | "subtract" | "multiply" | "divide" | "maximum" | "minimum" | "power" | "negate"
-        | "abs" | "relu" | "clamp" | "dequantize_int8" => out_elems,
+        | "abs" | "relu" | "clamp" | "dequantize_int8" | "uniform_dequantize" => out_elems,
         "reduce" | "reduce_sum" | "reduce_max" => op
             .operands
             .first()
@@ -486,10 +506,21 @@ fn profile_single_op(module: &Module, op_id: OpId, roofline: &HardwareRoofline) 
                 .get(1)
                 .map(|&v| static_dims(module, v))
                 .unwrap_or_default();
-            let kh = rhs_dims.first().copied().unwrap_or(1);
-            let kw = rhs_dims.get(1).copied().unwrap_or(1);
-            let ci = rhs_dims.get(2).copied().unwrap_or(1);
-            2 * out_elems * kh * kw * ci
+            let out_dims = op
+                .results
+                .first()
+                .map(|&v| static_dims(module, v))
+                .unwrap_or_default();
+            let rhs_total: u64 = rhs_dims.iter().copied().product::<u64>().max(1);
+            let c_out = out_dims
+                .last()
+                .copied()
+                .filter(|&c| rhs_dims.last() == Some(&c))
+                .or_else(|| rhs_dims.first().copied())
+                .unwrap_or(1)
+                .max(1);
+            let k_total = (rhs_total / c_out).max(1);
+            2 * out_elems * k_total
         }
         "im2col" => 0,
         _ => 0,

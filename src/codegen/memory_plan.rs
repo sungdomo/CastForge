@@ -1,3 +1,6 @@
+//! Static liveness analysis ([`LiveInterval`]) and interval-coloring arena buffer planner
+//! ([`MemoryPlan`], [`build_memory_plan`]).
+
 use crate::ir::{Attribute, BlockId, Module, ValueDef, ValueId};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -94,29 +97,40 @@ pub fn compute_module_liveness(module: &Module) -> HashMap<ValueId, LiveInterval
             }
         }
     }
-    // Fallback for any standalone values not in a function block
-    for (val_id, val) in &module.values {
-        if val.ty.as_tensor().is_none() || all.contains_key(&val_id) {
-            continue;
+    // Fallback for standalone modules without a `func.func` wrapper
+    if all.is_empty() {
+        if let Some(&blk_id) = module
+            .regions
+            .get(module.root_region)
+            .and_then(|r| r.blocks.first())
+        {
+            for iv in compute_block_liveness(module, blk_id) {
+                all.insert(iv.value, iv);
+            }
         }
-        let is_const = match val.def {
-            ValueDef::OpResult { op, .. } => module
-                .ops
-                .get(op)
-                .is_some_and(|o| o.is_op("stablehlo", "constant")),
-            _ => false,
-        };
-        all.insert(
-            val_id,
-            LiveInterval {
-                value: val_id,
-                first_def: 0,
-                last_use: 0,
-                is_constant: is_const,
-                is_block_arg: matches!(val.def, ValueDef::BlockArgument { .. }),
-                is_returned: false,
-            },
-        );
+        for (val_id, val) in &module.values {
+            if val.ty.as_tensor().is_none() || all.contains_key(&val_id) {
+                continue;
+            }
+            let is_const = match val.def {
+                ValueDef::OpResult { op, .. } => module
+                    .ops
+                    .get(op)
+                    .is_some_and(|o| o.is_op("stablehlo", "constant")),
+                _ => false,
+            };
+            all.insert(
+                val_id,
+                LiveInterval {
+                    value: val_id,
+                    first_def: 0,
+                    last_use: 0,
+                    is_constant: is_const,
+                    is_block_arg: matches!(val.def, ValueDef::BlockArgument { .. }),
+                    is_returned: false,
+                },
+            );
+        }
     }
     all
 }
@@ -214,19 +228,14 @@ pub fn build_memory_plan(module: &Module) -> MemoryPlan {
     let mut slots: Vec<ArenaSlot> = Vec::new();
 
     for (val_id, val) in &module.values {
+        let Some(&iv) = liveness.get(&val_id) else {
+            continue;
+        };
         let Some(t_ty) = val.ty.as_tensor() else {
             continue;
         };
         let elems = t_ty.num_elements().unwrap_or(1).max(1) as usize;
         let bytes = (elems * t_ty.dtype.bit_width()).div_ceil(8);
-        let iv = liveness.get(&val_id).copied().unwrap_or(LiveInterval {
-            value: val_id,
-            first_def: 0,
-            last_use: 0,
-            is_constant: false,
-            is_block_arg: false,
-            is_returned: false,
-        });
 
         let name = val
             .ssa_name

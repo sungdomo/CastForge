@@ -1,3 +1,5 @@
+//! Standalone Rust (`no_std`-compatible) source code generator (`CodegenTarget::Rust`).
+
 use crate::codegen::{
     GemmLoopOrder, MemoryPlan, SimdIsa, TargetConfig, build_memory_plan, sanitize_ident,
     tensor_len, tensor_shape_dims, value_ident,
@@ -115,6 +117,26 @@ fn r_idx(
         let name = value_ident(module, val_id, names, counter);
         format!("{name}[{idx_expr}]")
     }
+}
+
+fn r_bcast_idx(
+    module: &Module,
+    plan: &MemoryPlan,
+    val_id: ValueId,
+    idx_expr: &str,
+    res_len: usize,
+    names: &mut HashMap<ValueId, String>,
+    counter: &mut usize,
+) -> String {
+    let op_len = tensor_len(module, val_id).max(1);
+    let idx = if op_len == 1 && res_len > 1 {
+        "0".to_string()
+    } else if op_len < res_len {
+        format!("({idx_expr}) % {op_len}")
+    } else {
+        idx_expr.to_string()
+    };
+    r_idx(module, plan, val_id, &idx, names, counter)
 }
 
 fn emit_rust_func(
@@ -351,7 +373,16 @@ fn emit_rust_hlo_op(
     if let Some(Attribute::Int(sid)) = op.attributes.get("stream_id") {
         writeln!(out, "    // [stream:launch(stream_id={sid})]")?;
     }
-    let Some(hlo) = StableHloOp::from_op(op) else {
+    let hlo = if op.name.dialect == "castforge" {
+        StableHloOp::Composite {
+            name: format!("castforge.{}", op.name.name),
+            inputs: op.operands.to_vec(),
+            decomposition: String::new(),
+            results: op.results.to_vec(),
+        }
+    } else if let Some(h) = StableHloOp::from_op(op) {
+        h
+    } else {
         return Ok(());
     };
 
@@ -362,8 +393,8 @@ fn emit_rust_hlo_op(
         | StableHloOp::Divide { lhs, rhs, .. }
         | StableHloOp::Maximum { lhs, rhs, .. }
         | StableHloOp::Minimum { lhs, rhs, .. } => {
-            let a = r_idx(module, plan, lhs, "i", names, counter);
-            let b = r_idx(module, plan, rhs, "i", names, counter);
+            let a = r_bcast_idx(module, plan, lhs, "i", res_len, names, counter);
+            let b = r_bcast_idx(module, plan, rhs, "i", res_len, names, counter);
             let dst = r_idx(module, plan, res_val, "i", names, counter);
             let expr = match op.name.name.as_str() {
                 "add" => format!("{a} + {b}"),
@@ -409,8 +440,8 @@ fn emit_rust_hlo_op(
             writeln!(out, "    }}")?;
         }
         StableHloOp::Power { lhs, rhs, .. } => {
-            let a = r_idx(module, plan, lhs, "i", names, counter);
-            let b = r_idx(module, plan, rhs, "i", names, counter);
+            let a = r_bcast_idx(module, plan, lhs, "i", res_len, names, counter);
+            let b = r_bcast_idx(module, plan, rhs, "i", res_len, names, counter);
             let dst = r_idx(module, plan, res_val, "i", names, counter);
             writeln!(out, "    for i in 0..{res_len} {{")?;
             writeln!(out, "        {dst} = ({a}).powf({b});")?;
@@ -579,6 +610,7 @@ fn emit_rust_hlo_op(
         StableHloOp::Reduce {
             inputs,
             init_values,
+            reducer_op,
             ..
         } => {
             let in_len = tensor_len(module, inputs[0]);
@@ -593,10 +625,20 @@ fn emit_rust_hlo_op(
                 counter,
             );
             let dst = r_idx(module, plan, res_val, "o", names, counter);
+            let red_op = reducer_op.as_deref().unwrap_or("add");
+            let red_stmt = if red_op.contains("max") {
+                format!("acc = acc.max({src});")
+            } else if red_op.contains("min") {
+                format!("acc = acc.min({src});")
+            } else if red_op.contains("mul") {
+                format!("acc *= {src};")
+            } else {
+                format!("acc += {src};")
+            };
             writeln!(out, "    for o in 0..{res_len} {{")?;
             writeln!(out, "        let mut acc = {init0};")?;
             writeln!(out, "        for k in 0..{inner} {{")?;
-            writeln!(out, "            acc += {src};")?;
+            writeln!(out, "            {red_stmt}")?;
             writeln!(out, "        }}")?;
             writeln!(out, "        {dst} = acc;")?;
             writeln!(out, "    }}")?;
@@ -733,6 +775,24 @@ fn emit_rust_hlo_op(
                 }
                 writeln!(out, "        }}")?;
                 writeln!(out, "    }}")?;
+                if n_main < n {
+                    writeln!(out, "    for m in 0..{m_main} {{")?;
+                    writeln!(out, "        for n in {n_main}..{n} {{")?;
+                    writeln!(out, "            let mut acc = 0.0_f32;")?;
+                    writeln!(out, "            for k in 0..{k} {{ acc += {a} * {b}; }}")?;
+                    writeln!(out, "            {dst} = acc;")?;
+                    writeln!(out, "        }}")?;
+                    writeln!(out, "    }}")?;
+                }
+                if m_main < m {
+                    writeln!(out, "    for m in {m_main}..{m} {{")?;
+                    writeln!(out, "        for n in 0..{n} {{")?;
+                    writeln!(out, "            let mut acc = 0.0_f32;")?;
+                    writeln!(out, "            for k in 0..{k} {{ acc += {a} * {b}; }}")?;
+                    writeln!(out, "            {dst} = acc;")?;
+                    writeln!(out, "        }}")?;
+                    writeln!(out, "    }}")?;
+                }
             } else if config.is_tiled() {
                 let (tm, tn, tk) = (config.tile_m, config.tile_n, config.tile_k);
                 if config.double_buffer {
@@ -926,7 +986,13 @@ fn emit_rust_hlo_op(
                     counter,
                 );
                 let b = r_idx(module, plan, inputs[1], &b_idx, names, counter);
-                let bias = r_idx(module, plan, inputs[2], "idx", names, counter);
+                let bias_len = tensor_len(module, inputs[2]).max(1);
+                let bias_idx_str = if bias_len <= n {
+                    format!("n % {bias_len}")
+                } else {
+                    "idx".to_string()
+                };
+                let bias = r_idx(module, plan, inputs[2], &bias_idx_str, names, counter);
                 let dst = r_idx(module, plan, res_val, "idx", names, counter);
                 let epilogue = op
                     .attributes
@@ -943,7 +1009,8 @@ fn emit_rust_hlo_op(
                 writeln!(out, "            let val = acc + {bias};")?;
                 match epilogue {
                     "bias_relu" if inputs.len() >= 4 => {
-                        let z = r_idx(module, plan, inputs[3], "idx", names, counter);
+                        let z =
+                            r_bcast_idx(module, plan, inputs[3], "idx", res_len, names, counter);
                         writeln!(out, "            {dst} = val.max({z});")?;
                     }
                     "bias_tanh" => {
@@ -961,7 +1028,8 @@ fn emit_rust_hlo_op(
                         )?;
                     }
                     "bias_scale" if inputs.len() >= 4 => {
-                        let s = r_idx(module, plan, inputs[3], "idx", names, counter);
+                        let s =
+                            r_bcast_idx(module, plan, inputs[3], "idx", res_len, names, counter);
                         writeln!(out, "            {dst} = val * ({s});")?;
                     }
                     _ => {
@@ -1045,14 +1113,13 @@ fn emit_rust_hlo_op(
                 )?;
                 writeln!(out, "        for c in 0..{cols} {{")?;
                 if let Some(&w_id) = inputs.get(1) {
-                    let w = r_idx(
-                        module,
-                        plan,
-                        w_id,
-                        &format!("r * {cols} + c"),
-                        names,
-                        counter,
-                    );
+                    let w_len = tensor_len(module, w_id).max(1);
+                    let w_idx_s = if w_len <= cols {
+                        format!("c % {w_len}")
+                    } else {
+                        format!("r * {cols} + c")
+                    };
+                    let w = r_idx(module, plan, w_id, &w_idx_s, names, counter);
                     writeln!(out, "            {dst} = ({src}) * inv * ({w});")?;
                 } else {
                     writeln!(out, "            {dst} = ({src}) * inv;")?;
@@ -1483,6 +1550,348 @@ fn emit_rust_hlo_op(
                 writeln!(out, "    }}")?;
             }
         }
+        StableHloOp::Compare {
+            lhs,
+            rhs,
+            direction,
+            ..
+        } => {
+            let a = r_bcast_idx(module, plan, lhs, "i", res_len, names, counter);
+            let b = r_bcast_idx(module, plan, rhs, "i", res_len, names, counter);
+            let dst = r_idx(module, plan, res_val, "i", names, counter);
+            let cmp_op = match direction.as_str() {
+                "EQ" => "==",
+                "NE" => "!=",
+                "LT" => "<",
+                "LE" => "<=",
+                "GT" => ">",
+                "GE" => ">=",
+                _ => "==",
+            };
+            writeln!(out, "    for i in 0..{res_len} {{")?;
+            writeln!(
+                out,
+                "        {dst} = if ({a}) {cmp_op} ({b}) {{ 1.0_f32 }} else {{ 0.0_f32 }};"
+            )?;
+            writeln!(out, "    }}")?;
+        }
+        StableHloOp::Select {
+            pred,
+            on_true,
+            on_false,
+            ..
+        } => {
+            let p = r_bcast_idx(module, plan, pred, "i", res_len, names, counter);
+            let t = r_bcast_idx(module, plan, on_true, "i", res_len, names, counter);
+            let f = r_bcast_idx(module, plan, on_false, "i", res_len, names, counter);
+            let dst = r_idx(module, plan, res_val, "i", names, counter);
+            writeln!(out, "    for i in 0..{res_len} {{")?;
+            writeln!(
+                out,
+                "        {dst} = if ({p}) != 0.0_f32 {{ {t} }} else {{ {f} }};"
+            )?;
+            writeln!(out, "    }}")?;
+        }
+        StableHloOp::Iota { iota_dimension, .. } => {
+            let dims = module.values[res_val]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![res_len]);
+            let d = (iota_dimension.max(0) as usize).min(dims.len().saturating_sub(1));
+            let dim_size = (*dims.get(d).unwrap_or(&res_len)).max(1);
+            let inner: usize = dims.iter().skip(d + 1).product::<usize>().max(1);
+            let dst = r_idx(module, plan, res_val, "i", names, counter);
+            writeln!(out, "    for i in 0..{res_len} {{")?;
+            writeln!(out, "        {dst} = ((i / {inner}) % {dim_size}) as f32;")?;
+            writeln!(out, "    }}")?;
+        }
+        StableHloOp::Slice {
+            operand,
+            start_indices,
+            strides,
+            ..
+        } => {
+            let in_dims = module.values[operand]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![tensor_len(module, operand).max(1)]);
+            let out_dims = module.values[res_val]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![res_len]);
+            if in_dims.len() == 2 && out_dims.len() == 2 {
+                let s0 = (*start_indices.first().unwrap_or(&0)).max(0) as usize;
+                let s1 = (*start_indices.get(1).unwrap_or(&0)).max(0) as usize;
+                let st0 = (*strides.first().unwrap_or(&1)).max(1) as usize;
+                let st1 = (*strides.get(1).unwrap_or(&1)).max(1) as usize;
+                let in_c = in_dims[1].max(1);
+                let (out_r, out_c) = (out_dims[0], out_dims[1]);
+                let src = r_idx(
+                    module,
+                    plan,
+                    operand,
+                    &format!("({s0} + r * {st0}) * {in_c} + ({s1} + c * {st1})"),
+                    names,
+                    counter,
+                );
+                let dst = r_idx(
+                    module,
+                    plan,
+                    res_val,
+                    &format!("r * {out_c} + c"),
+                    names,
+                    counter,
+                );
+                writeln!(out, "    for r in 0..{out_r} {{")?;
+                writeln!(out, "        for c in 0..{out_c} {{ {dst} = {src}; }}")?;
+                writeln!(out, "    }}")?;
+            } else {
+                let s0 = (*start_indices.first().unwrap_or(&0)).max(0) as usize;
+                let st0 = (*strides.first().unwrap_or(&1)).max(1) as usize;
+                let in_len = tensor_len(module, operand).max(1);
+                let src = r_idx(
+                    module,
+                    plan,
+                    operand,
+                    &format!("({s0} + i * {st0}) % {in_len}"),
+                    names,
+                    counter,
+                );
+                let dst = r_idx(module, plan, res_val, "i", names, counter);
+                writeln!(out, "    for i in 0..{res_len} {{ {dst} = {src}; }}")?;
+            }
+        }
+        StableHloOp::DynamicSlice {
+            operand,
+            start_indices,
+            ..
+        } => {
+            let in_len = tensor_len(module, operand).max(1);
+            let max_start = in_len.saturating_sub(res_len);
+            let start_expr = if let Some(&s_id) = start_indices.first() {
+                let s0 = r_idx(module, plan, s_id, "0", names, counter);
+                format!("(({s0}).round() as isize).clamp(0, {max_start}) as usize")
+            } else {
+                "0usize".to_string()
+            };
+            let src = r_idx(module, plan, operand, "(start_off + i)", names, counter);
+            let dst = r_idx(module, plan, res_val, "i", names, counter);
+            writeln!(out, "    let start_off = {start_expr};")?;
+            writeln!(out, "    for i in 0..{res_len} {{ {dst} = {src}; }}")?;
+        }
+        StableHloOp::DynamicUpdateSlice {
+            operand,
+            update,
+            start_indices,
+            ..
+        } => {
+            let upd_len = tensor_len(module, update).min(res_len);
+            let max_start = res_len.saturating_sub(upd_len);
+            let start_expr = if let Some(&s_id) = start_indices.first() {
+                let s0 = r_idx(module, plan, s_id, "0", names, counter);
+                format!("(({s0}).round() as isize).clamp(0, {max_start}) as usize")
+            } else {
+                "0usize".to_string()
+            };
+            let src = r_idx(module, plan, operand, "i", names, counter);
+            let dst_i = r_idx(module, plan, res_val, "i", names, counter);
+            let upd = r_idx(module, plan, update, "u", names, counter);
+            let dst_u = r_idx(module, plan, res_val, "(start_off + u)", names, counter);
+            writeln!(out, "    for i in 0..{res_len} {{ {dst_i} = {src}; }}")?;
+            writeln!(out, "    let start_off = {start_expr};")?;
+            writeln!(out, "    for u in 0..{upd_len} {{ {dst_u} = {upd}; }}")?;
+        }
+        StableHloOp::Pad {
+            operand,
+            padding_value,
+            edge_padding_low,
+            interior_padding,
+            ..
+        } => {
+            let in_len = tensor_len(module, operand);
+            let low0 = (*edge_padding_low.first().unwrap_or(&0)).max(0) as usize;
+            let ip0 = (*interior_padding.first().unwrap_or(&0)).max(0) as usize;
+            let step = ip0 + 1;
+            let pv = r_idx(module, plan, padding_value, "0", names, counter);
+            let dst_i = r_idx(module, plan, res_val, "i", names, counter);
+            let src = r_idx(module, plan, operand, "k", names, counter);
+            let dst_k = r_idx(
+                module,
+                plan,
+                res_val,
+                &format!("{low0} + k * {step}"),
+                names,
+                counter,
+            );
+            writeln!(out, "    for i in 0..{res_len} {{ {dst_i} = {pv}; }}")?;
+            writeln!(out, "    for k in 0..{in_len} {{")?;
+            writeln!(
+                out,
+                "        if {low0} + k * {step} < {res_len} {{ {dst_k} = {src}; }}"
+            )?;
+            writeln!(out, "    }}")?;
+        }
+        StableHloOp::Concatenate {
+            inputs, dimension, ..
+        } => {
+            let out_dims = module.values[res_val]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![res_len]);
+            let dim = (dimension.max(0) as usize).min(out_dims.len().saturating_sub(1));
+            let outer: usize = out_dims.iter().take(dim).product::<usize>().max(1);
+            let out_cat_stride: usize = out_dims.iter().skip(dim).product::<usize>().max(1);
+            let inner: usize = out_dims.iter().skip(dim + 1).product::<usize>().max(1);
+            let mut cat_offset = 0usize;
+            for &inp in &inputs {
+                let in_dims = module.values[inp]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_else(|| vec![tensor_len(module, inp)]);
+                let in_cat = (*in_dims.get(dim).unwrap_or(&1)).max(1);
+                let chunk = in_cat * inner;
+                let src = r_idx(
+                    module,
+                    plan,
+                    inp,
+                    &format!("o * {chunk} + c"),
+                    names,
+                    counter,
+                );
+                let dst = r_idx(
+                    module,
+                    plan,
+                    res_val,
+                    &format!("o * {out_cat_stride} + {cat_offset} + c"),
+                    names,
+                    counter,
+                );
+                writeln!(out, "    for o in 0..{outer} {{")?;
+                writeln!(out, "        for c in 0..{chunk} {{ {dst} = {src}; }}")?;
+                writeln!(out, "    }}")?;
+                cat_offset += chunk;
+            }
+        }
+        StableHloOp::Convolution { lhs, rhs, .. } => {
+            let in_dims = module.values[lhs]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![1, 1, 1, 1]);
+            let w_dims = module.values[rhs]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![1, 1, 1, 1]);
+            let out_dims = module.values[res_val]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![1, 1, 1, 1]);
+            if in_dims.len() == 4 && w_dims.len() == 4 && out_dims.len() == 4 {
+                let (b_sz, ih, iw, ic) = (in_dims[0], in_dims[1], in_dims[2], in_dims[3]);
+                let (kh, kw, _, oc) = (w_dims[0], w_dims[1], w_dims[2], w_dims[3]);
+                let (_, oh, ow, _) = (out_dims[0], out_dims[1], out_dims[2], out_dims[3]);
+                let sh = match op.attributes.get("stride_h") {
+                    Some(Attribute::Int(v)) => (*v).max(1) as usize,
+                    _ => 1,
+                };
+                let sw = match op.attributes.get("stride_w") {
+                    Some(Attribute::Int(v)) => (*v).max(1) as usize,
+                    _ => sh,
+                };
+                let ph = match op.attributes.get("pad_h") {
+                    Some(Attribute::Int(v)) => (*v).max(0) as isize,
+                    _ => 0,
+                };
+                let pw = match op.attributes.get("pad_w") {
+                    Some(Attribute::Int(v)) => (*v).max(0) as isize,
+                    _ => ph,
+                };
+                let src = r_idx(
+                    module,
+                    plan,
+                    lhs,
+                    &format!("((b * {ih} + iy as usize) * {iw} + ix as usize) * {ic} + ci"),
+                    names,
+                    counter,
+                );
+                let flt = r_idx(
+                    module,
+                    plan,
+                    rhs,
+                    &format!("((ky * {kw} + kx) * {ic} + ci) * {oc} + co"),
+                    names,
+                    counter,
+                );
+                let dst = r_idx(
+                    module,
+                    plan,
+                    res_val,
+                    &format!("((b * {oh} + oy) * {ow} + ox) * {oc} + co"),
+                    names,
+                    counter,
+                );
+                writeln!(out, "    for b in 0..{b_sz} {{")?;
+                writeln!(out, "        for oy in 0..{oh} {{")?;
+                writeln!(out, "            for ox in 0..{ow} {{")?;
+                writeln!(out, "                for co in 0..{oc} {{")?;
+                writeln!(out, "                    let mut acc = 0.0_f32;")?;
+                writeln!(out, "                    for ky in 0..{kh} {{")?;
+                writeln!(out, "                        for kx in 0..{kw} {{")?;
+                writeln!(
+                    out,
+                    "                            let iy = (oy * {sh} + ky) as isize - {ph};"
+                )?;
+                writeln!(
+                    out,
+                    "                            let ix = (ox * {sw} + kx) as isize - {pw};"
+                )?;
+                writeln!(
+                    out,
+                    "                            if iy >= 0 && (iy as usize) < {ih} \
+                     && ix >= 0 && (ix as usize) < {iw} {{"
+                )?;
+                writeln!(
+                    out,
+                    "                                for ci in 0..{ic} {{ acc += {src} * {flt}; }}"
+                )?;
+                writeln!(out, "                            }}")?;
+                writeln!(out, "                        }}")?;
+                writeln!(out, "                    }}")?;
+                writeln!(out, "                    {dst} = acc;")?;
+                writeln!(out, "                }}")?;
+                writeln!(out, "            }}")?;
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
+            } else {
+                let k_len = tensor_len(module, rhs).max(1);
+                let in_len = tensor_len(module, lhs).max(1);
+                let src = r_idx(
+                    module,
+                    plan,
+                    lhs,
+                    &format!("(i + k) % {in_len}"),
+                    names,
+                    counter,
+                );
+                let flt = r_idx(module, plan, rhs, "k", names, counter);
+                let dst = r_idx(module, plan, res_val, "i", names, counter);
+                writeln!(out, "    for i in 0..{res_len} {{")?;
+                writeln!(out, "        let mut acc = 0.0_f32;")?;
+                writeln!(
+                    out,
+                    "        for k in 0..{k_len} {{ acc += {src} * {flt}; }}"
+                )?;
+                writeln!(out, "        {dst} = acc;")?;
+                writeln!(out, "    }}")?;
+            }
+        }
         _ => {}
     }
 
@@ -1702,7 +2111,13 @@ fn emit_rust_qmatmul(
     writeln!(out, "            }}")?;
     writeln!(out, "            let idx = m * {n} + n;")?;
     if let Some(&bias_id) = inputs.get(2) {
-        let bias = r_idx(module, plan, bias_id, "idx", names, counter);
+        let bias_len = tensor_len(module, bias_id).max(1);
+        let bias_idx_s = if bias_len <= n {
+            format!("n % {bias_len}")
+        } else {
+            "idx".to_string()
+        };
+        let bias = r_idx(module, plan, bias_id, &bias_idx_s, names, counter);
         writeln!(out, "            {dst} = acc + {bias};")?;
     } else {
         writeln!(out, "            {dst} = acc;")?;
@@ -1752,7 +2167,13 @@ fn emit_rust_residual_rmsnorm(
     writeln!(out, "        for c in 0..{cols} {{")?;
     writeln!(out, "            let h = ({x}) + ({res_in});")?;
     if let Some(&w_id) = inputs.get(2) {
-        let w = r_idx(module, plan, w_id, &idx_s, names, counter);
+        let w_len = tensor_len(module, w_id).max(1);
+        let w_idx_s = if w_len <= cols {
+            format!("c % {w_len}")
+        } else {
+            idx_s.clone()
+        };
+        let w = r_idx(module, plan, w_id, &w_idx_s, names, counter);
         writeln!(out, "            {dst} = h * inv * ({w});")?;
     } else {
         writeln!(out, "            {dst} = h * inv;")?;
@@ -1804,11 +2225,23 @@ fn emit_rust_layernorm(
     writeln!(out, "        for c in 0..{cols} {{")?;
     let mut expr = format!("(({x}) - mean) * inv");
     if let Some(&g_id) = inputs.get(1) {
-        let g = r_idx(module, plan, g_id, &idx_s, names, counter);
+        let g_len = tensor_len(module, g_id).max(1);
+        let g_idx_s = if g_len <= cols {
+            format!("c % {g_len}")
+        } else {
+            idx_s.clone()
+        };
+        let g = r_idx(module, plan, g_id, &g_idx_s, names, counter);
         expr = format!("{expr} * ({g})");
     }
     if let Some(&b_id) = inputs.get(2) {
-        let b = r_idx(module, plan, b_id, &idx_s, names, counter);
+        let b_len = tensor_len(module, b_id).max(1);
+        let b_idx_s = if b_len <= cols {
+            format!("c % {b_len}")
+        } else {
+            idx_s.clone()
+        };
+        let b = r_idx(module, plan, b_id, &b_idx_s, names, counter);
         expr = format!("{expr} + ({b})");
     }
     writeln!(out, "            {dst} = {expr};")?;
