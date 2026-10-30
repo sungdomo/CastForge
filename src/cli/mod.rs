@@ -792,7 +792,7 @@ fn build_translator_chain(
     let (first_name, _) = parse_pass_spec_item(items[0])?;
     let starts_with_frontend = matches!(
         first_name.as_str(),
-        "parse-mlir" | "parse" | "import-onnx" | "import-gguf"
+        "parse-mlir" | "parse" | "import-onnx" | "import-gguf" | "import-hf-config"
     );
     let mut first_in = "text";
     if !starts_with_frontend {
@@ -815,6 +815,13 @@ fn build_translator_chain(
                     first_in = "text";
                 }
                 chain.push(Box::new(OnnxImportTranslator));
+                last_out = "ir";
+            }
+            "import-hf-config" => {
+                if idx == 0 {
+                    first_in = "text";
+                }
+                chain.push(Box::new(crate::ir::HfConfigImportTranslator));
                 last_out = "ir";
             }
             "import-gguf" => {

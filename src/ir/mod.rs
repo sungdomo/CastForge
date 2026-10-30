@@ -16,10 +16,11 @@ pub mod verify_ir;
 pub mod viz;
 
 pub use import::{
-    GgmlType, GgufExportTranslator, OnnxExportTranslator, OnnxJsonInitializer, OnnxJsonModel,
-    OnnxJsonNode, OnnxJsonValueInfo, SafetensorsExportTranslator, collect_module_tensors,
-    export_gguf_bytes, export_gguf_file, export_onnx_file, export_onnx_json, import_gguf_bytes,
-    import_gguf_file, import_onnx_file, import_onnx_json,
+    GgmlType, GgufExportTranslator, HfConfigImportTranslator, HfModelConfig, OnnxExportTranslator,
+    OnnxJsonInitializer, OnnxJsonModel, OnnxJsonNode, OnnxJsonValueInfo,
+    SafetensorsExportTranslator, collect_module_tensors, export_gguf_bytes, export_gguf_file,
+    export_onnx_file, export_onnx_json, import_gguf_bytes, import_gguf_file, import_hf_config_json,
+    import_hf_model_dir, import_onnx_file, import_onnx_json,
 };
 pub use mlir::{
     GgufImportTranslator, MlirParseTranslator, MlirPrintTranslator, MlirPrinter,

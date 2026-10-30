@@ -2147,4 +2147,21 @@ module @gather_scatter_mod {
     assert!(rust_code.contains(".clamp("));
     let c_code = generate_code(&module, CodegenTarget::C).expect("c gather/scatter");
     assert!(c_code.contains("roundf("));
+
+    // Verify HuggingFace config.json Transformer graph synthesis + O2 optimization
+    let hf_cfg = r#"{
+        "model_type": "llama",
+        "hidden_size": 4,
+        "intermediate_size": 8,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 2,
+        "seq_len": 2
+    }"#;
+    let mut hf_mod =
+        castforge::ir::import_hf_config_json(hf_cfg, None).expect("import_hf_config_json");
+    assert_eq!(hf_mod.tensor_store.len(), 7);
+    let registry = PassRegistry::with_builtin_passes();
+    let mut pm = PassManager::from_pipeline_str(&registry, "O2").expect("O2 on hf_mod");
+    let res = pm.run(&mut hf_mod).expect("run O2 on hf_mod");
+    assert!(res[0].changed);
 }
