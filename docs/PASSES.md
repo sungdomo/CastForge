@@ -1,10 +1,11 @@
-# CastForge — Complete Reference of All 35 Graph IR Passes (+ Unified LoopIR Pass)
+# CastForge — Complete Reference of All 29 Graph IR Passes (+ Unified LoopIR Pass)
 
-CastForge provides **35 built-in modular A-to-B IR passes & presets** (`32 passes + 3 presets
+CastForge provides **29 built-in modular A-to-B IR passes & presets** (`26 passes + 3 presets
 O1/O2/O3`) in `castforge-passes` (plus the unified **`OptimizeLoopIrPass`** (`optimize-loop-ir`) in
 `castforge-codegen`). Every pass implements the unified `Pass` and `Translator` traits and maps
-1-to-1 to a clean source file in 8 domain subdirectories under `crates/castforge-passes/src/`
-(`general/`, `views/`, `weights/`, `fusion/`, `memory/`, `distributed/`, `loops/`, `tooling/`).
+**100% 1-to-1** to a dedicated source file (`26` `.rs` files) in 8 domain subdirectories under
+`crates/castforge-passes/src/` (`general/`, `views/`, `weights/`, `fusion/`, `memory/`,
+`distributed/`, `loops/`, `tooling/`).
 
 ---
 
@@ -12,21 +13,21 @@ O1/O2/O3`) in `castforge-passes` (plus the unified **`OptimizeLoopIrPass`** (`op
 
 | Category | Count | Directory / Section |
 | :--- | :---: | :--- |
-| **1. General MLIR & Algebraic Passes (+ `O1`/`O2`/`O3`)** | 11 | `src/general/` (Section 1) |
+| **1. General MLIR & Algebraic Passes (+ `O1`/`O2`/`O3`)** | 9 | `src/general/` (Section 1) |
 | **2. Views, Shape Specialization & Layout** | 2 | `src/views/` (Section 2) |
-| **3. Weight Surgery, Pruning & Quantization** | 5 | `src/weights/` (Section 3) |
-| **4. Transformer, GEMM & Operator Fusions** | 7 | `src/fusion/` (Section 4) |
+| **3. Weight Surgery, Pruning & Quantization** | 4 | `src/weights/` (Section 3) |
+| **4. Transformer, GEMM & Operator Fusions** | 6 | `src/fusion/` (Section 4) |
 | **5. Memory Planning, Remat & Offload** | 1 | `src/memory/` (Section 5) |
 | **6. Distributed Parallelism, Streams & Autodiff** | 2 | `src/distributed/` (Section 6) |
 | **7. Polyhedral Loop Scheduling & Tensor Cores** | 1 | `src/loops/` (Section 7) |
-| **8. IR Surgery, Verification & Tooling** | 6 | `src/tooling/` (Section 8) |
+| **8. IR Surgery, Verification & Tooling** | 4 | `src/tooling/` (Section 8) |
 | **9. Polyhedral / Imperative LoopIR** | +1 | `castforge-codegen` (Section 9) |
 
-*(Total: **35 registered Graph IR passes/presets** in `PassRegistry` + **`OptimizeLoopIrPass`**.)*
+*(Total: **29 registered Graph IR passes/presets** in `PassRegistry` + **`OptimizeLoopIrPass`**.)*
 
 ---
 
-## 1. General MLIR & Algebraic Optimization Passes (`src/general/`, 11 Entries)
+## 1. General MLIR & Algebraic Optimization Passes (`src/general/`, 9 Entries)
 
 ### 1.1 `dce` (`DeadCodeEliminationPass` — `general/dce.rs`)
 - **Options:** `symbols=true|false` (default: `true`)
@@ -35,9 +36,11 @@ O1/O2/O3`) in `castforge-passes` (plus the unified **`OptimizeLoopIrPass`** (`op
   topological order and eliminates unreachable private `func.func` symbols when `symbols=true`.
 
 ### 1.2 `cse` (`UnifiedCsePass` — `general/cse.rs`)
-- **Options:** `gvn=true|false` (default: `true`), `hoist_constants=true|false` (default: `false`)
+- **Options:** `gvn=true|false` (default: `true`), `licm=true|false` (default: `true`),
+  `hoist_constants=true|false` (default: `false`)
 - **Explanation:** Unified Common Subexpression Elimination (`CSE`), dominator-aware cross-region
-  Global Value Numbering (`GVN`), and optional block-entry constant hoisting/deduplication.
+  Global Value Numbering (`GVN`), Loop/Region-Invariant Code Motion (`LICM`), and optional
+  block-entry constant hoisting/deduplication.
 
 ### 1.3 `simplify-algebraic` (`UnifiedSimplifyAlgebraicPass` — `general/simplify_algebraic.rs`)
 - **Options:** `egraph=true|false` (default: `true`), `fuse_fma=true|false` (default: `true`)
@@ -57,27 +60,19 @@ O1/O2/O3`) in `castforge-passes` (plus the unified **`OptimizeLoopIrPass`** (`op
 - **Explanation:** Fixed-point canonicalizer combining `fold-views`, `simplify-algebraic`, `cse`,
   `fold-constants`, and `dce`.
 
-### 1.6 `licm` (`LicmPass` — `general/licm.rs`)
-- **Options:** None
-- **Explanation:** Loop/Region-Invariant Code Motion out of nested regions.
-
-### 1.7 `inliner` (`InlinerPass` — `general/inliner.rs`)
-- **Options:** None
-- **Explanation:** Inlines single-block `func.call` invocations into caller blocks.
-
-### 1.8 `topological-sort` (`TopologicalSortPass` — `general/topological_sort.rs`)
+### 1.6 `topological-sort` (`TopologicalSortPass` — `general/topological_sort.rs`)
 - **Options:** `mode=standard|min_memory` (default: `standard`)
 - **Explanation:** Reorders operations inside each basic block for SSA def-before-use (`standard`),
   or applies a Sethi-Ullman minimum-live-tensor priority schedule (`mode=min_memory`) that schedules
   operations freeing large intermediate buffers before operations allocating new ones
   (`castforge.min_memory_scheduled = true`).
 
-### 1.9–1.11 Optimization Pipeline Presets (`O1`, `O2`, `O3` — `general/canonicalize.rs`)
-- **`O1` (`OptO1Pass`):** Inlining, `fold-constants`, `licm`, `cse`, `fold-views`, `canonicalize`,
-  `dce`, and `topological-sort`.
+### 1.7–1.9 Optimization Pipeline Presets (`O1`, `O2`, `O3` — `general/canonicalize.rs`)
+- **`O1` (`OptO1Pass`):** Inlining, `fold-constants`, `cse(licm=true)`, `fold-views`,
+  `canonicalize`, `dce`, and `topological-sort`.
 - **`O2` (`OptO2Pass`):** `O1` + weight folding (`merge-weights(method=lora)`, `fold-weights`) +
-  unified Transformer/GEMM fusions (`fuse-norm`, `fuse-attention`, `fuse-activations`,
-  `fuse-softmax`, `fuse-gemm`, `fuse-elementwise`).
+  unified Transformer/GEMM fusions (`fuse-norm`, `fuse-attention`, `fuse-activations`, `fuse-gemm`,
+  `fuse-elementwise`).
 - **`O3` (`OptO3Pass`):** `specialize-shapes` + `O2` + `fuse-activations(kind=moe)` +
   `simplify-algebraic` + `shard-distributed` + `optimize-memory` + `fold-weights(mode=pack)`.
 
@@ -92,14 +87,16 @@ O1/O2/O3`) in `castforge-passes` (plus the unified **`OptimizeLoopIrPass`** (`op
   conversion & global layout propagation (`layout=nhwc,propagate=true`).
 
 ### 2.2 `specialize-shapes` (`UnifiedSpecializeShapesPass` — `views/specialize_shapes.rs`)
-- **Options:** `B=val,S=val,default=val`, `batch=N`, `buckets=1;4;8`
+- **Options:** `B=val,S=val,default=val`, `batch=N`, `buckets=1;4;8`, `token_prune_ratio=0.5`
 - **Explanation:** Unified shape specialization engine supporting symbolic dimension binding
-  (`B=4`), static batch resizing across activations (`batch=8`), and multi-bucket shape-specialized
-  function dispatch (`buckets=1;4;8`).
+  (`B=4`), static batch resizing across activations (`batch=8`), multi-bucket shape-specialized
+  function dispatch (`buckets=1;4;8`), and **ToMe / FastV / StreamingLLM dynamic sequence token
+  pruning & bipartite merging** (`token_prune_ratio=0.5`, `castforge.token_merging =
+  "tome_bipartite"`).
 
 ---
 
-## 3. Weight Surgery, Pruning & Quantization Passes (`src/weights/`, 5 Passes)
+## 3. Weight Surgery, Pruning & Quantization Passes (`src/weights/`, 4 Passes)
 
 ### 3.1 `quantize` (`QuantizePass` — `weights/quantize.rs`)
 - **Options:** `scheme=weight|groupwise|awq|fp8|nvfp4|mxfp4|f16|bf16|w8a8|smoothquant|hadamard`,
@@ -126,20 +123,17 @@ O1/O2/O3`) in `castforge-passes` (plus the unified **`OptimizeLoopIrPass`** (`op
   DARE task-vector arithmetic (`method=dare`), and compile-time LoRA adapter baking (`method=lora`).
 
 ### 3.4 `fold-weights` (`FoldWeightsPass` — `weights/fold_weights.rs`)
-- **Options:** `mode=batchnorm|norm|pack|all` (default: `batchnorm`)
-- **Explanation:** Unified compile-time weight folding & pre-packing pass absorbing pre-GEMM
-  RMSNorm/LayerNorm scales (`mode=norm`), post-Conv/GEMM BatchNorm scales (`mode=batchnorm`), and
-  pre-transposing 2D constant RHS weights `[K, N] -> [N, K]` (`mode=pack`, `packed_rhs = true`) for
-  unit-stride SIMD dot products.
-
-### 3.5 `externalize-weights` (`ExternalizeWeightsPass` — `weights/externalize_weights.rs`)
-- **Options:** `min_elements=2`, `inline=false`
-- **Explanation:** Moves inline `dense<...>` constants to `dense_resource<key>` in `TensorStore`
-  (or inlines them back when `inline=true`).
+- **Options:** `mode=batchnorm|norm|pack|externalize|inline|all` (default: `batchnorm`),
+  `min_elements=2`, `inline=true|false`
+- **Explanation:** Unified compile-time weight folding, pre-packing & SafeTensors storage pass
+  absorbing pre-GEMM RMSNorm/LayerNorm scales (`mode=norm`), post-Conv/GEMM BatchNorm scales
+  (`mode=batchnorm`), pre-transposing 2D constant RHS weights `[K, N] -> [N, K]` (`mode=pack`,
+  `packed_rhs = true`), and externalizing inline `dense<...>` constants to `dense_resource<key>` in
+  `TensorStore` (`mode=externalize`) or inlining them back (`mode=inline`).
 
 ---
 
-## 4. Transformer, GEMM & Operator Fusion Passes (`src/fusion/`, 7 Passes)
+## 4. Transformer, GEMM & Operator Fusion Passes (`src/fusion/`, 6 Passes)
 
 ### 4.1 `fuse-elementwise` (`UnifiedFuseElementwisePass` — `fusion/fuse_elementwise.rs`)
 - **Options:** `mode=composites|map_reduce|loops|megakernel|all` (default: `composites`),
@@ -151,13 +145,17 @@ O1/O2/O3`) in `castforge-passes` (plus the unified **`OptimizeLoopIrPass`** (`op
 
 ### 4.2 `fuse-gemm` (`FuseGemmPass` — `fusion/fuse_gemm.rs`)
 - **Options:** `kind=all|horizontal|dequant|epilogue` (default: `all`)
-- **Explanation:** Unified GEMM fusion combining horizontal parallel QKV/MLP dot fusion,
+- **Explanation:** Unified GEMM fusion combining horizontal parallel QKV/MLP dot fusion with
+  **compile-time constant weight concatenation** (`castforge.horizontal_weights_folded = true`),
   on-the-fly dequant+GEMM (`fused_qmatmul`), and chained GEMM + bias + activation + **residual
   add** epilogue fusion (`epilogue = "bias_relu_residual"`, `castforge.has_residual = true`).
 
 ### 4.3 `fuse-norm` (`FuseNormPass` — `fusion/fuse_norm.rs`)
-- **Options:** `kind=all|rmsnorm|residual_rmsnorm|layernorm` (default: `all`)
-- **Explanation:** Unified normalization fusion (`Residual+RMSNorm`, `RMSNorm`, and `LayerNorm`).
+- **Options:** `kind=all|rmsnorm|residual_rmsnorm|layernorm|softmax|log_softmax|cross_entropy`
+  (default: `all`), `chunk_size=1024`
+- **Explanation:** Unified normalization & softmax fusion combining `Residual+RMSNorm`, `RMSNorm`,
+  `LayerNorm`, `Softmax`, `LogSoftmax`, and **Liger-Kernel / Flash-Cross-Entropy**
+  (`kind=cross_entropy`, `castforge.fused_linear_cross_entropy = true`).
 
 ### 4.4 `fuse-activations` (`FuseActivationsPass` — `fusion/fuse_activations.rs`)
 - **Options:** `kind=all|swiglu|gelu|gated_mlp|moe` (default: `all`), `shared_expert=true|false`,
@@ -165,12 +163,7 @@ O1/O2/O3`) in `castforge-passes` (plus the unified **`OptimizeLoopIrPass`** (`op
 - **Explanation:** Unified activation, gated-MLP, and routed/shared-expert **Mixture-of-Experts
   (`MoE`)** fusion (`SwiGLU`, `GELU`, `GeGLU`, `FusedGatedMLP`, and `castforge.fused_moe`).
 
-### 4.5 `fuse-softmax` (`FuseSoftmaxPass` — `fusion/fuse_softmax.rs`)
-- **Options:** `kind=softmax|log_softmax|cross_entropy|all` (default: `all`), `chunk_size=1024`
-- **Explanation:** Unified Softmax, LogSoftmax, and **Liger-Kernel / Flash-Cross-Entropy**
-  (`kind=cross_entropy`, `castforge.fused_linear_cross_entropy = true`) composite fusion.
-
-### 4.6 `fuse-attention` (`UnifiedFuseAttentionPass` — `fusion/fuse_attention.rs`)
+### 4.5 `fuse-attention` (`UnifiedFuseAttentionPass` — `fusion/fuse_attention.rs`)
 - **Options:** `kind=all|sdpa|rope|mla|kv_cache|paged|flash_decoding|tree|sliding_window|kv_sharing`
   (`kv_lora_rank=512`, `max_seq_len=2048`, `page_block_size=16`, `max_blocks=64`, `split_kv=4`,
   `draft_tokens=4`, `tree_depth=2`, `window_size=4096`, `sink_tokens=4`, `share_every=2`)
@@ -180,7 +173,7 @@ O1/O2/O3`) in `castforge-passes` (plus the unified **`OptimizeLoopIrPass`** (`op
   (`kind=tree`), **Sliding-Window + Attention Sinks** (`kind=sliding_window`), and **YOCO / CLA
   Cross-Layer KV-Cache Sharing** (`kind=kv_sharing,share_every=2`).
 
-### 4.7 `decompose-composites` (`DecomposeCompositesPass` — `fusion/decompose_composites.rs`)
+### 4.6 `decompose-composites` (`DecomposeCompositesPass` — `fusion/decompose_composites.rs`)
 - **Options:** None
 - **Explanation:** Expands `stablehlo.composite` ops back to primitive StableHLO ops.
 
@@ -199,12 +192,14 @@ O1/O2/O3`) in `castforge-passes` (plus the unified **`OptimizeLoopIrPass`** (`op
 ## 6. Distributed Parallelism, Streams & Autodiff (`src/distributed/`, 2 Passes)
 
 - **`shard-distributed` (`ShardDistributedPass` — `distributed/shard_distributed.rs`):** Unified
-  distributed parallelism & stream pass (`mode=tp|ring_cp|pp|streams`, `devices=2`, `ring_size=4`,
-  `coalesce=true`, `stages=2`, `microbatches=4`, `schedule=1f1b`, `streams=2`) consolidating 1D
-  Megatron Tensor Parallelism (`tp`), RingAttention Context Parallelism (`ring_cp`), `all_reduce`
-  coalescing, 1F1B/Zero-Bubble Pipeline Parallelism (`pp`), and multi-stream async execution.
-- **`autodiff` (`AutodiffPass` — `distributed/autodiff.rs`):** Synthesizes reverse-mode VJP backward
-  gradient operations and optional in-graph SGD updates (`lr=...`).
+  distributed parallelism & stream pass (`mode=tp|ring_cp|pp|fsdp|zero3|streams`, `devices=2`,
+  `ring_size=4`, `coalesce=true`, `stages=2`, `microbatches=4`, `schedule=1f1b`, `streams=2`)
+  consolidating 1D Megatron Tensor Parallelism (`tp`), RingAttention Context Parallelism
+  (`ring_cp`), **ZeRO-3 / FSDP parameter sharding with `all_gather` prefetch & `reduce_scatter`
+  gradient sync** (`mode=fsdp|zero3`), `all_reduce` coalescing, 1F1B/Zero-Bubble Pipeline
+  Parallelism (`pp`), and multi-stream async execution.
+- **`autodiff` (`AutodiffPass` — `distributed/autodiff.rs`):** Synthesizes reverse-mode VJP
+  backward gradient operations and optional in-graph SGD updates (`lr=...`).
 
 ---
 
@@ -220,26 +215,25 @@ O1/O2/O3`) in `castforge-passes` (plus the unified **`OptimizeLoopIrPass`** (`op
 
 ---
 
-## 8. IR Surgery, Verification, Profiling & Tooling (`src/tooling/`, 6 Passes)
+## 8. IR Surgery, Verification, Profiling & Tooling (`src/tooling/`, 4 Passes)
 
-1. **`ir-edit` (`IrEditPass` — `tooling/ir_edit.rs`):** Unified surgical IR editor consolidating
-   op renaming (`rename_op=from:to`), attribute injection (`annotate_op=op:k=v`), input freezing/
-   unfreezing (`freeze=true,args=arg0:1.0`, `unfreeze=true,min_elements=2`), and intermediate value
-   tapping (`tap=%0;%1`).
-2. **`extract-subgraph` (`ExtractSubgraphPass` — `tooling/extract_subgraph.rs`):** Unified backward
-   dataflow cone slicer (`target=%v,stop_at=%in`) and bugpoint-style delta IR reducer
-   (`max_ops=1,keep_op=...`).
-3. **`outline-subgraphs` (`UnifiedOutlineSubgraphsPass` — `tooling/outline_subgraphs.rs`):** Unified
-   function/subgraph surgery pass (`mode=all|gemm|composites|dedup|compose|unroll`, `dedup=true`,
-   `first=...`, `second=...`, `repeat=N`) consolidating kernel outlining, LLVM `-mergefunc` function
-   deduplication, function composition (`f2(f1(x))`), and bounded `func.call` unrolling.
-4. **`normalize-ir` (`NormalizeIrPass` — `tooling/normalize_ir.rs`):** Unified canonical SSA renamer
-   (`ssa=true,prefix=v`) and metadata/location stripper (`debuginfo=true,attributes=true`).
-5. **`verify-ir` (`UnifiedVerifyIrPass` — `tooling/verify_ir.rs`):** Unified IR verification,
+1. **`ir-edit` (`IrEditPass` — `tooling/ir_edit.rs`):** Unified surgical IR editor & canonicalizer
+   consolidating op renaming (`rename_op=from:to`), attribute injection (`annotate_op=op:k=v`),
+   input freezing/unfreezing (`freeze=true,args=arg0:1.0`, `unfreeze=true,min_elements=2`),
+   intermediate value tapping (`tap=%0;%1`), canonical SSA renaming (`ssa=true,prefix=v`), and
+   debug/schedule metadata stripping (`debuginfo=true,attributes=true`).
+2. **`outline-subgraphs` (`UnifiedOutlineSubgraphsPass` — `tooling/outline_subgraphs.rs`):**
+   Unified function/subgraph surgery pass (`mode=all|gemm|composites|inline|extract|reduce|dedup|
+   compose|unroll`, `target=%v`, `stop_at=%in`, `max_ops=1`, `keep_op=...`, `dedup=true`,
+   `first=...`, `second=...`, `repeat=N`) consolidating kernel outlining, function inlining
+   (`mode=inline`), backward dataflow cone slicing (`mode=extract`), delta IR reduction
+   (`mode=reduce`), LLVM `-mergefunc` function deduplication, function composition, and bounded
+   `func.call` unrolling.
+3. **`verify-ir` (`UnifiedVerifyIrPass` — `tooling/verify_ir.rs`):** Unified IR verification,
    numerical sanitizer & hashing pass (`shapes=true,equiv=true,tol=1e-4,hash=true,bisect=N,
    sanitize=true,clamp_max=65504.0`) consolidating shape verification, signature equivalence,
    64-bit FNV-1a structural hashing, `castforge.nan_guard` finite clamps, and pass bisection.
-6. **`profile-ir` (`UnifiedProfileIrPass` — `tooling/profile_ir.rs`):** Unified Roofline
+4. **`profile-ir` (`UnifiedProfileIrPass` — `tooling/profile_ir.rs`):** Unified Roofline
    FLOPs/arithmetic-intensity analysis (`stats=true,ridge=10.0`) and `castforge.profile_region`
    timer instrumentation (`instrument=true,filter=gemm`).
 

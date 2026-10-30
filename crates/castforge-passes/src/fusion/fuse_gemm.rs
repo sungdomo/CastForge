@@ -193,7 +193,15 @@ impl Pass for FuseHorizontalDotPass {
                 };
 
                 let first_dot_id = cands[0].dot_op_id;
-                let dot_attrs = module.ops[first_dot_id].attributes.clone();
+                let mut dot_attrs = module.ops[first_dot_id].attributes.clone();
+                dot_attrs.insert(
+                    "castforge.horizontal_weights_folded".to_string(),
+                    Attribute::Bool(true),
+                );
+                dot_attrs.insert(
+                    "castforge.horizontal_fused_count".to_string(),
+                    Attribute::Int(cands.len() as i64),
+                );
 
                 let mut w_attrs = IndexMap::new();
                 w_attrs.insert(

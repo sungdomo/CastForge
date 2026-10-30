@@ -80,6 +80,9 @@ impl Pass for ShardDistributedPass {
                 .run(module)?,
             );
         }
+        if m == "fsdp" || m == "zero3" || m == "zero" {
+            steps.push(run_fsdp_sharding(module, self.devices)?);
+        }
         if m == "streams" || m == "stream" || m == "async" {
             steps.push(
                 ScheduleStreamsPass {
@@ -654,4 +657,52 @@ fn insert_stream_wait_before(
         .unwrap_or(block_ops.len());
     block_ops.insert(pos, new_op_id);
     res_val
+}
+
+fn run_fsdp_sharding(module: &mut Module, num_devices: usize) -> Result<PassResult> {
+    let devices = num_devices.max(2) as i64;
+    let mut modified = 0usize;
+    let blocks: Vec<BlockId> = module.blocks.keys().collect();
+    for block_id in blocks {
+        for op_id in module.block_ops(block_id) {
+            let Some(op) = module.ops.get_mut(op_id) else {
+                continue;
+            };
+            let is_gemm = op.is_op("stablehlo", "dot_general")
+                || (op.is_op("stablehlo", "composite")
+                    && op
+                        .attributes
+                        .get("name")
+                        .and_then(|a| a.as_str())
+                        .is_some_and(|n| {
+                            n == "castforge.fused_matmul_epilogue"
+                                || n == "castforge.fused_gated_mlp"
+                                || n == "castforge.fused_qmatmul"
+                        }));
+            if is_gemm {
+                op.attributes
+                    .insert("castforge.fsdp_sharded".to_string(), Attribute::Bool(true));
+                op.attributes.insert(
+                    "castforge.fsdp_devices".to_string(),
+                    Attribute::Int(devices),
+                );
+                op.attributes.insert(
+                    "castforge.fsdp_prefetch".to_string(),
+                    Attribute::String("all_gather".to_string()),
+                );
+                op.attributes.insert(
+                    "castforge.grad_sync".to_string(),
+                    Attribute::String("reduce_scatter".to_string()),
+                );
+                modified += 1;
+            }
+        }
+    }
+    Ok(PassResult {
+        pass_name: "shard-distributed".to_string(),
+        changed: modified > 0,
+        ops_removed: 0,
+        ops_modified: modified,
+        ops_created: 0,
+    })
 }

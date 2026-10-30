@@ -311,6 +311,7 @@ fn test_horizontal_dot_broadcast_slice_concat_and_reassociation() {
     assert!(res_h[0].changed);
     let printed_h = print_mlir(&horiz);
     assert_eq!(printed_h.matches("stablehlo.dot_general").count(), 1);
+    assert!(printed_h.contains("castforge.horizontal_weights_folded = true"));
     let rep_h =
         verify_module_numerics(&before, &horiz, 1e-5).expect("verify horizontal dot numerics");
     assert!(rep_h.passed, "max_abs_diff = {}", rep_h.max_abs_diff);

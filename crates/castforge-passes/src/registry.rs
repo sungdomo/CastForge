@@ -500,7 +500,7 @@ impl PassRegistry {
         );
         reg.register(
             "specialize-shapes",
-            "Unified symbolic shape specialization, static batch resizing, and bucket dispatch",
+            "Unified shape specialization, static batch resizing, bucketing, and token pruning",
             |opts| {
                 let mut default_dim = 1i64;
                 let mut bindings = IndexMap::new();
@@ -509,8 +509,15 @@ impl PassRegistry {
                     .or_else(|| opts.get("size"))
                     .and_then(|s| s.parse::<i64>().ok());
                 let buckets = opts.get("buckets").cloned();
+                let token_prune_ratio = opts
+                    .get("token_prune_ratio")
+                    .or_else(|| opts.get("prune_ratio"))
+                    .and_then(|s| s.parse::<f32>().ok());
                 for (k, v) in opts {
-                    if k == "batch" || k == "size" || k == "buckets" {
+                    if matches!(
+                        k.as_str(),
+                        "batch" | "size" | "buckets" | "token_prune_ratio" | "prune_ratio"
+                    ) {
                         continue;
                     }
                     if let Ok(n) = v.parse::<i64>() {
@@ -526,6 +533,7 @@ impl PassRegistry {
                     bindings,
                     batch,
                     buckets,
+                    token_prune_ratio,
                 }))
             },
         );

@@ -184,6 +184,7 @@ impl Pass for OptO3Pass {
             bindings: self.bindings.clone(),
             batch: None,
             buckets: None,
+            token_prune_ratio: None,
         };
         let steps = vec![
             spec_pass.run(module)?,

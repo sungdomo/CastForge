@@ -2020,4 +2020,23 @@ fn test_consolidated_and_sota_passes_groupwise_batchnorm_concat_paged_gvn() {
     let rg_ir = print_mlir(&rg_mod);
     assert!(rg_ir.contains("epilogue = \"bias_relu_residual\""));
     assert!(rg_ir.contains("castforge.has_residual = true"));
+
+    // 8. Test ZeRO-3 / FSDP parameter sharding (`shard-distributed(mode=fsdp,devices=4)`)
+    //    and Dynamic Token Pruning (`specialize-shapes(token_prune_ratio=0.5)`)
+    let mut fsdp_mod = parse_mlir(mlir).expect("parse mlir for fsdp + token_prune");
+    let mut pm_fsdp = PassManager::from_pipeline_str(
+        &registry,
+        concat!(
+            "shard-distributed(mode=fsdp,devices=4),",
+            "specialize-shapes(token_prune_ratio=0.5)"
+        ),
+    )
+    .expect("build fsdp + token_prune_ratio");
+    let fsdp_res = pm_fsdp.run(&mut fsdp_mod).expect("run fsdp + token_prune");
+    assert!(fsdp_res.iter().all(|r| r.changed));
+    let fsdp_ir = print_mlir(&fsdp_mod);
+    assert!(fsdp_ir.contains("castforge.fsdp_sharded = true"));
+    assert!(fsdp_ir.contains("castforge.fsdp_devices = 4"));
+    assert!(fsdp_ir.contains("castforge.token_prune_ratio = 0.5"));
+    assert!(fsdp_ir.contains("castforge.token_merging = \"tome_bipartite\""));
 }

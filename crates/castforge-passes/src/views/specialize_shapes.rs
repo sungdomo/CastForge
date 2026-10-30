@@ -9,14 +9,16 @@ use indexmap::IndexMap;
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 
-/// Unified Shape Specialization, Batch Resizing, and Bucketing Pass (`specialize-shapes`).
+/// Unified Shape Specialization, Batch Resizing, Bucketing & Token Pruning (`specialize-shapes`).
 ///
-/// Consolidates `specialize-shapes`, `resize-batch`, and `bucket-shapes` into a single pass.
+/// Consolidates `specialize-shapes`, `resize-batch`, `bucket-shapes`, and dynamic sequence token
+/// pruning/merging (`token_prune_ratio`).
 pub struct UnifiedSpecializeShapesPass {
     pub default_dim: i64,
     pub bindings: IndexMap<String, i64>,
     pub batch: Option<i64>,
     pub buckets: Option<String>,
+    pub token_prune_ratio: Option<f32>,
 }
 
 impl Default for UnifiedSpecializeShapesPass {
@@ -26,6 +28,7 @@ impl Default for UnifiedSpecializeShapesPass {
             bindings: IndexMap::new(),
             batch: None,
             buckets: None,
+            token_prune_ratio: None,
         }
     }
 }
@@ -36,7 +39,7 @@ impl Pass for UnifiedSpecializeShapesPass {
     }
 
     fn description(&self) -> &'static str {
-        "Unified symbolic shape specialization, static batch resizing, and bucket dispatch"
+        "Unified shape specialization, static batch resizing, bucketing, and token pruning"
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
@@ -59,6 +62,9 @@ impl Pass for UnifiedSpecializeShapesPass {
                 .run(module)?,
             );
         }
+        if let Some(ratio) = self.token_prune_ratio {
+            steps.push(run_token_pruning(module, ratio)?);
+        }
         Ok(PassResult {
             pass_name: self.name().to_string(),
             changed: steps.iter().any(|r| r.changed),
@@ -67,6 +73,59 @@ impl Pass for UnifiedSpecializeShapesPass {
             ops_created: steps.iter().map(|r| r.ops_created).sum(),
         })
     }
+}
+
+fn run_token_pruning(module: &mut Module, ratio: f32) -> Result<PassResult> {
+    let r = ratio.clamp(0.05, 0.95);
+    let mut modified = 0usize;
+    let blocks: Vec<BlockId> = module.blocks.keys().collect();
+    for block_id in blocks {
+        for op_id in module.block_ops(block_id) {
+            let Some(op) = module.ops.get(op_id).cloned() else {
+                continue;
+            };
+            let is_target = op.is_op("stablehlo", "dot_general")
+                || (op.is_op("stablehlo", "composite")
+                    && op
+                        .attributes
+                        .get("name")
+                        .and_then(|a| a.as_str())
+                        .is_some_and(|n| n.contains("attention") || n.contains("matmul")));
+            if !is_target {
+                continue;
+            }
+            let seq_len = op
+                .operands
+                .first()
+                .and_then(|&v| module.values[v].ty.as_tensor())
+                .and_then(|t| match t.shape.first() {
+                    Some(Dim::Static(d)) => Some(*d),
+                    _ => None,
+                })
+                .unwrap_or(1);
+            let kept = ((seq_len as f32) * (1.0 - r)).ceil().max(1.0) as i64;
+            let op_mut = &mut module.ops[op_id];
+            op_mut.attributes.insert(
+                "castforge.token_prune_ratio".to_string(),
+                Attribute::Float(r as f64),
+            );
+            op_mut.attributes.insert(
+                "castforge.token_merging".to_string(),
+                Attribute::String("tome_bipartite".to_string()),
+            );
+            op_mut
+                .attributes
+                .insert("castforge.kept_tokens".to_string(), Attribute::Int(kept));
+            modified += 1;
+        }
+    }
+    Ok(PassResult {
+        pass_name: "specialize-shapes".to_string(),
+        changed: modified > 0,
+        ops_removed: 0,
+        ops_modified: modified,
+        ops_created: 0,
+    })
 }
 
 /// Symbolic & Dynamic Shape Specialization & Inference Pass (`specialize-shapes`).
