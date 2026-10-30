@@ -2,9 +2,9 @@
 
 CastForge provides **21 built-in modular A-to-B IR passes & presets** (`18 passes + 3 presets
 O1/O2/O3`) in `src/passes/` (plus the unified **`OptimizeLoopIrPass`** (`optimize-loop-ir`) in
-`src/codegen/`). Every pass implements the unified `Pass` and `Translator` traits and maps
-**100% 1-to-1** to a dedicated source file (`18` pass `.rs` files + `mod.rs`) directly under
-`src/passes/`.
+`src/codegen/`). Every pass implements the unified `Pass` and `Translator` traits, executes via
+single-traversal IR sweeps where applicable, and is organized into focused pass modules and
+sub-packages (`src/passes/<pass>/`) under `src/passes/`.
 
 ---
 

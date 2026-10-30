@@ -123,7 +123,8 @@ CastForge is built around three foundational design principles:
   weight matrices use `dense_resource<key>` handles pointing into `Module::tensor_store`.
   `src/ir/tensor_store.rs` loads and saves `TensorStore` entries directly to/from HuggingFace
   `.safetensors` files.
-- **Weight Surgery Kernels (`quantize.rs`, `fold_weights.rs`, `merge_weights.rs`):**
+- **Weight Surgery Kernels (`src/passes/quantize/`, `src/passes/fold_weights/`,
+  `src/passes/merge_weights.rs`):**
   - `quantize_symmetric_f32`: Symmetric per-tensor `i8` (`[-128, 127]`) and `i4` (`[-8, 7]`)
     quantization emitting `!quant.uniform<i8:f32, scale:zp>`.
   - `prune_2d_columns_by_l1`: Structured output-column pruning by L1 norm with zero-dimension
@@ -189,7 +190,7 @@ target-independent `LoopModule` consisting of `LoopKernel`s and recursive `LoopS
 
 ## 7. Verification, Bisection & Roofline Cost Modeling
 
-- **Shape & Dominance Verification (`src/passes/verify_ir.rs`, `src/ir/stablehlo.rs`):** Every pass
+- **Shape & Dominance Verification (`src/passes/verify_ir/`, `src/ir/stablehlo.rs`):** Every pass
   in `PassManager` can automatically invoke `module.verify()` + `verify_stablehlo_shapes(&module)`
   after execution.
 - **Reference Interpreter (`src/codegen/eval.rs`):** Evaluates all StableHLO operations and all
