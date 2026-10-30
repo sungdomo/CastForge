@@ -31,10 +31,9 @@ support.
   and **SafeTensors** model importers & exporters.
 - [`crates/castforge-passes`](crates/castforge-passes): Unified `Pass`, `PassRegistry`, and
   `PassManager` with **21 canonical A-to-B IR translator modules & presets** (`18 passes + 3
-  presets`) organized with **100% 1-to-1 pass-to-file mapping** (`18` pass `.rs` files + `lib.rs`)
-  into 8 domain subdirectories (`general/`, `views/`, `weights/`, `fusion/`, `memory/`,
-  `distributed/`, `loops/`, `tooling/`), supporting static Rust construction, CLI pipeline strings
-  (`-p`), Unix pipes (`stdin -> stdout`), declarative TOML config files (`--config`), and
+  presets`) organized with **100% 1-to-1 pass-to-file mapping** (`18` pass `.rs` files + `lib.rs`
+  directly under `crates/castforge-passes/src/`), supporting static Rust construction, CLI pipeline
+  strings (`-p`), Unix pipes (`stdin -> stdout`), declarative TOML config files (`--config`), and
   step-by-step tracing.
 - [`crates/castforge-viz`](crates/castforge-viz): Computation graph exporter for **Mermaid**,
   **Graphviz DOT**, **JSON**, unified **MLIR Snapshot Diffing**, and a self-contained **Interactive

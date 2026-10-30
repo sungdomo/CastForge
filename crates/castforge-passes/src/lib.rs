@@ -1,76 +1,44 @@
 //! Unified [`Pass`], [`PassRegistry`], [`PassManager`], and **21 built-in A-to-B IR translator
 //! passes & presets** (`18` passes + `3` presets `O1`/`O2`/`O3` in `castforge-passes`), organized
-//! with 100% 1-to-1 file mapping into 8 domain subgroups: [`general`], [`views`], [`weights`],
-//! [`fusion`], [`memory`], [`distributed`], [`loops`], and [`tooling`].
+//! with 100% 1-to-1 pass-to-file mapping directly under `crates/castforge-passes/src/`.
 
-pub mod distributed {
-    pub mod shard_distributed;
-    pub use shard_distributed::*;
-}
+pub mod canonicalize;
+pub mod cse;
+pub mod dce;
+pub mod fold_views;
+pub mod fold_weights;
+pub mod fuse_attention;
+pub mod fuse_elementwise;
+pub mod fuse_gemm;
+pub mod fuse_norm;
+pub mod ir_edit;
+pub mod merge_weights;
+pub mod optimize_memory;
+pub mod quantize;
+pub mod schedule_loops;
+pub mod shard_distributed;
+pub mod simplify_algebraic;
+pub mod specialize_shapes;
+pub mod verify_ir;
 
-pub mod fusion {
-    pub mod fuse_attention;
-    pub mod fuse_elementwise;
-    pub mod fuse_gemm;
-    pub mod fuse_norm;
-    pub use fuse_attention::*;
-    pub use fuse_elementwise::*;
-    pub use fuse_gemm::*;
-    pub use fuse_norm::*;
-}
-
-pub mod general {
-    pub mod canonicalize;
-    pub mod cse;
-    pub mod dce;
-    pub mod simplify_algebraic;
-    pub use canonicalize::*;
-    pub use cse::*;
-    pub use dce::*;
-    pub use simplify_algebraic::*;
-}
-
-pub mod loops {
-    pub mod schedule_loops;
-    pub use schedule_loops::*;
-}
-
-pub mod memory {
-    pub mod optimize_memory;
-    pub use optimize_memory::*;
-}
-
-pub mod tooling {
-    pub mod ir_edit;
-    pub mod verify_ir;
-    pub use ir_edit::*;
-    pub use verify_ir::*;
-}
-
-pub mod views {
-    pub mod fold_views;
-    pub mod specialize_shapes;
-    pub use fold_views::*;
-    pub use specialize_shapes::*;
-}
-
-pub mod weights {
-    pub mod fold_weights;
-    pub mod merge_weights;
-    pub mod quantize;
-    pub use fold_weights::*;
-    pub use merge_weights::*;
-    pub use quantize::*;
-}
-
-pub use distributed::*;
-pub use fusion::*;
-pub use general::*;
-pub use loops::*;
-pub use memory::*;
-pub use tooling::*;
-pub use views::*;
-pub use weights::*;
+pub use canonicalize::*;
+pub use cse::*;
+pub use dce::*;
+pub use fold_views::*;
+pub use fold_weights::*;
+pub use fuse_attention::*;
+pub use fuse_elementwise::*;
+pub use fuse_gemm::*;
+pub use fuse_norm::*;
+pub use ir_edit::*;
+pub use merge_weights::*;
+pub use optimize_memory::*;
+pub use quantize::*;
+pub use schedule_loops::*;
+pub use shard_distributed::*;
+pub use simplify_algebraic::*;
+pub use specialize_shapes::*;
+pub use verify_ir::*;
 
 use anyhow::{Result, anyhow};
 use castforge_ir::Module;
