@@ -5,7 +5,8 @@ use crate::codegen::{
     HardwareRoofline, TargetConfig, analyze_module_cost, build_memory_plan,
 };
 use crate::ir::{
-    Attribute, Module, TensorStore, import_gguf_file, import_hf_model_dir, import_onnx_file,
+    Attribute, BlockId, Module, TensorStore, import_gguf_file, import_hf_model_dir,
+    import_onnx_file,
 };
 use crate::mlir::parse_mlir;
 use crate::passes::{PassManager, PassRegistry};
@@ -193,27 +194,17 @@ pub fn inspect_module(module: &Module) -> ModuleInspectionReport {
             .collect();
         let mut outputs = Vec::new();
         let mut fn_op_count = 0usize;
-
-        for &op_id in &block.ops {
-            let op = &module.ops[op_id];
-            if op.is_op("func", "return") {
-                for &v in &op.operands {
-                    outputs.push(module.values[v].ty.to_string());
-                }
-                continue;
-            }
-            fn_op_count += 1;
-            total_ops += 1;
-            let op_key = op.name.full_name();
-            *op_counts.entry(op_key).or_insert(0) += 1;
-
-            if op.is_op("stablehlo", "constant")
-                && !matches!(op.attributes.get("value"), Some(Attribute::TensorRef { .. }))
-                && let Some(&res_id) = op.results.first()
-                && let Some(tt) = module.values[res_id].ty.as_tensor()
-            {
-                inline_params += tt.num_elements().unwrap_or(1).max(1) as u64;
-            }
+        for (b_idx, &b_id) in module.regions[reg_id].blocks.iter().enumerate() {
+            inspect_block_ops(
+                module,
+                b_id,
+                b_idx == 0,
+                &mut fn_op_count,
+                &mut total_ops,
+                &mut op_counts,
+                &mut inline_params,
+                &mut outputs,
+            );
         }
 
         functions.push(FunctionSummary {
@@ -244,6 +235,61 @@ pub fn inspect_module(module: &Module) -> ModuleInspectionReport {
         naive_activation_bytes: mem_plan.naive_activation_bytes,
         reusable_arena_slots: mem_plan.reusable_slot_count,
         total_flops: cost.total_flops,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inspect_block_ops(
+    module: &Module,
+    blk_id: BlockId,
+    is_entry_block: bool,
+    fn_op_count: &mut usize,
+    total_ops: &mut usize,
+    op_counts: &mut IndexMap<String, usize>,
+    inline_params: &mut u64,
+    outputs: &mut Vec<String>,
+) {
+    let block = &module.blocks[blk_id];
+    for &op_id in &block.ops {
+        let op = &module.ops[op_id];
+        if op.is_op("func", "return") {
+            if is_entry_block {
+                for &v in &op.operands {
+                    outputs.push(module.values[v].ty.to_string());
+                }
+            }
+            continue;
+        }
+        if op.is_op("stablehlo", "return") {
+            continue;
+        }
+        *fn_op_count += 1;
+        *total_ops += 1;
+        let op_key = op.name.full_name();
+        *op_counts.entry(op_key).or_insert(0) += 1;
+
+        if op.is_op("stablehlo", "constant")
+            && !matches!(op.attributes.get("value"), Some(Attribute::TensorRef { .. }))
+            && let Some(&res_id) = op.results.first()
+            && let Some(tt) = module.values[res_id].ty.as_tensor()
+        {
+            *inline_params += tt.num_elements().unwrap_or(1).max(1) as u64;
+        }
+
+        for &sub_reg in &op.regions {
+            for &sub_blk in &module.regions[sub_reg].blocks {
+                inspect_block_ops(
+                    module,
+                    sub_blk,
+                    false,
+                    fn_op_count,
+                    total_ops,
+                    op_counts,
+                    inline_params,
+                    outputs,
+                );
+            }
+        }
     }
 }
 
@@ -379,12 +425,35 @@ fn load_any_module(input: Option<&PathBuf>) -> Result<Module> {
 }
 
 /// Lists all codegen targets, hardware `--arch` profiles, and composable translator stages.
-pub fn run_list_targets(json: bool, output: Option<&PathBuf>) -> Result<()> {
+pub fn run_list_targets(
+    filter: Option<&str>,
+    json: bool,
+    output: Option<&PathBuf>,
+) -> Result<()> {
     let catalog = target_catalog();
-    let targets = &catalog.target;
+    let q = filter.unwrap_or("").trim().to_ascii_lowercase();
+    let targets: Vec<&TargetBackendInfo> = catalog
+        .target
+        .iter()
+        .filter(|t| {
+            q.is_empty()
+                || t.target.to_ascii_lowercase().contains(&q)
+                || t.aliases.iter().any(|a| a.to_ascii_lowercase().contains(&q))
+                || t.description.to_ascii_lowercase().contains(&q)
+        })
+        .collect();
     let arch_profiles: Vec<ArchProfileInfo> = catalog
         .arch_profile
         .iter()
+        .filter(|spec| {
+            q.is_empty()
+                || spec.arch.to_ascii_lowercase().contains(&q)
+                || spec
+                    .aliases
+                    .iter()
+                    .any(|a| a.to_ascii_lowercase().contains(&q))
+                || spec.simd_isa.to_ascii_lowercase().contains(&q)
+        })
         .map(|spec| {
             let rf = HardwareRoofline::for_arch(&spec.arch);
             let _ = TargetConfig::for_arch(&spec.arch);
@@ -402,7 +471,15 @@ pub fn run_list_targets(json: bool, output: Option<&PathBuf>) -> Result<()> {
             }
         })
         .collect();
-    let translators = &catalog.translator;
+    let translators: Vec<&TranslatorStageInfo> = catalog
+        .translator
+        .iter()
+        .filter(|tr| {
+            q.is_empty()
+                || tr.stage.to_ascii_lowercase().contains(&q)
+                || tr.description.to_ascii_lowercase().contains(&q)
+        })
+        .collect();
 
     let text = if json {
         let payload = serde_json::json!({

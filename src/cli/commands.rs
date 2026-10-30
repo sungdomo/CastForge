@@ -2,11 +2,12 @@
 
 use crate::cli::args::{Cli, Commands};
 use crate::cli::chain::{
-    build_translator_chain_with_weights, parse_codegen_target_strict, parse_viz_format_strict,
+    build_translator_chain_with_weights, parse_codegen_target_strict, parse_loop_order_strict,
+    parse_simd_isa_strict, parse_viz_format_strict, validate_arch_profile,
 };
 use crate::cli::inspect::{run_inspect, run_list_targets};
 use crate::codegen::{
-    CodegenTarget, GemmLoopOrder, HardwareRoofline, OptimizeLoopIrPass, SimdIsa, TargetConfig,
+    CodegenTarget, GemmLoopOrder, HardwareRoofline, OptimizeLoopIrPass, TargetConfig,
     analyze_module_cost_with_roofline, apply_schedule_to_module, autotune_module,
     autotune_module_jit, build_memory_plan, compare_output_tensors, compile_shared_lib,
     emit_c_header, evaluate_function, evaluate_module, generate_code_with_config,
@@ -334,11 +335,14 @@ pub fn run() -> Result<()> {
             }
 
             let mut cfg = match &arch {
-                Some(arch_name) => TargetConfig::for_arch(arch_name),
+                Some(arch_name) => {
+                    validate_arch_profile(arch_name)?;
+                    TargetConfig::for_arch(arch_name)
+                }
                 None => TargetConfig::default(),
             };
             if autotune {
-                let roofline = build_roofline(arch.as_deref(), None, None);
+                let roofline = build_roofline(arch.as_deref(), None, None)?;
                 let report = autotune_module(&module, &roofline);
                 apply_schedule_to_module(&mut module, &report.best.config);
                 let simd_isa_base = cfg.simd_isa;
@@ -358,7 +362,7 @@ pub fn run() -> Result<()> {
                 cfg.wgsl_workgroup_size = wg.max(1);
             }
             if let Some(order) = loop_order {
-                cfg.loop_order = GemmLoopOrder::parse(&order);
+                cfg.loop_order = parse_loop_order_strict(&order)?;
             }
             if let Some(uf) = unroll {
                 cfg.unroll_factor = uf.max(1);
@@ -392,7 +396,7 @@ pub fn run() -> Result<()> {
                 cfg.double_buffer = db_flag;
             }
             if let Some(isa_str) = simd_isa {
-                let parsed = SimdIsa::parse(&isa_str);
+                let parsed = parse_simd_isa_strict(&isa_str)?;
                 cfg.simd_isa = parsed;
                 cfg.simd_width = parsed.default_lanes().max(1);
             }
@@ -473,14 +477,23 @@ pub fn run() -> Result<()> {
                 ),
             };
             let mut cfg = match &arch {
-                Some(a) => TargetConfig::for_arch(a),
+                Some(a) => {
+                    validate_arch_profile(a)?;
+                    TargetConfig::for_arch(a)
+                }
                 None => TargetConfig::default(),
             };
             if autotune {
-                let rf = build_roofline(arch.as_deref(), None, None);
+                let rf = build_roofline(arch.as_deref(), None, None)?;
                 let rep = autotune_module(&module, &rf);
                 apply_schedule_to_module(&mut module, &rep.best.config);
+                let simd_isa_base = cfg.simd_isa;
+                let simd_w_base = cfg.simd_width;
                 cfg = rep.best.config;
+                if arch.is_some() {
+                    cfg.simd_isa = simd_isa_base;
+                    cfg.simd_width = simd_w_base;
+                }
             }
             let bench = jit_execute_and_benchmark(&module, tgt, &cfg, warmup, iters)?;
             let text = if json {
@@ -526,7 +539,7 @@ pub fn run() -> Result<()> {
             let src = read_input_text(input.as_ref())?;
             let mut module = parse_mlir(&src)?;
             load_optional_weights(&mut module, weights.as_ref(), false)?;
-            let roofline = build_roofline(arch.as_deref(), peak_gflops, peak_bw_gbps);
+            let roofline = build_roofline(arch.as_deref(), peak_gflops, peak_bw_gbps)?;
             let before = analyze_module_cost_with_roofline(&module, &roofline);
             if let Some(spec) = passes {
                 let registry = PassRegistry::with_builtin_passes();
@@ -596,7 +609,7 @@ pub fn run() -> Result<()> {
                 let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
                 pm.run(&mut module)?;
             }
-            let roofline = build_roofline(arch.as_deref(), peak_gflops, peak_bw_gbps);
+            let roofline = build_roofline(arch.as_deref(), peak_gflops, peak_bw_gbps)?;
             let report = if bench_jit {
                 autotune_module_jit(&module, &roofline, top_k)?
             } else {
@@ -837,7 +850,9 @@ pub fn run() -> Result<()> {
             tree,
             options,
             json,
+            output,
         } => {
+            use std::fmt::Write as _;
             let registry = PassRegistry::with_builtin_passes();
             let q = filter.as_deref().unwrap_or("").to_ascii_lowercase();
             let entries: Vec<(&str, &str)> = registry
@@ -859,7 +874,7 @@ pub fn run() -> Result<()> {
                 })
                 .collect();
 
-            if json {
+            let text = if json {
                 let items: Vec<serde_json::Value> = entries
                     .iter()
                     .map(|&(name, desc)| {
@@ -887,15 +902,16 @@ pub fn run() -> Result<()> {
                         })
                     })
                     .collect();
-                println!("{}", serde_json::to_string_pretty(&items)?);
+                format!("{}\n", serde_json::to_string_pretty(&items)?)
             } else {
-                println!("Available CastForge Passes ({} matched):", entries.len());
-                println!("{:<28} {:<18} DESCRIPTION", "PASS NAME", "FAMILY");
-                println!("{}", "-".repeat(96));
+                let mut out = String::new();
+                let _ = writeln!(out, "Available CastForge Passes ({} matched):", entries.len());
+                let _ = writeln!(out, "{:<28} {:<18} DESCRIPTION", "PASS NAME", "FAMILY");
+                let _ = writeln!(out, "{}", "-".repeat(96));
                 for (name, desc) in entries {
                     let cat = registry.catalog_entry(name);
                     let family = cat.map(|c| c.family.as_str()).unwrap_or("custom");
-                    println!("{:<28} {:<18} {}", name, family, desc);
+                    let _ = writeln!(out, "{:<28} {:<18} {}", name, family, desc);
                     if tree {
                         let children: Vec<String> = cat
                             .map(|c| c.child_passes.clone())
@@ -914,7 +930,7 @@ pub fn run() -> Result<()> {
                             } else {
                                 "├─"
                             };
-                            println!("  {branch} {child}");
+                            let _ = writeln!(out, "  {branch} {child}");
                         }
                     }
                     if options
@@ -927,18 +943,25 @@ pub fn run() -> Result<()> {
                             } else {
                                 opt.default.clone()
                             };
-                            println!(
+                            let _ = writeln!(
+                                out,
                                 "      arg: {}=<val> (default: {}) — {}",
                                 opt.name, def, opt.desc
                             );
                         }
                     }
                 }
-            }
+                out
+            };
+            write_text_output(output.as_ref(), &text)?;
         }
 
-        Commands::ListTargets { json, output } => {
-            run_list_targets(json, output.as_ref())?;
+        Commands::ListTargets {
+            filter,
+            json,
+            output,
+        } => {
+            run_list_targets(filter.as_deref(), json, output.as_ref())?;
         }
 
         Commands::DirectPass(args) => {
@@ -951,7 +974,7 @@ pub fn run() -> Result<()> {
 }
 
 /// Executes a pass invoked directly as a top-level subcommand
-/// (`castforge <pass-spec> [input] [-o <output>] [-w <weights>] [--save-weights <path>]`).
+/// (`castforge <pass-spec> [key=val ...] [input] [-o <output>] [-w <weights>]`).
 fn run_direct_pass(registry: &PassRegistry, args: &[String]) -> Result<()> {
     let Some(pass_name) = args.first() else {
         anyhow::bail!("Missing pass name for direct pass invocation");
@@ -960,10 +983,14 @@ fn run_direct_pass(registry: &PassRegistry, args: &[String]) -> Result<()> {
     let mut output_path: Option<PathBuf> = None;
     let mut weights_path: Option<PathBuf> = None;
     let mut save_weights_path: Option<PathBuf> = None;
+    let mut extra_opts: Vec<String> = Vec::new();
     let mut generic = false;
     let mut locations = false;
     let mut quiet = false;
+    let mut verify_shapes = false;
     let mut verify_numerics = false;
+    let mut bisect = false;
+    let mut tolerance = 1e-4_f32;
 
     let mut idx = 1usize;
     while idx < args.len() {
@@ -989,17 +1016,36 @@ fn run_direct_pass(registry: &PassRegistry, args: &[String]) -> Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("Missing file path after `--save-weights`"))?;
                 save_weights_path = Some(PathBuf::from(val));
             }
+            "--tolerance" => {
+                idx += 1;
+                let val = args
+                    .get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("Missing float value after `--tolerance`"))?;
+                tolerance = val
+                    .parse()
+                    .with_context(|| format!("Invalid tolerance `{val}`"))?;
+            }
             "--generic" => {
                 generic = true;
             }
             "--locations" => {
                 locations = true;
             }
+            "--verify-shapes" => {
+                verify_shapes = true;
+            }
             "-q" | "--quiet" => {
                 quiet = true;
             }
             "--verify-numerics" => {
                 verify_numerics = true;
+            }
+            "--bisect" => {
+                bisect = true;
+            }
+            kv if !kv.starts_with('-') && kv.contains('=') && !std::path::Path::new(kv).exists() =>
+            {
+                extra_opts.push(kv.to_string());
             }
             positional if !positional.starts_with('-') && input_path.is_none() => {
                 input_path = Some(PathBuf::from(positional));
@@ -1014,10 +1060,18 @@ fn run_direct_pass(registry: &PassRegistry, args: &[String]) -> Result<()> {
         idx += 1;
     }
 
+    let full_spec = if extra_opts.is_empty() {
+        pass_name.clone()
+    } else if let Some(prefix) = pass_name.strip_suffix(')') {
+        format!("{prefix},{})", extra_opts.join(","))
+    } else {
+        format!("{pass_name}({})", extra_opts.join(","))
+    };
+
     let src = read_input_text(input_path.as_ref())?;
     let mut module = parse_mlir(&src)?;
     load_optional_weights(&mut module, weights_path.as_ref(), !quiet)?;
-    let baseline_eval = if verify_numerics {
+    let baseline_eval = if verify_numerics || bisect {
         let inputs = generate_synthetic_inputs(&module, None)?;
         let out_before = evaluate_module(&module, &inputs)?;
         Some((inputs, out_before))
@@ -1025,21 +1079,30 @@ fn run_direct_pass(registry: &PassRegistry, args: &[String]) -> Result<()> {
         None
     };
 
-    let mut pm = PassManager::from_pipeline_str(registry, pass_name)?;
-    let results = pm.run(&mut module)?;
-    if !quiet {
-        log_pass_results(&results);
-    }
-    if let Some((inputs, out_before)) = &baseline_eval {
-        let out_after = evaluate_module(&module, inputs)?;
-        let rep = compare_output_tensors(out_before, &out_after, 1e-4)?;
-        if !rep.passed {
-            anyhow::bail!(
-                "Numerical verification failed: max_abs_diff {:.6e} > tol {:.2e}",
-                rep.max_abs_diff,
-                rep.tolerance
-            );
+    let mut pm = PassManager::from_pipeline_str(registry, &full_spec)?;
+    if bisect {
+        let (inputs, out_before) = baseline_eval.as_ref().expect("baseline initialized");
+        run_pipeline_with_bisect(&mut pm, &mut module, inputs, out_before, tolerance, !quiet)?;
+    } else {
+        let results = pm.run(&mut module)?;
+        if !quiet {
+            log_pass_results(&results);
         }
+        if let Some((inputs, out_before)) = &baseline_eval {
+            let out_after = evaluate_module(&module, inputs)?;
+            let rep = compare_output_tensors(out_before, &out_after, tolerance)?;
+            if !rep.passed {
+                anyhow::bail!(
+                    "Numerical verification failed: max_abs_diff {:.6e} > tol {:.2e}",
+                    rep.max_abs_diff,
+                    rep.tolerance
+                );
+            }
+        }
+    }
+    if verify_shapes {
+        module.verify()?;
+        verify_all_stablehlo_shapes(&module)?;
     }
     if let Some(sw_path) = save_weights_path {
         module
@@ -1179,9 +1242,12 @@ fn build_roofline(
     arch: Option<&str>,
     peak_gflops: Option<f64>,
     peak_bw_gbps: Option<f64>,
-) -> HardwareRoofline {
+) -> Result<HardwareRoofline> {
     let mut roofline = match arch {
-        Some(a) => HardwareRoofline::for_arch(a),
+        Some(a) => {
+            validate_arch_profile(a)?;
+            HardwareRoofline::for_arch(a)
+        }
         None => HardwareRoofline::default(),
     };
     if let Some(g) = peak_gflops {
@@ -1190,7 +1256,7 @@ fn build_roofline(
     if let Some(bw) = peak_bw_gbps {
         roofline.peak_bandwidth_gbps = bw.max(1e-3);
     }
-    roofline
+    Ok(roofline)
 }
 
 fn read_input_text(input: Option<&PathBuf>) -> Result<String> {

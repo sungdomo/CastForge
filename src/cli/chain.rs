@@ -74,6 +74,52 @@ pub(crate) fn parse_viz_format_strict(s: &str) -> Result<VizFormat> {
     }
 }
 
+/// Strictly validates a hardware architecture profile name against `config/targets.toml`.
+pub(crate) fn validate_arch_profile(arch: &str) -> Result<()> {
+    let lower = arch.trim().to_ascii_lowercase();
+    if matches!(lower.as_str(), "scalar" | "generic" | "default" | "host") {
+        return Ok(());
+    }
+    let found = crate::cli::target_catalog()
+        .arch_profile
+        .iter()
+        .any(|p| p.arch == lower || p.aliases.iter().any(|a| a == &lower));
+    if found {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Unknown hardware architecture profile `{arch}`. \
+             Run `castforge list-targets` to see valid `--arch` profiles."
+        )
+    }
+}
+
+/// Strictly validates and parses a [`GemmLoopOrder`] string.
+pub(crate) fn parse_loop_order_strict(s: &str) -> Result<GemmLoopOrder> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "mnk" | "ijk" => Ok(GemmLoopOrder::Mnk),
+        "mkn" | "ikj" | "broadcast-a" | "broadcast_a" => Ok(GemmLoopOrder::Mkn),
+        "nkm" | "jki" => Ok(GemmLoopOrder::Nkm),
+        other => anyhow::bail!("Unknown loop order `{other}` (expected: mnk, mkn, or nkm)"),
+    }
+}
+
+/// Strictly validates and parses a [`SimdIsa`] string.
+pub(crate) fn parse_simd_isa_strict(s: &str) -> Result<SimdIsa> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "scalar" | "none" => Ok(SimdIsa::Scalar),
+        "avx2" | "x86-avx2" | "x86_64-avx2" => Ok(SimdIsa::Avx2),
+        "avx512" | "avx-512" | "x86-avx512" | "x86_64-avx512" => Ok(SimdIsa::Avx512),
+        "neon" | "asimd" | "aarch64-neon" | "arm64" => Ok(SimdIsa::Neon),
+        "sve" | "sve2" | "aarch64-sve" => Ok(SimdIsa::Sve),
+        "rvv" | "riscv-v" | "riscv64-rvv" => Ok(SimdIsa::Rvv),
+        "wasm" | "simd128" | "wasm-simd128" | "wasm32-simd128" => Ok(SimdIsa::WasmSimd128),
+        other => anyhow::bail!(
+            "Unknown SIMD ISA `{other}` (expected: scalar, avx2, avx512, neon, sve, rvv, or wasm)"
+        ),
+    }
+}
+
 /// Parses a `|`- or `,`-delimited translator chain specification into a validated
 /// [`TranslatorChain`], returning `(chain, initial_input_kind, final_output_kind)`.
 pub fn build_translator_chain(
@@ -200,12 +246,12 @@ pub fn build_translator_chain_with_weights(
                 last_out = "text";
             }
             "lower-to-loops" => {
-                let config = parse_target_config_opts(&opts);
+                let config = parse_target_config_opts(&opts)?;
                 chain.push(Box::new(TensorToLoopTranslator { config }));
                 last_out = "text";
             }
             "optimize-loop-ir" => {
-                let config = parse_target_config_opts(&opts);
+                let config = parse_target_config_opts(&opts)?;
                 let mut pass = OptimizeLoopIrPass::default();
                 if opts.contains_key("fuse") || opts.contains_key("fuse_loops") {
                     let key = if opts.contains_key("fuse") {
@@ -237,17 +283,17 @@ pub fn build_translator_chain_with_weights(
                 last_out = "text";
             }
             "compile-lib" | "shared-lib" => {
-                let config = parse_target_config_opts(&opts);
+                let config = parse_target_config_opts(&opts)?;
                 chain.push(Box::new(SharedLibTranslator { config }));
                 last_out = "bytes";
             }
             "autotune-schedule" => {
-                let roofline = parse_roofline_opts(&opts);
+                let roofline = parse_roofline_opts(&opts)?;
                 chain.push(Box::new(AutotuneScheduleTranslator { roofline }));
                 last_out = "ir";
             }
             "roofline-report" => {
-                let roofline = parse_roofline_opts(&opts);
+                let roofline = parse_roofline_opts(&opts)?;
                 chain.push(Box::new(RooflineReportTranslator { roofline }));
                 last_out = "text";
             }
@@ -279,7 +325,7 @@ pub fn build_translator_chain_with_weights(
                             _ => "rust",
                         });
                 let tgt = parse_codegen_target_strict(tgt_str)?;
-                let cfg = parse_target_config_opts(&opts);
+                let cfg = parse_target_config_opts(&opts)?;
                 chain.push(Box::new(CodegenTranslator::with_config(tgt, cfg)));
                 last_out = "text";
             }
@@ -320,9 +366,12 @@ fn parse_bool_opt(opts: &IndexMap<String, String>, key: &str, default: bool) -> 
 }
 
 /// Builds a [`TargetConfig`] from translator stage options (`arch`, `tile_size`, `unroll`, etc.).
-pub(crate) fn parse_target_config_opts(opts: &IndexMap<String, String>) -> TargetConfig {
+pub(crate) fn parse_target_config_opts(opts: &IndexMap<String, String>) -> Result<TargetConfig> {
     let mut cfg = match opts.get("arch") {
-        Some(arch) => TargetConfig::for_arch(arch),
+        Some(arch) => {
+            validate_arch_profile(arch)?;
+            TargetConfig::for_arch(arch)
+        }
         None => TargetConfig::default(),
     };
     if let Some(v) = opts.get("tile_size").or_else(|| opts.get("size"))
@@ -338,7 +387,7 @@ pub(crate) fn parse_target_config_opts(opts: &IndexMap<String, String>) -> Targe
         cfg.wgsl_workgroup_size = n.max(1);
     }
     if let Some(order) = opts.get("loop_order").or_else(|| opts.get("order")) {
-        cfg.loop_order = GemmLoopOrder::parse(order);
+        cfg.loop_order = parse_loop_order_strict(order)?;
     }
     if let Some(v) = opts.get("unroll").or_else(|| opts.get("unroll_factor"))
         && let Ok(n) = v.parse::<usize>()
@@ -382,17 +431,20 @@ pub(crate) fn parse_target_config_opts(opts: &IndexMap<String, String>) -> Targe
         cfg.double_buffer = parse_bool_opt(opts, "double_buffer", cfg.double_buffer);
     }
     if let Some(isa) = opts.get("simd_isa").or_else(|| opts.get("isa")) {
-        let parsed = SimdIsa::parse(isa);
+        let parsed = parse_simd_isa_strict(isa)?;
         cfg.simd_isa = parsed;
         cfg.simd_width = parsed.default_lanes().max(1);
     }
-    cfg
+    Ok(cfg)
 }
 
 /// Builds a [`HardwareRoofline`] from translator stage options (`arch`, `peak_gflops`, etc.).
-pub(crate) fn parse_roofline_opts(opts: &IndexMap<String, String>) -> HardwareRoofline {
+pub(crate) fn parse_roofline_opts(opts: &IndexMap<String, String>) -> Result<HardwareRoofline> {
     let mut roofline = match opts.get("arch") {
-        Some(arch) => HardwareRoofline::for_arch(arch),
+        Some(arch) => {
+            validate_arch_profile(arch)?;
+            HardwareRoofline::for_arch(arch)
+        }
         None => HardwareRoofline::default(),
     };
     if let Some(v) = opts.get("peak_gflops")
@@ -407,7 +459,7 @@ pub(crate) fn parse_roofline_opts(opts: &IndexMap<String, String>) -> HardwareRo
     {
         roofline.peak_bandwidth_gbps = bw.max(1e-3);
     }
-    roofline
+    Ok(roofline)
 }
 
 #[cfg(test)]
@@ -476,6 +528,10 @@ mod tests {
 
         assert!(build_translator_chain(&reg, "codegen(target=invalid_target)").is_err());
         assert!(build_translator_chain(&reg, "viz(format=invalid_format)").is_err());
+        assert!(build_translator_chain(&reg, "codegen-c(arch=unknown_arch)").is_err());
+        assert!(build_translator_chain(&reg, "codegen-c(loop_order=bad_order)").is_err());
+        assert!(build_translator_chain(&reg, "codegen-c(simd_isa=bad_isa)").is_err());
+        assert!(build_translator_chain(&reg, "fold-constants(bad_opt=1)").is_err());
 
         let cli_bench = Cli::try_parse_from([
             "castforge",
@@ -499,8 +555,21 @@ mod tests {
             Cli::try_parse_from(["castforge", "inspect", "model.mlir", "--json"]).unwrap();
         assert!(matches!(cli_inspect.command, Commands::Inspect { .. }));
 
-        let cli_targets = Cli::try_parse_from(["castforge", "targets", "--json"]).unwrap();
+        let cli_targets =
+            Cli::try_parse_from(["castforge", "targets", "hopper", "--json"]).unwrap();
         assert!(matches!(cli_targets.command, Commands::ListTargets { .. }));
+
+        let cli_passes = Cli::try_parse_from([
+            "castforge",
+            "list-passes",
+            "quantize",
+            "-t",
+            "-a",
+            "-o",
+            "passes.txt",
+        ])
+        .unwrap();
+        assert!(matches!(cli_passes.command, Commands::ListPasses { .. }));
 
         let mod_ir = crate::mlir::parse_mlir(
             r#"

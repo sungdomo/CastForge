@@ -449,6 +449,28 @@ impl PassRegistry {
         let desc = self.passes.get(name).ok_or_else(|| {
             anyhow!("Unknown pass `{name}`. Run `castforge list-passes` to see available passes.")
         })?;
+        if !opts.is_empty()
+            && let Some(cat) = self.catalog_entry(name)
+        {
+            if cat.options.is_empty() {
+                let bad: Vec<&str> = opts.keys().map(String::as_str).collect();
+                return Err(anyhow!(
+                    "Pass `{name}` does not accept options (got `{}`)",
+                    bad.join(", ")
+                ));
+            }
+            for k in opts.keys() {
+                let in_catalog = cat.options.iter().any(|o| o.name == *k);
+                if !in_catalog && !is_known_pass_option_alias(k) {
+                    let valid: Vec<&str> = cat.options.iter().map(|o| o.name.as_str()).collect();
+                    eprintln!(
+                        "[castforge:warn] pass `{name}`: unrecognized option `{k}` \
+                         (documented options: {})",
+                        valid.join(", ")
+                    );
+                }
+            }
+        }
         (desc.factory)(opts)
     }
 
@@ -456,4 +478,91 @@ impl PassRegistry {
     pub fn list(&self) -> impl Iterator<Item = (&'static str, &'static str)> + '_ {
         self.passes.values().map(|d| (d.name, d.description))
     }
+}
+
+fn is_known_pass_option_alias(key: &str) -> bool {
+    matches!(
+        key,
+        "mode"
+            | "kind"
+            | "target"
+            | "targets"
+            | "constants"
+            | "hoist"
+            | "dtype"
+            | "group"
+            | "mxfp8"
+            | "size"
+            | "samples"
+            | "num_samples"
+            | "inline"
+            | "chunk"
+            | "latent_rank"
+            | "rank"
+            | "seq_len"
+            | "block_size"
+            | "splits"
+            | "tokens"
+            | "depth"
+            | "draft_tokens"
+            | "tree_depth"
+            | "max_blocks"
+            | "window"
+            | "sliding_window"
+            | "sink_tokens"
+            | "rope_scaling"
+            | "rope_factor"
+            | "softcap"
+            | "logit_softcap"
+            | "qk_norm"
+            | "kv_dtype"
+            | "ssm_state_dim"
+            | "ssm_chunk_size"
+            | "prune_ratio"
+            | "learning_rate"
+            | "num_devices"
+            | "devices"
+            | "num_streams"
+            | "opt"
+            | "wd"
+            | "tile_size"
+            | "tile"
+            | "tile_m"
+            | "tile_n"
+            | "tile_k"
+            | "l2_tile"
+            | "reg_tile_m"
+            | "reg_tile_n"
+            | "unroll"
+            | "factor"
+            | "multiple"
+            | "align"
+            | "collapse"
+            | "skew"
+            | "prefetch"
+            | "split_k"
+            | "double_buffer"
+            | "width"
+            | "parallel"
+            | "warp_specialized"
+            | "tmem_columns"
+            | "max_n"
+            | "set_attr"
+            | "attr"
+            | "parameterize"
+            | "freeze"
+            | "tap"
+            | "values"
+            | "output"
+            | "inputs"
+            | "stats"
+            | "ops"
+            | "tolerance"
+            | "limit"
+            | "bisect"
+            | "ridge"
+            | "format"
+            | "name"
+            | "count"
+    )
 }

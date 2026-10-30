@@ -519,11 +519,18 @@ pub enum Commands {
         /// Emit registered passes (including family, hierarchy, and options) as formatted JSON
         #[arg(long = "json")]
         json: bool,
+
+        /// Optional output file path (defaults to stdout)
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
     },
 
     /// List all codegen targets, hardware `--arch` profiles, and composable translator stages
     #[command(visible_alias = "targets")]
     ListTargets {
+        /// Optional substring filter to match target, arch profile, or translator names
+        filter: Option<String>,
+
         /// Emit targets, arch profiles, and translators as formatted JSON
         #[arg(long = "json")]
         json: bool,
