@@ -1100,6 +1100,37 @@ module @export_and_gpu_demo {
         .expect("gguf module");
     assert_eq!(gguf_mod.tensor_store.len(), 2);
 
+    // Also verify quantized GGUF (Q8_0) round-trip and ONNX composite/modern-op round-trip
+    let reg = PassRegistry::with_builtin_passes();
+    let q_pass = reg
+        .create_pass("quantize-weights", &Default::default())
+        .expect("quantize-weights");
+    let mut q_gguf_chain = TranslatorChain::new()
+        .then(MlirParseTranslator)
+        .then(q_pass)
+        .then(GgufExportTranslator)
+        .then(GgufImportTranslator);
+    let q_gguf_mod = q_gguf_chain
+        .execute(Payload::Text(mlir.to_string()))
+        .expect("IR -> quantize -> GGUF Q8_0 -> IR")
+        .into_ir()
+        .expect("q_gguf module");
+    assert_eq!(q_gguf_mod.tensor_store.len(), 2);
+
+    let fuse_ep = reg
+        .create_pass("fuse-matmul-epilogue", &Default::default())
+        .expect("fuse-matmul-epilogue");
+    let mut comp_onnx_chain = TranslatorChain::new()
+        .then(MlirParseTranslator)
+        .then(fuse_ep)
+        .then(OnnxExportTranslator);
+    let comp_onnx_json = comp_onnx_chain
+        .execute(Payload::Text(mlir.to_string()))
+        .expect("IR -> fuse -> ONNX JSON")
+        .into_text()
+        .expect("onnx json");
+    assert!(comp_onnx_json.contains("castforge.fused_matmul"));
+
     let mut st_chain = TranslatorChain::new()
         .then(MlirParseTranslator)
         .then(SafetensorsExportTranslator);

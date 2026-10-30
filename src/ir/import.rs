@@ -2,7 +2,8 @@
 //! CastForge's Dual-Plane StableHLO IR (`Module` + `TensorStore`).
 
 use crate::ir::{
-    DType, Dim, Module, TensorEntry, TensorStore, TensorType, format_dense_f32_literal, parse_mlir,
+    Attribute, DType, Dim, Module, TensorBacking, TensorEntry, TensorStore, TensorType,
+    f32_to_bf16_bits, f32_to_f16_bits, format_dense_f32_literal, parse_mlir,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -221,11 +222,6 @@ pub fn collect_module_tensors(module: &Module) -> TensorStore {
             continue;
         };
         let n = tensor_ty.num_elements().unwrap_or(1).max(1) as usize;
-        let vals = op
-            .attributes
-            .get("value")
-            .and_then(|a| module.tensor_store.resolve_f32_attr(a, n))
-            .unwrap_or_else(|| vec![0.0; n]);
         let name = module.values[res_val]
             .ssa_name
             .as_deref()
@@ -234,9 +230,41 @@ pub fn collect_module_tensors(module: &Module) -> TensorStore {
                 idx += 1;
                 format!("const_{idx}.weight")
             });
+        if let DType::QuantUniform {
+            scale, zero_point, ..
+        } = &tensor_ty.dtype
+        {
+            let sc = scale.parse::<f32>().unwrap_or(1.0);
+            let zp = *zero_point;
+            let q_vals = op
+                .attributes
+                .get("value")
+                .and_then(|a| module.tensor_store.resolve_i8_attr(a, n))
+                .unwrap_or_else(|| vec![0; n]);
+            store.insert(TensorEntry {
+                name,
+                ty: tensor_ty,
+                backing: TensorBacking::QuantizedI8 {
+                    data: q_vals,
+                    scale: sc,
+                    zero_point: zp,
+                },
+            });
+            continue;
+        }
+        let vals = op
+            .attributes
+            .get("value")
+            .and_then(|a| module.tensor_store.resolve_f32_attr(a, n))
+            .unwrap_or_else(|| vec![0.0; n]);
+        let keep_dtype = match tensor_ty.dtype {
+            DType::F16 => DType::F16,
+            DType::BF16 => DType::BF16,
+            _ => DType::F32,
+        };
         store.insert(TensorEntry::from_f32(
             name,
-            TensorType::new(tensor_ty.shape, DType::F32),
+            TensorType::new(tensor_ty.shape, keep_dtype),
             vals,
         ));
     }
@@ -279,17 +307,53 @@ pub fn export_gguf_bytes(module: &Module) -> Vec<u8> {
         for &d in static_dims.iter().rev() {
             out.extend_from_slice(&d.to_le_bytes());
         }
-        out.extend_from_slice(&(GgmlType::F32 as u32).to_le_bytes());
+        let (ggml_ty, mut bytes) = match &tensor.backing {
+            TensorBacking::QuantizedI8 { data, scale, .. } => {
+                // Q8_0 block: 2-byte f16 scale + 32 x i8 quants = 34 bytes per 32 elements
+                let blocks = data.len().max(1).div_ceil(32);
+                let mut b = Vec::with_capacity(blocks * 34);
+                let sc_bits = f32_to_f16_bits(*scale).to_le_bytes();
+                for blk_idx in 0..blocks {
+                    b.extend_from_slice(&sc_bits);
+                    for i in 0..32 {
+                        let q = data.get(blk_idx * 32 + i).copied().unwrap_or(0);
+                        b.push(q as u8);
+                    }
+                }
+                (GgmlType::Q8_0, b)
+            }
+            _ => {
+                let f32_vals = tensor
+                    .as_f32_slice()
+                    .map(|s| s.to_vec())
+                    .unwrap_or_else(|| vec![0.0; 1]);
+                match tensor.ty.dtype {
+                    DType::F16 => {
+                        let mut b = Vec::with_capacity(f32_vals.len() * 2);
+                        for v in f32_vals {
+                            b.extend_from_slice(&f32_to_f16_bits(v).to_le_bytes());
+                        }
+                        (GgmlType::F16, b)
+                    }
+                    DType::BF16 => {
+                        let mut b = Vec::with_capacity(f32_vals.len() * 2);
+                        for v in f32_vals {
+                            b.extend_from_slice(&f32_to_bf16_bits(v).to_le_bytes());
+                        }
+                        (GgmlType::BF16, b)
+                    }
+                    _ => {
+                        let mut b = Vec::with_capacity(f32_vals.len() * 4);
+                        for v in f32_vals {
+                            b.extend_from_slice(&v.to_le_bytes());
+                        }
+                        (GgmlType::F32, b)
+                    }
+                }
+            }
+        };
+        out.extend_from_slice(&(ggml_ty as u32).to_le_bytes());
         out.extend_from_slice(&(current_offset as u64).to_le_bytes());
-
-        let f32_vals = tensor
-            .as_f32_slice()
-            .map(|s| s.to_vec())
-            .unwrap_or_else(|| vec![0.0; 1]);
-        let mut bytes = Vec::with_capacity(f32_vals.len() * 4);
-        for v in f32_vals {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
         let padded_len = bytes.len().div_ceil(GGUF_DEFAULT_ALIGNMENT) * GGUF_DEFAULT_ALIGNMENT;
         bytes.resize(padded_len, 0);
         current_offset += bytes.len();
@@ -456,7 +520,7 @@ pub fn import_onnx_json(json_str: &str) -> Result<Module> {
                     )?;
                 }
             }
-            "Add" | "Sub" | "Mul" | "Div" | "Max" | "Min" => {
+            "Add" | "Sub" | "Mul" | "Div" | "Max" | "Min" | "Pow" => {
                 let in1 = sanitize_name(node.inputs.get(1).ok_or_else(|| anyhow!("Binary rhs"))?);
                 let hlo = match node.op_type.as_str() {
                     "Add" => "add",
@@ -464,6 +528,7 @@ pub fn import_onnx_json(json_str: &str) -> Result<Module> {
                     "Mul" => "multiply",
                     "Div" => "divide",
                     "Max" => "maximum",
+                    "Pow" => "power",
                     _ => "minimum",
                 };
                 writeln!(
@@ -479,16 +544,135 @@ pub fn import_onnx_json(json_str: &str) -> Result<Module> {
                     "    %{out_name} = stablehlo.maximum %{in0}, %{z} : {out_ty}"
                 )?;
             }
-            "Tanh" | "Exp" | "Log" | "Sqrt" | "Rsqrt" | "Sigmoid" => {
+            "Tanh" | "Exp" | "Log" | "Sqrt" | "Rsqrt" | "Sigmoid" | "Sin" | "Cos" | "Abs"
+            | "Neg" => {
                 let hlo = match node.op_type.as_str() {
                     "Tanh" => "tanh",
                     "Exp" => "exponential",
                     "Log" => "log",
                     "Sqrt" => "sqrt",
                     "Rsqrt" => "rsqrt",
+                    "Sin" => "sine",
+                    "Cos" => "cosine",
+                    "Abs" => "abs",
+                    "Neg" => "negate",
                     _ => "logistic",
                 };
                 writeln!(mlir, "    %{out_name} = stablehlo.{hlo} %{in0} : {out_ty}")?;
+            }
+            "Clip" => {
+                let lo = node
+                    .inputs
+                    .get(1)
+                    .map(|s| sanitize_name(s))
+                    .unwrap_or_else(|| in0.clone());
+                let hi = node
+                    .inputs
+                    .get(2)
+                    .map(|s| sanitize_name(s))
+                    .unwrap_or_else(|| in0.clone());
+                writeln!(
+                    mlir,
+                    "    %{out_name} = \"stablehlo.clamp\"(%{lo}, %{in0}, %{hi}) \
+                     : ({out_ty}, {out_ty}, {out_ty}) -> {out_ty}"
+                )?;
+            }
+            "Gather" => {
+                let indices = sanitize_name(
+                    node.inputs
+                        .get(1)
+                        .ok_or_else(|| anyhow!("Gather indices"))?,
+                );
+                let idx_sh = shapes
+                    .get(&node.inputs[1])
+                    .cloned()
+                    .unwrap_or_else(|| vec![1]);
+                let idx_ty = format!("tensor<{}xf32>", fmt_shape(&idx_sh));
+                let row_w = node.output_shape.get(1).copied().unwrap_or(1);
+                writeln!(
+                    mlir,
+                    "    %{out_name} = \"stablehlo.gather\"(%{in0}, %{indices}) \
+                     {{slice_sizes = [1, {row_w}]}} : ({in0_ty}, {idx_ty}) -> {out_ty}"
+                )?;
+            }
+            "Concat" => {
+                let axis = node.attrs.get("axis").and_then(|v| v.as_i64()).unwrap_or(0);
+                let ins: Vec<String> = node
+                    .inputs
+                    .iter()
+                    .map(|s| format!("%{}", sanitize_name(s)))
+                    .collect();
+                let in_tys: Vec<String> = node
+                    .inputs
+                    .iter()
+                    .map(|s| {
+                        let sh = shapes
+                            .get(s)
+                            .cloned()
+                            .unwrap_or_else(|| node.output_shape.clone());
+                        format!("tensor<{}xf32>", fmt_shape(&sh))
+                    })
+                    .collect();
+                writeln!(
+                    mlir,
+                    "    %{out_name} = \"stablehlo.concatenate\"({}) \
+                     {{dimension = {axis}}} : ({}) -> {out_ty}",
+                    ins.join(", "),
+                    in_tys.join(", ")
+                )?;
+            }
+            "Where" => {
+                let cond = in0.clone();
+                let x = sanitize_name(node.inputs.get(1).ok_or_else(|| anyhow!("Where x"))?);
+                let y = sanitize_name(node.inputs.get(2).ok_or_else(|| anyhow!("Where y"))?);
+                writeln!(
+                    mlir,
+                    "    %{out_name} = stablehlo.select %{cond}, %{x}, %{y} \
+                     : ({in0_ty}, {out_ty}, {out_ty}) -> {out_ty}"
+                )?;
+            }
+            "ReduceSum" | "ReduceMax" => {
+                let z = format!("red_init_{idx}");
+                let reducer = if node.op_type == "ReduceMax" {
+                    "stablehlo.maximum"
+                } else {
+                    "stablehlo.add"
+                };
+                let axis = node.attrs.get("axis").and_then(|v| v.as_i64()).unwrap_or(1);
+                writeln!(
+                    mlir,
+                    "    %{z} = stablehlo.constant dense<0.0> : tensor<f32>"
+                )?;
+                writeln!(
+                    mlir,
+                    "    %{out_name} = stablehlo.reduce %{in0}, %{z} \
+                     {{dimensions = [{axis}], reducer = \"{reducer}\"}} \
+                     : ({in0_ty}, tensor<f32>) -> {out_ty}"
+                )?;
+            }
+            s if s.starts_with("castforge.") => {
+                let ins: Vec<String> = node
+                    .inputs
+                    .iter()
+                    .map(|inp| format!("%{}", sanitize_name(inp)))
+                    .collect();
+                let in_tys: Vec<String> = node
+                    .inputs
+                    .iter()
+                    .map(|inp| {
+                        let sh = shapes
+                            .get(inp)
+                            .cloned()
+                            .unwrap_or_else(|| node.output_shape.clone());
+                        format!("tensor<{}xf32>", fmt_shape(&sh))
+                    })
+                    .collect();
+                writeln!(
+                    mlir,
+                    "    %{out_name} = \"{s}\"({}) : ({}) -> {out_ty}",
+                    ins.join(", "),
+                    in_tys.join(", ")
+                )?;
             }
             "Reshape" => {
                 writeln!(
@@ -879,13 +1063,40 @@ fn build_onnx_model(module: &Module) -> OnnxJsonModel {
             }
 
             let op_inputs: Vec<String> = op.operands.iter().map(|&v| name_of(v)).collect();
-            let op_type = map_stablehlo_to_onnx_op(&op.name.name);
+            let op_type = if op.is_op("stablehlo", "composite") {
+                match op.attributes.get("name") {
+                    Some(Attribute::String(s)) => s.clone(),
+                    _ => "castforge.composite".to_string(),
+                }
+            } else if op.name.dialect == "castforge" {
+                op.name.full_name()
+            } else {
+                map_stablehlo_to_onnx_op(&op.name.name)
+            };
+            let mut attrs = HashMap::new();
+            for (k, v) in &op.attributes {
+                match v {
+                    Attribute::Int(n) => {
+                        attrs.insert(k.clone(), serde_json::json!(n));
+                    }
+                    Attribute::Float(f) => {
+                        attrs.insert(k.clone(), serde_json::json!(f));
+                    }
+                    Attribute::String(s) => {
+                        attrs.insert(k.clone(), serde_json::json!(s));
+                    }
+                    Attribute::DenseIntArray(arr) => {
+                        attrs.insert(k.clone(), serde_json::json!(arr));
+                    }
+                    _ => {}
+                }
+            }
             nodes.push(OnnxJsonNode {
                 op_type,
                 inputs: op_inputs,
                 outputs: vec![out_name],
                 output_shape: out_shape,
-                attrs: HashMap::new(),
+                attrs,
             });
         }
     }
@@ -926,9 +1137,25 @@ fn map_stablehlo_to_onnx_op(hlo_name: &str) -> String {
         "divide" => "Div".to_string(),
         "maximum" => "Max".to_string(),
         "minimum" => "Min".to_string(),
+        "power" => "Pow".to_string(),
         "exponential" => "Exp".to_string(),
+        "log" => "Log".to_string(),
         "tanh" => "Tanh".to_string(),
+        "sqrt" => "Sqrt".to_string(),
         "rsqrt" => "Rsqrt".to_string(),
+        "sine" => "Sin".to_string(),
+        "cosine" => "Cos".to_string(),
+        "abs" => "Abs".to_string(),
+        "negate" => "Neg".to_string(),
+        "logistic" => "Sigmoid".to_string(),
+        "clamp" => "Clip".to_string(),
+        "pad" => "Pad".to_string(),
+        "gather" => "Gather".to_string(),
+        "scatter" => "ScatterElements".to_string(),
+        "concatenate" => "Concat".to_string(),
+        "slice" | "dynamic_slice" => "Slice".to_string(),
+        "select" => "Where".to_string(),
+        "reduce" => "ReduceSum".to_string(),
         "transpose" => "Transpose".to_string(),
         "reshape" => "Reshape".to_string(),
         "convolution" => "Conv".to_string(),
