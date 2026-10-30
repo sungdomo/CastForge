@@ -791,8 +791,7 @@ impl TargetConfig {
     }
 
     /// Merges per-operation schedule attributes stamped by IR-to-IR loop passes
-    /// (`tile-loops`, `permute-loops`, `unroll-loops`, `vectorize-loops`) into a copy
-    /// of this [`TargetConfig`].
+    /// (`schedule-loops`) into a copy of this [`TargetConfig`].
     pub fn with_op_attributes(&self, op: &crate::ir::Operation) -> Self {
         let attrs = &op.attributes;
         let mut cfg = *self;

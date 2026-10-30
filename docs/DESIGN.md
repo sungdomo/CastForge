@@ -11,25 +11,25 @@ CastForge is built around three foundational design principles:
 
 1. **Everything is a Modular A-to-B Translator (`Translator` + `Payload`)**
    Every compiler component—frontend model importers (`.mlir`, `.safetensors`, `.onnx.json`,
-   `.pt.json`, `.gguf`), each of the **91 Graph IR passes & presets**, each of the **7 LoopIR
-   passes**, lowering stages (`ir -> loop-ir`), and backend code emitters (`loop-ir -> code`)—
-   implements the unified `castforge_ir::Translator` trait over a polymorphic
-   `castforge_ir::Payload`. Any stage can be composed into a `TranslatorChain` via CLI
-   (`castforge chain -s "A | B | C"`) or Rust API.
+   `.gguf`), each of the **21 Graph IR passes & presets** (`18` passes + `3` presets `O1`/`O2`/
+   `O3`), the unified **`OptimizeLoopIrPass`** (`optimize-loop-ir`), lowering stages
+   (`ir -> loop-ir`), and backend code emitters (`loop-ir -> code`)—implements the unified
+   `castforge::ir::Translator` trait over a polymorphic `castforge::ir::Payload`. Any stage can be
+   composed into a `TranslatorChain` via CLI (`castforge chain -s "A | B | C"`) or Rust API.
 2. **Dual-Plane Intermediate Representation (SSA Compute Graph + Weight Plane)**
    Traditional compilers treat multi-gigabyte model weights either as giant AST literals or as
    opaque external pointers. CastForge decouples them into two synchronized planes inside
-   `castforge_ir::Module`:
+   `castforge::ir::Module`:
    - **Compute Graph Plane:** Arena-allocated (`slotmap::SlotMap`) SSA operations, values, blocks,
      and regions (`OpId`, `ValueId`, `BlockId`, `RegionId`).
    - **Weight Plane (`TensorStore`):** Dedicated storage holding inline `f32`/`i64` tensors,
-     quantized `i8`/`i4` buffers (`TensorData::QuantizedI8`), or lazy zero-copy `SafeTensors` shard
-     references (`TensorData::ExternalFile`).
+     quantized `i8`/`i4` buffers (`TensorBacking::I8`), or lazy zero-copy `SafeTensors` shard
+     references.
 3. **Two-Tier IR Lowering (`Module` $\to$ `LoopModule` $\to$ Multi-Arch Target Source)**
    High-level algebraic, fusion, quantization, and graph surgery passes operate on the SSA
-   `Module`. Schedule and loop-nest transformations (`loop-interchange`, `loop-unroll`,
-   `loop-vectorize`, `fuse-loops`, `unroll-and-jam`, `collapse-parallel`, `loop-fission`) operate
-   on an explicit polyhedral/imperative `LoopModule` before target-specific code generation.
+   `Module`. Schedule and loop-nest transformations (`OptimizeLoopIrPass`: fusion, fission,
+   interchange, collapse-parallel, unroll-and-jam, unroll, and vectorize) operate on an explicit
+   polyhedral/imperative `LoopModule` before target-specific code generation.
 
 ---
 
@@ -38,20 +38,20 @@ CastForge is built around three foundational design principles:
 ```text
   +--------------------+   +-------------------+   +-------------------+
   |  Model Frontends   |   |   Weight Shards   |   |  StableHLO MLIR   |
-  | ONNX / Torch / GGUF|   |   (.safetensors)  |   |     (.mlir)       |
+  |    ONNX / GGUF     |   |   (.safetensors)  |   |     (.mlir)       |
   +---------+----------+   +---------+---------+   +---------+---------+
             |                        |                       |
             +------------------------+-----------------------+
                                      |
                                      v
                      +-------------------------------+
-                     |    castforge_ir::Module       |
+                     |    castforge::ir::Module      |
                      |  - SSA Compute Graph (SlotMap)|
                      |  - Weight Plane (TensorStore) |
                      +---------------+---------------+
                                      |
                +---------------------+---------------------+
-               |  91 Graph IR Passes & Presets (O1/O2/O3)  |
+               |  21 Graph IR Passes & Presets (O1/O2/O3)  |
                |  - Algebraic / Canonicalization / SCCP    |
                |  - Weight Surgery (Quant/Prune/Merge/LoRA)|
                |  - LLM & Transformer Operator Fusions     |
@@ -67,8 +67,8 @@ CastForge is built around three foundational design principles:
                                      |
                                      v
                      +-------------------------------+
-                     |   castforge_codegen::LoopIR   |
-                     |  - 7 LoopIR Passes            |
+                     | castforge::codegen::LoopModule|
+                     |  - OptimizeLoopIrPass         |
                      |    (interchange, unroll,      |
                      |     vectorize, jam, fission)  |
                      +---------------+---------------+
@@ -135,15 +135,15 @@ CastForge is built around three foundational design principles:
 
 ## 5. Static Liveness & Arena Memory Planning (`src/codegen`)
 
-1. **Block Liveness Analysis (`liveness.rs`):**
+1. **Block Liveness Analysis (`src/codegen/memory_plan.rs`):**
    `compute_block_liveness` assigns each operation in a block a topological step index `1..=N` and
    computes `LiveInterval { first_def, last_use, is_constant, is_block_arg, is_returned }` for
    every tensor SSA value.
-2. **In-Place Buffer Donation (`bufferize-inplace`):**
+2. **In-Place Buffer Donation (`optimize-memory(mode=inplace)`):**
    Elementwise operations whose input tensor has its final use at that exact instruction
    (`last_use == step`) and matches the output byte size are annotated with
    `inplace_operand = <idx>`.
-3. **Greedy Interval Coloring & $O(1)$ Lookup (`memory_plan.rs`):**
+3. **Greedy Interval Coloring & $O(1)$ Lookup (`src/codegen/memory_plan.rs`):**
    `build_memory_plan` allocates intermediate tensors into a single contiguous `arena: &mut [f32]`
    workspace. Non-overlapping live intervals share the same `ArenaSlot` (preferring minimal slot
    growth), while `inplace_operand` donors reuse the donor's slot at zero additional byte cost.
@@ -189,13 +189,14 @@ target-independent `LoopModule` consisting of `LoopKernel`s and recursive `LoopS
 
 ## 7. Verification, Bisection & Roofline Cost Modeling
 
-- **Shape & Dominance Verification (`verify.rs`):** Every pass in `PassManager` can automatically
-  invoke `module.verify()` + `verify_stablehlo_shapes(&module)` after execution.
-- **Reference Interpreter (`eval.rs`):** Evaluates all StableHLO operations and all `castforge.*`
-  fused composites on deterministic synthetic inputs. `verify_module_numerics` verifies numerical
-  equivalence within tolerance (e.g. `1e-4`), and `bisect_module_snapshots` pinpoints the exact
-  pass where numerical drift occurs in a single baseline evaluation.
-- **Roofline Performance Estimator (`cost_model.rs`):** Computes per-op and whole-module FLOPs,
-  memory traffic bytes (accounting for weight quantization and arena reuse), operational intensity
-  ($\text{FLOPs}/\text{Byte}$), and ridge-point bottleneck classification (`ComputeBound` vs.
-  `MemoryBound`).
+- **Shape & Dominance Verification (`src/passes/verify_ir.rs`, `src/ir/stablehlo.rs`):** Every pass
+  in `PassManager` can automatically invoke `module.verify()` + `verify_stablehlo_shapes(&module)`
+  after execution.
+- **Reference Interpreter (`src/codegen/eval.rs`):** Evaluates all StableHLO operations and all
+  `castforge.*` fused composites on deterministic synthetic inputs. `verify_module_numerics`
+  verifies numerical equivalence within tolerance (e.g. `1e-4`), and `bisect_module_snapshots`
+  pinpoints the exact pass where numerical drift occurs in a single baseline evaluation.
+- **Roofline Performance Estimator (`src/codegen/cost_model.rs`):** Computes per-op and whole-module
+  FLOPs, memory traffic bytes (accounting for weight quantization and arena reuse), operational
+  intensity ($\text{FLOPs}/\text{Byte}$), and ridge-point bottleneck classification (`ComputeBound`
+  vs. `MemoryBound`).

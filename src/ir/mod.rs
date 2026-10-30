@@ -437,7 +437,7 @@ impl Payload {
 /// built by concatenating a sequence of simple [`Translator`] modules in a [`TranslatorChain`].
 pub trait Translator: Send + Sync {
     /// Canonical identifier of this A-to-B translator module (e.g., `"parse-mlir"`,
-    /// `"fuse-attention"`, `"tile-loops"`, `"codegen-rust"`).
+    /// `"fuse-attention"`, `"schedule-loops"`, `"codegen-rust"`).
     fn name(&self) -> &str;
 
     /// Expected input representation (`"text"`, `"bytes"`, `"ir"`).

@@ -4,11 +4,7 @@ verify_after_each_pass = true
 max_iterations = 2
 
 [[pipeline]]
-pass = "fold-transpose"
-options = { eliminate_identity = "true" }
-
-[[pipeline]]
-pass = "fold-reshape"
+pass = "fold-views"
 
 [[pipeline]]
 pass = "cse"

@@ -26,7 +26,7 @@ O1/O2/O3`) in `src/passes/` (plus the unified **`OptimizeLoopIrPass`** (`optimiz
 
 ---
 
-## 1. General MLIR & Algebraic Optimization Passes (`src/`, 7 Entries)
+## 1. General MLIR & Algebraic Optimization Passes (`src/passes/`, 7 Entries)
 
 ### 1.1 `dce` (`DeadCodeEliminationPass` — `dce.rs`)
 - **Options:** `symbols=true|false` (default: `true`)
@@ -67,7 +67,7 @@ O1/O2/O3`) in `src/passes/` (plus the unified **`OptimizeLoopIrPass`** (`optimiz
 
 ---
 
-## 2. Views, Shape Specialization & Layout Passes (`src/`, 2 Passes)
+## 2. Views, Shape Specialization & Layout Passes (`src/passes/`, 2 Passes)
 
 ### 2.1 `fold-views` (`FoldViewsPass` — `fold_views.rs`)
 - **Options:** `layout=nhwc|nchw|col_major`, `propagate=true|false`
@@ -85,7 +85,7 @@ O1/O2/O3`) in `src/passes/` (plus the unified **`OptimizeLoopIrPass`** (`optimiz
 
 ---
 
-## 3. Weight Surgery, Pruning & Quantization Passes (`src/`, 3 Passes)
+## 3. Weight Surgery, Pruning & Quantization Passes (`src/passes/`, 3 Passes)
 
 ### 3.1 `quantize` (`QuantizePass` — `quantize.rs`)
 - **Options:** `scheme=weight|groupwise|awq|fp8|nvfp4|f16|bf16|w8a8|smoothquant|hadamard|qat_ste`
@@ -121,7 +121,7 @@ O1/O2/O3`) in `src/passes/` (plus the unified **`OptimizeLoopIrPass`** (`optimiz
 
 ---
 
-## 4. Transformer, GEMM & Operator Fusion Passes (`src/`, 4 Passes)
+## 4. Transformer, GEMM & Operator Fusion Passes (`src/passes/`, 4 Passes)
 
 ### 4.1 `fuse-elementwise` (`UnifiedFuseElementwisePass` — `fuse_elementwise.rs`)
 - **Options:** `mode=composites|map_reduce|loops|megakernel|decompose|activations|swiglu|gelu|moe`
@@ -165,7 +165,7 @@ O1/O2/O3`) in `src/passes/` (plus the unified **`OptimizeLoopIrPass`** (`optimiz
 
 ---
 
-## 5. Memory Planning, Rematerialization & Offloading (`src/`, 1 Pass)
+## 5. Memory Planning, Rematerialization & Offloading (`src/passes/`, 1 Pass)
 
 - **`optimize-memory` (`OptimizeMemoryPass` — `optimize_memory.rs`):** Unified memory
   optimization pass (`mode=all|inplace|zero_copy|remat|selective_remat|offload`, `min_distance=3`,
@@ -177,7 +177,7 @@ O1/O2/O3`) in `src/passes/` (plus the unified **`OptimizeLoopIrPass`** (`optimiz
 
 ---
 
-## 6. Distributed Parallelism, Streams & Autodiff (`src/`, 1 Pass)
+## 6. Distributed Parallelism, Streams & Autodiff (`src/passes/`, 1 Pass)
 
 - **`shard-distributed` (`ShardDistributedPass` — `shard_distributed.rs`):** Unified
   distributed parallelism, stream & reverse-mode AD pass
@@ -191,7 +191,7 @@ O1/O2/O3`) in `src/passes/` (plus the unified **`OptimizeLoopIrPass`** (`optimiz
 
 ---
 
-## 7. Polyhedral Loop Scheduling & Tensor Cores (`src/`, 1 Pass)
+## 7. Polyhedral Loop Scheduling & Tensor Cores (`src/passes/`, 1 Pass)
 
 - **`schedule-loops` (`ScheduleLoopsPass` — `schedule_loops.rs`):** Unified loop schedule,
   2D `convolution` to `im2col + dot_general` lowering (`lower_conv=true`), wide GEMM column
@@ -205,7 +205,7 @@ O1/O2/O3`) in `src/passes/` (plus the unified **`OptimizeLoopIrPass`** (`optimiz
 
 ---
 
-## 8. IR Surgery, Verification, Profiling & Tooling (`src/`, 2 Passes)
+## 8. IR Surgery, Verification, Profiling & Tooling (`src/passes/`, 2 Passes)
 
 1. **`ir-edit` (`IrEditPass` — `ir_edit.rs`):** Unified surgical IR editor, canonicalizer
    and subgraph outliner (`mode=edit|outline|all|gemm|composites|inline|extract|reduce|dedup|

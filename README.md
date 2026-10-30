@@ -38,7 +38,10 @@ support.
   **AMD ROCm HIP (`.hip.cpp`)**, and **Khronos OpenCL (`.cl`)**, plus **C/C++ FFI Header (`.h`)**
   and **Native Shared Libraries (`.so`/`.dylib`)**.
 - [`src/cli`](src/cli): The `castforge` command-line tool (`chain`, `opt`, `viz`, `codegen`,
-  `autotune`, `import`, `profile`, `run`, `list-passes`, plus direct pass subcommands).
+  `autotune`, `import`, `profile`, `run`, `list-passes`, plus direct pass subcommands), invoked by
+  [`src/main.rs`](src/main.rs) and exported alongside all modules in [`src/lib.rs`](src/lib.rs).
+- [`tests/`](tests): End-to-end integration test suites (`ai_opt_tests.rs`, `codegen_tests.rs`,
+  `pipeline_tests.rs`).
 
 ## Built-in A-to-B Translator Modules & Presets (21 Canonical Entries)
 
@@ -88,7 +91,7 @@ support.
 ## Quick Start
 
 ```bash
-# 1. List all 29 registered A-to-B translator modules and pipeline presets
+# 1. List all 21 registered A-to-B translator passes and pipeline presets
 cargo run --bin castforge -- list-passes
 
 # 2. Concatenate simple A-to-B translators via standard Unix pipes (stdin -> stdout)

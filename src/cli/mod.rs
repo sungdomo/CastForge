@@ -43,7 +43,7 @@ pub enum Commands {
         /// Input MLIR file path (reads from stdin if omitted or "-")
         input: Option<PathBuf>,
 
-        /// Comma- or pipe-separated pass pipeline (e.g. "fold-transpose | cse | dce")
+        /// Comma- or pipe-separated pass pipeline (e.g. "fold-views | cse | dce")
         #[arg(short = 'p', long = "passes")]
         passes: Option<String>,
 
@@ -277,7 +277,7 @@ pub enum Commands {
         input: Option<PathBuf>,
 
         /// Concatenated A-to-B translator stages separated by `|` or `,`
-        /// (e.g. "fuse-attention | tile-loops(size=16) | vectorize-loops(isa=avx2) | codegen-rust")
+        /// (e.g. "fuse-attention | schedule-loops(size=16,isa=avx2) | codegen-rust")
         #[arg(short = 's', long = "stages")]
         stages: String,
 
@@ -290,7 +290,7 @@ pub enum Commands {
     ListPasses,
 
     /// Dynamically invoke a single pass or preset directly by subcommand name
-    /// (e.g., `castforge canonicalize model.mlir` or `castforge fold-transpose model.mlir`)
+    /// (e.g., `castforge canonicalize model.mlir` or `castforge fold-views model.mlir`)
     #[command(external_subcommand)]
     DirectPass(Vec<String>),
 }
