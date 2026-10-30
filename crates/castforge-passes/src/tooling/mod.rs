@@ -1,31 +1,30 @@
-pub mod compose_funcs;
-pub mod dedup_and_normalize;
-pub mod extract_subgraph;
-pub mod freeze_inputs;
-pub mod hash_and_verify;
-pub mod instrument_and_strip;
-pub mod ir_edit;
-pub mod opt_presets;
-pub mod outline_subgraphs;
-pub mod print_op_stats;
-pub mod reduce_ir;
-pub mod sanitize_numerics;
-pub mod strip_debuginfo;
-pub mod strip_metadata;
-pub mod tap_intermediates;
+//! Compiler diagnostics, IR surgery, subgraph outlining, normalization, verification, and profiling
+//! passes.
 
-pub use compose_funcs::{ComposeFuncsPass, link_modules};
-pub use dedup_and_normalize::{DedupFunctionsPass, NormalizeSsaPass};
-pub use extract_subgraph::ExtractSubgraphPass;
-pub use freeze_inputs::{FreezeInputsPass, ParameterizeConstantsPass};
-pub use hash_and_verify::{HashIrPass, VerifyEquivPass, compute_structural_hash};
-pub use instrument_and_strip::{InstrumentProfilingPass, StripAttributesPass};
-pub use ir_edit::IrEditPass;
-pub use opt_presets::{OptO1Pass, OptO2Pass, OptO3Pass};
-pub use outline_subgraphs::OutlineSubgraphsPass;
-pub use print_op_stats::{PrintOpStatsPass, RooflineSummary, analyze_roofline};
-pub use reduce_ir::{BisectPassesPass, ReduceIrPass};
-pub use sanitize_numerics::SanitizeNumericsPass;
-pub use strip_debuginfo::StripDebugInfoPass;
-pub use strip_metadata::{StripMetadataPass, UnifiedFreezeInputsPass};
-pub use tap_intermediates::TapIntermediatesPass;
+pub mod extract_subgraph;
+pub mod ir_edit;
+pub mod normalize_ir;
+pub mod outline_subgraphs;
+pub mod profile_ir;
+pub mod verify_ir;
+
+pub use extract_subgraph::{ExtractSubgraphPass, ReduceIrPass};
+pub use ir_edit::{
+    FreezeInputsPass, IrEditPass, ParameterizeConstantsPass, TapIntermediatesPass,
+    UnifiedFreezeInputsPass,
+};
+pub use normalize_ir::{
+    NormalizeIrPass, NormalizeSsaPass, StripAttributesPass, StripDebugInfoPass, StripMetadataPass,
+};
+pub use outline_subgraphs::{
+    ComposeFuncsPass, DedupFunctionsPass, OutlineSubgraphsPass, UnifiedOutlineSubgraphsPass,
+    UnrollCallsPass, link_modules,
+};
+pub use profile_ir::{
+    InstrumentProfilingPass, PrintOpStatsPass, RooflineSummary, UnifiedProfileIrPass,
+    analyze_roofline,
+};
+pub use verify_ir::{
+    BisectPassesPass, HashIrPass, SanitizeNumericsPass, UnifiedVerifyIrPass, VerifyEquivPass,
+    VerifyShapesPass, compute_structural_hash,
+};

@@ -1,19 +1,75 @@
+//! Symbolic & Dynamic Shape Specialization, Batch Resizing, and Shape Bucketing
+//! (`specialize-shapes`).
+
 use crate::{Pass, PassResult};
 use anyhow::Result;
 use castforge_dialect_stablehlo::StableHloOp;
-use castforge_ir::{Attribute, BlockId, Dim, Module, TensorType, Type};
+use castforge_ir::{Attribute, BlockId, Dim, Module, OpName, TensorType, Type, ValueId};
 use indexmap::IndexMap;
+use smallvec::SmallVec;
+use std::collections::{HashMap, HashSet};
+
+/// Unified Shape Specialization, Batch Resizing, and Bucketing Pass (`specialize-shapes`).
+///
+/// Consolidates `specialize-shapes`, `resize-batch`, and `bucket-shapes` into a single pass.
+pub struct UnifiedSpecializeShapesPass {
+    pub default_dim: i64,
+    pub bindings: IndexMap<String, i64>,
+    pub batch: Option<i64>,
+    pub buckets: Option<String>,
+}
+
+impl Default for UnifiedSpecializeShapesPass {
+    fn default() -> Self {
+        Self {
+            default_dim: 1,
+            bindings: IndexMap::new(),
+            batch: None,
+            buckets: None,
+        }
+    }
+}
+
+impl Pass for UnifiedSpecializeShapesPass {
+    fn name(&self) -> &'static str {
+        "specialize-shapes"
+    }
+
+    fn description(&self) -> &'static str {
+        "Unified symbolic shape specialization, static batch resizing, and bucket dispatch"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let mut steps = Vec::new();
+        steps.push(
+            SpecializeShapesPass {
+                default_dim: self.default_dim,
+                bindings: self.bindings.clone(),
+            }
+            .run(module)?,
+        );
+        if let Some(batch) = self.batch {
+            steps.push(ResizeBatchPass { batch }.run(module)?);
+        }
+        if let Some(ref buckets) = self.buckets {
+            steps.push(
+                BucketShapesPass {
+                    buckets: buckets.clone(),
+                }
+                .run(module)?,
+            );
+        }
+        Ok(PassResult {
+            pass_name: self.name().to_string(),
+            changed: steps.iter().any(|r| r.changed),
+            ops_removed: steps.iter().map(|r| r.ops_removed).sum(),
+            ops_modified: steps.iter().map(|r| r.ops_modified).sum(),
+            ops_created: steps.iter().map(|r| r.ops_created).sum(),
+        })
+    }
+}
 
 /// Symbolic & Dynamic Shape Specialization & Inference Pass (`specialize-shapes`).
-///
-/// Inspired by Modular MAX Engine's symbolic shape specialization (`reify-shapes`):
-/// - Binds symbolic dimensions (`tensor<BxSx128xf32>`) and dynamic dimensions
-///   (`tensor<?x128xf32>`) using user-supplied symbol bindings (e.g. `B=4,S=128,default=1`).
-/// - Propagates static shapes forward through `stablehlo` operations (`dot_general`, `transpose`,
-///   `reshape` with a single `?` dimension, `reduce`, `concatenate`, `slice`, `composite`, and
-///   elementwise ops).
-/// - Updates `func.func` function signatures so downstream Arena Memory Planning (`MemoryPlan`),
-///   Roofline analysis, and target codegen operate on fully static shapes.
 pub struct SpecializeShapesPass {
     pub default_dim: i64,
     pub bindings: IndexMap<String, i64>,
@@ -75,7 +131,6 @@ impl Pass for SpecializeShapesPass {
         let mut modified = 0usize;
         let blocks: Vec<BlockId> = module.blocks.keys().collect();
 
-        // 1. Specialize all block arguments first
         for &block_id in &blocks {
             let args = module.blocks[block_id].arguments.clone();
             for arg_val in args {
@@ -89,7 +144,6 @@ impl Pass for SpecializeShapesPass {
             }
         }
 
-        // 2. Forward shape inference & specialization across all operations in each block
         for &block_id in &blocks {
             let ops = module.block_ops(block_id);
             for op_id in ops {
@@ -146,7 +200,6 @@ impl Pass for SpecializeShapesPass {
                             if let Some(in_t) = module.values[operand].ty.as_tensor()
                                 && let Some(total_elems) = in_t.num_elements()
                             {
-                                // If target shape has exactly one non-static dim, infer it!
                                 let non_static_count = cur_res_ty
                                     .shape
                                     .iter()
@@ -292,7 +345,6 @@ impl Pass for SpecializeShapesPass {
             }
         }
 
-        // 3. Synchronize `func.func` `function_type` attribute with specialized args & returns
         for fn_op_id in module.functions() {
             let Some(reg_id) = module.ops[fn_op_id].regions.first().copied() else {
                 continue;
@@ -345,5 +397,323 @@ impl Pass for SpecializeShapesPass {
             ops_modified: modified,
             ops_created: 0,
         })
+    }
+}
+
+/// Static Batch Dimension Resizer Pass (`resize-batch`).
+#[derive(Debug, Clone)]
+pub struct ResizeBatchPass {
+    /// Target leading batch size (`>= 1`, default `4`).
+    pub batch: i64,
+}
+
+impl Default for ResizeBatchPass {
+    fn default() -> Self {
+        Self { batch: 4 }
+    }
+}
+
+impl Pass for ResizeBatchPass {
+    fn name(&self) -> &'static str {
+        "resize-batch"
+    }
+
+    fn description(&self) -> &'static str {
+        "Rewrites the leading batch dimension across activations while preserving 2D GEMM weights"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let new_batch = self.batch.max(1);
+        let mut modified = 0usize;
+
+        for fn_op_id in module.functions() {
+            let reg_id = module.ops[fn_op_id].regions[0];
+            let block_id = module.regions[reg_id].blocks[0];
+            let args = module.blocks[block_id].arguments.clone();
+            let ops = module.blocks[block_id].ops.clone();
+
+            let Some(&first_arg) = args.first() else {
+                continue;
+            };
+            let Some(old_batch) = leading_static_dim(module, first_arg) else {
+                continue;
+            };
+            if old_batch == new_batch {
+                continue;
+            }
+
+            let mut weight_rhs_vals: HashSet<ValueId> = HashSet::new();
+            for &op_id in &ops {
+                let op = &module.ops[op_id];
+                if op.is_op("stablehlo", "dot_general") && op.operands.len() >= 2 {
+                    weight_rhs_vals.insert(op.operands[1]);
+                }
+            }
+
+            for &arg_id in &args {
+                if weight_rhs_vals.contains(&arg_id) {
+                    continue;
+                }
+                if set_leading_dim(module, arg_id, old_batch, new_batch) {
+                    modified += 1;
+                }
+            }
+
+            for &op_id in &ops {
+                if module.ops[op_id].is_op("func", "return") {
+                    continue;
+                }
+                let res_ids: Vec<ValueId> = module.ops[op_id].results.to_vec();
+                for res_id in res_ids {
+                    if weight_rhs_vals.contains(&res_id) {
+                        continue;
+                    }
+                    if set_leading_dim(module, res_id, old_batch, new_batch) {
+                        modified += 1;
+                        if let Some(Attribute::DenseElements { ty, .. }) =
+                            module.ops[op_id].attributes.get_mut("value")
+                            && !ty.shape.is_empty()
+                        {
+                            ty.shape[0] = Dim::Static(new_batch);
+                        }
+                    }
+                }
+            }
+
+            let inputs: Vec<Type> = module.blocks[block_id]
+                .arguments
+                .iter()
+                .map(|&a| module.values[a].ty.clone())
+                .collect();
+            let results: Vec<Type> = ops
+                .iter()
+                .find(|&&id| module.ops[id].is_op("func", "return"))
+                .map(|&ret_id| {
+                    module.ops[ret_id]
+                        .operands
+                        .iter()
+                        .map(|&v| module.values[v].ty.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            module.ops[fn_op_id].attributes.insert(
+                "function_type".to_string(),
+                Attribute::Type(Type::Function { inputs, results }),
+            );
+        }
+
+        Ok(PassResult {
+            pass_name: self.name().to_string(),
+            changed: modified > 0,
+            ops_removed: 0,
+            ops_modified: modified,
+            ops_created: 0,
+        })
+    }
+}
+
+fn leading_static_dim(module: &Module, vid: ValueId) -> Option<i64> {
+    module.values[vid]
+        .ty
+        .as_tensor()
+        .and_then(|t| match t.shape.first() {
+            Some(Dim::Static(d)) => Some(*d),
+            _ => None,
+        })
+}
+
+fn set_leading_dim(module: &mut Module, vid: ValueId, old_batch: i64, new_batch: i64) -> bool {
+    if let Type::Tensor(ref mut t) = module.values[vid].ty
+        && !t.shape.is_empty()
+        && t.shape[0] == Dim::Static(old_batch)
+    {
+        t.shape[0] = Dim::Static(new_batch);
+        return true;
+    }
+    false
+}
+
+/// Multi-Bucket Shape Cloner Pass (`bucket-shapes`).
+#[derive(Debug, Clone)]
+pub struct BucketShapesPass {
+    /// Semicolon/comma-separated batch sizes to specialize (default `"1;4;8"`).
+    pub buckets: String,
+}
+
+impl Default for BucketShapesPass {
+    fn default() -> Self {
+        Self {
+            buckets: "1;4;8".to_string(),
+        }
+    }
+}
+
+impl Pass for BucketShapesPass {
+    fn name(&self) -> &'static str {
+        "bucket-shapes"
+    }
+
+    fn description(&self) -> &'static str {
+        "Clones the entry function into batch-specialized bucket variants (@fn_batch_B)"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let Some(&src_fn_id) = module.functions().first() else {
+            return Ok(PassResult::unchanged(self.name()));
+        };
+        let batch_sizes: Vec<i64> = self
+            .buckets
+            .split([',', ';'])
+            .filter_map(|s| s.trim().parse::<i64>().ok())
+            .filter(|&b| b >= 1)
+            .collect();
+        if batch_sizes.is_empty() {
+            return Ok(PassResult::unchanged(self.name()));
+        }
+
+        let src_sym = module.ops[src_fn_id]
+            .attributes
+            .get("sym_name")
+            .and_then(|a| a.as_str())
+            .unwrap_or("main")
+            .to_string();
+        let src_reg = module.ops[src_fn_id].regions[0];
+        let src_blk = module.regions[src_reg].blocks[0];
+        let src_args = module.blocks[src_blk].arguments.clone();
+        let src_ops = module.blocks[src_blk].ops.clone();
+
+        let old_batch = src_args
+            .first()
+            .and_then(|&a| module.values[a].ty.as_tensor())
+            .and_then(|t| match t.shape.first() {
+                Some(Dim::Static(d)) => Some(*d),
+                _ => None,
+            })
+            .unwrap_or(1);
+
+        let mut weight_rhs_vals: HashSet<ValueId> = HashSet::new();
+        for &op_id in &src_ops {
+            let op = &module.ops[op_id];
+            if op.is_op("stablehlo", "dot_general") && op.operands.len() >= 2 {
+                weight_rhs_vals.insert(op.operands[1]);
+            }
+        }
+
+        let mod_body = module.body_block();
+        let mut created_fns = 0usize;
+
+        for &b_size in &batch_sizes {
+            let dst_blk = module.create_block(None);
+            let mut val_map: HashMap<ValueId, ValueId> = HashMap::new();
+            let mut in_types = Vec::with_capacity(src_args.len());
+
+            for &arg_id in &src_args {
+                let ssa = module.values[arg_id].ssa_name.clone();
+                let mut ty = module.values[arg_id].ty.clone();
+                if !weight_rhs_vals.contains(&arg_id) {
+                    resize_type_batch(&mut ty, old_batch, b_size);
+                }
+                in_types.push(ty.clone());
+                let new_arg = module.add_block_argument(dst_blk, ssa, ty);
+                val_map.insert(arg_id, new_arg);
+            }
+
+            let mut out_types = Vec::new();
+            for &op_id in &src_ops {
+                let op = module.ops[op_id].clone();
+                let mapped_operands: SmallVec<[ValueId; 4]> = op
+                    .operands
+                    .iter()
+                    .map(|&v| val_map.get(&v).copied().unwrap_or(v))
+                    .collect();
+
+                if op.is_op("func", "return") {
+                    for &opnd in &mapped_operands {
+                        out_types.push(module.values[opnd].ty.clone());
+                    }
+                }
+
+                let mut res_specs = Vec::with_capacity(op.results.len());
+                for &old_r in &op.results {
+                    let ssa = module.values[old_r].ssa_name.clone();
+                    let mut r_ty = module.values[old_r].ty.clone();
+                    if !weight_rhs_vals.contains(&old_r) {
+                        resize_type_batch(&mut r_ty, old_batch, b_size);
+                    }
+                    res_specs.push((ssa, r_ty));
+                }
+
+                let mut attrs = op.attributes.clone();
+                if let Some(Attribute::DenseElements { ty, .. }) = attrs.get_mut("value")
+                    && op
+                        .results
+                        .first()
+                        .is_some_and(|r| !weight_rhs_vals.contains(r))
+                    && !ty.shape.is_empty()
+                    && ty.shape[0] == Dim::Static(old_batch)
+                {
+                    ty.shape[0] = Dim::Static(b_size);
+                }
+
+                let new_op_id = module.add_operation(
+                    dst_blk,
+                    op.name,
+                    mapped_operands,
+                    res_specs,
+                    attrs,
+                    Vec::new(),
+                    op.custom_syntax,
+                    op.location,
+                );
+                for (&old_r, &new_r) in op.results.iter().zip(module.ops[new_op_id].results.iter())
+                {
+                    val_map.insert(old_r, new_r);
+                }
+            }
+
+            let dst_reg = module.create_region(vec![dst_blk]);
+            let mut fn_attrs = module.ops[src_fn_id].attributes.clone();
+            fn_attrs.insert(
+                "sym_name".to_string(),
+                Attribute::String(format!("{src_sym}_batch_{b_size}")),
+            );
+            fn_attrs.insert(
+                "function_type".to_string(),
+                Attribute::Type(Type::Function {
+                    inputs: in_types,
+                    results: out_types,
+                }),
+            );
+            let loc = module.ops[src_fn_id].location.clone();
+            module.add_operation(
+                mod_body,
+                OpName::new("func", "func"),
+                SmallVec::new(),
+                Vec::new(),
+                fn_attrs,
+                vec![dst_reg],
+                true,
+                loc,
+            );
+            created_fns += 1;
+        }
+
+        Ok(PassResult {
+            pass_name: self.name().to_string(),
+            changed: created_fns > 0,
+            ops_removed: 0,
+            ops_modified: 0,
+            ops_created: created_fns,
+        })
+    }
+}
+
+fn resize_type_batch(ty: &mut Type, old_batch: i64, new_batch: i64) {
+    if let Type::Tensor(ref mut t) = *ty
+        && !t.shape.is_empty()
+        && (t.shape[0] == Dim::Static(old_batch)
+            || matches!(t.shape[0], Dim::Dynamic | Dim::Symbolic(_)))
+    {
+        t.shape[0] = Dim::Static(new_batch);
     }
 }

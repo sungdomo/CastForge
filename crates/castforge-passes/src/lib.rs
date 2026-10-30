@@ -1,4 +1,4 @@
-//! Unified [`Pass`], [`PassRegistry`], [`PassManager`], and **82 built-in A-to-B IR translator
+//! Unified [`Pass`], [`PassRegistry`], [`PassManager`], and **51 built-in A-to-B IR translator
 //! passes & presets** (`castforge-passes`), organized into 8 domain subgroups:
 //! [`general`], [`views`], [`weights`], [`fusion`], [`memory`], [`distributed`], [`loops`], and
 //! [`tooling`].

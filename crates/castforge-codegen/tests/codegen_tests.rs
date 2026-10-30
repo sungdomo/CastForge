@@ -121,7 +121,7 @@ module @numeric_verify_demo {
     let registry = PassRegistry::with_builtin_passes();
     let mut pm = PassManager::from_pipeline_str(
         &registry,
-        "fold-batchnorm,fuse-gemm(kind=epilogue),fold-constants,dce",
+        "fold-weights,fuse-gemm(kind=epilogue),fold-constants,dce",
     )
     .expect("build pipeline");
     pm.run(&mut after).expect("run pipeline");
@@ -229,9 +229,9 @@ module @inplace_demo {
 
     let mut inplace_mod = baseline.clone();
     let registry = PassRegistry::with_builtin_passes();
-    let mut pm =
-        PassManager::from_pipeline_str(&registry, "bufferize-inplace").expect("inplace pipeline");
-    let res = pm.run(&mut inplace_mod).expect("run bufferize-inplace");
+    let mut pm = PassManager::from_pipeline_str(&registry, "optimize-memory(mode=inplace)")
+        .expect("inplace pipeline");
+    let res = pm.run(&mut inplace_mod).expect("run optimize-memory");
     assert!(res[0].changed);
 
     let inplace_plan = build_memory_plan(&inplace_mod);
@@ -350,7 +350,11 @@ module @advanced_loops_demo {
     let registry = PassRegistry::with_builtin_passes();
     let mut pm = PassManager::from_pipeline_str(
         &registry,
-        "fuse-rope,fuse-elementwise(mode=loops),fuse-elementwise(mode=loops,max_steps=2)",
+        concat!(
+            "fuse-attention(kind=rope),",
+            "fuse-elementwise(mode=loops),",
+            "fuse-elementwise(mode=loops,max_steps=2)"
+        ),
     )
     .expect("fission pipeline");
     let res = pm.run(&mut transformed).expect("run pipeline");
@@ -432,9 +436,11 @@ module @complete_fusion_and_polyhedral {
     let before = parse_mlir(mlir).expect("parse complete mlir");
     let mut fused = before.clone();
     let registry = PassRegistry::with_builtin_passes();
-    let mut pm =
-        PassManager::from_pipeline_str(&registry, "fuse-softmax,fuse-attention,fuse-map-reduce")
-            .expect("complete fusion pipeline");
+    let mut pm = PassManager::from_pipeline_str(
+        &registry,
+        "fuse-softmax,fuse-attention,fuse-elementwise(mode=map_reduce)",
+    )
+    .expect("complete fusion pipeline");
     let res = pm.run(&mut fused).expect("run complete fusion");
     assert!(res[0].changed);
     assert!(res[1].changed);
@@ -507,7 +513,7 @@ module @conv_model {
     let registry = PassRegistry::with_builtin_passes();
     let mut pm = PassManager::from_pipeline_str(
         &registry,
-        "lower-conv-to-gemm,fold-views,fuse-gemm(kind=epilogue),dce",
+        "schedule-loops(lower_conv=true),fold-views,fuse-gemm(kind=epilogue),dce",
     )
     .expect("conv pipeline");
     pm.run(&mut lowered).expect("run conv pipeline");
@@ -759,10 +765,10 @@ module @advanced_compiler_frontiers {
     let mut pm = PassManager::from_pipeline_str(
         &registry,
         concat!(
-            "optimize-attention(mode=kv_cache,max_seq_len=4096),",
+            "fuse-attention(mode=kv_cache,max_seq_len=4096),",
             "shard-distributed(mode=tp,devices=4,coalesce=false),",
             "simplify-algebraic(egraph=true),",
-            "rematerialize"
+            "optimize-memory(mode=remat)"
         ),
     )
     .expect("frontiers pipeline");
@@ -842,8 +848,9 @@ module @moe_block {
     let before = parse_mlir(moe_mlir).expect("parse moe_block");
     let mut fused = before.clone();
     let registry = PassRegistry::with_builtin_passes();
-    let mut pm = PassManager::from_pipeline_str(&registry, "fuse-moe,fuse-attention")
-        .expect("moe+attn pipeline");
+    let mut pm =
+        PassManager::from_pipeline_str(&registry, "fuse-activations(kind=moe),fuse-attention")
+            .expect("moe+attn pipeline");
     let res = pm.run(&mut fused).expect("run moe+attn");
     assert!(res[0].changed);
     assert!(res[1].changed);
@@ -872,10 +879,9 @@ module @moe_block {
     let dec_rep = verify_module_numerics(&before, &decomposed, 1e-5).expect("verify decomposed");
     assert!(dec_rep.passed);
 
-    // Verify mixed-precision pass (bf16 & f16) and ping-pong double buffering
+    // Verify mixed-precision via quantize(dtype=bf16) and ping-pong double buffering
     let mut mp_mod = before.clone();
-    let mut mp_pm =
-        PassManager::from_pipeline_str(&registry, "mixed-precision(dtype=bf16)").expect("mp");
+    let mut mp_pm = PassManager::from_pipeline_str(&registry, "quantize(dtype=bf16)").expect("mp");
     let mp_res = mp_pm.run(&mut mp_mod).expect("run mp");
     assert!(mp_res[0].changed);
     let mp_ir = print_mlir(&mp_mod);
@@ -915,7 +921,7 @@ module @parallel_branches {
     let registry = PassRegistry::with_builtin_passes();
     let mut pm = PassManager::from_pipeline_str(
         &registry,
-        "quantize(scheme=w8a8,bits=8,samples=4),schedule-streams(streams=2)",
+        "quantize(scheme=w8a8,bits=8,samples=4),shard-distributed(mode=streams,streams=2)",
     )
     .expect("calibrate + streams pipeline");
     let res = pm.run(&mut after).expect("run calibrate + streams");
@@ -1277,11 +1283,13 @@ module @ir_tools_demo {
     let inl_rep = verify_module_numerics(&base, &re_inlined, 1e-5).expect("verify re-inlined");
     assert!(inl_rep.passed);
 
-    // 3. Delta IR Reducer (`reduce-ir`) & Pass Bisector (`bisect-passes`)
+    // 3. Delta IR Reducer (`extract-subgraph(max_ops=1)`) & Pass Bisector (`verify-ir(bisect=2)`)
     let mut reduced = base.clone();
-    let mut red_pm =
-        PassManager::from_pipeline_str(&registry, "reduce-ir(max_ops=1,keep_op=exponential)")
-            .expect("reduce-ir");
+    let mut red_pm = PassManager::from_pipeline_str(
+        &registry,
+        "extract-subgraph(max_ops=1,keep_op=exponential)",
+    )
+    .expect("extract-subgraph(max_ops=1)");
     let red_res = red_pm.run(&mut reduced).expect("run reduce-ir");
     assert!(red_res[0].changed);
     let red_ir = print_mlir(&reduced);
@@ -1289,24 +1297,21 @@ module @ir_tools_demo {
     assert!(!red_ir.contains("stablehlo.dot_general"));
 
     let mut step1 = base.clone();
-    PassManager::from_pipeline_str(
-        &registry,
-        "fuse-gemm(kind=epilogue) | bisect-passes(limit=2)",
-    )
-    .unwrap()
-    .run(&mut step1)
-    .unwrap();
+    PassManager::from_pipeline_str(&registry, "fuse-gemm(kind=epilogue) | verify-ir(bisect=2)")
+        .unwrap()
+        .run(&mut step1)
+        .unwrap();
     let bisect_rep =
         bisect_module_snapshots(&base, &[("fuse-gemm".to_string(), step1.clone())], 1e-5)
             .expect("bisect snapshots");
     assert!(bisect_rep.first_failing_pass.is_none());
     assert!(bisect_rep.steps[0].passed);
 
-    // 4. Numerical Sanitizer (`sanitize-numerics`) + Codegen + Decompose
+    // 4. Numerical Sanitizer (`verify-ir(sanitize=true)`) + Codegen + Decompose
     let mut sanitized = base.clone();
     let mut san_pm =
-        PassManager::from_pipeline_str(&registry, "sanitize-numerics(clamp_max=65504.0)")
-            .expect("sanitize-numerics");
+        PassManager::from_pipeline_str(&registry, "verify-ir(sanitize=true,clamp_max=65504.0)")
+            .expect("verify-ir(sanitize=true)");
     let san_res = san_pm.run(&mut sanitized).expect("run sanitize");
     assert!(san_res[0].changed);
     let san_ir = print_mlir(&sanitized);
@@ -1344,9 +1349,9 @@ module @stage2_mod {
 
     let mut comp_pm = PassManager::from_pipeline_str(
         &registry,
-        "compose-funcs(first=main,second=postprocess,entry=end_to_end)",
+        "outline-subgraphs(mode=compose,first=main,second=postprocess,entry=end_to_end)",
     )
-    .expect("compose-funcs");
+    .expect("outline-subgraphs(mode=compose)");
     let comp_res = comp_pm.run(&mut linked).expect("run compose-funcs");
     assert!(comp_res[0].changed);
     let comp_ir = print_mlir(&linked);
@@ -1375,11 +1380,11 @@ module @two_layer_gemm {
     let base = parse_mlir(mlir).expect("parse two_layer_gemm");
     let registry = PassRegistry::with_builtin_passes();
 
-    // 1. Symmetric `freeze-inputs` <-> `parameterize-constants` round-trip
+    // 1. Symmetric `ir-edit(args=...)` <-> `ir-edit(unfreeze=true)` round-trip
     let mut frozen = base.clone();
-    let mut frz_pm = PassManager::from_pipeline_str(&registry, "freeze-inputs(args=w1;w2)")
-        .expect("freeze-inputs");
-    let frz_res = frz_pm.run(&mut frozen).expect("run freeze-inputs");
+    let mut frz_pm = PassManager::from_pipeline_str(&registry, "ir-edit(args=w1;w2)")
+        .expect("ir-edit(args=w1;w2)");
+    let frz_res = frz_pm.run(&mut frozen).expect("run ir-edit(args)");
     assert!(frz_res[0].changed);
     let frz_ir = print_mlir(&frozen);
     assert!(frz_ir.contains("func.func @main(%x: tensor<2x4xf32>) -> tensor<2x4xf32>"));
@@ -1387,21 +1392,21 @@ module @two_layer_gemm {
 
     let mut re_param = frozen.clone();
     let mut prm_pm =
-        PassManager::from_pipeline_str(&registry, "freeze-inputs(unfreeze=true,min_elements=2)")
-            .expect("freeze-inputs(unfreeze=true)");
+        PassManager::from_pipeline_str(&registry, "ir-edit(unfreeze=true,min_elements=2)")
+            .expect("ir-edit(unfreeze=true)");
     let prm_res = prm_pm
         .run(&mut re_param)
-        .expect("run freeze-inputs(unfreeze=true)");
+        .expect("run ir-edit(unfreeze=true)");
     assert!(prm_res[0].changed);
     let prm_ir = print_mlir(&re_param);
     assert!(!prm_ir.contains("stablehlo.constant"));
     assert!(prm_ir.contains("%w1: tensor<4x4xf32>, %w2: tensor<4x4xf32>"));
 
-    // 2. Intermediate Activation Tapper (`tap-intermediates`)
+    // 2. Intermediate Activation Tapper (`ir-edit(tap=h1)`)
     let mut tapped = base.clone();
-    let mut tap_pm = PassManager::from_pipeline_str(&registry, "tap-intermediates(values=h1)")
-        .expect("tap-intermediates");
-    let tap_res = tap_pm.run(&mut tapped).expect("run tap-intermediates");
+    let mut tap_pm =
+        PassManager::from_pipeline_str(&registry, "ir-edit(tap=h1)").expect("ir-edit(tap=h1)");
+    let tap_res = tap_pm.run(&mut tapped).expect("run ir-edit(tap=h1)");
     assert!(tap_res[0].changed);
     let tap_ir = print_mlir(&tapped);
     assert!(tap_ir.contains("-> (tensor<2x4xf32>, tensor<2x4xf32>)"));
@@ -1418,11 +1423,13 @@ module @two_layer_gemm {
     assert!(rsz_ir.contains("%w1: tensor<4x4xf32>"));
     assert!(rsz_ir.contains("-> tensor<8x4xf32>"));
 
-    // 4. Outlining + Identical Function Deduplicator (`outline-subgraphs | dedup-functions`)
+    // 4. Outlining + Identical Function Deduplicator (`outline-subgraphs(mode=gemm,dedup=true)`)
     let mut deduped = base.clone();
-    let mut dedup_pm =
-        PassManager::from_pipeline_str(&registry, "outline-subgraphs(mode=gemm) | dedup-functions")
-            .expect("outline + dedup");
+    let mut dedup_pm = PassManager::from_pipeline_str(
+        &registry,
+        "outline-subgraphs(mode=gemm,dedup=false) | outline-subgraphs(mode=dedup)",
+    )
+    .expect("outline + dedup");
     let dedup_res = dedup_pm.run(&mut deduped).expect("run outline + dedup");
     assert!(dedup_res[0].changed);
     assert!(dedup_res[1].changed);
@@ -1433,11 +1440,11 @@ module @two_layer_gemm {
     let dedup_rep = verify_module_numerics(&base, &deduped, 1e-5).expect("verify deduped");
     assert!(dedup_rep.passed);
 
-    // 5. Canonical SSA Renamer & Attribute Sorter (`normalize-ssa`)
+    // 5. Canonical SSA Renamer & Attribute Sorter (`normalize-ir(prefix=t)`)
     let mut norm = base.clone();
-    let mut norm_pm = PassManager::from_pipeline_str(&registry, "normalize-ssa(prefix=t)")
-        .expect("normalize-ssa");
-    let norm_res = norm_pm.run(&mut norm).expect("run normalize-ssa");
+    let mut norm_pm = PassManager::from_pipeline_str(&registry, "normalize-ir(prefix=t)")
+        .expect("normalize-ir(prefix=t)");
+    let norm_res = norm_pm.run(&mut norm).expect("run normalize-ir");
     assert!(norm_res[0].changed);
     let norm_ir = print_mlir(&norm);
     assert!(norm_ir.contains("%arg0: tensor<2x4xf32>"));
@@ -1466,13 +1473,14 @@ module @advanced_ir_tools {
     let base = parse_mlir(mlir).expect("parse advanced_ir_tools");
     let registry = PassRegistry::with_builtin_passes();
 
-    // 1. Structural Hashing (`hash-ir`) + Invariant Verification (`verify-equiv`)
+    // 1. Structural Hashing + Invariant Verification (`verify-ir`)
     let mut hashed = base.clone();
-    let mut hash_pm =
-        PassManager::from_pipeline_str(&registry, "hash-ir | verify-equiv").expect("hash+verify");
-    let hash_res = hash_pm
-        .run(&mut hashed)
-        .expect("run hash-ir | verify-equiv");
+    let mut hash_pm = PassManager::from_pipeline_str(
+        &registry,
+        "verify-ir(hash=true,equiv=false) | verify-ir(hash=false,equiv=true)",
+    )
+    .expect("hash+verify");
+    let hash_res = hash_pm.run(&mut hashed).expect("run verify-ir");
     assert!(hash_res[0].changed);
     assert!(hash_res[1].changed);
     let hash_ir = print_mlir(&hashed);
@@ -1501,10 +1509,11 @@ module @advanced_ir_tools {
     assert!(bkt_ir.contains("func.func @main_batch_1(%x: tensor<1x4xf32>)"));
     assert!(bkt_ir.contains("func.func @main_batch_4(%x: tensor<4x4xf32>)"));
 
-    // 4. Host Memory Activation Offloader (`offload-activations`) + Decompose round-trip
+    // 4. Host Memory Activation Offloader (`optimize-memory(mode=offload)`) + Decompose round-trip
     let mut offloaded = base.clone();
-    let mut off_pm = PassManager::from_pipeline_str(&registry, "offload-activations(min_span=2)")
-        .expect("offload-activations");
+    let mut off_pm =
+        PassManager::from_pipeline_str(&registry, "optimize-memory(mode=offload,min_span=2)")
+            .expect("optimize-memory(mode=offload)");
     let off_res = off_pm.run(&mut offloaded).expect("run offload-activations");
     assert!(off_res[0].changed);
     let off_ir = print_mlir(&offloaded);
@@ -1516,11 +1525,13 @@ module @advanced_ir_tools {
     let off_rep = verify_module_numerics(&base, &offloaded, 1e-5).expect("verify offloaded");
     assert!(off_rep.passed);
 
-    // 5. Spatial & Matrix Layout Canonicalizer (`convert-layout`)
+    // 5. Spatial & Matrix Layout Canonicalizer (`fold-views(layout=nhwc)`)
     let mut layout_mod = base.clone();
-    let mut layout_pm = PassManager::from_pipeline_str(&registry, "convert-layout(layout=nhwc)")
-        .expect("convert-layout");
-    let layout_res = layout_pm.run(&mut layout_mod).expect("run convert-layout");
+    let mut layout_pm = PassManager::from_pipeline_str(&registry, "fold-views(layout=nhwc)")
+        .expect("fold-views(layout=nhwc)");
+    let layout_res = layout_pm
+        .run(&mut layout_mod)
+        .expect("run fold-views(layout=nhwc)");
     assert!(layout_res[0].changed);
     let layout_ir = print_mlir(&layout_mod);
     assert!(layout_ir.contains("data_layout = \"nhwc\""));
@@ -1532,7 +1543,7 @@ module @advanced_ir_tools {
 #[test]
 fn test_pad_for_tiling_split_gemm_unroll_calls_hoist_all_reduce_instrument_and_strip() {
     let registry = PassRegistry::with_builtin_passes();
-    assert_eq!(registry.list().count(), 67);
+    assert_eq!(registry.list().count(), 35);
 
     let mlir = r#"
 module @final_ninety_suite {
@@ -1545,7 +1556,7 @@ module @final_ninety_suite {
 "#;
     let base = parse_mlir(mlir).expect("parse final_ninety_suite");
 
-    // 1. Tile-alignment padding (`schedule-loops(align=8)`) + metadata stripping (`strip-metadata`)
+    // 1. Tile-alignment padding (`schedule-loops(align=8)`) + metadata stripping (`normalize-ir`)
     let mut padded = base.clone();
     let mut pad_pm = PassManager::from_pipeline_str(&registry, "schedule-loops(align=8)")
         .expect("schedule-loops(align=8)");
@@ -1559,18 +1570,21 @@ module @final_ninety_suite {
 
     let mut stripped = padded.clone();
     let mut strip_pm =
-        PassManager::from_pipeline_str(&registry, "strip-metadata").expect("strip-metadata");
-    let strip_res = strip_pm.run(&mut stripped).expect("run strip-metadata");
+        PassManager::from_pipeline_str(&registry, "normalize-ir(attributes=true,ssa=false)")
+            .expect("normalize-ir(attributes=true)");
+    let strip_res = strip_pm.run(&mut stripped).expect("run normalize-ir");
     assert!(strip_res[0].changed);
     let strip_ir = print_mlir(&stripped);
     assert!(!strip_ir.contains("pad_align"));
     assert!(!strip_ir.contains("padded_mnk"));
 
-    // 2. Large GEMM Column-Splitting (`split-large-gemm`) + exact numerical verification
+    // 2. Large GEMM Column-Splitting (`schedule-loops(max_n=2)`) + exact numerical verification
     let mut split_gemm = base.clone();
-    let mut split_pm = PassManager::from_pipeline_str(&registry, "split-large-gemm(max_n=2)")
-        .expect("split-large-gemm");
-    let split_res = split_pm.run(&mut split_gemm).expect("run split-large-gemm");
+    let mut split_pm = PassManager::from_pipeline_str(&registry, "schedule-loops(max_n=2)")
+        .expect("schedule-loops(max_n=2)");
+    let split_res = split_pm
+        .run(&mut split_gemm)
+        .expect("run schedule-loops(max_n=2)");
     assert!(split_res[0].changed);
     assert_eq!(split_res[0].ops_created, 5);
     let split_ir = print_mlir(&split_gemm);
@@ -1592,7 +1606,7 @@ module @square_block {
     let mut unrolled = parse_mlir(sq_mlir).expect("parse square_block");
     let mut unroll_pm = PassManager::from_pipeline_str(
         &registry,
-        "outline-subgraphs(mode=gemm) | unroll-calls(repeat=3)",
+        "outline-subgraphs(mode=gemm,dedup=false) | outline-subgraphs(mode=unroll,repeat=3)",
     )
     .expect("outline + unroll-calls");
     let unroll_res = unroll_pm.run(&mut unrolled).expect("run unroll-calls");
@@ -1614,14 +1628,14 @@ module @square_block {
     let spmd_ir = print_mlir(&spmd_mod);
     assert!(spmd_ir.contains("async_overlap = true"));
 
-    // 5. Per-Op Profiling Region Injector (`instrument-profiling`) + Rust/C99 codegen + Decompose
+    // 5. Per-Op Profiling Region Injector (`profile-ir(instrument=true)`) + Rust/C99 codegen
     let mut prof_mod = base.clone();
-    let mut prof_pm =
-        PassManager::from_pipeline_str(&registry, "instrument-profiling(filter=gemm)")
-            .expect("instrument-profiling");
-    let prof_res = prof_pm
-        .run(&mut prof_mod)
-        .expect("run instrument-profiling");
+    let mut prof_pm = PassManager::from_pipeline_str(
+        &registry,
+        "profile-ir(stats=false,instrument=true,filter=gemm)",
+    )
+    .expect("profile-ir");
+    let prof_res = prof_pm.run(&mut prof_mod).expect("run profile-ir");
     assert!(prof_res[0].changed);
     let prof_ir = print_mlir(&prof_mod);
     assert!(prof_ir.contains("castforge.profile_region"));
@@ -1809,39 +1823,40 @@ fn test_consolidated_and_sota_passes_groupwise_batchnorm_concat_paged_gvn() {
     let mut module = parse_mlir(mlir).expect("parse sota_pipeline");
     let baseline = module.clone();
 
-    let mut pm_bn =
-        PassManager::from_pipeline_str(&registry, "fold-batchnorm,cse,eliminate-concat-copies")
-            .expect("build sota pipeline");
+    let mut pm_bn = PassManager::from_pipeline_str(
+        &registry,
+        "fold-weights,cse,optimize-memory(mode=zero_copy)",
+    )
+    .expect("build sota pipeline");
     let res = pm_bn.run(&mut module).expect("run sota pipeline");
-    assert!(res[0].changed, "fold-batchnorm absorbed scale into weight");
+    assert!(res[0].changed, "fold-weights absorbed scale into weight");
     assert_eq!(res[1].ops_removed, 1, "cse deduplicated commutative add");
     assert!(res[2].changed, "eliminate-concat-copies routed producer");
 
     let rep = verify_module_numerics(&baseline, &module, 1e-4).expect("verify numerics");
-    assert!(rep.passed, "fold-batchnorm + cse numerically equivalent");
+    assert!(rep.passed, "fold-weights + cse numerically equivalent");
 
     let printed = print_mlir(&module);
     assert!(printed.contains("castforge.batchnorm_folded = true"));
     assert!(printed.contains("castforge.zero_copy_concat = true"));
 
-    // 2. Test quantize(scheme=groupwise) + strip-metadata
+    // 2. Test quantize(scheme=groupwise) + normalize-ir(attributes=true)
     let mut pm_gw = PassManager::from_pipeline_str(
         &registry,
-        "quantize(scheme=groupwise,bits=4,group_size=2,awq_salient=true)",
+        "quantize(scheme=awq,bits=4,group_size=2,salient_ratio=0.25)",
     )
-    .expect("build quantize(scheme=groupwise)");
-    let gw_res = pm_gw
-        .run(&mut module)
-        .expect("run quantize(scheme=groupwise)");
+    .expect("build quantize(scheme=awq)");
+    let gw_res = pm_gw.run(&mut module).expect("run quantize(scheme=awq)");
     assert!(gw_res[0].changed);
     assert!(print_mlir(&module).contains("awq_groupwise"));
+    assert!(print_mlir(&module).contains("castforge.awq_salient_channels = 1"));
 
-    let mut pm_strip =
-        PassManager::from_pipeline_str(&registry, "strip-metadata").expect("strip-metadata");
-    pm_strip.run(&mut module).expect("run strip-metadata");
+    let mut pm_strip = PassManager::from_pipeline_str(&registry, "normalize-ir(attributes=true)")
+        .expect("normalize-ir(attributes=true)");
+    pm_strip.run(&mut module).expect("run normalize-ir");
     assert!(!print_mlir(&module).contains("castforge.batchnorm_folded"));
 
-    // 3. Test fuse-norm, fuse-activations, and optimize-attention(mode=paged)
+    // 3. Test fuse-norm, fuse-activations, and fuse-attention(mode=paged)
     let attn_mlir = concat!(
         "module @paged_attn_demo {\n",
         "  func.func @main(%q: tensor<2x2xf32>, %k: tensor<2x2xf32>, %v: tensor<2x2xf32>) ",
@@ -1858,7 +1873,7 @@ fn test_consolidated_and_sota_passes_groupwise_batchnorm_concat_paged_gvn() {
         &registry,
         concat!(
             "fuse-norm,fuse-activations,",
-            "optimize-attention(mode=paged,page_block_size=16,max_blocks=64)"
+            "fuse-attention(mode=paged,page_block_size=16,max_blocks=64)"
         ),
     )
     .expect("build paged-attention pipeline");
@@ -1869,16 +1884,16 @@ fn test_consolidated_and_sota_passes_groupwise_batchnorm_concat_paged_gvn() {
             .expect("emit cuda for paged attention");
     assert!(cuda_src.contains("PagedAttention KV block-table addressing (page_block_size=16)"));
 
-    // 4. Test optimize-attention(mode=all), shard-distributed(mode=ring_cp),
-    //    quantize(scheme=fp8), and fuse-megakernel
+    // 4. Test fuse-attention(mode=flash_decoding|tree), shard-distributed(mode=ring_cp),
+    //    quantize(scheme=fp8), and fuse-elementwise(mode=megakernel)
     let mut sota5_mod = parse_mlir(attn_mlir).expect("parse attn_mlir for sota5");
     let mut pm_sota5 = PassManager::from_pipeline_str(
         &registry,
         concat!(
-            "optimize-attention(mode=flash_decoding,split_kv=8),",
+            "fuse-attention(mode=flash_decoding,split_kv=8),",
             "shard-distributed(mode=ring_cp,ring_size=4),",
-            "optimize-attention(mode=tree,tree_depth=5,draft_tokens=4),",
-            "fuse-megakernel"
+            "fuse-attention(mode=tree,tree_depth=5,draft_tokens=4),",
+            "fuse-elementwise(mode=megakernel)"
         ),
     )
     .expect("build sota5 pipeline");
@@ -1897,17 +1912,19 @@ fn test_consolidated_and_sota_passes_groupwise_batchnorm_concat_paged_gvn() {
     assert!(fp8_res[0].changed);
     assert!(print_mlir(&fp8_mod).contains("fp8_e4m3"));
 
-    // 5. Test the 5 new SOTA passes: fuse-mla, hadamard-quant-rotation,
-    //    fuse-linear-cross-entropy, shard-pipeline-parallel, lower-tensor-cores
+    // 5. Test the 5 SOTA passes via unified entrypoints: fuse-attention(kind=mla),
+    //    quantize(scheme=hadamard), fuse-softmax(kind=cross_entropy),
+    //    shard-distributed(mode=pp), and schedule-loops(tensor_cores=wgmma)
     let mut new5_mod = parse_mlir(mlir).expect("parse mlir for new5");
     let mut pm_new5 = PassManager::from_pipeline_str(
         &registry,
         concat!(
-            "fuse-mla(kv_lora_rank=512),",
-            "hadamard-quant-rotation(block_size=64),",
-            "fuse-linear-cross-entropy(chunk_size=4096),",
-            "shard-pipeline-parallel(stages=2,microbatches=4,schedule=1f1b),",
-            "lower-tensor-cores(arch=wgmma,tile=64x128x16)"
+            "fuse-attention(kind=mla,kv_lora_rank=512),",
+            "quantize(scheme=hadamard,block_size=64),",
+            "fuse-softmax(kind=cross_entropy,chunk_size=4096),",
+            "shard-distributed(mode=pp,stages=2,microbatches=4,schedule=1f1b),",
+            "schedule-loops(tensor_cores=wgmma,mma_tile=64x128x16),",
+            "topological-sort(mode=min_memory)"
         ),
     )
     .expect("build new5 pipeline");
@@ -1919,4 +1936,86 @@ fn test_consolidated_and_sota_passes_groupwise_batchnorm_concat_paged_gvn() {
     assert!(new5_printed.contains("castforge.fused_linear_cross_entropy = true"));
     assert!(new5_printed.contains("castforge.pp_schedule = \"1f1b\""));
     assert!(new5_printed.contains("castforge.tensor_core_arch = \"wgmma\""));
+    assert!(new5_printed.contains("castforge.min_memory_scheduled = true"));
+
+    // 6. Test SmoothQuant, Global Layout Propagation, Sliding-Window + Attention Sinks,
+    //    NVFP4 E2M1 Quantization, Cross-Layer KV Sharing, and Dynamic Activation Sparsity
+    let mut sq_mod = parse_mlir(mlir).expect("parse mlir for smoothquant");
+    let mut pm_sq = PassManager::from_pipeline_str(
+        &registry,
+        concat!(
+            "quantize(scheme=smoothquant,alpha=0.5),",
+            "fold-views(layout=nhwc,propagate=true),",
+            "prune-weights(mode=activation_sparse,sparsity=0.5)"
+        ),
+    )
+    .expect("build smoothquant + propagate layout + activation_sparse");
+    let sq_res = pm_sq.run(&mut sq_mod).expect("run smoothquant + layout");
+    assert!(sq_res.iter().all(|r| r.changed));
+    let sq_ir = print_mlir(&sq_mod);
+    assert!(sq_ir.contains("castforge.quant_scheme = \"smoothquant\""));
+    assert!(sq_ir.contains("castforge.layout_propagated = true"));
+    assert!(sq_ir.contains("castforge.activation_sparsity = 0.5"));
+
+    let mut fp4_mod = parse_mlir(mlir).expect("parse mlir for nvfp4");
+    let mut pm_fp4 = PassManager::from_pipeline_str(&registry, "quantize(scheme=nvfp4)")
+        .expect("build quantize(scheme=nvfp4)");
+    let fp4_res = pm_fp4
+        .run(&mut fp4_mod)
+        .expect("run quantize(scheme=nvfp4)");
+    assert!(fp4_res[0].changed);
+    assert!(print_mlir(&fp4_mod).contains("castforge.quant_scheme = \"nvfp4\""));
+
+    let mut sw_mod = parse_mlir(attn_mlir).expect("parse attn_mlir for sliding_window");
+    let mut pm_sw = PassManager::from_pipeline_str(
+        &registry,
+        concat!(
+            "fuse-attention(mode=sliding_window,window_size=4096,sink_tokens=4),",
+            "fuse-attention(kind=kv_sharing,share_every=2)"
+        ),
+    )
+    .expect("build sliding_window + kv_sharing attention");
+    let sw_res = pm_sw
+        .run(&mut sw_mod)
+        .expect("run sliding_window + kv_sharing");
+    assert!(sw_res.iter().all(|r| r.changed));
+    let sw_ir = print_mlir(&sw_mod);
+    assert!(sw_ir.contains("castforge.sliding_window = 4096"));
+    assert!(sw_ir.contains("castforge.attention_sinks = 4"));
+    assert!(sw_ir.contains("castforge.kv_shared = true"));
+
+    let mut loop_mod = castforge_codegen::lower_to_loop_ir(&baseline, &TargetConfig::default());
+    let mut opt_loop = castforge_codegen::OptimizeLoopIrPass::default();
+    let changed = castforge_codegen::LoopPass::run(&mut opt_loop, &mut loop_mod);
+    let _ = changed;
+
+    // 7. Test chained GEMM epilogue + residual add fusion (`bias_relu_residual`)
+    let res_gemm_mlir = concat!(
+        "module @res_gemm {\n",
+        "  func.func @main(%x: tensor<2x4xf32>, %w: tensor<4x4xf32>, ",
+        "%b: tensor<2x4xf32>, %r: tensor<2x4xf32>) -> tensor<2x4xf32> {\n",
+        "    %z = \"stablehlo.constant\"() {value = dense<0.0> : tensor<2x4xf32>} ",
+        ": () -> tensor<2x4xf32>\n",
+        "    %mm = \"stablehlo.dot_general\"(%x, %w) ",
+        ": (tensor<2x4xf32>, tensor<4x4xf32>) -> tensor<2x4xf32>\n",
+        "    %biased = \"stablehlo.add\"(%mm, %b) ",
+        ": (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>\n",
+        "    %act = \"stablehlo.maximum\"(%biased, %z) ",
+        ": (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>\n",
+        "    %out = \"stablehlo.add\"(%act, %r) ",
+        ": (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>\n",
+        "    \"func.return\"(%out) : (tensor<2x4xf32>) -> ()\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut rg_mod = parse_mlir(res_gemm_mlir).expect("parse res_gemm_mlir");
+    let mut pm_rg = PassManager::from_pipeline_str(&registry, "fuse-gemm(kind=epilogue)")
+        .expect("build fuse-gemm(kind=epilogue)");
+    let rg_res = pm_rg
+        .run(&mut rg_mod)
+        .expect("run fuse-gemm(kind=epilogue)");
+    assert!(rg_res[0].changed);
+    let rg_ir = print_mlir(&rg_mod);
+    assert!(rg_ir.contains("epilogue = \"bias_relu_residual\""));
+    assert!(rg_ir.contains("castforge.has_residual = true"));
 }

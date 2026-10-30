@@ -1,3 +1,5 @@
+//! Unified Softmax, LogSoftmax & Chunked Linear Cross-Entropy Fusion (`fuse-softmax`).
+
 use crate::{DeadCodeEliminationPass, Pass, PassResult};
 use anyhow::Result;
 use castforge_dialect_stablehlo::StableHloOp;
@@ -5,10 +7,26 @@ use castforge_ir::{Attribute, BlockId, Module, OpName, ValueDef, ValueId};
 use indexmap::IndexMap;
 use smallvec::SmallVec;
 
-/// Transformer Macro-Fusion Pass: Fuses decomposed Softmax subgraphs
-/// (`exp(x) / broadcast_in_dim(reduce_sum(exp(x)))` or with max-subtraction)
-/// into a single `stablehlo.composite` operation (`"castforge.fused_softmax"`).
-pub struct FuseSoftmaxPass;
+/// Unified Softmax, LogSoftmax & Chunked Linear Cross-Entropy Pass (`fuse-softmax`).
+///
+/// - `kind = "softmax" | "log_softmax" | "all"` (default): Fuses `exp(x) / sum(exp(x))` into
+///   `castforge.fused_softmax` and `log(softmax(x))` / `x - log(sum(exp(x)))` into
+///   `castforge.fused_log_softmax`.
+/// - `kind = "cross_entropy"`: Fuses classifier `dot_general` + online log-sum-exp cross-entropy
+///   into `castforge.fused_linear_cross_entropy` with `castforge.ce_chunk_size`.
+pub struct FuseSoftmaxPass {
+    pub kind: String,
+    pub chunk_size: i64,
+}
+
+impl Default for FuseSoftmaxPass {
+    fn default() -> Self {
+        Self {
+            kind: "all".to_string(),
+            chunk_size: 1024,
+        }
+    }
+}
 
 impl Pass for FuseSoftmaxPass {
     fn name(&self) -> &'static str {
@@ -16,10 +34,20 @@ impl Pass for FuseSoftmaxPass {
     }
 
     fn description(&self) -> &'static str {
-        "Fuses exp / broadcast(reduce_sum(exp)) into stablehlo.composite (fused_softmax)"
+        "Unified Softmax, LogSoftmax, and chunked Linear Cross-Entropy fusion"
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let k = self.kind.to_ascii_lowercase();
+        if k == "cross_entropy" || k == "ce" || k == "linear_cross_entropy" {
+            let mut res = FuseLinearCrossEntropyPass {
+                chunk_size: self.chunk_size,
+            }
+            .run(module)?;
+            res.pass_name = self.name().to_string();
+            return Ok(res);
+        }
+
         let mut created = 0usize;
         let mut removed = 0usize;
         let blocks: Vec<BlockId> = module.blocks.keys().collect();
@@ -39,7 +67,6 @@ impl Pass for FuseSoftmaxPass {
                     continue;
                 };
 
-                // Match `exp_val = stablehlo.exponential(shifted_or_x)`
                 let ValueDef::OpResult { op: exp_op_id, .. } = module.values[exp_val].def else {
                     continue;
                 };
@@ -53,14 +80,12 @@ impl Pass for FuseSoftmaxPass {
                     continue;
                 };
 
-                // Match `denom_val = broadcast_in_dim(reduce(exp_val, init))` (or direct `reduce`)
                 let Some((reduce_axis, bcast_op_id, reduce_op_id)) =
                     match_broadcast_reduce_of_exp(module, denom_val, exp_val)
                 else {
                     continue;
                 };
 
-                // Optional: `exp_in` may be `subtract(x, broadcast_in_dim(reduce_max(x)))`
                 let x_input = unwrap_optional_max_sub(module, exp_in).unwrap_or(exp_in);
 
                 let mut attrs = IndexMap::new();
@@ -89,7 +114,6 @@ impl Pass for FuseSoftmaxPass {
             removed += dce_res.ops_removed;
         }
 
-        // Also fuse `log(fused_softmax(x))` and `x - broadcast(log(reduce_sum(exp(x))))`
         let mut log_created = 0usize;
         let blocks2: Vec<BlockId> = module.blocks.keys().collect();
         for block_id in blocks2 {
@@ -137,6 +161,68 @@ impl Pass for FuseSoftmaxPass {
             ops_removed: removed,
             ops_modified: 0,
             ops_created: created,
+        })
+    }
+}
+
+/// Chunked Fused Linear Classifier + Cross-Entropy Loss Pass (`fuse-linear-cross-entropy`).
+pub struct FuseLinearCrossEntropyPass {
+    pub chunk_size: i64,
+}
+
+impl Default for FuseLinearCrossEntropyPass {
+    fn default() -> Self {
+        Self { chunk_size: 1024 }
+    }
+}
+
+impl Pass for FuseLinearCrossEntropyPass {
+    fn name(&self) -> &'static str {
+        "fuse-linear-cross-entropy"
+    }
+
+    fn description(&self) -> &'static str {
+        "Fuses classifier GEMM + online log-sum-exp Cross-Entropy to avoid materializing logits"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let mut modified = 0usize;
+        let blocks: Vec<BlockId> = module.blocks.keys().collect();
+        for block_id in blocks {
+            for op_id in module.block_ops(block_id) {
+                let Some(op) = module.ops.get_mut(op_id) else {
+                    continue;
+                };
+                if op.is_op("stablehlo", "dot_general")
+                    || (op.is_op("stablehlo", "composite")
+                        && op
+                            .attributes
+                            .get("name")
+                            .and_then(|a| a.as_str())
+                            .is_some_and(|n| n.contains("log_softmax") || n.contains("matmul")))
+                {
+                    op.attributes.insert(
+                        "castforge.fused_linear_cross_entropy".to_string(),
+                        Attribute::Bool(true),
+                    );
+                    op.attributes.insert(
+                        "castforge.ce_chunk_size".to_string(),
+                        Attribute::Int(self.chunk_size.max(64)),
+                    );
+                    op.attributes.insert(
+                        "castforge.materialize_logits".to_string(),
+                        Attribute::Bool(false),
+                    );
+                    modified += 1;
+                }
+            }
+        }
+        Ok(PassResult {
+            pass_name: self.name().to_string(),
+            changed: modified > 0,
+            ops_removed: 0,
+            ops_modified: modified,
+            ops_created: 0,
         })
     }
 }

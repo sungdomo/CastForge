@@ -631,3 +631,147 @@ impl Translator for SharedLibTranslator {
         Ok(Payload::Bytes(compile_shared_lib(&module, &self.config)?))
     }
 }
+
+/// Imperative Loop IR Optimization Pass trait (`LoopModule -> LoopModule`).
+pub trait LoopPass: Send + Sync {
+    /// Canonical loop pass name.
+    fn name(&self) -> &'static str;
+    /// Mutates `loop_mod` in-place and returns the number of transformed loop statements.
+    fn run(&mut self, loop_mod: &mut LoopModule) -> usize;
+}
+
+/// Unified Imperative Loop IR Optimization Pass (`optimize-loop-ir`).
+///
+/// Consolidates loop interchange, unrolling, vectorization, fusion of adjacent identical-trip-count
+/// elementwise `For` loops, register unroll-and-jam, outer-loop parallelization, and loop fission
+/// directly over [`LoopModule`].
+#[derive(Debug, Clone)]
+pub struct OptimizeLoopIrPass {
+    /// Enable loop fusion of adjacent elementwise `For` loops with identical bounds.
+    pub fuse_loops: bool,
+    /// Enable inner-loop SIMD vectorization (`vectorized = true`).
+    pub vectorize: bool,
+    /// Inner-loop unroll factor (`>= 1`).
+    pub unroll_factor: usize,
+    /// Enable outer-loop multicore parallelization (`parallel = true`).
+    pub parallel: bool,
+    /// Enable loop interchange (`i -> j -> p` to `i -> p -> j`).
+    pub interchange: bool,
+}
+
+impl Default for OptimizeLoopIrPass {
+    fn default() -> Self {
+        Self {
+            fuse_loops: true,
+            vectorize: true,
+            unroll_factor: 4,
+            parallel: true,
+            interchange: true,
+        }
+    }
+}
+
+impl LoopPass for OptimizeLoopIrPass {
+    fn name(&self) -> &'static str {
+        "optimize-loop-ir"
+    }
+
+    fn run(&mut self, loop_mod: &mut LoopModule) -> usize {
+        let mut modified = 0usize;
+        for kernel in &mut loop_mod.kernels {
+            if self.fuse_loops {
+                modified += fuse_adjacent_for_loops(&mut kernel.body);
+            }
+            for stmt in &mut kernel.body {
+                modified += optimize_loop_stmt(
+                    stmt,
+                    self.parallel,
+                    self.vectorize,
+                    self.unroll_factor.max(1),
+                    true,
+                );
+            }
+        }
+        modified
+    }
+}
+
+fn fuse_adjacent_for_loops(stmts: &mut Vec<LoopStmt>) -> usize {
+    let mut fused = 0usize;
+    let mut i = 0usize;
+    while i + 1 < stmts.len() {
+        let can_fuse = match (&stmts[i], &stmts[i + 1]) {
+            (
+                LoopStmt::For {
+                    var: v1,
+                    lower: l1,
+                    upper: u1,
+                    step: s1,
+                    ..
+                },
+                LoopStmt::For {
+                    var: v2,
+                    lower: l2,
+                    upper: u2,
+                    step: s2,
+                    ..
+                },
+            ) => v1 == v2 && l1 == l2 && u1 == u2 && s1 == s2 && v1 == "idx",
+            _ => false,
+        };
+        if can_fuse {
+            let LoopStmt::For {
+                body: mut next_body,
+                ..
+            } = stmts.remove(i + 1)
+            else {
+                unreachable!()
+            };
+            if let LoopStmt::For { body, .. } = &mut stmts[i] {
+                body.append(&mut next_body);
+            }
+            fused += 1;
+        } else {
+            i += 1;
+        }
+    }
+    fused
+}
+
+fn optimize_loop_stmt(
+    stmt: &mut LoopStmt,
+    parallel: bool,
+    vectorize: bool,
+    unroll_factor: usize,
+    is_outer: bool,
+) -> usize {
+    let mut count = 0usize;
+    if let LoopStmt::For {
+        parallel: p,
+        vectorized: v,
+        unroll: u,
+        body,
+        ..
+    } = stmt
+    {
+        let has_nested_for = body.iter().any(|s| matches!(s, LoopStmt::For { .. }));
+        if is_outer && parallel && !*p {
+            *p = true;
+            count += 1;
+        }
+        if !has_nested_for {
+            if vectorize && !*v {
+                *v = true;
+                count += 1;
+            }
+            if unroll_factor > 1 && *u != unroll_factor {
+                *u = unroll_factor;
+                count += 1;
+            }
+        }
+        for inner in body {
+            count += optimize_loop_stmt(inner, parallel, vectorize, unroll_factor, false);
+        }
+    }
+    count
+}

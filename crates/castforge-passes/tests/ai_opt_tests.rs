@@ -90,9 +90,8 @@ module @fold_norm_demo {
 fn test_fold_norm_weights() {
     let mut module = parse_mlir(FOLD_NORM_WEIGHTS_MLIR).expect("parse fold norm MLIR");
     let registry = PassRegistry::with_builtin_passes();
-    let mut pm =
-        PassManager::from_pipeline_str(&registry, "fold-batchnorm").expect("valid pipeline");
-    let res = pm.run(&mut module).expect("run fold-batchnorm");
+    let mut pm = PassManager::from_pipeline_str(&registry, "fold-weights").expect("valid pipeline");
+    let res = pm.run(&mut module).expect("run fold-weights");
     assert!(res[0].changed);
 
     let printed = print_mlir(&module);
@@ -462,7 +461,7 @@ fn test_specialize_symbolic_and_dynamic_shapes() {
 
     // Bind B=4: `%x` becomes `tensor<4x6xf32>` (24 elements), `%reshaped` (`tensor<?x3xf32>`)
     // infers `? = 24 / 3 = 8` (`tensor<8x3xf32>`), and `%out` becomes `tensor<8x2xf32>`!
-    let mut pm = PassManager::from_pipeline_str(&registry, "specialize-shapes(B=4),verify-shapes")
+    let mut pm = PassManager::from_pipeline_str(&registry, "specialize-shapes(B=4),verify-ir")
         .expect("specialize-shapes pipeline");
     let res = pm.run(&mut module).expect("run specialize-shapes");
     assert!(res[0].changed);
@@ -481,9 +480,11 @@ fn test_pack_weights_and_unit_stride_codegen() {
     let mut packed = before.clone();
     let registry = PassRegistry::with_builtin_passes();
 
-    let mut pm =
-        PassManager::from_pipeline_str(&registry, "merge-weights(method=lora),pack-weights")
-            .expect("merge-weights(method=lora),pack-weights pipeline");
+    let mut pm = PassManager::from_pipeline_str(
+        &registry,
+        "merge-weights(method=lora),fold-weights(mode=pack)",
+    )
+    .expect("merge-weights(method=lora),fold-weights(mode=pack) pipeline");
     let res = pm.run(&mut packed).expect("run bake-lora,pack-weights");
     assert!(res[0].changed);
     assert!(res[1].changed);
@@ -558,9 +559,14 @@ fn test_fuse_rope_and_gqa_attention() {
     let mut fused = before.clone();
     let registry = PassRegistry::with_builtin_passes();
 
-    let mut pm = PassManager::from_pipeline_str(&registry, "fuse-rope,fuse-attention")
-        .expect("fuse-rope,fuse-attention pipeline");
-    let res = pm.run(&mut fused).expect("run fuse-rope,fuse-attention");
+    let mut pm = PassManager::from_pipeline_str(
+        &registry,
+        "fuse-attention(kind=rope),fuse-attention(kind=sdpa)",
+    )
+    .expect("fuse-attention(kind=rope),fuse-attention(kind=sdpa) pipeline");
+    let res = pm
+        .run(&mut fused)
+        .expect("run fuse-attention(kind=rope),fuse-attention(kind=sdpa)");
     assert!(res[0].changed);
     assert!(res[1].changed);
 
@@ -612,15 +618,15 @@ fn test_o1_o2_o3_and_llm_opt_presets() {
     let rep_o2 = verify_module_numerics(&before_o2, &mod_o2, 1e-5).expect("verify O2");
     assert!(rep_o2.passed);
 
-    // 3. Test O3 / llm-opt preset on LoRA + MatMul + weight packing
+    // 3. Test O3 preset on LoRA + MatMul + weight packing
     let before_o3 = parse_mlir(BAKE_LORA_MLIR).expect("parse o3 mlir");
     let mut mod_o3 = before_o3.clone();
-    let mut pm_o3 = PassManager::from_pipeline_str(&registry, "llm-opt").expect("llm-opt pipeline");
-    let res_o3 = pm_o3.run(&mut mod_o3).expect("run llm-opt");
+    let mut pm_o3 = PassManager::from_pipeline_str(&registry, "O3").expect("O3 pipeline");
+    let res_o3 = pm_o3.run(&mut mod_o3).expect("run O3");
     assert!(res_o3[0].changed);
     let printed_o3 = print_mlir(&mod_o3);
     assert!(printed_o3.contains("packed_rhs = true"));
-    let rep_o3 = verify_module_numerics(&before_o3, &mod_o3, 1e-5).expect("verify llm-opt");
+    let rep_o3 = verify_module_numerics(&before_o3, &mod_o3, 1e-5).expect("verify O3");
     assert!(rep_o3.passed);
 
     // 4. Test O3(B=4) with symbolic shape specialization

@@ -83,7 +83,7 @@ module @rmsnorm_test {
 
     let registry = PassRegistry::with_builtin_passes();
     let mut module = parse_mlir(mlir).expect("parse failed");
-    let mut pm = PassManager::from_pipeline_str(&registry, "verify-shapes,canonicalize")
+    let mut pm = PassManager::from_pipeline_str(&registry, "verify-ir,canonicalize")
         .expect("pipeline build failed");
     pm.run(&mut module).expect("pipeline run failed");
 
@@ -194,7 +194,7 @@ module @general_passes {
 
     let mut pm = PassManager::from_pipeline_str(
         &registry,
-        "inliner,dce,fold-constants,topological-sort,strip-metadata,print-op-stats",
+        "inliner,dce,fold-constants,topological-sort,normalize-ir(debuginfo=true),profile-ir",
     )
     .expect("pipeline build failed");
 

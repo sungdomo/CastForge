@@ -35,9 +35,9 @@ pub use crate::eval::{
 pub use crate::jit::{JitBenchmarkResult, autotune_module_jit, jit_execute_and_benchmark};
 pub use crate::liveness::{LiveInterval, compute_block_liveness, compute_module_liveness};
 pub use crate::loop_ir::{
-    CHeaderTranslator, LoopKernel, LoopModule, LoopStmt, SharedLibTranslator,
-    TensorToLoopTranslator, compile_shared_lib, emit_c_header, emit_cuda_module_with_config,
-    emit_msl_module_with_config, lower_to_loop_ir,
+    CHeaderTranslator, LoopKernel, LoopModule, LoopPass, LoopStmt, OptimizeLoopIrPass,
+    SharedLibTranslator, TensorToLoopTranslator, compile_shared_lib, emit_c_header,
+    emit_cuda_module_with_config, emit_msl_module_with_config, lower_to_loop_ir,
 };
 pub use crate::memory_plan::{BufferAllocation, MemoryPlan, build_memory_plan};
 pub use crate::target_config::{GemmLoopOrder, SimdIsa, TargetConfig};
