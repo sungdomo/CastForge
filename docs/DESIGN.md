@@ -86,29 +86,29 @@ CastForge is built around three foundational design principles:
 
 ---
 
-## 3. Workspace Crate Topology
+## 3. Source Module Topology (`src/`)
 
-- **`castforge-ir`**: Core arena-backed SSA data structures (`Module`, `Operation`, `Value`,
+- **`src/ir`**: Core arena-backed SSA data structures (`Module`, `Operation`, `Value`,
   `Block`, `Region`), `Type`/`DType`/`Dim`, `TensorStore`, and `Payload`/`Translator`/
   `TranslatorChain`.
-- **`castforge-dialect-stablehlo`**: Strongly-typed `StableHloOp` pattern-matching view over
-  generic MLIR operations, `FuncView`, and `verify_stablehlo_shapes`.
-- **`castforge-mlir`**: Zero-dependency recursive-descent MLIR parser (`parse_mlir`) and
-  deterministic pretty-printer (`print_module`) supporting both custom assembly and generic MLIR.
-- **`castforge-passes`**: `Pass` trait, `PassManager`, `PassRegistry`, declarative TOML/JSON
-  `PipelineConfig`, and **91 built-in Graph IR transformation passes and presets**.
-- **`castforge-codegen`**: Liveness analysis, static arena memory planner (`MemoryPlan`), Roofline
-  cost model, reference interpreter (`evaluate_module`), `LoopModule` + **7 LoopIR passes**,
+- **`src/stablehlo`**: Strongly-typed `StableHloOp` pattern-matching view over generic MLIR
+  operations, `FuncView`, and `verify_stablehlo_shapes`.
+- **`src/mlir`**: Zero-dependency recursive-descent MLIR parser (`parse_mlir`) and deterministic
+  pretty-printer (`print_module`) supporting both custom assembly and generic MLIR.
+- **`src/passes`**: `Pass` trait, `PassManager`, `PassRegistry`, declarative TOML/JSON
+  `PipelineConfig`, and **21 built-in Graph IR transformation passes and presets**.
+- **`src/codegen`**: Liveness analysis, static arena memory planner (`MemoryPlan`), Roofline cost
+  model, reference interpreter (`evaluate_module`), `LoopModule` + **`OptimizeLoopIrPass`**,
   `CodegenBackend` + `BackendRegistry` (7 built-in targets + 7 CPU SIMD ISAs), autotuner, and
   native C JIT runner.
-- **`castforge-viz`**: Graphviz DOT (`to_dot`) and self-contained interactive HTML5/SVG
-  step-by-step pass debugger (`to_interactive_trace_html`).
-- **`castforge-cli`**: Unified `castforge` command-line tool exposing `opt`, `translate`,
-  `codegen`, `autotune`, `jit`, `verify`, `stats`, `inspect`, `viz`, `diff`, and `list-passes`.
+- **`src/viz`**: Graphviz DOT (`to_dot`) and self-contained interactive HTML5/SVG step-by-step pass
+  debugger (`to_interactive_trace_html`).
+- **`src/cli`**: Unified `castforge` command-line tool exposing `opt`, `translate`, `codegen`,
+  `autotune`, `jit`, `verify`, `stats`, `inspect`, `viz`, `diff`, and `list-passes`.
 
 ---
 
-## 4. Dual-Plane IR Details (`castforge-ir`)
+## 4. Dual-Plane IR Details (`src/ir`)
 
 ### 4.1 SSA Compute Graph Plane
 - **Arena Storage:** Operations (`OpId`), SSA values (`ValueId`), basic blocks (`BlockId`), and
@@ -122,11 +122,11 @@ CastForge is built around three foundational design principles:
 - **$O(N)$ Reference Counting:** `Module::compute_use_counts()` computes operand reference counts
   across all active blocks in a single $O(N)$ sweep, enabling linear-time Dead Code Elimination.
 
-### 4.2 Weight Plane (`TensorStore`) & Weight Surgery (`castforge-passes/src/`)
-- **Pure IR Storage (`castforge-ir`):** Small constants remain inline in MLIR attributes, while
-  large weight matrices use `dense_resource<key>` handles pointing into `Module::tensor_store`.
-  `crates/castforge-ir/src/tensor_store.rs` loads and saves `TensorStore` entries directly to/from
-  HuggingFace `.safetensors` files.
+### 4.2 Weight Plane (`TensorStore`) & Weight Surgery (`src/passes/`)
+- **Pure IR Storage (`src/ir`):** Small constants remain inline in MLIR attributes, while large
+  weight matrices use `dense_resource<key>` handles pointing into `Module::tensor_store`.
+  `src/ir/tensor_store.rs` loads and saves `TensorStore` entries directly to/from HuggingFace
+  `.safetensors` files.
 - **Weight Surgery Kernels (`quantize.rs`, `fold_weights.rs`, `merge_weights.rs`):**
   - `quantize_symmetric_f32`: Symmetric per-tensor `i8` (`[-128, 127]`) and `i4` (`[-8, 7]`)
     quantization emitting `!quant.uniform<i8:f32, scale:zp>`.
@@ -137,7 +137,7 @@ CastForge is built around three foundational design principles:
 
 ---
 
-## 5. Static Liveness & Arena Memory Planning (`castforge-codegen`)
+## 5. Static Liveness & Arena Memory Planning (`src/codegen`)
 
 1. **Block Liveness Analysis (`liveness.rs`):**
    `compute_block_liveness` assigns each operation in a block a topological step index `1..=N` and

@@ -1,10 +1,10 @@
 # CastForge — Complete Reference of All 21 Graph IR Passes (+ Unified LoopIR Pass)
 
 CastForge provides **21 built-in modular A-to-B IR passes & presets** (`18 passes + 3 presets
-O1/O2/O3`) in `castforge-passes` (plus the unified **`OptimizeLoopIrPass`** (`optimize-loop-ir`) in
-`castforge-codegen`). Every pass implements the unified `Pass` and `Translator` traits and maps
-**100% 1-to-1** to a dedicated source file (`18` pass `.rs` files + `lib.rs`) directly under
-`crates/castforge-passes/src/`.
+O1/O2/O3`) in `src/passes/` (plus the unified **`OptimizeLoopIrPass`** (`optimize-loop-ir`) in
+`src/codegen/`). Every pass implements the unified `Pass` and `Translator` traits and maps
+**100% 1-to-1** to a dedicated source file (`18` pass `.rs` files + `mod.rs`) directly under
+`src/passes/`.
 
 ---
 
@@ -20,7 +20,7 @@ O1/O2/O3`) in `castforge-passes` (plus the unified **`OptimizeLoopIrPass`** (`op
 | **6. Distributed Parallelism, Streams & Autodiff** | 1 | Section 6 |
 | **7. Polyhedral Loop Scheduling & Tensor Cores** | 1 | Section 7 |
 | **8. IR Surgery, Verification & Tooling** | 2 | Section 8 |
-| **9. Polyhedral / Imperative LoopIR** | +1 | `castforge-codegen` (Section 9) |
+| **9. Polyhedral / Imperative LoopIR** | +1 | `src/codegen/` (Section 9) |
 
 *(Total: **21 registered Graph IR passes/presets** in `PassRegistry` + **`OptimizeLoopIrPass`**.)*
 
@@ -222,7 +222,7 @@ O1/O2/O3`) in `castforge-passes` (plus the unified **`OptimizeLoopIrPass`** (`op
 
 ---
 
-## 9. Polyhedral / Imperative LoopIR Pass (`castforge-codegen`, 1 Unified Pass)
+## 9. Polyhedral / Imperative LoopIR Pass (`src/codegen/`, 1 Unified Pass)
 
 - **`optimize-loop-ir` (`OptimizeLoopIrPass`):** Unified imperative `LoopModule` transformation pass
   orchestrating `LoopFusionPass`, `LoopFissionPass`, `LoopInterchangePass`,

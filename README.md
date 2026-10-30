@@ -15,40 +15,35 @@ support.
   Detailed explanation, CLI options, and IR transformation rules for all 21 Graph IR passes/presets
   (`18 passes + 3 presets O1/O2/O3`) and unified `OptimizeLoopIrPass` (`optimize-loop-ir`).
 
-## Workspace Architecture
+## Project Directory Structure (`src/`)
 
-- [`crates/castforge-ir`](crates/castforge-ir): Arena-allocated MLIR-compatible IR (`Module`,
-  `Operation`, `Value`, `Block`, `Region`, `Type`, `Attribute`, `Location`), structural verifier,
-  binary `.safetensors` zero-copy reader/writer, and the `TensorStore` weight plane (`2` `.rs`
-  files: `lib.rs` and `tensor_store.rs`).
-- [`crates/castforge-dialect-stablehlo`](crates/castforge-dialect-stablehlo): Strongly-typed
-  `stablehlo` and `func` dialect views (`StableHloOp`, `DotDimensionNumbers`, `FuncView`) and
-  shape verifiers.
-- [`crates/castforge-mlir`](crates/castforge-mlir): Zero-C++ MLIR parser & printer supporting both
-  **MLIR Generic Form** (`"stablehlo.add"(...)`) and **Pretty/Custom Syntax**
-  (`stablehlo.add %0, %1 : tensor<...>`), `!quant.uniform` quantized tensor types,
-  `dense_resource<key>` external weight references, plus symmetric **GGUF v2/v3**, **ONNX-JSON**,
-  and **SafeTensors** model importers & exporters.
-- [`crates/castforge-passes`](crates/castforge-passes): Unified `Pass`, `PassRegistry`, and
-  `PassManager` with **21 canonical A-to-B IR translator modules & presets** (`18 passes + 3
-  presets`) organized with **100% 1-to-1 pass-to-file mapping** (`18` pass `.rs` files + `lib.rs`
-  directly under `crates/castforge-passes/src/`), supporting static Rust construction, CLI pipeline
-  strings (`-p`), Unix pipes (`stdin -> stdout`), declarative TOML config files (`--config`), and
-  step-by-step tracing.
-- [`crates/castforge-viz`](crates/castforge-viz): Computation graph exporter for **Mermaid**,
-  **Graphviz DOT**, **JSON**, unified **MLIR Snapshot Diffing**, and a self-contained **Interactive
-  HTML Pass Timeline, Roofline & Arena Memory Liveness Debugger**.
-- [`crates/castforge-codegen`](crates/castforge-codegen): Liveness analyzer (`LivenessAnalysis`),
-  greedy interval-coloring arena buffer planner (`MemoryPlan`), progressive `LoopModule` IR with
-  unified `OptimizeLoopIrPass`, pluggable `CodegenBackend` & `BackendRegistry`, multi-architecture
-  SIMD profiles (`x86_64` AVX2/AVX-512, `aarch64` NEON/SVE, `riscv64` RVV, `wasm32` SIMD128),
-  Roofline & native JIT schedule auto-tuner, in-memory reference IR interpreter, and 7 built-in
-  codegen targets: **Rust**, **C99**, **WebGPU WGSL**, **NVIDIA CUDA (`.cu`)**, **Apple Metal
-  (`.metal`)**, **AMD ROCm HIP (`.hip.cpp`)**, and **Khronos OpenCL (`.cl`)**, plus **C/C++ FFI
-  Header (`.h`)** and **Native Shared Libraries (`.so`/`.dylib`)**.
-- [`crates/castforge-cli`](crates/castforge-cli): The `castforge` command-line tool (`chain`,
-  `opt`, `viz`, `codegen`, `autotune`, `import`, `profile`, `run`, `list-passes`, plus direct pass
-  subcommands).
+- [`src/ir`](src/ir): Arena-allocated MLIR-compatible IR (`Module`, `Operation`, `Value`, `Block`,
+  `Region`, `Type`, `Attribute`, `Location`), structural verifier, binary `.safetensors` zero-copy
+  reader/writer, and the `TensorStore` weight plane (`mod.rs` and `tensor_store.rs`).
+- [`src/stablehlo`](src/stablehlo): Strongly-typed `stablehlo` and `func` dialect views
+  (`StableHloOp`, `DotDimensionNumbers`, `FuncView`) and shape verifiers (`mod.rs`).
+- [`src/mlir`](src/mlir): Zero-C++ MLIR parser & printer supporting both **MLIR Generic Form**
+  (`"stablehlo.add"(...)`) and **Pretty/Custom Syntax** (`stablehlo.add %0, %1 : tensor<...>`),
+  `!quant.uniform` quantized tensor types, `dense_resource<key>` external weight references, plus
+  symmetric **GGUF v2/v3**, **ONNX-JSON**, and **SafeTensors** model importers & exporters.
+- [`src/passes`](src/passes): Unified `Pass`, `PassRegistry`, and `PassManager` with **21 canonical
+  A-to-B IR translator modules & presets** (`18 passes + 3 presets`) organized with **100% 1-to-1
+  pass-to-file mapping** (`18` pass `.rs` files + `mod.rs` directly under `src/passes/`), supporting
+  static Rust construction, CLI pipeline strings (`-p`), Unix pipes (`stdin -> stdout`), declarative
+  TOML config files (`--config`), and step-by-step tracing.
+- [`src/viz`](src/viz): Computation graph exporter for **Mermaid**, **Graphviz DOT**, **JSON**,
+  unified **MLIR Snapshot Diffing**, and a self-contained **Interactive HTML Pass Timeline,
+  Roofline & Arena Memory Liveness Debugger**.
+- [`src/codegen`](src/codegen): Liveness analyzer (`LivenessAnalysis`), greedy interval-coloring
+  arena buffer planner (`MemoryPlan`), progressive `LoopModule` IR with unified
+  `OptimizeLoopIrPass`, pluggable `CodegenBackend` & `BackendRegistry`, multi-architecture SIMD
+  profiles (`x86_64` AVX2/AVX-512, `aarch64` NEON/SVE, `riscv64` RVV, `wasm32` SIMD128), Roofline &
+  native JIT schedule auto-tuner, in-memory reference IR interpreter, and 7 built-in codegen
+  targets: **Rust**, **C99**, **WebGPU WGSL**, **NVIDIA CUDA (`.cu`)**, **Apple Metal (`.metal`)**,
+  **AMD ROCm HIP (`.hip.cpp`)**, and **Khronos OpenCL (`.cl`)**, plus **C/C++ FFI Header (`.h`)**
+  and **Native Shared Libraries (`.so`/`.dylib`)**.
+- [`src/cli`](src/cli): The `castforge` command-line tool (`chain`, `opt`, `viz`, `codegen`,
+  `autotune`, `import`, `profile`, `run`, `list-passes`, plus direct pass subcommands).
 
 ## Built-in A-to-B Translator Modules & Presets (21 Canonical Entries)
 
