@@ -47,6 +47,14 @@ pub enum Commands {
         #[arg(long)]
         generic: bool,
 
+        /// Emit source location annotations (`loc(...)`) in printed MLIR
+        #[arg(long = "locations")]
+        locations: bool,
+
+        /// Verify StableHLO shape & type inference rules after passes
+        #[arg(long = "verify-shapes")]
+        verify_shapes: bool,
+
         /// Print pass execution statistics to stderr (--stats=false or -q to suppress)
         #[arg(
             long,
@@ -87,6 +95,14 @@ pub enum Commands {
         #[arg(short = 'w', long = "weights")]
         weights: Option<PathBuf>,
 
+        /// Optional target function name to evaluate (defaults to first `func.func`)
+        #[arg(long = "func")]
+        func: Option<String>,
+
+        /// Optional explicit input tensors (`"v1,v2;v3,v4"`), overriding synthetic inputs
+        #[arg(long = "inputs")]
+        inputs: Option<String>,
+
         /// Bisect the pass pipeline step-by-step to pinpoint numerical drift
         #[arg(long = "bisect")]
         bisect: bool,
@@ -94,6 +110,14 @@ pub enum Commands {
         /// Numerical verification tolerance when -p/--passes or --bisect is used
         #[arg(long = "tolerance", default_value_t = 1e-4)]
         tolerance: f32,
+
+        /// Emit evaluation outputs and verification metrics as JSON
+        #[arg(long = "json")]
+        json: bool,
+
+        /// Optional output file path (defaults to stdout)
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
     },
 
     /// Parse and round-trip an MLIR file (pretty or --generic form)
@@ -108,6 +132,14 @@ pub enum Commands {
         /// Emit canonical MLIR Generic Form
         #[arg(long)]
         generic: bool,
+
+        /// Emit source location annotations (`loc(...)`) in printed MLIR
+        #[arg(long = "locations")]
+        locations: bool,
+
+        /// Verify StableHLO shape & type inference rules in addition to SSA dominance
+        #[arg(long = "verify-shapes")]
+        verify_shapes: bool,
     },
 
     /// Export the IR computation graph or interactive Pass Timeline Debugger
@@ -222,6 +254,48 @@ pub enum Commands {
         arch: Option<String>,
     },
 
+    /// Compile and benchmark generated Rust/C99 code natively on the host CPU with numeric check
+    Bench {
+        /// Input MLIR file path (reads from stdin if omitted or "-")
+        input: Option<PathBuf>,
+
+        /// Native JIT target to benchmark: rust or c
+        #[arg(short = 't', long = "target", default_value = "rust")]
+        target: String,
+
+        /// Optional pass pipeline to run before codegen & benchmarking
+        #[arg(short = 'p', long = "passes")]
+        passes: Option<String>,
+
+        /// Optional input `.safetensors` file to load into TensorStore
+        #[arg(short = 'w', long = "weights")]
+        weights: Option<PathBuf>,
+
+        /// Optional hardware architecture profile (e.g. x86_64-avx2, aarch64-neon)
+        #[arg(long = "arch")]
+        arch: Option<String>,
+
+        /// Automatically search and apply the Roofline-optimal loop schedule before benchmarking
+        #[arg(long = "autotune")]
+        autotune: bool,
+
+        /// Number of warmup iterations before timing
+        #[arg(long = "warmup", default_value_t = 3)]
+        warmup: usize,
+
+        /// Number of timed benchmark iterations
+        #[arg(long = "iters", default_value_t = 20)]
+        iters: usize,
+
+        /// Emit benchmark report as JSON
+        #[arg(long = "json")]
+        json: bool,
+
+        /// Optional output file path (defaults to stdout)
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
+    },
+
     /// Analyze FLOPs, memory bandwidth traffic, arithmetic intensity, and Roofline bottlenecks
     Profile {
         /// Input MLIR file path (reads from stdin if omitted or "-")
@@ -294,6 +368,50 @@ pub enum Commands {
         json: bool,
 
         /// Optional output file path to write the schedule-stamped MLIR module (or JSON if --json)
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
+    },
+
+    /// Compute a unified MLIR diff between two files or before vs. after a pass pipeline
+    Diff {
+        /// First (baseline) MLIR file path (reads from stdin if omitted or "-")
+        input: Option<PathBuf>,
+
+        /// Optional second MLIR file path to compare against `input`
+        second: Option<PathBuf>,
+
+        /// Optional pass pipeline to run on `input` when `second` is omitted
+        #[arg(short = 'p', long = "passes")]
+        passes: Option<String>,
+
+        /// Optional input `.safetensors` file to load into TensorStore before passes
+        #[arg(short = 'w', long = "weights")]
+        weights: Option<PathBuf>,
+
+        /// Optional output file path (defaults to stdout)
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
+    },
+
+    /// Inspect a model, MLIR module, or `.safetensors` weight file (functions, ops, weights, arena)
+    #[command(visible_alias = "info")]
+    Inspect {
+        /// Input path (.mlir, .gguf, .onnx.json, config.json, or .safetensors)
+        input: Option<PathBuf>,
+
+        /// Optional `.safetensors` weights file to include in inspection
+        #[arg(short = 'w', long = "weights")]
+        weights: Option<PathBuf>,
+
+        /// Optional pass pipeline to run before inspecting the module
+        #[arg(short = 'p', long = "passes")]
+        passes: Option<String>,
+
+        /// Emit inspection report as formatted JSON
+        #[arg(long = "json")]
+        json: bool,
+
+        /// Optional output file path (defaults to stdout)
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
     },
@@ -387,9 +505,28 @@ pub enum Commands {
 
     /// List all registered transformation and optimization passes
     ListPasses {
+        /// Optional substring filter to match pass names or descriptions
+        filter: Option<String>,
+
         /// Display composite pass hierarchy (`child_passes`) as a tree
         #[arg(short = 't', long = "tree")]
         tree: bool,
+
+        /// Emit registered passes as formatted JSON
+        #[arg(long = "json")]
+        json: bool,
+    },
+
+    /// List all codegen targets, hardware `--arch` profiles, and composable translator stages
+    #[command(visible_alias = "targets")]
+    ListTargets {
+        /// Emit targets, arch profiles, and translators as formatted JSON
+        #[arg(long = "json")]
+        json: bool,
+
+        /// Optional output file path (defaults to stdout)
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
     },
 
     /// Dynamically invoke a single pass or preset directly by subcommand name

@@ -189,10 +189,12 @@ pub fn build_translator_chain_with_weights(
             }
             "print-mlir" | "print" => {
                 let generic = parse_bool_opt(&opts, "generic", false);
+                let locations = parse_bool_opt(&opts, "locations", false)
+                    || parse_bool_opt(&opts, "print_locations", false);
                 chain.push(Box::new(MlirPrintTranslator {
                     options: PrintOptions {
                         generic_form: generic,
-                        print_locations: false,
+                        print_locations: locations,
                     },
                 }));
                 last_out = "text";
@@ -474,5 +476,47 @@ mod tests {
 
         assert!(build_translator_chain(&reg, "codegen(target=invalid_target)").is_err());
         assert!(build_translator_chain(&reg, "viz(format=invalid_format)").is_err());
+
+        let cli_bench = Cli::try_parse_from([
+            "castforge",
+            "bench",
+            "model.mlir",
+            "-t",
+            "c",
+            "--autotune",
+            "--iters",
+            "10",
+            "--json",
+        ])
+        .expect("bench parses");
+        assert!(matches!(cli_bench.command, Commands::Bench { .. }));
+
+        let cli_diff =
+            Cli::try_parse_from(["castforge", "diff", "a.mlir", "b.mlir"]).expect("diff parses");
+        assert!(matches!(cli_diff.command, Commands::Diff { .. }));
+
+        let cli_inspect =
+            Cli::try_parse_from(["castforge", "inspect", "model.mlir", "--json"]).unwrap();
+        assert!(matches!(cli_inspect.command, Commands::Inspect { .. }));
+
+        let cli_targets = Cli::try_parse_from(["castforge", "targets", "--json"]).unwrap();
+        assert!(matches!(cli_targets.command, Commands::ListTargets { .. }));
+
+        let mod_ir = crate::mlir::parse_mlir(
+            r#"
+            module @demo {
+              func.func @main(%x: tensor<2x2xf32>) -> tensor<2x2xf32> {
+                %0 = stablehlo.add %x, %x : tensor<2x2xf32>
+                func.return %0 : tensor<2x2xf32>
+              }
+            }
+            "#,
+        )
+        .unwrap();
+        let rep = crate::cli::inspect_module(&mod_ir);
+        assert_eq!(rep.name, "demo");
+        assert_eq!(rep.functions.len(), 1);
+        assert_eq!(rep.total_ops, 1);
+        assert_eq!(rep.op_histogram.get("stablehlo.add"), Some(&1));
     }
 }

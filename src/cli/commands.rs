@@ -4,16 +4,17 @@ use crate::cli::args::{Cli, Commands};
 use crate::cli::chain::{
     build_translator_chain_with_weights, parse_codegen_target_strict, parse_viz_format_strict,
 };
+use crate::cli::inspect::{run_inspect, run_list_targets};
 use crate::codegen::{
-    GemmLoopOrder, HardwareRoofline, OptimizeLoopIrPass, SimdIsa, TargetConfig,
+    CodegenTarget, GemmLoopOrder, HardwareRoofline, OptimizeLoopIrPass, SimdIsa, TargetConfig,
     analyze_module_cost_with_roofline, apply_schedule_to_module, autotune_module,
     autotune_module_jit, build_memory_plan, compare_output_tensors, compile_shared_lib,
-    emit_c_header, evaluate_module, generate_code_with_config, generate_synthetic_inputs,
-    lower_to_loop_ir,
+    emit_c_header, evaluate_function, evaluate_module, generate_code_with_config,
+    generate_synthetic_inputs, jit_execute_and_benchmark, lower_to_loop_ir,
 };
 use crate::ir::{
-    Module, PassResult, Payload, collect_module_tensors, export_gguf_file, export_onnx_file,
-    import_hf_model_dir,
+    Module, OpId, PassResult, Payload, collect_module_tensors, export_gguf_file, export_onnx_file,
+    import_hf_model_dir, verify_stablehlo_shapes,
 };
 use crate::mlir::{
     PrintOptions, import_gguf_file, import_onnx_file, parse_mlir, print_mlir,
@@ -21,7 +22,7 @@ use crate::mlir::{
 };
 use crate::passes::{ComposeFunctionsPass, Pass, PassManager, PassRegistry, link_modules};
 use crate::viz::{
-    TimelineFrame, VizFormat, build_graph_json, render_module, render_timeline_html,
+    TimelineFrame, VizFormat, build_graph_json, diff_modules, render_module, render_timeline_html,
 };
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -42,6 +43,8 @@ pub fn run() -> Result<()> {
             weights,
             save_weights,
             generic,
+            locations,
+            verify_shapes,
             stats,
             quiet,
             verify_numerics,
@@ -106,6 +109,11 @@ pub fn run() -> Result<()> {
                 }
             }
 
+            if verify_shapes {
+                module.verify()?;
+                verify_all_stablehlo_shapes(&module)?;
+            }
+
             if let Some(sw_path) = save_weights {
                 module
                     .tensor_store
@@ -124,7 +132,7 @@ pub fn run() -> Result<()> {
                 &module,
                 PrintOptions {
                     generic_form: generic,
-                    print_locations: false,
+                    print_locations: locations,
                 },
             );
             write_text_output(output.as_ref(), &formatted)?;
@@ -134,14 +142,22 @@ pub fn run() -> Result<()> {
             input,
             passes,
             weights,
+            func,
+            inputs: raw_inputs,
             bisect,
             tolerance,
+            json,
+            output,
         } => {
             let src = read_input_text(input.as_ref())?;
             let mut module = parse_mlir(&src)?;
             load_optional_weights(&mut module, weights.as_ref(), false)?;
-            let inputs = generate_synthetic_inputs(&module, None)?;
-            let baseline = evaluate_module(&module, &inputs)?;
+            let fn_id = resolve_target_func(&module, func.as_deref())?;
+            let inputs = match raw_inputs {
+                Some(spec) => parse_cli_inputs(&spec)?,
+                None => generate_synthetic_inputs(&module, Some(fn_id))?,
+            };
+            let baseline = evaluate_function(&module, fn_id, &inputs)?;
             if let Some(spec) = passes {
                 let registry = PassRegistry::with_builtin_passes();
                 let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
@@ -157,15 +173,27 @@ pub fn run() -> Result<()> {
                 } else {
                     pm.run(&mut module)?;
                 }
-                let optimized_out = evaluate_module(&module, &inputs)?;
+                let opt_fn_id = resolve_target_func(&module, func.as_deref())?;
+                let optimized_out = evaluate_function(&module, opt_fn_id, &inputs)?;
                 let rep = compare_output_tensors(&baseline, &optimized_out, tolerance)?;
-                println!(
-                    "Numerical verification: {} (max_abs_diff = {:.6e}, tol = {:.2e})",
-                    if rep.passed { "PASSED" } else { "FAILED" },
-                    rep.max_abs_diff,
-                    rep.tolerance
-                );
-                println!("Outputs: {optimized_out:?}");
+                let text = if json {
+                    let payload = serde_json::json!({
+                        "passed": rep.passed,
+                        "max_abs_diff": rep.max_abs_diff,
+                        "tolerance": rep.tolerance,
+                        "outputs": optimized_out,
+                    });
+                    format!("{}\n", serde_json::to_string_pretty(&payload)?)
+                } else {
+                    format!(
+                        "Numerical verification: {} (max_abs_diff = {:.6e}, tol = {:.2e})\n\
+                         Outputs: {optimized_out:?}\n",
+                        if rep.passed { "PASSED" } else { "FAILED" },
+                        rep.max_abs_diff,
+                        rep.tolerance
+                    )
+                };
+                write_text_output(output.as_ref(), &text)?;
                 if !rep.passed {
                     anyhow::bail!(
                         "Numerical verification failed: max_abs_diff {:.6e} > tol {:.2e}",
@@ -174,7 +202,13 @@ pub fn run() -> Result<()> {
                     );
                 }
             } else {
-                println!("Outputs: {baseline:?}");
+                let text = if json {
+                    let payload = serde_json::json!({ "outputs": baseline });
+                    format!("{}\n", serde_json::to_string_pretty(&payload)?)
+                } else {
+                    format!("Outputs: {baseline:?}\n")
+                };
+                write_text_output(output.as_ref(), &text)?;
             }
         }
 
@@ -182,15 +216,20 @@ pub fn run() -> Result<()> {
             input,
             output,
             generic,
+            locations,
+            verify_shapes,
         } => {
             let src = read_input_text(input.as_ref())?;
             let module = parse_mlir(&src)?;
             module.verify()?;
+            if verify_shapes {
+                verify_all_stablehlo_shapes(&module)?;
+            }
             let formatted = print_mlir_with_options(
                 &module,
                 PrintOptions {
                     generic_form: generic,
-                    print_locations: false,
+                    print_locations: locations,
                 },
             );
             write_text_output(output.as_ref(), &formatted)?;
@@ -406,6 +445,74 @@ pub fn run() -> Result<()> {
             }
         }
 
+        Commands::Bench {
+            input,
+            target,
+            passes,
+            weights,
+            arch,
+            autotune,
+            warmup,
+            iters,
+            json,
+            output,
+        } => {
+            let src = read_input_text(input.as_ref())?;
+            let mut module = parse_mlir(&src)?;
+            load_optional_weights(&mut module, weights.as_ref(), false)?;
+            if let Some(spec) = passes {
+                let registry = PassRegistry::with_builtin_passes();
+                let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
+                pm.run(&mut module)?;
+            }
+            let tgt = match parse_codegen_target_strict(&target)? {
+                CodegenTarget::Rust => CodegenTarget::Rust,
+                CodegenTarget::C => CodegenTarget::C,
+                other => anyhow::bail!(
+                    "Native CPU JIT benchmarking supports `rust` or `c` targets (got `{other:?}`)"
+                ),
+            };
+            let mut cfg = match &arch {
+                Some(a) => TargetConfig::for_arch(a),
+                None => TargetConfig::default(),
+            };
+            if autotune {
+                let rf = build_roofline(arch.as_deref(), None, None);
+                let rep = autotune_module(&module, &rf);
+                apply_schedule_to_module(&mut module, &rep.best.config);
+                cfg = rep.best.config;
+            }
+            let bench = jit_execute_and_benchmark(&module, tgt, &cfg, warmup, iters)?;
+            let text = if json {
+                format!("{}\n", serde_json::to_string_pretty(&bench)?)
+            } else {
+                format!(
+                    "=== CastForge Native JIT Benchmark ({:?}) ===\n\
+                     Iterations: {} (Warmup: {})\n\
+                     Min Latency: {:.2} ns | Avg Latency: {:.2} ns\n\
+                     Numerics Verified: {} (max_abs_diff = {:.6e})\n",
+                    bench.target,
+                    bench.iterations,
+                    warmup,
+                    bench.min_latency_ns,
+                    bench.avg_latency_ns,
+                    if bench.numerics_verified {
+                        "PASSED"
+                    } else {
+                        "FAILED"
+                    },
+                    bench.max_abs_diff
+                )
+            };
+            write_text_output(output.as_ref(), &text)?;
+            if !bench.numerics_verified {
+                anyhow::bail!(
+                    "JIT benchmark numerical check failed: max_abs_diff {:.6e}",
+                    bench.max_abs_diff
+                );
+            }
+        }
+
         Commands::Profile {
             input,
             passes,
@@ -507,6 +614,53 @@ pub fn run() -> Result<()> {
             } else {
                 print!("{}", report.summary_table(top_k));
             }
+        }
+
+        Commands::Diff {
+            input,
+            second,
+            passes,
+            weights,
+            output,
+        } => {
+            let src_a = read_input_text(input.as_ref())?;
+            let mut mod_a = parse_mlir(&src_a)?;
+            load_optional_weights(&mut mod_a, weights.as_ref(), false)?;
+            let mod_b = if let Some(sec_path) = second {
+                let src_b = read_input_text(Some(&sec_path))?;
+                let mut parsed_b = parse_mlir(&src_b)?;
+                if let Some(spec) = passes {
+                    let registry = PassRegistry::with_builtin_passes();
+                    let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
+                    pm.run(&mut parsed_b)?;
+                }
+                parsed_b
+            } else {
+                let mut cloned = mod_a.clone();
+                let spec = passes.as_deref().unwrap_or("canonicalize");
+                let registry = PassRegistry::with_builtin_passes();
+                let mut pm = PassManager::from_pipeline_str(&registry, spec)?;
+                pm.run(&mut cloned)?;
+                cloned
+            };
+            let diff_txt = diff_modules(&mod_a, &mod_b);
+            write_text_output(output.as_ref(), &diff_txt)?;
+        }
+
+        Commands::Inspect {
+            input,
+            weights,
+            passes,
+            json,
+            output,
+        } => {
+            run_inspect(
+                input.as_ref(),
+                weights.as_ref(),
+                passes.as_deref(),
+                json,
+                output.as_ref(),
+            )?;
         }
 
         Commands::Import {
@@ -678,28 +832,63 @@ pub fn run() -> Result<()> {
             write_text_output(output.as_ref(), &formatted)?;
         }
 
-        Commands::ListPasses { tree } => {
+        Commands::ListPasses { filter, tree, json } => {
             let registry = PassRegistry::with_builtin_passes();
-            println!("Available CastForge Passes:");
-            println!("{:<28} DESCRIPTION", "PASS NAME");
-            println!("{}", "-".repeat(86));
-            for (name, desc) in registry.list() {
-                println!("{:<28} {}", name, desc);
-                if tree
-                    && let Ok(instance) = registry.create_pass(name, &Default::default())
-                    && instance.is_composite()
-                {
-                    let children = instance.child_passes();
-                    for (idx, child) in children.iter().enumerate() {
-                        let branch = if idx + 1 == children.len() {
-                            "└─"
-                        } else {
-                            "├─"
-                        };
-                        println!("  {branch} {child}");
+            let q = filter.as_deref().unwrap_or("").to_ascii_lowercase();
+            let entries: Vec<(&str, &str)> = registry
+                .list()
+                .into_iter()
+                .filter(|(n, d)| {
+                    q.is_empty()
+                        || n.to_ascii_lowercase().contains(&q)
+                        || d.to_ascii_lowercase().contains(&q)
+                })
+                .collect();
+
+            if json {
+                let items: Vec<serde_json::Value> = entries
+                    .iter()
+                    .map(|&(name, desc)| {
+                        let children: Vec<&str> = registry
+                            .create_pass(name, &Default::default())
+                            .ok()
+                            .map(|p| p.child_passes().to_vec())
+                            .unwrap_or_default();
+                        serde_json::json!({
+                            "name": name,
+                            "description": desc,
+                            "is_composite": !children.is_empty(),
+                            "child_passes": children,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&items)?);
+            } else {
+                println!("Available CastForge Passes ({} matched):", entries.len());
+                println!("{:<28} DESCRIPTION", "PASS NAME");
+                println!("{}", "-".repeat(86));
+                for (name, desc) in entries {
+                    println!("{:<28} {}", name, desc);
+                    if tree
+                        && let Ok(instance) = registry.create_pass(name, &Default::default())
+                        && instance.is_composite()
+                    {
+                        let children = instance.child_passes();
+                        for (idx, child) in children.iter().enumerate() {
+                            let branch = if idx + 1 == children.len() {
+                                "└─"
+                            } else {
+                                "├─"
+                            };
+                            println!("  {branch} {child}");
+                        }
                     }
                 }
             }
+        }
+
+        Commands::ListTargets { json, output } => {
+            run_list_targets(json, output.as_ref())?;
         }
 
         Commands::DirectPass(args) => {
@@ -722,6 +911,7 @@ fn run_direct_pass(registry: &PassRegistry, args: &[String]) -> Result<()> {
     let mut weights_path: Option<PathBuf> = None;
     let mut save_weights_path: Option<PathBuf> = None;
     let mut generic = false;
+    let mut locations = false;
     let mut quiet = false;
     let mut verify_numerics = false;
 
@@ -751,6 +941,9 @@ fn run_direct_pass(registry: &PassRegistry, args: &[String]) -> Result<()> {
             }
             "--generic" => {
                 generic = true;
+            }
+            "--locations" => {
+                locations = true;
             }
             "-q" | "--quiet" => {
                 quiet = true;
@@ -808,10 +1001,55 @@ fn run_direct_pass(registry: &PassRegistry, args: &[String]) -> Result<()> {
         &module,
         PrintOptions {
             generic_form: generic,
-            print_locations: false,
+            print_locations: locations,
         },
     );
     write_text_output(output_path.as_ref(), &formatted)
+}
+
+fn resolve_target_func(module: &Module, func_name: Option<&str>) -> Result<OpId> {
+    let fns = module.functions();
+    let Some(target) = func_name else {
+        return fns
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("Module contains no `func.func` operations"));
+    };
+    let clean = target.trim().trim_start_matches('@');
+    for fn_id in fns {
+        if module.ops[fn_id]
+            .attributes
+            .get("sym_name")
+            .and_then(|a| a.as_str())
+            .is_some_and(|s| s == clean)
+        {
+            return Ok(fn_id);
+        }
+    }
+    anyhow::bail!("Function `@{clean}` not found in module")
+}
+
+fn parse_cli_inputs(spec: &str) -> Result<Vec<Vec<f32>>> {
+    let mut tensors = Vec::new();
+    for group in spec.split(';') {
+        let g = group.trim();
+        if g.is_empty() {
+            continue;
+        }
+        let mut vals = Vec::new();
+        for tok in g.split(',') {
+            let t = tok.trim();
+            if t.is_empty() {
+                continue;
+            }
+            let v: f32 = t
+                .parse()
+                .with_context(|| format!("Invalid float value `{t}` in --inputs"))?;
+            vals.push(v);
+        }
+        tensors.push(vals);
+    }
+    Ok(tensors)
 }
 
 fn load_optional_weights(
@@ -926,6 +1164,13 @@ fn write_text_output(output: Option<&PathBuf>, content: &str) -> Result<()> {
             .with_context(|| format!("Failed to write {}", out_path.display()))?;
     } else {
         print!("{content}");
+    }
+    Ok(())
+}
+
+fn verify_all_stablehlo_shapes(module: &Module) -> Result<()> {
+    for op_id in module.ops.keys() {
+        verify_stablehlo_shapes(module, op_id).map_err(|e| anyhow::anyhow!(e))?;
     }
     Ok(())
 }
