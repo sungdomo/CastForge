@@ -1,11 +1,10 @@
 use crate::{
-    AutodiffPass, CanonicalizePass, DeadCodeEliminationPass, DecomposeCompositesPass,
-    FoldConstantsPass, FoldViewsPass, FoldWeightsPass, FuseActivationsPass, FuseGemmPass,
-    FuseNormPass, IrEditPass, OptO1Pass, OptO2Pass, OptO3Pass, OptimizeMemoryPass, Pass,
-    PassOptions, PruneWeightsPass, QuantizePass, ScheduleLoopsPass, ShardDistributedPass,
-    TopologicalSortPass, UnifiedCsePass, UnifiedFuseAttentionPass, UnifiedFuseElementwisePass,
-    UnifiedMergeWeightsPass, UnifiedOutlineSubgraphsPass, UnifiedProfileIrPass,
-    UnifiedSimplifyAlgebraicPass, UnifiedSpecializeShapesPass, UnifiedVerifyIrPass,
+    AutodiffPass, CanonicalizePass, DeadCodeEliminationPass, FoldViewsPass, FoldWeightsPass,
+    FuseActivationsPass, FuseGemmPass, FuseNormPass, IrEditPass, OptO1Pass, OptO2Pass, OptO3Pass,
+    OptimizeMemoryPass, Pass, PassOptions, PruneWeightsPass, QuantizePass, ScheduleLoopsPass,
+    ShardDistributedPass, UnifiedCsePass, UnifiedFuseAttentionPass, UnifiedFuseElementwisePass,
+    UnifiedMergeWeightsPass, UnifiedOutlineSubgraphsPass, UnifiedSimplifyAlgebraicPass,
+    UnifiedSpecializeShapesPass, UnifiedVerifyIrPass,
 };
 use anyhow::{Result, anyhow};
 use indexmap::IndexMap;
@@ -36,7 +35,7 @@ impl PassRegistry {
         }
     }
 
-    /// Create a registry pre-populated with all 29 built-in CastForge passes and presets.
+    /// Create a registry pre-populated with all 25 built-in CastForge passes and presets.
     pub fn with_builtin_passes() -> Self {
         let mut reg = Self::new();
         reg.register(
@@ -81,29 +80,33 @@ impl PassRegistry {
         );
         reg.register(
             "simplify-algebraic",
-            "Unified algebraic identities (x+0->x, x*1->x, x*0->0) and e-graph FMA/factoring",
+            "Unified constant folding, SCCP, algebraic identities, e-graph factoring & FMA",
             |opts| {
+                let fold_constants = opts
+                    .get("fold_constants")
+                    .or_else(|| opts.get("constants"))
+                    .map(|v| v != "false" && v != "0")
+                    .unwrap_or(true);
+                let include_conditional = opts
+                    .get("conditional")
+                    .map(|v| v != "false" && v != "0")
+                    .unwrap_or(true);
+                let const_only = opts
+                    .get("mode")
+                    .is_some_and(|m| m == "constants" || m == "fold");
                 let egraph = opts
                     .get("egraph")
                     .map(|v| v != "false" && v != "0")
-                    .unwrap_or(true);
+                    .unwrap_or(!const_only);
                 let fuse_fma = opts
                     .get("fuse_fma")
                     .map(|s| s != "false" && s != "0")
-                    .unwrap_or(true);
-                Ok(Box::new(UnifiedSimplifyAlgebraicPass { egraph, fuse_fma }))
-            },
-        );
-        reg.register(
-            "fold-constants",
-            "Constant folding & conditional propagation (arithmetic, shape, compare/select)",
-            |opts| {
-                let include_conditional = opts
-                    .get("conditional")
-                    .map(|v| v != "false")
-                    .unwrap_or(true);
-                Ok(Box::new(FoldConstantsPass {
+                    .unwrap_or(!const_only);
+                Ok(Box::new(UnifiedSimplifyAlgebraicPass {
+                    fold_constants,
                     include_conditional,
+                    egraph,
+                    fuse_fma,
                 }))
             },
         );
@@ -288,10 +291,15 @@ impl PassRegistry {
         );
         reg.register(
             "fuse-elementwise",
-            "Unified elementwise, map-reduce, megakernel, and register loop-chain fusion",
+            "Unified elementwise, map-reduce, megakernel, loop-chain fusion & decomposition",
             |opts| {
                 let mode = opts.get("mode").cloned().unwrap_or_else(|| {
-                    if opts.contains_key("max_steps") {
+                    if opts
+                        .get("decompose")
+                        .is_some_and(|v| v == "true" || v == "1")
+                    {
+                        "decompose".to_string()
+                    } else if opts.contains_key("max_steps") {
                         "loops".to_string()
                     } else {
                         "composites".to_string()
@@ -478,24 +486,23 @@ impl PassRegistry {
             },
         );
         reg.register(
-            "decompose-composites",
-            "Expands stablehlo.composite operations back into primitive StableHLO ops",
-            |_opts| Ok(Box::new(DecomposeCompositesPass)),
-        );
-        reg.register(
             "canonicalize",
-            "Composite canonicalization pass (fold-views + simplify-algebraic + cse + dce)",
-            |_opts| Ok(Box::new(CanonicalizePass)),
-        );
-        reg.register(
-            "topological-sort",
-            "Reorders operations for SSA def-before-use and optional peak-memory minimization",
+            "Composite canonicalization & topological/peak-memory scheduler (mode=all|min_memory)",
             |opts| {
-                let mode = opts
-                    .get("mode")
-                    .cloned()
-                    .unwrap_or_else(|| "standard".to_string());
-                Ok(Box::new(TopologicalSortPass { mode }))
+                let mode = opts.get("mode").cloned().unwrap_or_else(|| {
+                    if opts
+                        .get("min_memory")
+                        .is_some_and(|v| v == "true" || v == "1")
+                    {
+                        "min_memory".to_string()
+                    } else {
+                        "all".to_string()
+                    }
+                });
+                let toposort = opts
+                    .get("toposort")
+                    .is_some_and(|v| v == "true" || v == "1");
+                Ok(Box::new(CanonicalizePass { mode, toposort }))
             },
         );
         reg.register(
@@ -879,7 +886,7 @@ impl PassRegistry {
         );
         reg.register(
             "verify-ir",
-            "Unified IR verifier, structural FNV-1a hasher, equivalence, sanitizer & bisection",
+            "Unified IR verifier, structural hasher, equivalence, sanitizer, bisection & profiling",
             |opts| {
                 let sanitize = opts
                     .get("sanitize")
@@ -893,6 +900,24 @@ impl PassRegistry {
                     .get("eps")
                     .and_then(|s| s.parse::<f64>().ok())
                     .unwrap_or(1e-6);
+                let instrument = opts
+                    .get("instrument")
+                    .map(|s| s == "true" || s == "1")
+                    .unwrap_or_else(|| opts.contains_key("filter") || opts.contains_key("ops"));
+                let profile = opts
+                    .get("profile")
+                    .or_else(|| opts.get("stats"))
+                    .map(|s| s != "false" && s != "0")
+                    .unwrap_or_else(|| opts.contains_key("ridge"));
+                let filter = opts
+                    .get("filter")
+                    .or_else(|| opts.get("ops"))
+                    .cloned()
+                    .unwrap_or_else(|| "gemm".to_string());
+                let ridge_flops_per_byte = opts
+                    .get("ridge")
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(10.0);
                 let shapes = opts
                     .get("shapes")
                     .map(|s| s != "false" && s != "0")
@@ -900,7 +925,7 @@ impl PassRegistry {
                 let equiv = opts
                     .get("equiv")
                     .map(|s| s != "false" && s != "0")
-                    .unwrap_or(!sanitize);
+                    .unwrap_or(!sanitize && !instrument);
                 let tolerance = opts
                     .get("tol")
                     .or_else(|| opts.get("tolerance"))
@@ -909,7 +934,7 @@ impl PassRegistry {
                 let hash = opts
                     .get("hash")
                     .map(|s| s != "false" && s != "0")
-                    .unwrap_or(!sanitize);
+                    .unwrap_or(!sanitize && !instrument);
                 let bisect_limit = opts
                     .get("bisect")
                     .or_else(|| opts.get("limit"))
@@ -923,41 +948,16 @@ impl PassRegistry {
                     sanitize,
                     clamp_max,
                     eps,
-                }))
-            },
-        );
-        reg.register(
-            "profile-ir",
-            "Unified Roofline FLOPs/intensity analysis and profiling region instrumentation",
-            |opts| {
-                let stats = opts
-                    .get("stats")
-                    .map(|s| s != "false" && s != "0")
-                    .unwrap_or(true);
-                let ridge_flops_per_byte = opts
-                    .get("ridge")
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(10.0);
-                let instrument = opts
-                    .get("instrument")
-                    .map(|s| s == "true" || s == "1")
-                    .unwrap_or_else(|| opts.contains_key("filter") || opts.contains_key("ops"));
-                let filter = opts
-                    .get("filter")
-                    .or_else(|| opts.get("ops"))
-                    .cloned()
-                    .unwrap_or_else(|| "gemm".to_string());
-                Ok(Box::new(UnifiedProfileIrPass {
-                    stats,
-                    ridge_flops_per_byte,
+                    profile,
                     instrument,
                     filter,
+                    ridge_flops_per_byte,
                 }))
             },
         );
         reg.register(
             "O1",
-            "Preset O1: Inlining, fold-constants, LICM, GVN, fold-views, canonicalize, dce",
+            "Preset O1: Inlining, simplify-algebraic, LICM, GVN, fold-views, canonicalize, dce",
             |_opts| Ok(Box::new(OptO1Pass)),
         );
         reg.register(

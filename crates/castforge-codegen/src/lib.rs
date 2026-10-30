@@ -7,8 +7,6 @@ pub mod autotune;
 pub mod backend;
 pub mod cost_model;
 pub mod eval;
-pub mod jit;
-pub mod liveness;
 pub mod loop_ir;
 pub mod memory_plan;
 pub mod target_c;
@@ -17,8 +15,8 @@ pub mod target_rust;
 pub mod target_wgsl;
 
 pub use crate::autotune::{
-    AutotuneCandidate, AutotuneReport, AutotuneScheduleTranslator, apply_schedule_to_module,
-    autotune_module,
+    AutotuneCandidate, AutotuneReport, AutotuneScheduleTranslator, JitBenchmarkResult,
+    apply_schedule_to_module, autotune_module, autotune_module_jit, jit_execute_and_benchmark,
 };
 pub use crate::backend::{
     BackendRegistry, C99Backend, CodegenBackend, CudaBackend, CustomBackendTranslator, HipBackend,
@@ -32,14 +30,15 @@ pub use crate::eval::{
     BisectReport, BisectStep, NumericVerificationReport, bisect_module_snapshots,
     evaluate_function, evaluate_module, generate_synthetic_inputs, verify_module_numerics,
 };
-pub use crate::jit::{JitBenchmarkResult, autotune_module_jit, jit_execute_and_benchmark};
-pub use crate::liveness::{LiveInterval, compute_block_liveness, compute_module_liveness};
 pub use crate::loop_ir::{
     CHeaderTranslator, LoopKernel, LoopModule, LoopPass, LoopStmt, OptimizeLoopIrPass,
     SharedLibTranslator, TensorToLoopTranslator, compile_shared_lib, emit_c_header,
     emit_cuda_module_with_config, emit_msl_module_with_config, lower_to_loop_ir,
 };
-pub use crate::memory_plan::{BufferAllocation, MemoryPlan, build_memory_plan};
+pub use crate::memory_plan::{
+    BufferAllocation, LiveInterval, MemoryPlan, build_memory_plan, compute_block_liveness,
+    compute_module_liveness,
+};
 pub use crate::target_config::{GemmLoopOrder, SimdIsa, TargetConfig};
 use anyhow::Result;
 use castforge_ir::{Dim, Module, TensorType, ValueId};

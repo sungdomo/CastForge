@@ -121,7 +121,7 @@ module @numeric_verify_demo {
     let registry = PassRegistry::with_builtin_passes();
     let mut pm = PassManager::from_pipeline_str(
         &registry,
-        "fold-weights,fuse-gemm(kind=epilogue),fold-constants,dce",
+        "fold-weights,fuse-gemm(kind=epilogue),simplify-algebraic(mode=constants),dce",
     )
     .expect("build pipeline");
     pm.run(&mut after).expect("run pipeline");
@@ -457,8 +457,8 @@ module @complete_fusion_and_polyhedral {
 
     // Verify decompose-composites round-trip on map_reduce + log_softmax
     let mut decomposed = fused.clone();
-    let mut dec_pm =
-        PassManager::from_pipeline_str(&registry, "decompose-composites").expect("decompose");
+    let mut dec_pm = PassManager::from_pipeline_str(&registry, "fuse-elementwise(mode=decompose)")
+        .expect("decompose");
     dec_pm.run(&mut decomposed).expect("run decompose");
     let dec_rep = verify_module_numerics(&before, &decomposed, 1e-5).expect("verify decomposed");
     assert!(dec_rep.passed, "max_abs_diff = {}", dec_rep.max_abs_diff);
@@ -798,8 +798,8 @@ module @advanced_compiler_frontiers {
 
     // Verify decompose-composites lowers castforge.fma back to multiply + add
     let mut decomposed = after.clone();
-    let mut dec_pm =
-        PassManager::from_pipeline_str(&registry, "decompose-composites").expect("decompose");
+    let mut dec_pm = PassManager::from_pipeline_str(&registry, "fuse-elementwise(mode=decompose)")
+        .expect("decompose");
     dec_pm.run(&mut decomposed).expect("run decompose");
     let dec_rep = verify_module_numerics(&before, &decomposed, 1e-5).expect("verify decomposed");
     assert!(dec_rep.passed);
@@ -873,8 +873,8 @@ module @moe_block {
 
     // Verify decompose-composites lowers castforge.fused_moe back to dot_general + multiply + add
     let mut decomposed = fused.clone();
-    let mut dec_pm =
-        PassManager::from_pipeline_str(&registry, "decompose-composites").expect("decompose");
+    let mut dec_pm = PassManager::from_pipeline_str(&registry, "fuse-elementwise(mode=decompose)")
+        .expect("decompose");
     dec_pm.run(&mut decomposed).expect("run decompose");
     let dec_rep = verify_module_numerics(&before, &decomposed, 1e-5).expect("verify decomposed");
     assert!(dec_rep.passed);
@@ -959,8 +959,8 @@ module @parallel_branches {
 
     // Verify decompose-composites lowers static_quantize and stream_wait cleanly
     let mut decomposed = after.clone();
-    let mut dec_pm =
-        PassManager::from_pipeline_str(&registry, "decompose-composites").expect("decompose");
+    let mut dec_pm = PassManager::from_pipeline_str(&registry, "fuse-elementwise(mode=decompose)")
+        .expect("decompose");
     dec_pm.run(&mut decomposed).expect("run decompose");
     let dec_rep = verify_module_numerics(&before, &decomposed, 1e-5).expect("verify decomposed");
     assert!(dec_rep.passed);
@@ -1327,7 +1327,7 @@ module @ir_tools_demo {
     assert!(san_c.contains("[sanitize:nan_guard(clamp_max=65504.0)]"));
 
     let mut dec_san = sanitized.clone();
-    PassManager::from_pipeline_str(&registry, "decompose-composites")
+    PassManager::from_pipeline_str(&registry, "fuse-elementwise(mode=decompose)")
         .unwrap()
         .run(&mut dec_san)
         .unwrap();
@@ -1545,7 +1545,7 @@ module @advanced_ir_tools {
 #[test]
 fn test_pad_for_tiling_split_gemm_unroll_calls_hoist_all_reduce_instrument_and_strip() {
     let registry = PassRegistry::with_builtin_passes();
-    assert_eq!(registry.list().count(), 29);
+    assert_eq!(registry.list().count(), 25);
 
     let mlir = r#"
 module @final_ninety_suite {
@@ -1630,13 +1630,13 @@ module @square_block {
     let spmd_ir = print_mlir(&spmd_mod);
     assert!(spmd_ir.contains("async_overlap = true"));
 
-    // 5. Per-Op Profiling Region Injector (`profile-ir(instrument=true)`) + Rust/C99 codegen
+    // 5. Per-Op Profiling Region Injector (`verify-ir(instrument=true)`) + Rust/C99 codegen
     let mut prof_mod = base.clone();
     let mut prof_pm = PassManager::from_pipeline_str(
         &registry,
-        "profile-ir(stats=false,instrument=true,filter=gemm)",
+        "verify-ir(instrument=true,filter=gemm,equiv=false,hash=false)",
     )
-    .expect("profile-ir");
+    .expect("verify-ir(instrument=true)");
     let prof_res = prof_pm.run(&mut prof_mod).expect("run profile-ir");
     assert!(prof_res[0].changed);
     let prof_ir = print_mlir(&prof_mod);
@@ -1926,7 +1926,7 @@ fn test_consolidated_and_sota_passes_groupwise_batchnorm_concat_paged_gvn() {
             "fuse-norm(kind=cross_entropy,chunk_size=4096),",
             "shard-distributed(mode=pp,stages=2,microbatches=4,schedule=1f1b),",
             "schedule-loops(tensor_cores=wgmma,mma_tile=64x128x16),",
-            "topological-sort(mode=min_memory)"
+            "canonicalize(mode=min_memory)"
         ),
     )
     .expect("build new5 pipeline");

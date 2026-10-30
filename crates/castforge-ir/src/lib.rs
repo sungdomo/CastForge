@@ -6,11 +6,9 @@
 //! A-to-B pipeline abstraction.
 
 pub mod attr;
-pub mod safetensors_io;
 pub mod tensor_store;
 pub mod translator;
 pub mod types;
-pub mod verify;
 
 pub use attr::Attribute;
 pub use tensor_store::{
@@ -19,13 +17,25 @@ pub use tensor_store::{
 };
 pub use translator::{Payload, Translator, TranslatorChain};
 pub use types::{DType, Dim, TensorType, Type};
-pub use verify::VerifyError;
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use slotmap::{SlotMap, new_key_type};
 use smallvec::SmallVec;
 use std::fmt;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum VerifyError {
+    #[error("Operation `{op_name}` references missing operand ValueId")]
+    DanglingOperand { op_name: String },
+
+    #[error("Operation `{op_name}` references missing result ValueId")]
+    DanglingResult { op_name: String },
+
+    #[error("Region references missing BlockId")]
+    DanglingBlock,
+}
 
 new_key_type! {
     pub struct OpId;
@@ -343,5 +353,36 @@ impl Module {
                     .unwrap_or(false)
             })
             .collect()
+    }
+
+    /// Verifies structural integrity of the IR (all SSA ValueIds, OpIds, and BlockIds resolve).
+    pub fn verify(&self) -> Result<(), VerifyError> {
+        for (_, region) in &self.regions {
+            for &block_id in &region.blocks {
+                let Some(block) = self.blocks.get(block_id) else {
+                    return Err(VerifyError::DanglingBlock);
+                };
+                for &op_id in &block.ops {
+                    let Some(op) = self.ops.get(op_id) else {
+                        continue;
+                    };
+                    for &operand in &op.operands {
+                        if !self.values.contains_key(operand) {
+                            return Err(VerifyError::DanglingOperand {
+                                op_name: op.name.full_name(),
+                            });
+                        }
+                    }
+                    for &result in &op.results {
+                        if !self.values.contains_key(result) {
+                            return Err(VerifyError::DanglingResult {
+                                op_name: op.name.full_name(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }

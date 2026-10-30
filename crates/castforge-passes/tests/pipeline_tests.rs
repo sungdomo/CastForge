@@ -195,8 +195,9 @@ module @general_passes {
     let mut pm = PassManager::from_pipeline_str(
         &registry,
         concat!(
-            "outline-subgraphs(mode=inline),dce,fold-constants,",
-            "topological-sort,ir-edit(debuginfo=true),profile-ir"
+            "outline-subgraphs(mode=inline),dce,simplify-algebraic(mode=constants),",
+            "canonicalize(mode=toposort),ir-edit(debuginfo=true),",
+            "verify-ir(profile=true,equiv=false,hash=false)"
         ),
     )
     .expect("pipeline build failed");
@@ -261,7 +262,7 @@ module @unified_passes {
     // 4. Eliminate both dead private functions (@add_vec and @dead_private) via unified `dce`
     let mut pm = PassManager::from_pipeline_str(
         &registry,
-        "outline-subgraphs(mode=inline),fold-constants,dce",
+        "outline-subgraphs(mode=inline),simplify-algebraic(mode=constants),dce",
     )
     .expect("pipeline build failed");
     pm.run(&mut module).expect("pipeline execution failed");

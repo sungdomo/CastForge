@@ -1,24 +1,17 @@
 //! Pure-Rust MLIR parser & printer and symmetric ONNX-JSON / GGUF / SafeTensors model translators
 //! (`castforge-mlir`).
 
-pub mod export;
 pub mod import;
 pub mod parser;
-pub mod parser_special;
-pub mod parser_types;
 pub mod printer;
 
-pub use export::{
-    GgufExportTranslator, OnnxExportTranslator, SafetensorsExportTranslator, export_gguf_file,
-    export_onnx_file, export_onnx_json,
-};
 pub use import::{
-    GgmlType, OnnxJsonInitializer, OnnxJsonModel, OnnxJsonNode, OnnxJsonValueInfo,
-    collect_module_tensors, export_gguf_bytes, import_gguf_bytes, import_gguf_file,
-    import_onnx_file, import_onnx_json,
+    GgmlType, GgufExportTranslator, OnnxExportTranslator, OnnxJsonInitializer, OnnxJsonModel,
+    OnnxJsonNode, OnnxJsonValueInfo, SafetensorsExportTranslator, collect_module_tensors,
+    export_gguf_bytes, export_gguf_file, export_onnx_file, export_onnx_json, import_gguf_bytes,
+    import_gguf_file, import_onnx_file, import_onnx_json,
 };
-pub use parser::{MlirParser, ParseError};
-pub use parser_types::parse_type;
+pub use parser::{MlirParser, ParseError, parse_type};
 pub use printer::{MlirPrinter, PrintOptions};
 
 use castforge_ir::Module;

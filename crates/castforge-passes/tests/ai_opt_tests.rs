@@ -20,8 +20,11 @@ module @sink_transpose_demo {
 fn test_sink_transpose_and_constant_fold() {
     let mut module = parse_mlir(SINK_TRANSPOSE_MLIR).expect("parse sink transpose MLIR");
     let registry = PassRegistry::with_builtin_passes();
-    let mut pm = PassManager::from_pipeline_str(&registry, "fold-views,fold-constants,dce")
-        .expect("valid pipeline");
+    let mut pm = PassManager::from_pipeline_str(
+        &registry,
+        "fold-views,simplify-algebraic(mode=constants),dce",
+    )
+    .expect("valid pipeline");
     let history = pm.run(&mut module).expect("run pipeline");
     assert!(history.iter().any(|r| r.changed));
 
@@ -137,7 +140,7 @@ fn test_fuse_softmax_and_decompose_composites() {
 
     // Decompose back to primitive StableHLO ops and verify numerical equivalence again
     let mut decomposed = fused.clone();
-    let mut dec_pm = PassManager::from_pipeline_str(&registry, "decompose-composites")
+    let mut dec_pm = PassManager::from_pipeline_str(&registry, "fuse-elementwise(mode=decompose)")
         .expect("decompose pipeline");
     dec_pm.run(&mut decomposed).expect("run decompose");
 
@@ -419,7 +422,7 @@ fn test_fuse_swiglu_and_generalized_matmul_epilogue() {
 
     // Decompose back to primitive ops and verify bit-accuracy
     let mut decomp_mod = swiglu_mod.clone();
-    let mut pm_d = PassManager::from_pipeline_str(&registry, "decompose-composites")
+    let mut pm_d = PassManager::from_pipeline_str(&registry, "fuse-elementwise(mode=decompose)")
         .expect("decompose pipeline");
     pm_d.run(&mut decomp_mod).expect("run decompose");
     let printed_d = print_mlir(&decomp_mod);
@@ -588,7 +591,7 @@ fn test_fuse_rope_and_gqa_attention() {
 
     // Also verify decompose-composites restores primitive RoPE ops
     let mut decomposed = fused.clone();
-    let mut dec_pm = PassManager::from_pipeline_str(&registry, "decompose-composites")
+    let mut dec_pm = PassManager::from_pipeline_str(&registry, "fuse-elementwise(mode=decompose)")
         .expect("decompose pipeline");
     dec_pm.run(&mut decomposed).expect("run decompose");
     let dec_printed = print_mlir(&decomposed);
