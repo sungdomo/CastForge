@@ -81,65 +81,221 @@ impl Pass for ScheduleLoopsPass {
             r.pass_name = self.name().to_string();
             return Ok(r);
         }
-        let mut steps = Vec::new();
+        let mut created = 0usize;
+        let mut modified = 0usize;
+        let mut removed = 0usize;
         if let Some(max_n) = self.max_n
             && max_n > 0
         {
-            steps.push(SplitLargeGemmPass { max_n }.run(module)?);
+            let r = SplitLargeGemmPass { max_n }.run(module)?;
+            created += r.ops_created;
+            modified += r.ops_modified;
+            removed += r.ops_removed;
         }
-        steps.extend([
-            PadForTilingPass { align: self.align }.run(module)?,
-            TileLoopsPass {
-                tile_m: self.tile_size,
-                tile_n: self.tile_size,
-                tile_k: self.tile_size,
-                l2_tile: self.l2_tile,
-                reg_m: self.reg_tile,
-                reg_n: self.reg_tile,
-            }
-            .run(module)?,
-            PermuteLoopsPass {
-                order: self.order.clone(),
-                collapse: self.collapse,
-                skew: self.skew,
-            }
-            .run(module)?,
-            UnrollLoopsPass {
-                factor: self.unroll_factor,
-                prefetch: self.prefetch,
-                split_k: self.split_k,
-                double_buffer: self.double_buffer,
-            }
-            .run(module)?,
-            VectorizeLoopsPass {
-                width: self.vector_width,
-                isa: self.isa.clone(),
-                parallel: self.parallel,
-            }
-            .run(module)?,
-        ]);
-        if let Some(ref tc_arch) = self.tensor_cores
-            && !tc_arch.eq_ignore_ascii_case("none")
-        {
-            steps.push(
-                LowerTensorCoresPass {
-                    arch: tc_arch.clone(),
-                    mma_m: self.mma_tile.0,
-                    mma_n: self.mma_tile.1,
-                    mma_k: self.mma_tile.2,
-                    warp_specialized: self.warp_specialized,
-                    tmem_columns: self.tmem_columns,
-                }
-                .run(module)?,
-            );
-        }
+        modified += self.stamp_all_schedule_attributes_single_pass(module);
         Ok(PassResult {
             pass_name: self.name().to_string(),
-            changed: steps.iter().any(|r| r.changed),
-            ops_removed: steps.iter().map(|r| r.ops_removed).sum(),
-            ops_modified: steps.iter().map(|r| r.ops_modified).sum(),
-            ops_created: steps.iter().map(|r| r.ops_created).sum(),
+            changed: created > 0 || modified > 0 || removed > 0,
+            ops_removed: removed,
+            ops_modified: modified,
+            ops_created: created,
         })
+    }
+}
+
+impl ScheduleLoopsPass {
+    fn stamp_all_schedule_attributes_single_pass(&self, module: &mut Module) -> usize {
+        let mut modified = 0usize;
+        let align = self.align.max(1);
+        let round_up = |x: i64| ((x + align - 1) / align) * align;
+        let order_low = self.order.to_ascii_lowercase();
+        let isa_low = self.isa.to_ascii_lowercase();
+        let tc_info = self
+            .tensor_cores
+            .as_ref()
+            .filter(|s| !s.eq_ignore_ascii_case("none") && !s.is_empty())
+            .map(|arch| {
+                let arch_low = arch.to_ascii_lowercase();
+                let is_blackwell = matches!(arch_low.as_str(), "tcgen05" | "blackwell" | "sm100");
+                let instr = match arch_low.as_str() {
+                    "tcgen05" | "blackwell" | "sm100" => "tcgen05.mma.cta_group::2.kind::f8f6f4",
+                    "cdna3" | "mfma" | "rocm" | "mi300x" => "v_mfma_f32_16x16x16_f16",
+                    "apple" | "metal" | "simdgroup" => "simdgroup_multiply_accumulate",
+                    "ampere" | "wmma" => "nvcuda::wmma::mma_sync",
+                    _ => "wgmma.mma_async.sync.aligned",
+                };
+                (arch.clone(), instr, is_blackwell)
+            });
+
+        let blocks: Vec<BlockId> = module.blocks.keys().collect();
+        for block_id in blocks {
+            let ops = module.block_ops(block_id);
+            for op_id in ops {
+                let Some(op) = module.ops.get(op_id) else {
+                    continue;
+                };
+                if op.is_op("func", "return") || op.is_op("stablehlo", "constant") {
+                    continue;
+                }
+                let hlo = StableHloOp::from_op(op);
+                let is_dot = matches!(hlo, Some(StableHloOp::DotGeneral { .. }));
+                let is_conv = matches!(hlo, Some(StableHloOp::Convolution { .. }));
+                let is_reduce = matches!(hlo, Some(StableHloOp::Reduce { .. }));
+                let is_tc_composite = op.is_op("stablehlo", "composite")
+                    && op
+                        .attributes
+                        .get("name")
+                        .and_then(|a| a.as_str())
+                        .is_some_and(|n| n.contains("matmul") || n.contains("attention"));
+
+                let pad_dims = if is_dot && op.operands.len() >= 2 {
+                    let lt = module.values[op.operands[0]].ty.as_tensor().cloned();
+                    let rt = module.values[op.operands[1]].ty.as_tensor().cloned();
+                    match (lt, rt) {
+                        (Some(l), Some(r)) if l.shape.len() == 2 && r.shape.len() == 2 => {
+                            match (&l.shape[0], &l.shape[1], &r.shape[1]) {
+                                (Dim::Static(m), Dim::Static(k), Dim::Static(n)) => {
+                                    Some((*m, *k, *n, round_up(*m), round_up(*k), round_up(*n)))
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                let attrs = &mut module.ops[op_id].attributes;
+                // 1. Pad-for-tiling alignment metadata
+                if let Some((m, k, n, pm, pk, pn)) = pad_dims {
+                    attrs.insert("pad_align".to_string(), Attribute::Int(align));
+                    attrs.insert(
+                        "padded_mnk".to_string(),
+                        Attribute::DenseIntArray(vec![pm, pn, pk]),
+                    );
+                    attrs.insert(
+                        "pad_deltas".to_string(),
+                        Attribute::DenseIntArray(vec![pm - m, pn - n, pk - k]),
+                    );
+                }
+
+                // 2. L1/L2/register tiling attributes
+                if is_dot || is_conv {
+                    if self.tile_size > 0 {
+                        let t = self.tile_size as i64;
+                        attrs.insert("loop_tile_m".to_string(), Attribute::Int(t));
+                        attrs.insert("loop_tile_n".to_string(), Attribute::Int(t));
+                        attrs.insert("loop_tile_k".to_string(), Attribute::Int(t));
+                    }
+                    if self.l2_tile > 0 {
+                        attrs.insert(
+                            "loop_l2_tile".to_string(),
+                            Attribute::Int(self.l2_tile as i64),
+                        );
+                    }
+                    if self.reg_tile > 1 {
+                        let rt = self.reg_tile as i64;
+                        attrs.insert("loop_reg_m".to_string(), Attribute::Int(rt));
+                        attrs.insert("loop_reg_n".to_string(), Attribute::Int(rt));
+                    }
+                }
+
+                // 3. Loop permutation, collapse & wavefront skew
+                if is_dot {
+                    attrs.insert(
+                        "loop_order".to_string(),
+                        Attribute::String(order_low.clone()),
+                    );
+                    if self.skew {
+                        attrs.insert("loop_skew".to_string(), Attribute::Bool(true));
+                    }
+                }
+                if self.collapse {
+                    attrs.insert("loop_collapse".to_string(), Attribute::Bool(true));
+                }
+
+                // 4. Loop unrolling, prefetching, Split-K & double-buffering
+                if is_dot || is_reduce {
+                    if self.unroll_factor > 1 {
+                        attrs.insert(
+                            "loop_unroll".to_string(),
+                            Attribute::Int(self.unroll_factor as i64),
+                        );
+                    }
+                    if self.prefetch > 0 {
+                        attrs.insert(
+                            "loop_prefetch".to_string(),
+                            Attribute::Int(self.prefetch as i64),
+                        );
+                    }
+                    if self.split_k > 1 {
+                        attrs.insert(
+                            "loop_split_k".to_string(),
+                            Attribute::Int(self.split_k as i64),
+                        );
+                    }
+                    if self.double_buffer {
+                        attrs.insert("loop_double_buffer".to_string(), Attribute::Bool(true));
+                    }
+                }
+
+                // 5. SIMD vectorization & multicore parallelization
+                attrs.insert("simd_vectorize".to_string(), Attribute::Bool(true));
+                attrs.insert(
+                    "simd_width".to_string(),
+                    Attribute::Int(self.vector_width as i64),
+                );
+                if !isa_low.is_empty() && isa_low != "scalar" {
+                    attrs.insert("simd_isa".to_string(), Attribute::String(isa_low.clone()));
+                }
+                if self.parallel {
+                    attrs.insert("loop_parallel".to_string(), Attribute::Bool(true));
+                }
+
+                // 6. GPU Tensor Cores / Matrix Cores (`wgmma` / `tcgen05` / `wmma` / `mfma`)
+                if (is_dot || is_tc_composite)
+                    && let Some((ref arch, instr, is_blackwell)) = tc_info
+                {
+                    attrs.insert(
+                        "castforge.tensor_core_arch".to_string(),
+                        Attribute::String(arch.clone()),
+                    );
+                    attrs.insert(
+                        "castforge.tensor_core_intrinsic".to_string(),
+                        Attribute::String(instr.to_string()),
+                    );
+                    attrs.insert(
+                        "castforge.mma_shape".to_string(),
+                        Attribute::DenseIntArray(vec![
+                            self.mma_tile.0,
+                            self.mma_tile.1,
+                            self.mma_tile.2,
+                        ]),
+                    );
+                    if is_blackwell {
+                        attrs.insert(
+                            "castforge.tmem_allocated".to_string(),
+                            Attribute::Bool(true),
+                        );
+                        attrs.insert(
+                            "castforge.tmem_columns".to_string(),
+                            Attribute::Int(self.tmem_columns.max(64) as i64),
+                        );
+                    }
+                    if self.warp_specialized || is_blackwell {
+                        attrs.insert(
+                            "castforge.warp_specialized".to_string(),
+                            Attribute::Bool(true),
+                        );
+                        attrs.insert("castforge.tma_multicast".to_string(), Attribute::Bool(true));
+                    }
+                }
+
+                modified += 1;
+            }
+        }
+        modified
     }
 }
 
