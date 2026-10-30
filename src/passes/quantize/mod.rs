@@ -1,7 +1,7 @@
-//! Unified Quantization & Outlier Suppression Passes (`quantize`, `hadamard-quant-rotation`).
+//! Unified Quantization & Outlier Suppression Passes (`quantize`, `rotate-hadamard`).
 //!
 //! Consolidates `quantize-weights`, `quantize-groupwise`, `quantize-fp8`, `calibrate-quantize`,
-//! **SmoothQuant** (`scheme=smoothquant`), and `hadamard-quant-rotation`.
+//! **SmoothQuant** (`scheme=smoothquant`), and `rotate-hadamard`.
 
 pub mod formats;
 
@@ -23,10 +23,10 @@ use smallvec::SmallVec;
 /// - `scheme=groupwise|awq|gptq` (`QuantizeGroupwisePass` with AWQ salient-channel protection)
 /// - `scheme=fp8|mxfp8` (`QuantizeFp8Pass`)
 /// - `scheme=fp4|mxfp4|nvfp4` (Blackwell NVFP4 / OCP MXFP4 E2M1 4-bit float microscaling)
-/// - `scheme=f16|bf16|mixed_precision` (`MixedPrecisionPass`)
+/// - `scheme=f16|bf16|mixed_precision` (`LowerMixedPrecisionPass`)
 /// - `scheme=w8a8|calibrate|static` (`CalibrateQuantizePass`)
 /// - `scheme=smoothquant` (per-channel activation-to-weight migration)
-/// - `scheme=hadamard|quarot|spinquant` or `hadamard=true` (`HadamardQuantRotationPass`)
+/// - `scheme=hadamard|quarot|spinquant` or `hadamard=true` (`RotateHadamardPass`)
 pub struct QuantizePass {
     pub scheme: String,
     pub bits: u8,
@@ -70,6 +70,17 @@ impl Pass for QuantizePass {
         "Unified quantization & precision (weight|awq|fp8|nvfp4|f16|bf16|w8a8|smoothquant|hadamard)"
     }
 
+    fn child_passes(&self) -> &'static [&'static str] {
+        &[
+            "rotate-hadamard",
+            "quantize-weights",
+            "quantize-groupwise",
+            "quantize-fp8",
+            "calibrate-quantize",
+            "lower-mixed-precision",
+        ]
+    }
+
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let s = self.scheme.to_ascii_lowercase();
         if matches!(s.as_str(), "f16" | "bf16" | "mixed_precision" | "amp") {
@@ -78,29 +89,29 @@ impl Pass for QuantizePass {
             } else {
                 DType::F16
             };
-            let mut res = MixedPrecisionPass { target_dtype }.run(module)?;
-            res.pass_name = self.name().to_string();
-            return Ok(res);
+            return Ok(LowerMixedPrecisionPass { target_dtype }
+                .run(module)?
+                .with_name(self.name()));
         }
         if matches!(s.as_str(), "hadamard" | "quarot" | "spinquant") {
-            let mut res = HadamardQuantRotationPass {
+            return Ok(RotateHadamardPass {
                 block_size: self.block_size.max(2),
             }
-            .run(module)?;
-            res.pass_name = self.name().to_string();
-            return Ok(res);
+            .run(module)?
+            .with_name(self.name()));
         }
 
-        let mut rot_modified = 0usize;
+        let mut steps = Vec::new();
         if self.hadamard {
-            let rot = HadamardQuantRotationPass {
-                block_size: self.block_size.max(2),
-            }
-            .run(module)?;
-            rot_modified = rot.ops_modified;
+            steps.push(
+                RotateHadamardPass {
+                    block_size: self.block_size.max(2),
+                }
+                .run(module)?,
+            );
         }
 
-        let mut res = match s.as_str() {
+        let main_step = match s.as_str() {
             "groupwise" | "awq" | "gptq" => QuantizeGroupwisePass {
                 bits: self.bits,
                 group_size: self.group_size,
@@ -130,10 +141,8 @@ impl Pass for QuantizePass {
             }
             .run(module)?,
         };
-        res.pass_name = self.name().to_string();
-        res.changed |= rot_modified > 0;
-        res.ops_modified += rot_modified;
-        Ok(res)
+        steps.push(main_step);
+        Ok(PassResult::aggregate(self.name(), &steps))
     }
 }
 

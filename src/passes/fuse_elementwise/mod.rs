@@ -56,12 +56,25 @@ impl Pass for FuseElementwisePass {
         "Unified elementwise, activation (SwiGLU/GELU/GeGLU/MoE), map-reduce & loop-chain fusion"
     }
 
+    fn child_passes(&self) -> &'static [&'static str] {
+        &[
+            "fuse-activations",
+            "fuse-swiglu",
+            "fuse-gelu",
+            "fuse-gated-mlp",
+            "fuse-moe",
+            "fuse-map-reduce",
+            "fuse-loops",
+            "split-loops",
+            "fuse-megakernel",
+            "decompose-composites",
+        ]
+    }
+
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let m = self.mode.to_ascii_lowercase();
         if matches!(m.as_str(), "decompose" | "expand" | "lower") {
-            let mut r = DecomposeCompositesPass.run(module)?;
-            r.pass_name = self.name().to_string();
-            return Ok(r);
+            return Ok(DecomposeCompositesPass.run(module)?.with_name(self.name()));
         }
         if m == "loops" || m == "chain" || self.max_steps > 0 {
             let mut steps = vec![FuseLoopsPass.run(module)?];
@@ -73,59 +86,49 @@ impl Pass for FuseElementwisePass {
                     .run(module)?,
                 );
             }
-            return Ok(PassResult {
-                pass_name: self.name().to_string(),
-                changed: steps.iter().any(|r| r.changed),
-                ops_removed: steps.iter().map(|r| r.ops_removed).sum(),
-                ops_modified: steps.iter().map(|r| r.ops_modified).sum(),
-                ops_created: steps.iter().map(|r| r.ops_created).sum(),
-            });
+            return Ok(PassResult::aggregate(self.name(), &steps));
         }
         if m == "megakernel" || m == "persistent" {
-            let mut r = FuseMegakernelPass.run(module)?;
-            r.pass_name = self.name().to_string();
-            return Ok(r);
+            return Ok(FuseMegakernelPass.run(module)?.with_name(self.name()));
+        }
+        if matches!(
+            m.as_str(),
+            "activations" | "swiglu" | "gelu" | "geglu" | "gated_mlp" | "mlp" | "moe"
+        ) || (self.shared_expert && m != "all")
+        {
+            let kind = if m == "activations" {
+                "all".to_string()
+            } else {
+                m
+            };
+            return Ok(FuseActivationsPass {
+                kind,
+                shared_expert: self.shared_expert,
+                top_k: self.top_k,
+                capacity_factor: self.capacity_factor,
+            }
+            .run(module)?
+            .with_name(self.name()));
+        }
+        if m == "map_reduce" || m == "reduce" {
+            return Ok(FuseMapReducePass.run(module)?.with_name(self.name()));
+        }
+        if m == "all" {
+            let steps = [
+                FuseActivationsPass {
+                    kind: "all".to_string(),
+                    shared_expert: self.shared_expert,
+                    top_k: self.top_k,
+                    capacity_factor: self.capacity_factor,
+                }
+                .run(module)?,
+                FuseMapReducePass.run(module)?,
+                FuseAddMaxPass.run(module)?,
+            ];
+            return Ok(PassResult::aggregate(self.name(), &steps));
         }
 
-        let do_all = m == "all";
-        let do_activations = do_all
-            || matches!(
-                m.as_str(),
-                "activations" | "swiglu" | "gelu" | "geglu" | "gated_mlp" | "mlp" | "moe"
-            )
-            || self.shared_expert;
-        let do_mlp = do_all || matches!(m.as_str(), "activations" | "gated_mlp" | "mlp");
-        let do_swiglu = do_mlp || m == "swiglu";
-        let do_gelu = do_mlp || m == "gelu" || m == "geglu";
-        let do_moe = do_all || m == "activations" || m == "moe" || self.shared_expert;
-        let do_map_reduce = do_all || m == "map_reduce" || m == "reduce";
-        let do_add_max = do_all || (!do_activations && !do_map_reduce);
-
-        let (created, modified, mut removed) = fuse_elementwise_and_activations_single_traversal(
-            module,
-            do_mlp,
-            do_swiglu,
-            do_gelu,
-            do_moe,
-            do_add_max,
-            do_map_reduce,
-            self.shared_expert,
-            self.top_k,
-            self.capacity_factor,
-        );
-
-        if (do_activations || do_map_reduce) && (created > 0 || modified > 0) {
-            let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
-            removed += dce_res.ops_removed;
-        }
-
-        Ok(PassResult {
-            pass_name: self.name().to_string(),
-            changed: created > 0 || modified > 0 || removed > 0,
-            ops_removed: removed,
-            ops_modified: modified,
-            ops_created: created,
-        })
+        Ok(FuseAddMaxPass.run(module)?.with_name(self.name()))
     }
 }
 

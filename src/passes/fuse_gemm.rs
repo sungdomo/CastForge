@@ -31,30 +31,33 @@ impl Pass for FuseGemmPass {
     }
 
     fn description(&self) -> &'static str {
-        "Single-traversal GEMM fusion (horizontal QKV/MLP dot, dequant+GEMM, and GEMM+epilogue)"
+        "Unified GEMM fusion (horizontal QKV/MLP dot, dequant+GEMM, and GEMM+epilogue)"
+    }
+
+    fn child_passes(&self) -> &'static [&'static str] {
+        &[
+            "fuse-horizontal-dot",
+            "fuse-dequant-matmul",
+            "fuse-matmul-epilogue",
+        ]
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let k = self.kind.to_ascii_lowercase();
-        let do_horiz = k == "all" || k == "horizontal";
-        let do_deq = k == "all" || k == "dequant";
-        let do_epi = k == "all" || k == "epilogue";
-
-        let (created, modified, mut removed) =
-            fuse_gemm_single_traversal(module, do_horiz, do_deq, do_epi)?;
-
-        if created > 0 || modified > 0 || removed > 0 {
-            let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
-            removed += dce_res.ops_removed;
+        match k.as_str() {
+            "horizontal" => Ok(FuseHorizontalDotPass.run(module)?.with_name(self.name())),
+            "dequant" => Ok(FuseDequantMatmulPass.run(module)?.with_name(self.name())),
+            "epilogue" => Ok(FuseMatmulEpiloguePass.run(module)?.with_name(self.name())),
+            _ => PassResult::run_sequence(
+                self.name(),
+                module,
+                &mut [
+                    &mut FuseHorizontalDotPass,
+                    &mut FuseDequantMatmulPass,
+                    &mut FuseMatmulEpiloguePass,
+                ],
+            ),
         }
-
-        Ok(PassResult {
-            pass_name: self.name().to_string(),
-            changed: created > 0 || modified > 0,
-            ops_removed: removed,
-            ops_modified: modified,
-            ops_created: created,
-        })
     }
 }
 

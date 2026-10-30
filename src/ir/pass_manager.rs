@@ -27,6 +27,39 @@ impl PassResult {
             ops_created: 0,
         }
     }
+
+    /// Re-labels this [`PassResult`] with `pass_name` (used when a composite pass delegates to a
+    /// child pass).
+    pub fn with_name(mut self, pass_name: &str) -> Self {
+        self.pass_name = pass_name.to_string();
+        self
+    }
+
+    /// Aggregates a sequence of child [`PassResult`]s into a single composite result for
+    /// `pass_name`.
+    pub fn aggregate(pass_name: &str, steps: &[PassResult]) -> Self {
+        Self {
+            pass_name: pass_name.to_string(),
+            changed: steps.iter().any(|r| r.changed),
+            ops_removed: steps.iter().map(|r| r.ops_removed).sum(),
+            ops_modified: steps.iter().map(|r| r.ops_modified).sum(),
+            ops_created: steps.iter().map(|r| r.ops_created).sum(),
+        }
+    }
+
+    /// Executes an ordered sequence of lower-level child passes on `module` and aggregates their
+    /// results under `pass_name`.
+    pub fn run_sequence(
+        pass_name: &str,
+        module: &mut Module,
+        children: &mut [&mut dyn Pass],
+    ) -> Result<Self> {
+        let mut steps = Vec::with_capacity(children.len());
+        for child in children {
+            steps.push(child.run(module)?);
+        }
+        Ok(Self::aggregate(pass_name, &steps))
+    }
 }
 
 /// Snapshot of the IR before/after a pass for step-by-step visual debugging.
@@ -42,10 +75,25 @@ pub struct PassTraceStep {
 pub type PassOptions = IndexMap<String, String>;
 
 /// Core trait implemented by all IR transformation, optimization, verification, and surgery passes.
+///
+/// Passes form a two-tier hierarchy:
+/// - **Leaf passes** perform a single optimization (or tightly related single-traversal family).
+/// - **Composite passes** (`is_composite() == true`) orchestrate a sequence of lower-level passes
+///   listed in [`Pass::child_passes`].
 pub trait Pass: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn run(&mut self, module: &mut Module) -> Result<PassResult>;
+
+    /// Names of lower-level passes orchestrated by this pass (`&[]` for leaf passes).
+    fn child_passes(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Returns `true` if this pass is a higher-level composite pass containing child passes.
+    fn is_composite(&self) -> bool {
+        !self.child_passes().is_empty()
+    }
 }
 
 impl Translator for Box<dyn Pass> {

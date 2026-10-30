@@ -45,30 +45,34 @@ impl Pass for CanonicalizePass {
         )
     }
 
+    fn child_passes(&self) -> &'static [&'static str] {
+        &[
+            "cse",
+            "simplify-algebraic",
+            "fold-views",
+            "dce",
+            "topological-sort",
+        ]
+    }
+
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let m = self.mode.to_ascii_lowercase();
         if matches!(m.as_str(), "toposort" | "standard" | "topo") {
-            let mut res = TopologicalSortPass {
+            return Ok(TopologicalSortPass {
                 mode: "standard".to_string(),
             }
-            .run(module)?;
-            res.pass_name = self.name().to_string();
-            return Ok(res);
+            .run(module)?
+            .with_name(self.name()));
         }
         if matches!(m.as_str(), "min_memory" | "memory" | "sethi_ullman") {
-            let mut res = TopologicalSortPass {
+            return Ok(TopologicalSortPass {
                 mode: "min_memory".to_string(),
             }
-            .run(module)?;
-            res.pass_name = self.name().to_string();
-            return Ok(res);
+            .run(module)?
+            .with_name(self.name()));
         }
 
-        let mut total = PassResult {
-            pass_name: self.name().to_string(),
-            ..Default::default()
-        };
-
+        let mut all_steps = Vec::new();
         for _ in 0..8 {
             let steps = [
                 CsePass::default().run(module)?,
@@ -76,23 +80,18 @@ impl Pass for CanonicalizePass {
                 FoldViewsPass::default().run(module)?,
                 DeadCodeEliminationPass::default().run(module)?,
             ];
-
             let iter_changed = steps.iter().any(|r| r.changed);
-            total.changed |= iter_changed;
-            total.ops_removed += steps.iter().map(|r| r.ops_removed).sum::<usize>();
-            total.ops_modified += steps.iter().map(|r| r.ops_modified).sum::<usize>();
+            all_steps.extend(steps);
             if !iter_changed {
                 break;
             }
         }
 
         if self.toposort {
-            let topo = TopologicalSortPass::default().run(module)?;
-            total.changed |= topo.changed;
-            total.ops_modified += topo.ops_modified;
+            all_steps.push(TopologicalSortPass::default().run(module)?);
         }
 
-        Ok(total)
+        Ok(PassResult::aggregate(self.name(), &all_steps))
     }
 }
 
@@ -358,6 +357,18 @@ impl Pass for OptO1Pass {
         "Preset O1: Inlining, simplify-algebraic, LICM, CSE/GVN, fold-views, canonicalize, dce"
     }
 
+    fn child_passes(&self) -> &'static [&'static str] {
+        &[
+            "inline-calls",
+            "simplify-algebraic",
+            "cse",
+            "fold-views",
+            "canonicalize",
+            "dce",
+            "topological-sort",
+        ]
+    }
+
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let steps = [
             InlineCallsPass.run(module)?,
@@ -368,7 +379,7 @@ impl Pass for OptO1Pass {
             DeadCodeEliminationPass::default().run(module)?,
             TopologicalSortPass::default().run(module)?,
         ];
-        Ok(aggregate_results(self.name(), &steps))
+        Ok(PassResult::aggregate(self.name(), &steps))
     }
 }
 
@@ -385,6 +396,23 @@ impl Pass for OptO2Pass {
 
     fn description(&self) -> &'static str {
         "Preset O2: O1 + LoRA/BatchNorm weight folding + unified Transformer/GEMM fusions"
+    }
+
+    fn child_passes(&self) -> &'static [&'static str] {
+        &[
+            "O1",
+            "fold-views",
+            "merge-weights",
+            "fold-weights",
+            "fuse-norm",
+            "fuse-attention",
+            "fuse-activations",
+            "fuse-softmax",
+            "fuse-gemm",
+            "fuse-elementwise",
+            "canonicalize",
+            "dce",
+        ]
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
@@ -434,7 +462,7 @@ impl Pass for OptO2Pass {
             CanonicalizePass::default().run(module)?,
             DeadCodeEliminationPass::default().run(module)?,
         ];
-        Ok(aggregate_results(self.name(), &steps))
+        Ok(PassResult::aggregate(self.name(), &steps))
     }
 }
 
@@ -465,6 +493,19 @@ impl Pass for OptO3Pass {
 
     fn description(&self) -> &'static str {
         "Preset O3: Shape specialization + O2 + MoE/FMA/zero-copy + weight packing + arena"
+    }
+
+    fn child_passes(&self) -> &'static [&'static str] {
+        &[
+            "specialize-shapes",
+            "O2",
+            "fuse-activations",
+            "simplify-algebraic",
+            "shard-distributed",
+            "fold-weights",
+            "optimize-memory",
+            "topological-sort",
+        ]
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
@@ -507,16 +548,6 @@ impl Pass for OptO3Pass {
             .run(module)?,
             TopologicalSortPass::default().run(module)?,
         ];
-        Ok(aggregate_results(self.name(), &steps))
-    }
-}
-
-fn aggregate_results(name: &str, steps: &[PassResult]) -> PassResult {
-    PassResult {
-        pass_name: name.to_string(),
-        changed: steps.iter().any(|r| r.changed),
-        ops_removed: steps.iter().map(|r| r.ops_removed).sum(),
-        ops_modified: steps.iter().map(|r| r.ops_modified).sum(),
-        ops_created: steps.iter().map(|r| r.ops_created).sum(),
+        Ok(PassResult::aggregate(self.name(), &steps))
     }
 }

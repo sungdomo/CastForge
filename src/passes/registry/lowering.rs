@@ -178,9 +178,9 @@ pub(super) fn register_lowering_passes(reg: &mut PassRegistry) {
         },
     );
     reg.register(
-        "hoist-all-reduce",
+        "coalesce-all-reduce",
         "Coalesces adjacent all_reduce ops and annotates compute-communication overlap",
-        |_opts| Ok(Box::new(HoistAllReducePass)),
+        |_opts| Ok(Box::new(CoalesceAllReducePass)),
     );
     reg.register(
         "schedule-loops",

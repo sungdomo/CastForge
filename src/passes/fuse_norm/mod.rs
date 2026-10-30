@@ -35,36 +35,42 @@ impl Pass for FuseNormPass {
         "Unified normalization & softmax fusion (RMSNorm, LayerNorm, Softmax, Cross-Entropy)"
     }
 
+    fn child_passes(&self) -> &'static [&'static str] {
+        &[
+            "fuse-rmsnorm",
+            "fuse-residual-norm",
+            "fuse-layernorm",
+            "fuse-softmax",
+            "fuse-linear-cross-entropy",
+        ]
+    }
+
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let k = self.kind.to_ascii_lowercase();
-        let do_res_rms = k == "all" || k == "residual_rmsnorm" || k == "residual";
-        let do_rms = do_res_rms || k == "rmsnorm" || k == "rms";
-        let do_ln = k == "all" || k == "layernorm" || k == "ln";
-        let do_sm = k == "all" || k == "softmax" || k == "log_softmax";
-        let do_ce = k == "cross_entropy" || k == "ce" || k == "linear_cross_entropy";
-
-        let (created, modified) = fuse_norm_single_traversal(
-            module,
-            do_rms,
-            do_res_rms,
-            do_ln,
-            do_sm,
-            do_ce,
-            self.chunk_size,
-        );
-        let mut removed = 0usize;
-        if created > 0 || modified > 0 {
-            let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
-            removed += dce_res.ops_removed;
+        match k.as_str() {
+            "rmsnorm" | "rms" => Ok(FuseRmsNormPass.run(module)?.with_name(self.name())),
+            "residual_rmsnorm" | "residual" => {
+                Ok(FuseResidualNormPass.run(module)?.with_name(self.name()))
+            }
+            "layernorm" | "ln" => Ok(FuseLayerNormPass.run(module)?.with_name(self.name())),
+            "softmax" | "log_softmax" => Ok(FuseSoftmaxPass::default()
+                .run(module)?
+                .with_name(self.name())),
+            "cross_entropy" | "ce" | "linear_cross_entropy" => Ok(FuseLinearCrossEntropyPass {
+                chunk_size: self.chunk_size,
+            }
+            .run(module)?
+            .with_name(self.name())),
+            _ => PassResult::run_sequence(
+                self.name(),
+                module,
+                &mut [
+                    &mut FuseResidualNormPass,
+                    &mut FuseLayerNormPass,
+                    &mut FuseSoftmaxPass::default(),
+                ],
+            ),
         }
-
-        Ok(PassResult {
-            pass_name: self.name().to_string(),
-            changed: created > 0 || modified > 0,
-            ops_removed: removed,
-            ops_modified: modified,
-            ops_created: created,
-        })
     }
 }
 

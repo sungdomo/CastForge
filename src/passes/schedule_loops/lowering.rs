@@ -66,7 +66,11 @@ impl Pass for PadForTilingPass {
                 dst.insert("pad_align".to_string(), Attribute::Int(align));
                 dst.insert(
                     "padded_mnk".to_string(),
-                    Attribute::DenseIntArray(vec![pm, pk, pn]),
+                    Attribute::DenseIntArray(vec![pm, pn, pk]),
+                );
+                dst.insert(
+                    "pad_deltas".to_string(),
+                    Attribute::DenseIntArray(vec![pm - m, pn - n, pk - k]),
                 );
                 modified += 1;
             }

@@ -56,12 +56,18 @@ impl Pass for FoldWeightsPass {
         "Unified weight folding, SIMD pre-packing, SafeTensors externalization & pruning"
     }
 
+    fn child_passes(&self) -> &'static [&'static str] {
+        &[
+            "fold-norm-weights",
+            "fold-batchnorm",
+            "pack-weights",
+            "externalize-weights",
+            "prune-weights",
+        ]
+    }
+
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let m = self.mode.to_ascii_lowercase();
-        let mut modified = 0usize;
-        let mut removed = 0usize;
-        let mut created = 0usize;
-
         if matches!(
             m.as_str(),
             "prune" | "structured" | "2to4" | "activation_sparse" | "activation" | "teal"
@@ -71,43 +77,33 @@ impl Pass for FoldWeightsPass {
             } else {
                 m
             };
-            let mut r = PruneWeightsPass {
+            return Ok(PruneWeightsPass {
                 mode: prune_mode,
                 sparsity: self.sparsity,
             }
-            .run(module)?;
-            r.pass_name = self.name().to_string();
-            return Ok(r);
+            .run(module)?
+            .with_name(self.name()));
         }
 
         if matches!(m.as_str(), "externalize" | "ext" | "inline") || self.inline {
-            let r = crate::passes::ExternalizeWeightsPass {
+            return Ok(crate::passes::ExternalizeWeightsPass {
                 min_elements: self.min_elements,
                 inline: self.inline || m == "inline",
             }
-            .run(module)?;
-            modified += r.ops_modified;
-            removed += r.ops_removed;
-            created += r.ops_created;
-        } else {
-            let do_norm = matches!(
-                m.as_str(),
-                "norm" | "fold_norm" | "batchnorm" | "bn" | "all"
-            );
-            let do_bn = matches!(m.as_str(), "batchnorm" | "bn" | "all");
-            let do_pack = matches!(m.as_str(), "pack" | "pack_weights" | "all");
-            let (m_cnt, r_cnt) = fold_weights_single_traversal(module, do_norm, do_bn, do_pack)?;
-            modified += m_cnt;
-            removed += r_cnt;
+            .run(module)?
+            .with_name(self.name()));
         }
 
-        Ok(PassResult {
-            pass_name: self.name().to_string(),
-            changed: modified > 0 || removed > 0 || created > 0,
-            ops_removed: removed,
-            ops_modified: modified,
-            ops_created: created,
-        })
+        let mut steps = Vec::new();
+        if matches!(m.as_str(), "norm" | "fold_norm") {
+            steps.push(FoldNormWeightsPass.run(module)?);
+        } else if matches!(m.as_str(), "batchnorm" | "bn" | "all") {
+            steps.push(FoldBatchNormPass.run(module)?);
+        }
+        if matches!(m.as_str(), "pack" | "pack_weights" | "all") {
+            steps.push(PackWeightsPass.run(module)?);
+        }
+        Ok(PassResult::aggregate(self.name(), &steps))
     }
 }
 

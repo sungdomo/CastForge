@@ -49,6 +49,18 @@ impl Pass for OutlineSubgraphsPass {
         "Unified subgraph outlining, inlining, extraction, function dedup, composition & unrolling"
     }
 
+    fn child_passes(&self) -> &'static [&'static str] {
+        &[
+            "outline-kernels",
+            "inline-calls",
+            "extract-subgraph",
+            "reduce-ir",
+            "dedup-functions",
+            "compose-functions",
+            "unroll-calls",
+        ]
+    }
+
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let m = self.mode.to_ascii_lowercase();
         let mut steps = Vec::new();
@@ -72,7 +84,7 @@ impl Pass for OutlineSubgraphsPass {
             }
             "compose" => {
                 steps.push(
-                    ComposeFuncsPass {
+                    ComposeFunctionsPass {
                         first: self.first.clone(),
                         second: self.second.clone(),
                         entry_name: self.entry_name.clone(),
@@ -105,7 +117,7 @@ impl Pass for OutlineSubgraphsPass {
                     );
                 } else {
                     steps.push(
-                        OutlineKernelSubgraphsPass {
+                        OutlineKernelsPass {
                             mode: self.mode.clone(),
                         }
                         .run(module)?,
@@ -124,23 +136,17 @@ impl Pass for OutlineSubgraphsPass {
                 }
             }
         }
-        Ok(PassResult {
-            pass_name: self.name().to_string(),
-            changed: steps.iter().any(|r| r.changed),
-            ops_removed: steps.iter().map(|r| r.ops_removed).sum(),
-            ops_modified: steps.iter().map(|r| r.ops_modified).sum(),
-            ops_created: steps.iter().map(|r| r.ops_created).sum(),
-        })
+        Ok(PassResult::aggregate(self.name(), &steps))
     }
 }
 
-/// Kernel Subgraph Outliner helper (`outline-subgraphs`).
+/// Kernel Subgraph Outliner Pass (`outline-kernels`).
 #[derive(Debug, Clone)]
-pub struct OutlineKernelSubgraphsPass {
+pub struct OutlineKernelsPass {
     pub mode: String,
 }
 
-impl Default for OutlineKernelSubgraphsPass {
+impl Default for OutlineKernelsPass {
     fn default() -> Self {
         Self {
             mode: "all".to_string(),
@@ -148,9 +154,9 @@ impl Default for OutlineKernelSubgraphsPass {
     }
 }
 
-impl Pass for OutlineKernelSubgraphsPass {
+impl Pass for OutlineKernelsPass {
     fn name(&self) -> &'static str {
-        "outline-subgraphs"
+        "outline-kernels"
     }
 
     fn description(&self) -> &'static str {
@@ -405,15 +411,15 @@ pub fn link_modules(base: &mut Module, other: &Module) -> Result<usize> {
     Ok(linked)
 }
 
-/// Function Composer Pass (`compose-funcs`).
+/// Function Composer Pass (`compose-functions`).
 #[derive(Debug, Clone)]
-pub struct ComposeFuncsPass {
+pub struct ComposeFunctionsPass {
     pub first: String,
     pub second: String,
     pub entry_name: String,
 }
 
-impl Default for ComposeFuncsPass {
+impl Default for ComposeFunctionsPass {
     fn default() -> Self {
         Self {
             first: String::new(),
@@ -423,9 +429,9 @@ impl Default for ComposeFuncsPass {
     }
 }
 
-impl Pass for ComposeFuncsPass {
+impl Pass for ComposeFunctionsPass {
     fn name(&self) -> &'static str {
-        "compose-funcs"
+        "compose-functions"
     }
 
     fn description(&self) -> &'static str {

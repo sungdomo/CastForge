@@ -140,20 +140,23 @@ impl Pass for PruneWeightsPass {
         "Unified weight & activation sparsity (mode=structured|2to4|activation_sparse)"
     }
 
+    fn child_passes(&self) -> &'static [&'static str] {
+        &["prune-structured", "prune-2to4"]
+    }
+
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let m = self.mode.to_ascii_lowercase();
-        let mut res = if m == "2to4" {
-            Sparsify2To4Pass.run(module)?
+        let res = if m == "2to4" {
+            Prune2To4Pass.run(module)?
         } else if matches!(m.as_str(), "activation_sparse" | "activation" | "teal") {
             run_activation_sparsity(module, self.sparsity)?
         } else {
-            StructuredPruningPass {
+            PruneStructuredPass {
                 sparsity: self.sparsity,
             }
             .run(module)?
         };
-        res.pass_name = self.name().to_string();
-        Ok(res)
+        Ok(res.with_name(self.name()))
     }
 }
 
@@ -200,17 +203,17 @@ fn run_activation_sparsity(module: &mut Module, sparsity: f32) -> Result<PassRes
 }
 
 /// Structured Channel Pruning Pass (`prune-structured`).
-pub struct StructuredPruningPass {
+pub struct PruneStructuredPass {
     pub sparsity: f32,
 }
 
-impl Default for StructuredPruningPass {
+impl Default for PruneStructuredPass {
     fn default() -> Self {
         Self { sparsity: 0.5 }
     }
 }
 
-impl Pass for StructuredPruningPass {
+impl Pass for PruneStructuredPass {
     fn name(&self) -> &'static str {
         "prune-structured"
     }
@@ -363,13 +366,13 @@ impl Pass for StructuredPruningPass {
     }
 }
 
-/// NVIDIA 2:4 Semi-Structured Weight Sparsifier Pass (`sparsify-2to4`).
+/// NVIDIA 2:4 Semi-Structured Weight Pruning Pass (`prune-2to4`).
 #[derive(Debug, Clone, Default)]
-pub struct Sparsify2To4Pass;
+pub struct Prune2To4Pass;
 
-impl Pass for Sparsify2To4Pass {
+impl Pass for Prune2To4Pass {
     fn name(&self) -> &'static str {
-        "sparsify-2to4"
+        "prune-2to4"
     }
 
     fn description(&self) -> &'static str {

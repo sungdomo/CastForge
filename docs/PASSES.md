@@ -1,29 +1,37 @@
-# CastForge — Complete Reference of All 38 Graph IR Passes (+ Unified LoopIR Pass)
+# CastForge — Complete Reference of All 103 Hierarchical Graph IR Passes (+ LoopIR Pass)
 
-CastForge provides **38 built-in modular single-traversal A-to-B IR passes & presets** (`35 passes +
-3 presets O1/O2/O3`) across `src/passes/` and `src/ir/verify_ir.rs` (plus the unified
-**`OptimizeLoopIrPass`** (`optimize-loop-ir`) in `src/codegen/`). Core pass execution infrastructure
-(`Pass`, `PassManager`, `PassRegistry`) and `verify-ir` (`src/ir/verify_ir.rs`) live in `src/ir/`,
-while all transformation passes and `PassRegistry::with_builtin_passes()` are organized into focused
-pass modules and sub-packages (`src/passes/<pass>/`) under `src/passes/`.
+CastForge provides **103 built-in modular A-to-B IR passes & presets** (`38 top-level/composite
+passes & presets + 65 single-optimization leaf passes`) across `src/passes/` and
+`src/ir/verify_ir.rs` (plus the unified **`OptimizeLoopIrPass`** (`optimize-loop-ir`) in
+`src/codegen/`).
+
+- **Leaf passes** perform a single optimization (or tightly related single-traversal family) in a
+  single path and may invoke tightly coupled cleanup passes such as
+  `DeadCodeEliminationPass::ssa_only()`.
+- **Higher-level composite passes** (`Pass::is_composite() == true`, e.g., `canonicalize`,
+  `specialize-shapes`, `quantize`, `merge-weights`, `fold-weights`, `prune-weights`,
+  `fuse-elementwise`, `fuse-gemm`, `fuse-norm`, `fuse-attention`, `optimize-memory`,
+  `shard-distributed`, `schedule-loops`, `normalize-ir`, `outline-subgraphs`, `verify-ir`, `O1`,
+  `O2`, `O3`) contain an ordered sequence of lower-level passes (`Pass::child_passes()`) aggregated
+  via `PassResult::aggregate` / `PassResult::run_sequence`.
 
 ---
 
 ## Summary by Category
 
-| Category | Count | Section |
-| :--- | :---: | :--- |
-| **1. General MLIR & Algebraic Passes (+ `O1`/`O2`/`O3`)** | 7 | Section 1 |
-| **2. Views, Shape Specialization & Layout** | 2 | Section 2 |
-| **3. Weight Surgery, Pruning & Quantization** | 5 | Section 3 |
-| **4. Transformer, GEMM & Operator Fusions** | 7 | Section 4 |
-| **5. Memory Planning, Remat & Offload** | 3 | Section 5 |
-| **6. Distributed Parallelism, Streams & Autodiff** | 3 | Section 6 |
-| **7. Polyhedral Loop Scheduling & Tensor Cores** | 3 | Section 7 |
-| **8. IR Surgery, Verification & Tooling** | 8 | Section 8 |
-| **9. Polyhedral / Imperative LoopIR** | +1 | `src/codegen/` (Section 9) |
+| Category | Top | Leaf | Section |
+| :--- | :---: | :---: | :--- |
+| **1. General MLIR & Algebraic Passes (+ `O1`/`O2`/`O3`)** | 7 | +2 | Section 1 |
+| **2. Views, Shape Specialization & Layout** | 2 | +2 | Section 2 |
+| **3. Weight Surgery, Pruning & Quantization** | 5 | +13 | Section 3 |
+| **4. Transformer, GEMM & Operator Fusions** | 7 | +21 | Section 4 |
+| **5. Memory Planning, Remat & Offload** | 3 | +2 | Section 5 |
+| **6. Distributed Parallelism, Streams & Autodiff** | 3 | +4 | Section 6 |
+| **7. Polyhedral Loop Scheduling & Tensor Cores** | 3 | +6 | Section 7 |
+| **8. IR Surgery, Verification & Tooling** | 8 | +15 | Section 8 |
+| **9. Polyhedral / Imperative LoopIR** | +1 | — | Section 9 |
 
-*(Total: **38 registered Graph IR passes/presets** in `PassRegistry` + **`OptimizeLoopIrPass`**.)*
+*(Total: **103 registered Graph IR passes/presets** in `PassRegistry` + **`OptimizeLoopIrPass`**.)*
 
 ---
 
@@ -208,7 +216,7 @@ pass modules and sub-packages (`src/passes/<pass>/`) under `src/passes/`.
    Zero-Bubble Pipeline Parallelism (`pp`), and multi-stream async execution (`streams`).
 2. **`autodiff` (`AutodiffPass` — `shard_distributed/autodiff.rs`):** Single-traversal
    reverse-mode VJP automatic differentiation & in-place SGD weight update synthesis (`lr=0.01`).
-3. **`hoist-all-reduce` (`HoistAllReducePass` — `shard_distributed/autodiff.rs`):**
+3. **`coalesce-all-reduce` (`CoalesceAllReducePass` — `shard_distributed/mod.rs`):**
    Single-traversal `all_reduce` coalescer and compute-communication overlap scheduler.
 
 ---

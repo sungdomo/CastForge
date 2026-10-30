@@ -1333,7 +1333,7 @@ module @ir_tools_demo {
     let dec_san_rep = verify_module_numerics(&base, &dec_san, 1e-5).expect("verify dec_san");
     assert!(dec_san_rep.passed);
 
-    // 5. Module Linker (`link_modules`) & Function Composer (`compose-funcs`)
+    // 5. Module Linker (`link_modules`) & Function Composer (`compose-functions`)
     let stage2_mlir = r#"
 module @stage2_mod {
   func.func @postprocess(%h: tensor<2x4xf32>) -> tensor<2x4xf32> {
@@ -1353,7 +1353,7 @@ module @stage2_mod {
         "normalize-ir(mode=compose,first=main,second=postprocess,entry=end_to_end)",
     )
     .expect("normalize-ir(mode=compose)");
-    let comp_res = comp_pm.run(&mut linked).expect("run compose-funcs");
+    let comp_res = comp_pm.run(&mut linked).expect("run compose-functions");
     assert!(comp_res[0].changed);
     let comp_ir = print_mlir(&linked);
     assert!(comp_ir.contains("func.func @end_to_end("));
@@ -1542,7 +1542,24 @@ module @advanced_ir_tools {
 #[test]
 fn test_pad_for_tiling_split_gemm_unroll_calls_hoist_all_reduce_instrument_and_strip() {
     let registry = PassRegistry::with_builtin_passes();
-    assert_eq!(registry.list().count(), 38);
+    assert_eq!(registry.list().count(), 103);
+    for (name, _) in registry.list() {
+        let pass = registry
+            .create_pass(name, &Default::default())
+            .expect("instantiate registered pass");
+        assert_eq!(
+            pass.name(),
+            name,
+            "Registered pass '{name}' returned mismatched Pass::name() '{}'",
+            pass.name()
+        );
+        for &child in pass.child_passes() {
+            assert!(
+                registry.list().any(|(registered, _)| registered == child),
+                "Composite pass '{name}' references unregistered child pass '{child}'"
+            );
+        }
+    }
 
     let mlir = r#"
 module @final_ninety_suite {

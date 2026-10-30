@@ -41,38 +41,36 @@ impl Pass for FuseActivationsPass {
         "Unified activation, gated-MLP & MoE fusion (SwiGLU, GELU, GeGLU, GatedMLP, MoE)"
     }
 
+    fn child_passes(&self) -> &'static [&'static str] {
+        &["fuse-swiglu", "fuse-gelu", "fuse-gated-mlp", "fuse-moe"]
+    }
+
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let k = self.kind.to_ascii_lowercase();
-        let do_mlp = k == "all" || k == "gated_mlp" || k == "mlp";
-        let do_swiglu = do_mlp || k == "swiglu";
-        let do_gelu = do_mlp || k == "gelu" || k == "geglu";
-        let do_moe = k == "all" || k == "moe" || self.shared_expert;
-
-        let (created, modified, mut removed) = fuse_elementwise_and_activations_single_traversal(
-            module,
-            do_mlp,
-            do_swiglu,
-            do_gelu,
-            do_moe,
-            false,
-            false,
-            self.shared_expert,
-            self.top_k,
-            self.capacity_factor,
-        );
-
-        if created > 0 || modified > 0 {
-            let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
-            removed += dce_res.ops_removed;
-        }
-
-        Ok(PassResult {
-            pass_name: self.name().to_string(),
-            changed: created > 0 || modified > 0 || removed > 0,
-            ops_removed: removed,
-            ops_modified: modified,
-            ops_created: created,
-        })
+        let res = match k.as_str() {
+            "swiglu" => FuseSwiGluPass.run(module)?,
+            "gelu" | "geglu" => FuseGeluPass.run(module)?,
+            "gated_mlp" | "mlp" => FuseGatedMlpPass.run(module)?,
+            "moe" => FuseMoePass {
+                shared_expert: self.shared_expert,
+                top_k: self.top_k,
+                capacity_factor: self.capacity_factor,
+            }
+            .run(module)?,
+            _ => {
+                let steps = [
+                    FuseGatedMlpPass.run(module)?,
+                    FuseMoePass {
+                        shared_expert: self.shared_expert,
+                        top_k: self.top_k,
+                        capacity_factor: self.capacity_factor,
+                    }
+                    .run(module)?,
+                ];
+                PassResult::aggregate(self.name(), &steps)
+            }
+        };
+        Ok(res.with_name(self.name()))
     }
 }
 

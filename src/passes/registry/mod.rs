@@ -1,5 +1,6 @@
 //! Built-in [`PassRegistry`] and pass factory registration (`src/passes/registry`).
 
+mod leaf;
 mod lowering;
 
 use super::*;
@@ -551,6 +552,7 @@ impl PassRegistry {
             },
         );
         lowering::register_lowering_passes(&mut reg);
+        leaf::register_leaf_passes(&mut reg);
         reg
     }
 }

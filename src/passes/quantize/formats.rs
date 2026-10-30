@@ -236,20 +236,20 @@ fn insert_static_quantize_before(
     res_val
 }
 
-/// QuaRot / SpinQuant Walsh-Hadamard Outlier Suppression Pass (`hadamard-quant-rotation`).
-pub struct HadamardQuantRotationPass {
+/// QuaRot / SpinQuant Walsh-Hadamard Outlier Suppression Pass (`rotate-hadamard`).
+pub struct RotateHadamardPass {
     pub block_size: usize,
 }
 
-impl Default for HadamardQuantRotationPass {
+impl Default for RotateHadamardPass {
     fn default() -> Self {
         Self { block_size: 4 }
     }
 }
 
-impl Pass for HadamardQuantRotationPass {
+impl Pass for RotateHadamardPass {
     fn name(&self) -> &'static str {
-        "hadamard-quant-rotation"
+        "rotate-hadamard"
     }
 
     fn description(&self) -> &'static str {
@@ -466,12 +466,12 @@ pub(super) fn run_fp4_quantize(
     })
 }
 
-/// Automatic Mixed Precision Pass (`mixed-precision`).
-pub struct MixedPrecisionPass {
+/// Automatic Mixed Precision Lowering Pass (`lower-mixed-precision`).
+pub struct LowerMixedPrecisionPass {
     pub target_dtype: DType,
 }
 
-impl Default for MixedPrecisionPass {
+impl Default for LowerMixedPrecisionPass {
     fn default() -> Self {
         Self {
             target_dtype: DType::F16,
@@ -479,9 +479,9 @@ impl Default for MixedPrecisionPass {
     }
 }
 
-impl Pass for MixedPrecisionPass {
+impl Pass for LowerMixedPrecisionPass {
     fn name(&self) -> &'static str {
-        "mixed-precision"
+        "lower-mixed-precision"
     }
 
     fn description(&self) -> &'static str {

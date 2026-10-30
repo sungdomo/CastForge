@@ -42,47 +42,41 @@ impl Pass for OptimizeMemoryPass {
         "Unified memory optimization (in-place donation, zero-copy concat, remat, host offload)"
     }
 
+    fn child_passes(&self) -> &'static [&'static str] {
+        &[
+            "bufferize-inplace",
+            "eliminate-concat-copies",
+            "rematerialize",
+            "offload-activations",
+        ]
+    }
+
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let m = self.mode.to_ascii_lowercase();
-        let do_inplace = m == "all" || m == "inplace";
-        let do_zero_copy = m == "all" || m == "zero_copy" || m == "concat";
-        if do_inplace || do_zero_copy {
-            let modified = optimize_memory_inplace_and_zero_copy(module, do_inplace, do_zero_copy);
-            return Ok(PassResult {
-                pass_name: self.name().to_string(),
-                changed: modified > 0,
-                ops_removed: 0,
-                ops_modified: modified,
-                ops_created: 0,
-            });
+        match m.as_str() {
+            "inplace" => Ok(BufferizeInplacePass.run(module)?.with_name(self.name())),
+            "zero_copy" | "concat" => Ok(EliminateConcatCopiesPass
+                .run(module)?
+                .with_name(self.name())),
+            "remat" | "rematerialize" => Ok(RematerializePass {
+                min_distance: self.min_distance,
+            }
+            .run(module)?
+            .with_name(self.name())),
+            "selective_remat" | "selective" => {
+                Ok(run_selective_remat(module, self.min_distance)?.with_name(self.name()))
+            }
+            "offload" => Ok(OffloadActivationsPass {
+                min_span: self.min_span,
+            }
+            .run(module)?
+            .with_name(self.name())),
+            _ => PassResult::run_sequence(
+                self.name(),
+                module,
+                &mut [&mut BufferizeInplacePass, &mut EliminateConcatCopiesPass],
+            ),
         }
-        let mut steps = Vec::new();
-        if m == "remat" || m == "rematerialize" {
-            steps.push(
-                RematerializePass {
-                    min_distance: self.min_distance,
-                }
-                .run(module)?,
-            );
-        }
-        if m == "selective_remat" || m == "selective" {
-            steps.push(run_selective_remat(module, self.min_distance)?);
-        }
-        if m == "offload" {
-            steps.push(
-                OffloadActivationsPass {
-                    min_span: self.min_span,
-                }
-                .run(module)?,
-            );
-        }
-        Ok(PassResult {
-            pass_name: self.name().to_string(),
-            changed: steps.iter().any(|r| r.changed),
-            ops_removed: steps.iter().map(|r| r.ops_removed).sum(),
-            ops_modified: steps.iter().map(|r| r.ops_modified).sum(),
-            ops_created: steps.iter().map(|r| r.ops_created).sum(),
-        })
     }
 }
 

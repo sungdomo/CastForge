@@ -39,12 +39,16 @@ impl Pass for MergeWeightsPass {
         "Unified weight merging, task arithmetic/DARE, and LoRA baking (slerp|ties|dare|lora)"
     }
 
+    fn child_passes(&self) -> &'static [&'static str] {
+        &["bake-lora", "merge-task-vectors"]
+    }
+
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let m = self.method.to_ascii_lowercase();
-        let mut res = match m.as_str() {
+        let res = match m.as_str() {
             "lora" | "bake_lora" => BakeLoraPass { alpha: self.alpha }.run(module)?,
             "dora" | "bake_dora" => run_bake_dora(module, self.alpha)?,
-            "task_arithmetic" | "task" | "dare" => TaskArithmeticPass {
+            "task_arithmetic" | "task" | "dare" => MergeTaskVectorsPass {
                 lambda: self.lambda,
                 drop_rate: self.drop_rate,
             }
@@ -65,8 +69,7 @@ impl Pass for MergeWeightsPass {
             }
             .run(module)?,
         };
-        res.pass_name = self.name().to_string();
-        Ok(res)
+        Ok(res.with_name(self.name()))
     }
 }
 
@@ -448,13 +451,13 @@ fn const_2d_dims(module: &Module, val_id: ValueId) -> Option<(crate::ir::OpId, u
     Some((op_id, *r as usize, *c as usize))
 }
 
-/// Multi-Checkpoint Task Arithmetic & DARE Delta Pruning (`task-arithmetic`).
-pub struct TaskArithmeticPass {
+/// Multi-Checkpoint Task Vector Merging & DARE Delta Pruning (`merge-task-vectors`).
+pub struct MergeTaskVectorsPass {
     pub lambda: f32,
     pub drop_rate: f32,
 }
 
-impl Default for TaskArithmeticPass {
+impl Default for MergeTaskVectorsPass {
     fn default() -> Self {
         Self {
             lambda: 1.0,
@@ -463,9 +466,9 @@ impl Default for TaskArithmeticPass {
     }
 }
 
-impl Pass for TaskArithmeticPass {
+impl Pass for MergeTaskVectorsPass {
     fn name(&self) -> &'static str {
-        "task-arithmetic"
+        "merge-task-vectors"
     }
 
     fn description(&self) -> &'static str {

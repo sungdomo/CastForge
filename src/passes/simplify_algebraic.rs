@@ -42,6 +42,10 @@ impl Pass for SimplifyAlgebraicPass {
         "Unified constant folding, SCCP, algebraic identities, e-graph factoring & FMA extraction"
     }
 
+    fn child_passes(&self) -> &'static [&'static str] {
+        &["fold-constants"]
+    }
+
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let mut created = 0usize;
         let mut modified = 0usize;
@@ -129,8 +133,30 @@ impl Pass for SimplifyAlgebraicPass {
     }
 }
 
-/// Constant query utilities used across passes (`const_splat` and `const_f32_vec`).
+/// Constant Folding & Conditional Constant Propagation (SCCP) Pass (`fold-constants`).
+#[derive(Debug, Clone, Default)]
 pub struct FoldConstantsPass;
+
+impl Pass for FoldConstantsPass {
+    fn name(&self) -> &'static str {
+        "fold-constants"
+    }
+
+    fn description(&self) -> &'static str {
+        "Evaluates pure operations on constant inputs at compile time (including SCCP)"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        Ok(SimplifyAlgebraicPass {
+            fold_constants: true,
+            include_conditional: true,
+            egraph: false,
+            fuse_fma: false,
+        }
+        .run(module)?
+        .with_name(self.name()))
+    }
+}
 
 impl FoldConstantsPass {
     pub fn const_splat(module: &Module, val_id: ValueId) -> Option<f64> {

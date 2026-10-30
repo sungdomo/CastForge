@@ -20,8 +20,8 @@ use smallvec::SmallVec;
 /// - `kind=mla` (`FuseMlaPass` — DeepSeek-V2/V3 Multi-Head Latent Attention KV absorption)
 /// - `kind=kv_cache` (`InjectKvCachePass` — stateful KV-cache injection)
 /// - `kind=paged` (`LowerPagedAttentionPass` — vLLM PagedAttention block tables)
-/// - `kind=flash_decoding` (`FlashDecodingPass` — Split-KV parallel LSE reduction)
-/// - `kind=tree|speculative_tree` (`SpeculativeTreeAttentionPass` — Medusa/EAGLE tree masks)
+/// - `kind=flash_decoding` (`LowerFlashDecodingPass` — Split-KV parallel LSE reduction)
+/// - `kind=tree|speculative_tree` (`LowerTreeAttentionPass` — Medusa/EAGLE tree masks)
 /// - `kind=sliding_window` (Mistral/Gemma-2 sliding window + StreamingLLM attention sinks)
 /// - `kind=kv_sharing` (YOCO / Cross-Layer KV-cache sharing across `share_every` layers)
 pub struct FuseAttentionPass {
@@ -79,6 +79,17 @@ impl Pass for FuseAttentionPass {
         "Unified attention fusion & serving (SDPA/RoPE/MLA/KV-cache/Paged/Flash/Sliding/KVShare)"
     }
 
+    fn child_passes(&self) -> &'static [&'static str] {
+        &[
+            "fuse-rope",
+            "fuse-mla",
+            "inject-kv-cache",
+            "lower-paged-attention",
+            "lower-flash-decoding",
+            "lower-tree-attention",
+        ]
+    }
+
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let k = self.kind.to_ascii_lowercase();
         let do_rope = k == "all" || k == "rope";
@@ -116,6 +127,11 @@ impl Pass for FuseAttentionPass {
         let kv_dt_low = self.kv_dtype.as_ref().map(|s| s.to_ascii_lowercase());
         let share_stride = self.share_every.max(2);
 
+        let mut steps = Vec::new();
+        if do_rope {
+            steps.push(FuseRopePass.run(module)?);
+        }
+
         let mut created = 0usize;
         let mut modified = 0usize;
         let blocks: Vec<BlockId> = module.blocks.keys().collect();
@@ -130,26 +146,7 @@ impl Pass for FuseAttentionPass {
                     continue;
                 };
 
-                if do_rope
-                    && let Some(StableHloOp::Add { lhs, rhs, .. }) = StableHloOp::from_op(&op)
-                    && let Some(RopeMatch { x, cos, sin }) = match_rope_pair(module, lhs, rhs)
-                        .or_else(|| match_rope_pair(module, rhs, lhs))
-                {
-                    let mut attrs = IndexMap::new();
-                    attrs.insert(
-                        "name".to_string(),
-                        Attribute::String("castforge.fused_rope".to_string()),
-                    );
-                    attrs.insert(
-                        "decomposition".to_string(),
-                        Attribute::SymbolRef("fused_rope_impl".to_string()),
-                    );
-                    let op_mut = &mut module.ops[op_id];
-                    op_mut.name = OpName::new("stablehlo", "composite");
-                    op_mut.operands = SmallVec::from_slice(&[x, cos, sin]);
-                    op_mut.attributes = attrs;
-                    created += 1;
-                } else if do_sdpa {
+                if do_sdpa {
                     if try_fuse_softmax_at_op(module, op_id, &op) {
                         continue;
                     }
@@ -245,23 +242,6 @@ impl Pass for FuseAttentionPass {
                     modified += 1;
                 }
 
-                if do_mla && (is_dot || is_fused_attn) {
-                    let attrs = &mut module.ops[op_id].attributes;
-                    attrs.insert(
-                        "castforge.mla_compressed_kv".to_string(),
-                        Attribute::Bool(true),
-                    );
-                    attrs.insert(
-                        "castforge.mla_latent_rank".to_string(),
-                        Attribute::Int(self.kv_lora_rank.max(16)),
-                    );
-                    attrs.insert(
-                        "castforge.mla_w_uk_absorbed".to_string(),
-                        Attribute::Bool(true),
-                    );
-                    modified += 1;
-                }
-
                 if do_kv_cache
                     && is_fused_attn
                     && module.ops[op_id].operands.len() >= 3
@@ -313,57 +293,6 @@ impl Pass for FuseAttentionPass {
                     attrs.insert(
                         "castforge.kv_per_head_scale".to_string(),
                         Attribute::Bool(true),
-                    );
-                    modified += 1;
-                }
-
-                if do_paged && is_fused_attn {
-                    let attrs = &mut module.ops[op_id].attributes;
-                    attrs.insert(
-                        "castforge.paged_attention".to_string(),
-                        Attribute::Bool(true),
-                    );
-                    attrs.insert(
-                        "castforge.page_block_size".to_string(),
-                        Attribute::Int(self.page_block_size.max(4) as i64),
-                    );
-                    attrs.insert(
-                        "castforge.max_blocks".to_string(),
-                        Attribute::Int(self.max_blocks.max(1) as i64),
-                    );
-                    modified += 1;
-                }
-
-                if do_flash && is_fused_attn {
-                    let attrs = &mut module.ops[op_id].attributes;
-                    attrs.insert(
-                        "castforge.flash_decoding".to_string(),
-                        Attribute::Bool(true),
-                    );
-                    attrs.insert(
-                        "castforge.split_kv".to_string(),
-                        Attribute::Int(self.split_kv.max(2) as i64),
-                    );
-                    attrs.insert(
-                        "castforge.partial_lse_reduce".to_string(),
-                        Attribute::Bool(true),
-                    );
-                    modified += 1;
-                }
-
-                if do_tree && is_fused_attn {
-                    let attrs = &mut module.ops[op_id].attributes;
-                    attrs.insert(
-                        "castforge.speculative_tree".to_string(),
-                        Attribute::Bool(true),
-                    );
-                    attrs.insert(
-                        "castforge.draft_tokens".to_string(),
-                        Attribute::Int(self.draft_tokens.max(1) as i64),
-                    );
-                    attrs.insert(
-                        "castforge.tree_depth".to_string(),
-                        Attribute::Int(self.tree_depth.max(1) as i64),
                     );
                     modified += 1;
                 }
@@ -432,19 +361,55 @@ impl Pass for FuseAttentionPass {
             }
         }
 
+        if do_mla {
+            steps.push(
+                FuseMlaPass {
+                    latent_rank: self.kv_lora_rank,
+                }
+                .run(module)?,
+            );
+        }
+        if do_paged {
+            steps.push(
+                LowerPagedAttentionPass {
+                    page_block_size: self.page_block_size,
+                    max_blocks: self.max_blocks,
+                }
+                .run(module)?,
+            );
+        }
+        if do_flash {
+            steps.push(
+                LowerFlashDecodingPass {
+                    split_kv: self.split_kv,
+                }
+                .run(module)?,
+            );
+        }
+        if do_tree {
+            steps.push(
+                LowerTreeAttentionPass {
+                    draft_tokens: self.draft_tokens,
+                    tree_depth: self.tree_depth,
+                }
+                .run(module)?,
+            );
+        }
+
         let mut removed = 0usize;
         if created > 0 || (do_kv_share && modified > 0) {
             let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
             removed += dce_res.ops_removed;
         }
-
-        Ok(PassResult {
+        steps.push(PassResult {
             pass_name: self.name().to_string(),
             changed: created > 0 || modified > 0 || removed > 0,
             ops_removed: removed,
             ops_modified: modified,
             ops_created: created,
-        })
+        });
+
+        Ok(PassResult::aggregate(self.name(), &steps))
     }
 }
 

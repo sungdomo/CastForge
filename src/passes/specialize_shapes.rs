@@ -42,30 +42,37 @@ impl Pass for SpecializeShapesPass {
         "Unified shape specialization, static batch resizing, bucketing, and token pruning"
     }
 
+    fn child_passes(&self) -> &'static [&'static str] {
+        &["resize-batch", "bucket-shapes"]
+    }
+
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let mut modified = specialize_and_resize_single_traversal(
+        let modified = specialize_and_resize_single_traversal(
             module,
             self,
             true,
-            self.batch,
+            None,
             self.token_prune_ratio,
         );
-        let mut created = 0usize;
-        if let Some(ref buckets) = self.buckets {
-            let b_res = BucketShapesPass {
-                buckets: buckets.clone(),
-            }
-            .run(module)?;
-            created += b_res.ops_created;
-            modified += b_res.ops_modified;
-        }
-        Ok(PassResult {
+        let mut steps = vec![PassResult {
             pass_name: self.name().to_string(),
-            changed: modified > 0 || created > 0,
+            changed: modified > 0,
             ops_removed: 0,
             ops_modified: modified,
-            ops_created: created,
-        })
+            ops_created: 0,
+        }];
+        if let Some(batch) = self.batch {
+            steps.push(ResizeBatchPass { batch }.run(module)?);
+        }
+        if let Some(ref buckets) = self.buckets {
+            steps.push(
+                BucketShapesPass {
+                    buckets: buckets.clone(),
+                }
+                .run(module)?,
+            );
+        }
+        Ok(PassResult::aggregate(self.name(), &steps))
     }
 }
 

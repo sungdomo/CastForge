@@ -4,7 +4,7 @@
 //! - `mode=tp|spmd|all` (`ShardSpmdPass` — Megatron-style 1D Tensor Parallelism)
 //! - `mode=ring_cp|ring|all` (`ShardRingAttentionPass` — RingAttention Context Parallelism)
 //! - `mode=pp|pipeline` (`ShardPipelineParallelPass` — 1F1B / Zero-Bubble Pipeline Parallelism)
-//! - `mode=coalesce|hoist|all` (`HoistAllReducePass` — collective `all_reduce` coalescing)
+//! - `mode=coalesce|hoist|all` (`CoalesceAllReducePass` — collective `all_reduce` coalescing)
 //! - `mode=streams|async` (`ScheduleStreamsPass` — multi-stream compute/copy overlap)
 
 pub mod autodiff;
@@ -58,6 +58,17 @@ impl Pass for ShardDistributedPass {
         "Unified distributed parallelism (TP, Ring-CP, PP, FSDP, EP, streams, & reverse-mode VJP)"
     }
 
+    fn child_passes(&self) -> &'static [&'static str] {
+        &[
+            "shard-spmd",
+            "shard-ring-attention",
+            "shard-pipeline-parallel",
+            "coalesce-all-reduce",
+            "schedule-streams",
+            "autodiff",
+        ]
+    }
+
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let m = self.mode.to_ascii_lowercase();
         let mut steps = Vec::new();
@@ -73,15 +84,24 @@ impl Pass for ShardDistributedPass {
         let do_tp = m == "tp" || m == "spmd" || m == "all";
         let do_ring = m == "ring_cp" || m == "ring" || m == "all";
         let do_coalesce = m == "coalesce" || m == "hoist" || m == "all" || self.coalesce;
-        if do_tp || do_ring || do_coalesce {
-            steps.push(shard_tp_ring_and_coalesce_single_traversal(
-                module,
-                do_tp,
-                do_ring,
-                do_coalesce,
-                self.devices,
-                self.ring_size,
-            )?);
+        if do_tp {
+            steps.push(
+                ShardSpmdPass {
+                    num_devices: self.devices,
+                }
+                .run(module)?,
+            );
+        }
+        if do_ring {
+            steps.push(
+                ShardRingAttentionPass {
+                    ring_size: self.ring_size,
+                }
+                .run(module)?,
+            );
+        }
+        if do_coalesce {
+            steps.push(CoalesceAllReducePass.run(module)?);
         }
 
         if m == "pp" || m == "pipeline" {
@@ -108,13 +128,7 @@ impl Pass for ShardDistributedPass {
                 .run(module)?,
             );
         }
-        Ok(PassResult {
-            pass_name: self.name().to_string(),
-            changed: steps.iter().any(|r| r.changed),
-            ops_removed: steps.iter().map(|r| r.ops_removed).sum(),
-            ops_modified: steps.iter().map(|r| r.ops_modified).sum(),
-            ops_created: steps.iter().map(|r| r.ops_created).sum(),
-        })
+        Ok(PassResult::aggregate(self.name(), &steps))
     }
 }
 
@@ -519,13 +533,13 @@ impl Pass for ShardPipelineParallelPass {
     }
 }
 
-/// Collective All-Reduce Coalescer & Async Overlap Pass (`hoist-all-reduce`).
+/// Collective All-Reduce Coalescer & Async Overlap Pass (`coalesce-all-reduce`).
 #[derive(Debug, Clone, Default)]
-pub struct HoistAllReducePass;
+pub struct CoalesceAllReducePass;
 
-impl Pass for HoistAllReducePass {
+impl Pass for CoalesceAllReducePass {
     fn name(&self) -> &'static str {
-        "hoist-all-reduce"
+        "coalesce-all-reduce"
     }
 
     fn description(&self) -> &'static str {

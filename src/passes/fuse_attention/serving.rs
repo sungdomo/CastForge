@@ -158,20 +158,20 @@ impl Pass for LowerPagedAttentionPass {
     }
 }
 
-/// FlashDecoding / Split-KV Attention Pass (`flash-decoding`).
-pub struct FlashDecodingPass {
+/// FlashDecoding / Split-KV Attention Lowering Pass (`lower-flash-decoding`).
+pub struct LowerFlashDecodingPass {
     pub split_kv: usize,
 }
 
-impl Default for FlashDecodingPass {
+impl Default for LowerFlashDecodingPass {
     fn default() -> Self {
         Self { split_kv: 4 }
     }
 }
 
-impl Pass for FlashDecodingPass {
+impl Pass for LowerFlashDecodingPass {
     fn name(&self) -> &'static str {
-        "flash-decoding"
+        "lower-flash-decoding"
     }
 
     fn description(&self) -> &'static str {
@@ -213,13 +213,13 @@ impl Pass for FlashDecodingPass {
     }
 }
 
-/// Speculative Decoding Tree Attention Pass (`speculative-tree-attention`).
-pub struct SpeculativeTreeAttentionPass {
+/// Speculative Decoding Tree Attention Lowering Pass (`lower-tree-attention`).
+pub struct LowerTreeAttentionPass {
     pub draft_tokens: usize,
     pub tree_depth: usize,
 }
 
-impl Default for SpeculativeTreeAttentionPass {
+impl Default for LowerTreeAttentionPass {
     fn default() -> Self {
         Self {
             draft_tokens: 4,
@@ -228,9 +228,9 @@ impl Default for SpeculativeTreeAttentionPass {
     }
 }
 
-impl Pass for SpeculativeTreeAttentionPass {
+impl Pass for LowerTreeAttentionPass {
     fn name(&self) -> &'static str {
-        "speculative-tree-attention"
+        "lower-tree-attention"
     }
 
     fn description(&self) -> &'static str {

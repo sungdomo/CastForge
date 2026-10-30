@@ -65,10 +65,20 @@ impl Pass for NormalizeIrPass {
         "Unified IR normalization, subgraph outlining/inlining/extraction, freezing & tapping"
     }
 
+    fn child_passes(&self) -> &'static [&'static str] {
+        &[
+            "outline-subgraphs",
+            "parameterize-constants",
+            "freeze-inputs",
+            "tap-intermediates",
+            "strip-debuginfo",
+            "strip-attributes",
+            "normalize-ssa",
+        ]
+    }
+
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let mut modified = 0usize;
-        let mut created = 0usize;
-        let mut removed = 0usize;
+        let mut steps = Vec::new();
 
         if self.mode.is_some()
             || self.dedup
@@ -82,78 +92,77 @@ impl Pass for NormalizeIrPass {
                 Some("outline") | None => "all".to_string(),
                 Some(other) => other.to_string(),
             };
-            let r = OutlineSubgraphsPass {
-                mode: m,
-                dedup: self.dedup,
-                first: self.first.clone(),
-                second: self.second.clone(),
-                entry_name: if self.entry_name.is_empty() {
-                    "composed_main".to_string()
-                } else {
-                    self.entry_name.clone()
-                },
-                repeat: self.repeat.max(1),
-                target: self.target.clone(),
-                stop_at: self.stop_at.clone(),
-                max_ops: self.max_ops,
-                keep_op: self.keep_op.clone(),
-            }
-            .run(module)?;
-            modified += r.ops_modified;
-            created += r.ops_created;
-            removed += r.ops_removed;
+            steps.push(
+                OutlineSubgraphsPass {
+                    mode: m,
+                    dedup: self.dedup,
+                    first: self.first.clone(),
+                    second: self.second.clone(),
+                    entry_name: if self.entry_name.is_empty() {
+                        "composed_main".to_string()
+                    } else {
+                        self.entry_name.clone()
+                    },
+                    repeat: self.repeat.max(1),
+                    target: self.target.clone(),
+                    stop_at: self.stop_at.clone(),
+                    max_ops: self.max_ops,
+                    keep_op: self.keep_op.clone(),
+                }
+                .run(module)?,
+            );
         }
 
         if self.unfreeze {
-            let r = ParameterizeConstantsPass {
-                min_elements: self.min_elements.max(1),
-            }
-            .run(module)?;
-            modified += r.ops_modified;
-            created += r.ops_created;
-            removed += r.ops_removed;
+            steps.push(
+                ParameterizeConstantsPass {
+                    min_elements: self.min_elements.max(1),
+                }
+                .run(module)?,
+            );
         } else if self.freeze || !self.args.is_empty() {
-            let r = FreezeInputsPass {
-                args: self.args.clone(),
-                value: if self.value == 0.0 { 0.5 } else { self.value },
-            }
-            .run(module)?;
-            modified += r.ops_modified;
-            created += r.ops_created;
-            removed += r.ops_removed;
+            steps.push(
+                FreezeInputsPass {
+                    args: self.args.clone(),
+                    value: if self.value == 0.0 { 0.5 } else { self.value },
+                }
+                .run(module)?,
+            );
         }
 
         if let Some(ref tap_vals) = self.tap {
-            let r = TapIntermediatesPass {
-                values: tap_vals.clone(),
-            }
-            .run(module)?;
-            modified += r.ops_modified;
-            created += r.ops_created;
-            removed += r.ops_removed;
+            steps.push(
+                TapIntermediatesPass {
+                    values: tap_vals.clone(),
+                }
+                .run(module)?,
+            );
         }
 
-        if self.rename_op.is_some()
-            || self.annotate_op.is_some()
-            || self.ssa
-            || self.debuginfo
-            || self.attributes
-        {
-            modified += self.apply_metadata_and_ssa_edits_single_traversal(module);
+        if self.rename_op.is_some() || self.annotate_op.is_some() {
+            steps.push(self.apply_op_rename_and_annotate(module));
+        }
+        if self.debuginfo {
+            steps.push(StripDebugInfoPass.run(module)?);
+        }
+        if self.attributes {
+            steps.push(StripAttributesPass.run(module)?);
+        }
+        if self.ssa {
+            steps.push(
+                NormalizeSsaPass {
+                    prefix: self.prefix.clone(),
+                }
+                .run(module)?,
+            );
         }
 
-        Ok(PassResult {
-            pass_name: self.name().to_string(),
-            changed: modified > 0 || created > 0 || removed > 0,
-            ops_removed: removed,
-            ops_modified: modified,
-            ops_created: created,
-        })
+        Ok(PassResult::aggregate(self.name(), &steps))
     }
 }
 
 impl NormalizeIrPass {
-    fn apply_metadata_and_ssa_edits_single_traversal(&self, module: &mut Module) -> usize {
+    fn apply_op_rename_and_annotate(&self, module: &mut Module) -> PassResult {
         let mut modified = 0usize;
         let rename_pair = self
             .rename_op
@@ -170,41 +179,11 @@ impl NormalizeIrPass {
                 )
             })
         });
-        let pfx = if self.prefix.trim().is_empty() {
-            "v"
-        } else {
-            self.prefix.trim()
-        };
 
         for fn_id in module.functions() {
-            if self.debuginfo && module.ops[fn_id].location != Location::Unknown {
-                module.ops[fn_id].location = Location::Unknown;
-                modified += 1;
-            }
-            if self.attributes {
-                let before = module.ops[fn_id].attributes.len();
-                module.ops[fn_id]
-                    .attributes
-                    .retain(|k, _| !is_transient_attribute(k));
-                if module.ops[fn_id].attributes.len() < before {
-                    modified += 1;
-                }
-            }
             let reg_id = module.ops[fn_id].regions[0];
             let blk_id = module.regions[reg_id].blocks[0];
-            if self.ssa {
-                let args = module.blocks[blk_id].arguments.clone();
-                for (idx, arg_id) in args.into_iter().enumerate() {
-                    let target_name = format!("arg{idx}");
-                    if module.values[arg_id].ssa_name.as_deref() != Some(&target_name) {
-                        module.values[arg_id].ssa_name = Some(target_name);
-                        modified += 1;
-                    }
-                }
-            }
-
             let ops = module.blocks[blk_id].ops.clone();
-            let mut val_counter = 0usize;
             for op_id in ops {
                 if let Some((ref from_name, ref to_name)) = rename_pair
                     && module.ops[op_id].name == *from_name
@@ -220,37 +199,15 @@ impl NormalizeIrPass {
                         .insert(attr_key.clone(), attr_val.clone());
                     modified += 1;
                 }
-                if self.debuginfo && module.ops[op_id].location != Location::Unknown {
-                    module.ops[op_id].location = Location::Unknown;
-                    modified += 1;
-                }
-                if self.attributes {
-                    let before = module.ops[op_id].attributes.len();
-                    module.ops[op_id]
-                        .attributes
-                        .retain(|k, _| !is_transient_attribute(k));
-                    if module.ops[op_id].attributes.len() < before {
-                        modified += 1;
-                    }
-                }
-                if self.ssa {
-                    let results: Vec<ValueId> = module.ops[op_id].results.to_vec();
-                    for res_id in results {
-                        let target_name = format!("{pfx}{val_counter}");
-                        val_counter += 1;
-                        if module.values[res_id].ssa_name.as_deref() != Some(&target_name) {
-                            module.values[res_id].ssa_name = Some(target_name);
-                            modified += 1;
-                        }
-                    }
-                    let mut pairs: Vec<(String, Attribute)> =
-                        module.ops[op_id].attributes.drain(..).collect();
-                    pairs.sort_by(|a, b| a.0.cmp(&b.0));
-                    module.ops[op_id].attributes = pairs.into_iter().collect();
-                }
             }
         }
-        modified
+        PassResult {
+            pass_name: self.name().to_string(),
+            changed: modified > 0,
+            ops_removed: 0,
+            ops_modified: modified,
+            ops_created: 0,
+        }
     }
 }
 
