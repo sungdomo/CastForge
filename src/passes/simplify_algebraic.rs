@@ -15,14 +15,14 @@ use std::collections::HashSet;
 
 /// Unified Algebraic Simplification, Constant Folding & E-Graph Factoring/FMA Pass
 /// (`simplify-algebraic`).
-pub struct UnifiedSimplifyAlgebraicPass {
+pub struct SimplifyAlgebraicPass {
     pub fold_constants: bool,
     pub include_conditional: bool,
     pub egraph: bool,
     pub fuse_fma: bool,
 }
 
-impl Default for UnifiedSimplifyAlgebraicPass {
+impl Default for SimplifyAlgebraicPass {
     fn default() -> Self {
         Self {
             fold_constants: true,
@@ -33,7 +33,7 @@ impl Default for UnifiedSimplifyAlgebraicPass {
     }
 }
 
-impl Pass for UnifiedSimplifyAlgebraicPass {
+impl Pass for SimplifyAlgebraicPass {
     fn name(&self) -> &'static str {
         "simplify-algebraic"
     }

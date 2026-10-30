@@ -5,13 +5,13 @@ use std::collections::{HashMap, HashSet};
 
 /// Unified Common Subexpression Elimination, Dominator GVN, LICM & Constant Hoisting (`cse`),
 /// executed in a single top-down region/block traversal.
-pub struct UnifiedCsePass {
+pub struct CsePass {
     pub gvn: bool,
     pub hoist_constants: bool,
     pub licm: bool,
 }
 
-impl Default for UnifiedCsePass {
+impl Default for CsePass {
     fn default() -> Self {
         Self {
             gvn: true,
@@ -21,7 +21,7 @@ impl Default for UnifiedCsePass {
     }
 }
 
-impl Pass for UnifiedCsePass {
+impl Pass for CsePass {
     fn name(&self) -> &'static str {
         "cse"
     }
@@ -55,7 +55,7 @@ impl Pass for UnifiedCsePass {
     }
 }
 
-impl UnifiedCsePass {
+impl CsePass {
     fn process_region(
         &self,
         module: &mut Module,

@@ -1,4 +1,4 @@
-//! Submodule `outline` of `ir_edit`.
+//! Submodule `outline` of `normalize_ir`.
 
 use super::*;
 use crate::ir::{Attribute, Location, Module, OpId, OpName, Type, ValueId};
@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 /// Unified Subgraph Outlining, Inlining, Extraction, Deduplication, Composition & Unrolling
 /// (`outline-subgraphs`).
-pub struct UnifiedOutlineSubgraphsPass {
+pub struct OutlineSubgraphsPass {
     pub mode: String,
     pub dedup: bool,
     pub first: String,
@@ -23,7 +23,7 @@ pub struct UnifiedOutlineSubgraphsPass {
     pub keep_op: String,
 }
 
-impl Default for UnifiedOutlineSubgraphsPass {
+impl Default for OutlineSubgraphsPass {
     fn default() -> Self {
         Self {
             mode: "all".to_string(),
@@ -40,7 +40,7 @@ impl Default for UnifiedOutlineSubgraphsPass {
     }
 }
 
-impl Pass for UnifiedOutlineSubgraphsPass {
+impl Pass for OutlineSubgraphsPass {
     fn name(&self) -> &'static str {
         "outline-subgraphs"
     }
@@ -53,8 +53,8 @@ impl Pass for UnifiedOutlineSubgraphsPass {
         let m = self.mode.to_ascii_lowercase();
         let mut steps = Vec::new();
         match m.as_str() {
-            "inline" | "inliner" => {
-                steps.push(InlinerPass.run(module)?);
+            "inline" | "inliner" | "inline-calls" => {
+                steps.push(InlineCallsPass.run(module)?);
             }
             "extract" | "reduce" => {
                 steps.push(
@@ -105,7 +105,7 @@ impl Pass for UnifiedOutlineSubgraphsPass {
                     );
                 } else {
                     steps.push(
-                        OutlineSubgraphsPass {
+                        OutlineKernelSubgraphsPass {
                             mode: self.mode.clone(),
                         }
                         .run(module)?,
@@ -134,13 +134,13 @@ impl Pass for UnifiedOutlineSubgraphsPass {
     }
 }
 
-/// Subgraph Outliner Pass (`outline-subgraphs`).
+/// Kernel Subgraph Outliner helper (`outline-subgraphs`).
 #[derive(Debug, Clone)]
-pub struct OutlineSubgraphsPass {
+pub struct OutlineKernelSubgraphsPass {
     pub mode: String,
 }
 
-impl Default for OutlineSubgraphsPass {
+impl Default for OutlineKernelSubgraphsPass {
     fn default() -> Self {
         Self {
             mode: "all".to_string(),
@@ -148,7 +148,7 @@ impl Default for OutlineSubgraphsPass {
     }
 }
 
-impl Pass for OutlineSubgraphsPass {
+impl Pass for OutlineKernelSubgraphsPass {
     fn name(&self) -> &'static str {
         "outline-subgraphs"
     }

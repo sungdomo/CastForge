@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 ///
 /// Consolidates `specialize-shapes`, `resize-batch`, `bucket-shapes`, and dynamic sequence token
 /// pruning/merging (`token_prune_ratio`).
-pub struct UnifiedSpecializeShapesPass {
+pub struct SpecializeShapesPass {
     pub default_dim: i64,
     pub bindings: IndexMap<String, i64>,
     pub batch: Option<i64>,
@@ -21,7 +21,7 @@ pub struct UnifiedSpecializeShapesPass {
     pub token_prune_ratio: Option<f32>,
 }
 
-impl Default for UnifiedSpecializeShapesPass {
+impl Default for SpecializeShapesPass {
     fn default() -> Self {
         Self {
             default_dim: 1,
@@ -33,7 +33,7 @@ impl Default for UnifiedSpecializeShapesPass {
     }
 }
 
-impl Pass for UnifiedSpecializeShapesPass {
+impl Pass for SpecializeShapesPass {
     fn name(&self) -> &'static str {
         "specialize-shapes"
     }
@@ -43,13 +43,9 @@ impl Pass for UnifiedSpecializeShapesPass {
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let spec_helper = SpecializeShapesPass {
-            default_dim: self.default_dim,
-            bindings: self.bindings.clone(),
-        };
         let mut modified = specialize_and_resize_single_traversal(
             module,
-            &spec_helper,
+            self,
             true,
             self.batch,
             self.token_prune_ratio,
@@ -253,21 +249,6 @@ fn specialize_and_resize_single_traversal(
     modified
 }
 
-/// Symbolic & Dynamic Shape Specialization & Inference Pass (`specialize-shapes`).
-pub struct SpecializeShapesPass {
-    pub default_dim: i64,
-    pub bindings: IndexMap<String, i64>,
-}
-
-impl Default for SpecializeShapesPass {
-    fn default() -> Self {
-        Self {
-            default_dim: 1,
-            bindings: IndexMap::new(),
-        }
-    }
-}
-
 impl SpecializeShapesPass {
     fn resolve_dim(&self, dim: &Dim) -> (Dim, bool) {
         match dim {
@@ -299,27 +280,6 @@ impl SpecializeShapesPass {
             },
             changed,
         )
-    }
-}
-
-impl Pass for SpecializeShapesPass {
-    fn name(&self) -> &'static str {
-        "specialize-shapes"
-    }
-
-    fn description(&self) -> &'static str {
-        "Binds dynamic/symbolic dimensions (?, B, S) and propagates static shapes across the IR"
-    }
-
-    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let modified = specialize_and_resize_single_traversal(module, self, true, None, None);
-        Ok(PassResult {
-            pass_name: self.name().to_string(),
-            changed: modified > 0,
-            ops_removed: 0,
-            ops_modified: modified,
-            ops_created: 0,
-        })
     }
 }
 

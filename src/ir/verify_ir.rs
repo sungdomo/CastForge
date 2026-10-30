@@ -39,7 +39,7 @@ impl Pass for VerifyShapesPass {
 
 /// Unified IR Verification, Equivalence, Sanitizer, Structural Hashing, Bisection & Roofline
 /// Profiling Pass (`verify-ir`).
-pub struct UnifiedVerifyIrPass {
+pub struct VerifyIrPass {
     pub shapes: bool,
     pub equiv: bool,
     pub hash: bool,
@@ -54,7 +54,7 @@ pub struct UnifiedVerifyIrPass {
     pub ridge_flops_per_byte: f64,
 }
 
-impl Default for UnifiedVerifyIrPass {
+impl Default for VerifyIrPass {
     fn default() -> Self {
         Self {
             shapes: true,
@@ -73,7 +73,7 @@ impl Default for UnifiedVerifyIrPass {
     }
 }
 
-impl Pass for UnifiedVerifyIrPass {
+impl Pass for VerifyIrPass {
     fn name(&self) -> &'static str {
         "verify-ir"
     }
@@ -118,7 +118,7 @@ impl Pass for UnifiedVerifyIrPass {
     }
 }
 
-fn verify_ir_single_traversal(pass: &UnifiedVerifyIrPass, module: &mut Module) -> Result<usize> {
+fn verify_ir_single_traversal(pass: &VerifyIrPass, module: &mut Module) -> Result<usize> {
     if pass.equiv || pass.bisect_limit.is_some() {
         module.verify()?;
     }

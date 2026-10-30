@@ -1,4 +1,4 @@
-//! Submodule `inliner` of `ir_edit`.
+//! Submodule `inliner` of `normalize_ir`.
 
 use crate::ir::{Attribute, BlockId, Module, OpId, Type, ValueDef, ValueId};
 use crate::passes::{Pass, PassResult};
@@ -144,12 +144,12 @@ fn fingerprint_function(module: &Module, fn_id: OpId) -> String {
     fp
 }
 
-/// Function Call Inliner Pass (`inliner`).
-pub struct InlinerPass;
+/// Function Call Inliner Pass (`inline-calls`).
+pub struct InlineCallsPass;
 
-impl Pass for InlinerPass {
+impl Pass for InlineCallsPass {
     fn name(&self) -> &'static str {
-        "inliner"
+        "inline-calls"
     }
 
     fn description(&self) -> &'static str {

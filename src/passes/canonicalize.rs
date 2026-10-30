@@ -3,11 +3,10 @@
 
 use crate::ir::{Attribute, BlockId, Module, OpId, ValueDef, ValueId};
 use crate::passes::{
-    DeadCodeEliminationPass, FoldViewsPass, FoldWeightsPass, FuseActivationsPass,
-    FuseElementwisePass, FuseGemmPass, FuseNormPass, FuseSoftmaxPass, InlinerPass,
-    OptimizeMemoryPass, Pass, PassResult, ShardDistributedPass, UnifiedCsePass,
-    UnifiedFuseAttentionPass, UnifiedMergeWeightsPass, UnifiedSimplifyAlgebraicPass,
-    UnifiedSpecializeShapesPass,
+    CsePass, DeadCodeEliminationPass, FoldViewsPass, FoldWeightsPass, FuseActivationsPass,
+    FuseAddMaxPass, FuseAttentionPass, FuseGemmPass, FuseNormPass, FuseSoftmaxPass,
+    InlineCallsPass, MergeWeightsPass, OptimizeMemoryPass, Pass, PassResult, ShardDistributedPass,
+    SimplifyAlgebraicPass, SpecializeShapesPass,
 };
 use anyhow::Result;
 use indexmap::IndexMap;
@@ -72,8 +71,8 @@ impl Pass for CanonicalizePass {
 
         for _ in 0..8 {
             let steps = [
-                UnifiedCsePass::default().run(module)?,
-                UnifiedSimplifyAlgebraicPass::default().run(module)?,
+                CsePass::default().run(module)?,
+                SimplifyAlgebraicPass::default().run(module)?,
                 FoldViewsPass::default().run(module)?,
                 DeadCodeEliminationPass::default().run(module)?,
             ];
@@ -361,9 +360,9 @@ impl Pass for OptO1Pass {
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let steps = [
-            InlinerPass.run(module)?,
-            UnifiedSimplifyAlgebraicPass::default().run(module)?,
-            UnifiedCsePass::default().run(module)?,
+            InlineCallsPass.run(module)?,
+            SimplifyAlgebraicPass::default().run(module)?,
+            CsePass::default().run(module)?,
             FoldViewsPass::default().run(module)?,
             CanonicalizePass::default().run(module)?,
             DeadCodeEliminationPass::default().run(module)?,
@@ -392,7 +391,7 @@ impl Pass for OptO2Pass {
         let steps = [
             OptO1Pass.run(module)?,
             FoldViewsPass::default().run(module)?,
-            UnifiedMergeWeightsPass {
+            MergeWeightsPass {
                 method: "lora".to_string(),
                 alpha: 1.0,
                 ..Default::default()
@@ -404,7 +403,7 @@ impl Pass for OptO2Pass {
             }
             .run(module)?,
             FuseNormPass::default().run(module)?,
-            UnifiedFuseAttentionPass {
+            FuseAttentionPass {
                 kind: "rope".to_string(),
                 ..Default::default()
             }
@@ -424,14 +423,14 @@ impl Pass for OptO2Pass {
                 ..Default::default()
             }
             .run(module)?,
-            UnifiedFuseAttentionPass {
+            FuseAttentionPass {
                 kind: "sdpa".to_string(),
                 ..Default::default()
             }
             .run(module)?,
             FuseSoftmaxPass::default().run(module)?,
             FuseGemmPass::default().run(module)?,
-            FuseElementwisePass.run(module)?,
+            FuseAddMaxPass.run(module)?,
             CanonicalizePass::default().run(module)?,
             DeadCodeEliminationPass::default().run(module)?,
         ];
@@ -469,7 +468,7 @@ impl Pass for OptO3Pass {
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let mut spec_pass = UnifiedSpecializeShapesPass {
+        let mut spec_pass = SpecializeShapesPass {
             default_dim: self.default_dim,
             bindings: self.bindings.clone(),
             batch: None,
@@ -484,7 +483,7 @@ impl Pass for OptO3Pass {
                 ..Default::default()
             }
             .run(module)?,
-            UnifiedSimplifyAlgebraicPass {
+            SimplifyAlgebraicPass {
                 fold_constants: true,
                 include_conditional: true,
                 egraph: true,

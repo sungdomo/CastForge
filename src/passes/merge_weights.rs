@@ -10,7 +10,7 @@ use anyhow::Result;
 use indexmap::IndexMap;
 
 /// Unified Weight Merging, Task Arithmetic, DARE & LoRA Baking Pass (`merge-weights`).
-pub struct UnifiedMergeWeightsPass {
+pub struct MergeWeightsPass {
     pub method: String,
     pub t: f32,
     pub lambda: f32,
@@ -18,7 +18,7 @@ pub struct UnifiedMergeWeightsPass {
     pub alpha: f32,
 }
 
-impl Default for UnifiedMergeWeightsPass {
+impl Default for MergeWeightsPass {
     fn default() -> Self {
         Self {
             method: "linear".to_string(),
@@ -30,7 +30,7 @@ impl Default for UnifiedMergeWeightsPass {
     }
 }
 
-impl Pass for UnifiedMergeWeightsPass {
+impl Pass for MergeWeightsPass {
     fn name(&self) -> &'static str {
         "merge-weights"
     }
@@ -49,17 +49,17 @@ impl Pass for UnifiedMergeWeightsPass {
                 drop_rate: self.drop_rate,
             }
             .run(module)?,
-            "slerp" => MergeWeightsPass {
+            "slerp" => PairwiseMergeWeightsPass {
                 method: MergeMethod::Slerp,
                 t: self.t,
             }
             .run(module)?,
-            "ties" => MergeWeightsPass {
+            "ties" => PairwiseMergeWeightsPass {
                 method: MergeMethod::Ties,
                 t: self.t,
             }
             .run(module)?,
-            _ => MergeWeightsPass {
+            _ => PairwiseMergeWeightsPass {
                 method: MergeMethod::Linear,
                 t: self.t,
             }
@@ -70,13 +70,13 @@ impl Pass for UnifiedMergeWeightsPass {
     }
 }
 
-/// Weight Merging Pass (`merge-weights`).
-pub struct MergeWeightsPass {
+/// Pairwise Weight Merging helper (`merge-weights`).
+pub struct PairwiseMergeWeightsPass {
     pub method: MergeMethod,
     pub t: f32,
 }
 
-impl Pass for MergeWeightsPass {
+impl Pass for PairwiseMergeWeightsPass {
     fn name(&self) -> &'static str {
         "merge-weights"
     }

@@ -30,7 +30,7 @@ impl Pass for InjectKvCachePass {
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let mut res = UnifiedFuseAttentionPass {
+        let mut res = FuseAttentionPass {
             kind: "kv_cache".to_string(),
             max_seq_len: self.max_seq_len,
             ..Default::default()

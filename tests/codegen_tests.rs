@@ -1242,10 +1242,10 @@ module @ir_tools_demo {
     let base = parse_mlir(mlir).expect("parse ir_tools_demo");
     let registry = PassRegistry::with_builtin_passes();
 
-    // 1. Subgraph Extractor (`ir-edit(target=mm)`): slice backward cone up to %mm
+    // 1. Subgraph Extractor (`normalize-ir(target=mm)`): slice backward cone up to %mm
     let mut sliced = base.clone();
-    let mut slice_pm = PassManager::from_pipeline_str(&registry, "ir-edit(target=mm)")
-        .expect("ir-edit(target=mm)");
+    let mut slice_pm = PassManager::from_pipeline_str(&registry, "normalize-ir(target=mm)")
+        .expect("normalize-ir(target=mm)");
     let slice_res = slice_pm.run(&mut sliced).expect("run extract-subgraph");
     assert!(slice_res[0].changed);
     let sliced_ir = print_mlir(&sliced);
@@ -1254,8 +1254,9 @@ module @ir_tools_demo {
 
     // Also test cutting at `stop_at=mm` to promote `%mm` to a function input argument
     let mut cut_sliced = base.clone();
-    let mut cut_pm = PassManager::from_pipeline_str(&registry, "ir-edit(target=act,stop_at=mm)")
-        .expect("cut ir-edit");
+    let mut cut_pm =
+        PassManager::from_pipeline_str(&registry, "normalize-ir(target=act,stop_at=mm)")
+            .expect("cut normalize-ir");
     cut_pm
         .run(&mut cut_sliced)
         .expect("run cut extract-subgraph");
@@ -1264,10 +1265,10 @@ module @ir_tools_demo {
     assert!(cut_ir.contains("stablehlo.add"));
     assert!(cut_ir.contains("stablehlo.exponential"));
 
-    // 2. Subgraph Outliner (`ir-edit(mode=gemm)`) <-> Inliner (`mode=inline`) symmetric round-trip
+    // 2. Subgraph Outliner (`normalize-ir(mode=gemm)`) <-> Inliner (`mode=inline`) round-trip
     let mut outlined = base.clone();
     let mut out_pm =
-        PassManager::from_pipeline_str(&registry, "ir-edit(mode=gemm)").expect("outline");
+        PassManager::from_pipeline_str(&registry, "normalize-ir(mode=gemm)").expect("outline");
     let out_res = out_pm.run(&mut outlined).expect("run outline");
     assert!(out_res[0].changed);
     let out_ir = print_mlir(&outlined);
@@ -1277,19 +1278,19 @@ module @ir_tools_demo {
     assert!(out_rep.passed);
 
     let mut re_inlined = outlined.clone();
-    let mut inl_pm =
-        PassManager::from_pipeline_str(&registry, "ir-edit(mode=inline) | dce").expect("inliner");
-    inl_pm.run(&mut re_inlined).expect("run inliner");
+    let mut inl_pm = PassManager::from_pipeline_str(&registry, "normalize-ir(mode=inline) | dce")
+        .expect("inline-calls");
+    inl_pm.run(&mut re_inlined).expect("run inline-calls");
     let inl_ir = print_mlir(&re_inlined);
     assert!(!inl_ir.contains("func.call"));
     let inl_rep = verify_module_numerics(&base, &re_inlined, 1e-5).expect("verify re-inlined");
     assert!(inl_rep.passed);
 
-    // 3. Delta IR Reducer (`ir-edit(max_ops=1)`) & Pass Bisector (`verify-ir(bisect=2)`)
+    // 3. Delta IR Reducer (`normalize-ir(max_ops=1)`) & Pass Bisector (`verify-ir(bisect=2)`)
     let mut reduced = base.clone();
     let mut red_pm =
-        PassManager::from_pipeline_str(&registry, "ir-edit(max_ops=1,keep_op=exponential)")
-            .expect("ir-edit(max_ops=1)");
+        PassManager::from_pipeline_str(&registry, "normalize-ir(max_ops=1,keep_op=exponential)")
+            .expect("normalize-ir(max_ops=1)");
     let red_res = red_pm.run(&mut reduced).expect("run reduce-ir");
     assert!(red_res[0].changed);
     let red_ir = print_mlir(&reduced);
@@ -1349,9 +1350,9 @@ module @stage2_mod {
 
     let mut comp_pm = PassManager::from_pipeline_str(
         &registry,
-        "ir-edit(mode=compose,first=main,second=postprocess,entry=end_to_end)",
+        "normalize-ir(mode=compose,first=main,second=postprocess,entry=end_to_end)",
     )
-    .expect("ir-edit(mode=compose)");
+    .expect("normalize-ir(mode=compose)");
     let comp_res = comp_pm.run(&mut linked).expect("run compose-funcs");
     assert!(comp_res[0].changed);
     let comp_ir = print_mlir(&linked);
@@ -1380,11 +1381,11 @@ module @two_layer_gemm {
     let base = parse_mlir(mlir).expect("parse two_layer_gemm");
     let registry = PassRegistry::with_builtin_passes();
 
-    // 1. Symmetric `ir-edit(args=...)` <-> `ir-edit(unfreeze=true)` round-trip
+    // 1. Symmetric `normalize-ir(args=...)` <-> `normalize-ir(unfreeze=true)` round-trip
     let mut frozen = base.clone();
-    let mut frz_pm = PassManager::from_pipeline_str(&registry, "ir-edit(args=w1;w2)")
-        .expect("ir-edit(args=w1;w2)");
-    let frz_res = frz_pm.run(&mut frozen).expect("run ir-edit(args)");
+    let mut frz_pm = PassManager::from_pipeline_str(&registry, "normalize-ir(args=w1;w2)")
+        .expect("normalize-ir(args=w1;w2)");
+    let frz_res = frz_pm.run(&mut frozen).expect("run normalize-ir(args)");
     assert!(frz_res[0].changed);
     let frz_ir = print_mlir(&frozen);
     assert!(frz_ir.contains("func.func @main(%x: tensor<2x4xf32>) -> tensor<2x4xf32>"));
@@ -1392,21 +1393,21 @@ module @two_layer_gemm {
 
     let mut re_param = frozen.clone();
     let mut prm_pm =
-        PassManager::from_pipeline_str(&registry, "ir-edit(unfreeze=true,min_elements=2)")
-            .expect("ir-edit(unfreeze=true)");
+        PassManager::from_pipeline_str(&registry, "normalize-ir(unfreeze=true,min_elements=2)")
+            .expect("normalize-ir(unfreeze=true)");
     let prm_res = prm_pm
         .run(&mut re_param)
-        .expect("run ir-edit(unfreeze=true)");
+        .expect("run normalize-ir(unfreeze=true)");
     assert!(prm_res[0].changed);
     let prm_ir = print_mlir(&re_param);
     assert!(!prm_ir.contains("stablehlo.constant"));
     assert!(prm_ir.contains("%w1: tensor<4x4xf32>, %w2: tensor<4x4xf32>"));
 
-    // 2. Intermediate Activation Tapper (`ir-edit(tap=h1)`)
+    // 2. Intermediate Activation Tapper (`normalize-ir(tap=h1)`)
     let mut tapped = base.clone();
-    let mut tap_pm =
-        PassManager::from_pipeline_str(&registry, "ir-edit(tap=h1)").expect("ir-edit(tap=h1)");
-    let tap_res = tap_pm.run(&mut tapped).expect("run ir-edit(tap=h1)");
+    let mut tap_pm = PassManager::from_pipeline_str(&registry, "normalize-ir(tap=h1)")
+        .expect("normalize-ir(tap=h1)");
+    let tap_res = tap_pm.run(&mut tapped).expect("run normalize-ir(tap=h1)");
     assert!(tap_res[0].changed);
     let tap_ir = print_mlir(&tapped);
     assert!(tap_ir.contains("-> (tensor<2x4xf32>, tensor<2x4xf32>)"));
@@ -1423,11 +1424,11 @@ module @two_layer_gemm {
     assert!(rsz_ir.contains("%w1: tensor<4x4xf32>"));
     assert!(rsz_ir.contains("-> tensor<8x4xf32>"));
 
-    // 4. Outlining + Identical Function Deduplicator (`ir-edit(mode=gemm,dedup=true)`)
+    // 4. Outlining + Identical Function Deduplicator (`normalize-ir(mode=gemm,dedup=true)`)
     let mut deduped = base.clone();
     let mut dedup_pm = PassManager::from_pipeline_str(
         &registry,
-        "ir-edit(mode=gemm,dedup=false) | ir-edit(mode=dedup)",
+        "normalize-ir(mode=gemm,dedup=false) | normalize-ir(mode=dedup)",
     )
     .expect("outline + dedup");
     let dedup_res = dedup_pm.run(&mut deduped).expect("run outline + dedup");
@@ -1440,11 +1441,11 @@ module @two_layer_gemm {
     let dedup_rep = verify_module_numerics(&base, &deduped, 1e-5).expect("verify deduped");
     assert!(dedup_rep.passed);
 
-    // 5. Canonical SSA Renamer & Attribute Sorter (`ir-edit(prefix=t)`)
+    // 5. Canonical SSA Renamer & Attribute Sorter (`normalize-ir(prefix=t)`)
     let mut norm = base.clone();
-    let mut norm_pm =
-        PassManager::from_pipeline_str(&registry, "ir-edit(prefix=t)").expect("ir-edit(prefix=t)");
-    let norm_res = norm_pm.run(&mut norm).expect("run ir-edit(prefix=t)");
+    let mut norm_pm = PassManager::from_pipeline_str(&registry, "normalize-ir(prefix=t)")
+        .expect("normalize-ir(prefix=t)");
+    let norm_res = norm_pm.run(&mut norm).expect("run normalize-ir(prefix=t)");
     assert!(norm_res[0].changed);
     let norm_ir = print_mlir(&norm);
     assert!(norm_ir.contains("%arg0: tensor<2x4xf32>"));
@@ -1554,7 +1555,7 @@ module @final_ninety_suite {
 "#;
     let base = parse_mlir(mlir).expect("parse final_ninety_suite");
 
-    // 1. Tile-alignment padding (`schedule-loops(align=8)`) + metadata stripping (`ir-edit`)
+    // 1. Tile-alignment padding (`schedule-loops(align=8)`) + metadata stripping (`normalize-ir`)
     let mut padded = base.clone();
     let mut pad_pm = PassManager::from_pipeline_str(&registry, "schedule-loops(align=8)")
         .expect("schedule-loops(align=8)");
@@ -1568,9 +1569,9 @@ module @final_ninety_suite {
 
     let mut stripped = padded.clone();
     let mut strip_pm =
-        PassManager::from_pipeline_str(&registry, "ir-edit(attributes=true,ssa=false)")
-            .expect("ir-edit(attributes=true)");
-    let strip_res = strip_pm.run(&mut stripped).expect("run ir-edit");
+        PassManager::from_pipeline_str(&registry, "normalize-ir(attributes=true,ssa=false)")
+            .expect("normalize-ir(attributes=true)");
+    let strip_res = strip_pm.run(&mut stripped).expect("run normalize-ir");
     assert!(strip_res[0].changed);
     let strip_ir = print_mlir(&stripped);
     assert!(!strip_ir.contains("pad_align"));
@@ -1591,7 +1592,7 @@ module @final_ninety_suite {
     let split_rep = verify_module_numerics(&base, &split_gemm, 1e-5).expect("verify split_gemm");
     assert!(split_rep.passed);
 
-    // 3. Outlining + Bounded Call Unroller (`outline-subgraphs | unroll-calls(repeat=3) | inliner`)
+    // 3. Outlining + Bounded Call Unroller (`outline-subgraphs | unroll-calls(repeat=3)`)
     let sq_mlir = r#"
 module @square_block {
   func.func @main(%x: tensor<4x4xf32>, %w: tensor<4x4xf32>) -> tensor<4x4xf32> {
@@ -1604,7 +1605,7 @@ module @square_block {
     let mut unrolled = parse_mlir(sq_mlir).expect("parse square_block");
     let mut unroll_pm = PassManager::from_pipeline_str(
         &registry,
-        "ir-edit(mode=gemm,dedup=false) | ir-edit(mode=unroll,repeat=3)",
+        "normalize-ir(mode=gemm,dedup=false) | normalize-ir(mode=unroll,repeat=3)",
     )
     .expect("outline + unroll-calls");
     let unroll_res = unroll_pm.run(&mut unrolled).expect("run unroll-calls");
@@ -1764,7 +1765,7 @@ module @sota_cse_dce {
     assert!(!use_counts.is_empty());
 
     let mut pm = PassManager::new()
-        .add_pass(castforge::passes::UnifiedCsePass::default())
+        .add_pass(castforge::passes::CsePass::default())
         .add_pass(castforge::passes::DeadCodeEliminationPass::default());
     let results = pm.run(&mut module).expect("run cse + dce");
     assert_eq!(
@@ -1849,9 +1850,9 @@ fn test_consolidated_and_sota_passes_groupwise_batchnorm_concat_paged_gvn() {
     assert!(print_mlir(&module).contains("awq_groupwise"));
     assert!(print_mlir(&module).contains("castforge.awq_salient_channels = 1"));
 
-    let mut pm_strip = PassManager::from_pipeline_str(&registry, "ir-edit(attributes=true)")
-        .expect("ir-edit(attributes=true)");
-    pm_strip.run(&mut module).expect("run ir-edit");
+    let mut pm_strip = PassManager::from_pipeline_str(&registry, "normalize-ir(attributes=true)")
+        .expect("normalize-ir(attributes=true)");
+    pm_strip.run(&mut module).expect("run normalize-ir");
     assert!(!print_mlir(&module).contains("castforge.batchnorm_folded"));
 
     // 3. Test fuse-norm, fuse-activations, and fuse-attention(mode=paged)

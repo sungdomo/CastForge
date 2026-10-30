@@ -1,5 +1,5 @@
-//! Elementwise loop-chain fusion (`FuseLoopsPass`), fission (`FissionLoopsPass`), and persistent
-//! megakernel fusion (`FuseMegakernelPass`).
+//! Elementwise loop-chain fusion (`FuseLoopsPass`), loop splitting (`SplitLoopsPass`), and
+//! persistent megakernel fusion (`FuseMegakernelPass`).
 
 use crate::ir::{
     Attribute, BlockId, Location, Module, OpId, OpName, Operation, Type, Value, ValueDef, ValueId,
@@ -191,20 +191,20 @@ fn is_fusable_elementwise(module: &Module, op_id: OpId) -> bool {
     )
 }
 
-/// Loop Fission / Loop Distribution Pass (`fission-loops`).
-pub struct FissionLoopsPass {
+/// Loop Splitting / Loop Distribution Pass (`split-loops`).
+pub struct SplitLoopsPass {
     pub max_steps: usize,
 }
 
-impl Default for FissionLoopsPass {
+impl Default for SplitLoopsPass {
     fn default() -> Self {
         Self { max_steps: 2 }
     }
 }
 
-impl Pass for FissionLoopsPass {
+impl Pass for SplitLoopsPass {
     fn name(&self) -> &'static str {
-        "fission-loops"
+        "split-loops"
     }
 
     fn description(&self) -> &'static str {

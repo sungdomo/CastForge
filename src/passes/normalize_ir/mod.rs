@@ -1,5 +1,5 @@
-//! Unified Surgical IR Editing, Subgraph Outlining/Inlining/Extraction, Input Freezing,
-//! Parameterization & Activation Tapping (`ir-edit`).
+//! Unified IR Normalization, Subgraph Outlining/Inlining/Extraction, Input Freezing,
+//! Parameterization & Activation Tapping (`normalize-ir`).
 
 pub mod inliner;
 pub mod outline;
@@ -14,10 +14,10 @@ use indexmap::IndexMap;
 use smallvec::SmallVec;
 use std::collections::HashSet;
 
-/// Surgical IR Edit, Subgraph Outlining/Inlining/Extraction, Input Freezing, Parameterization,
-/// Tapping & Normalization Pass (`ir-edit`).
+/// Surgical IR Normalization, Subgraph Outlining/Inlining/Extraction, Input Freezing,
+/// Parameterization & Activation Tapping Pass (`normalize-ir`).
 #[derive(Debug, Clone, Default)]
-pub struct IrEditPass {
+pub struct NormalizeIrPass {
     /// Subgraph mode (`outline`, `all`, `gemm`, `composites`, `inline`, `extract`, `reduce`,
     /// `dedup`, `compose`, `unroll`).
     pub mode: Option<String>,
@@ -56,13 +56,13 @@ pub struct IrEditPass {
     pub attributes: bool,
 }
 
-impl Pass for IrEditPass {
+impl Pass for NormalizeIrPass {
     fn name(&self) -> &'static str {
-        "ir-edit"
+        "normalize-ir"
     }
 
     fn description(&self) -> &'static str {
-        "Unified IR surgery, subgraph outlining/inlining/extraction, freezing, tapping & cleanup"
+        "Unified IR normalization, subgraph outlining/inlining/extraction, freezing & tapping"
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
@@ -82,7 +82,7 @@ impl Pass for IrEditPass {
                 Some("outline") | None => "all".to_string(),
                 Some(other) => other.to_string(),
             };
-            let r = UnifiedOutlineSubgraphsPass {
+            let r = OutlineSubgraphsPass {
                 mode: m,
                 dedup: self.dedup,
                 first: self.first.clone(),
@@ -152,7 +152,7 @@ impl Pass for IrEditPass {
     }
 }
 
-impl IrEditPass {
+impl NormalizeIrPass {
     fn apply_metadata_and_ssa_edits_single_traversal(&self, module: &mut Module) -> usize {
         let mut modified = 0usize;
         let rename_pair = self

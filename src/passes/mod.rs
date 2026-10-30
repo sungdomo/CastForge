@@ -2,7 +2,7 @@
 //! (`castforge::passes`).
 //!
 //! Core pass execution and verification infrastructure ([`Pass`], [`PassManager`],
-//! [`PassRegistry`], [`UnifiedVerifyIrPass`]) lives in [`crate::ir`] and is re-exported here for
+//! [`PassRegistry`], [`VerifyIrPass`]) lives in [`crate::ir`] and is re-exported here for
 //! ergonomics.
 
 pub mod canonicalize;
@@ -14,8 +14,8 @@ pub mod fuse_attention;
 pub mod fuse_elementwise;
 pub mod fuse_gemm;
 pub mod fuse_norm;
-pub mod ir_edit;
 pub mod merge_weights;
+pub mod normalize_ir;
 pub mod optimize_memory;
 pub mod quantize;
 pub mod registry;
@@ -34,8 +34,8 @@ pub use fuse_attention::*;
 pub use fuse_elementwise::*;
 pub use fuse_gemm::*;
 pub use fuse_norm::*;
-pub use ir_edit::*;
 pub use merge_weights::*;
+pub use normalize_ir::*;
 pub use optimize_memory::*;
 pub use quantize::*;
 pub use schedule_loops::*;

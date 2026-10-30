@@ -35,7 +35,7 @@ pub(super) fn register_lowering_passes(reg: &mut PassRegistry) {
                     }
                 }
             }
-            Ok(Box::new(UnifiedSpecializeShapesPass {
+            Ok(Box::new(SpecializeShapesPass {
                 default_dim,
                 bindings,
                 batch,
@@ -328,8 +328,8 @@ pub(super) fn register_lowering_passes(reg: &mut PassRegistry) {
         },
     );
     reg.register(
-        "ir-edit",
-        "Unified IR surgery, subgraph outlining/inlining/extraction, freezing, tapping & ssa",
+        "normalize-ir",
+        "Unified IR normalization, subgraph outlining/inlining/extraction, freezing & tapping",
         |opts| {
             let target = opts
                 .get("target")
@@ -420,7 +420,7 @@ pub(super) fn register_lowering_passes(reg: &mut PassRegistry) {
                 .get("attributes")
                 .map(|s| s == "true" || s == "1")
                 .unwrap_or(false);
-            Ok(Box::new(IrEditPass {
+            Ok(Box::new(NormalizeIrPass {
                 mode,
                 dedup,
                 first,
@@ -449,7 +449,7 @@ pub(super) fn register_lowering_passes(reg: &mut PassRegistry) {
     reg.register(
         "inline-calls",
         "Inlines func.call sites by cloning callee body operations into the caller",
-        |_opts| Ok(Box::new(InlinerPass)),
+        |_opts| Ok(Box::new(InlineCallsPass)),
     );
     reg.register(
         "outline-subgraphs",
@@ -463,7 +463,7 @@ pub(super) fn register_lowering_passes(reg: &mut PassRegistry) {
                 .get("dedup")
                 .map(|s| s != "false" && s != "0")
                 .unwrap_or(true);
-            Ok(Box::new(UnifiedOutlineSubgraphsPass {
+            Ok(Box::new(OutlineSubgraphsPass {
                 mode,
                 dedup,
                 ..Default::default()
@@ -558,7 +558,7 @@ pub(super) fn register_lowering_passes(reg: &mut PassRegistry) {
                 .get("bisect")
                 .or_else(|| opts.get("limit"))
                 .and_then(|s| s.parse::<usize>().ok());
-            Ok(Box::new(UnifiedVerifyIrPass {
+            Ok(Box::new(VerifyIrPass {
                 shapes,
                 equiv,
                 tolerance,

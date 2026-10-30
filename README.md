@@ -65,7 +65,7 @@ support.
 | `fuse-elementwise` | Fusion | Single-traversal `SwiGLU`/`GELU`/`GeGLU`/`GatedMLP`/`MoE` fusion |
 | `decompose-composites` | Fusion | Expands `castforge.*` composites into primitive StableHLO ops |
 | `fuse-loops` | Fusion | Fuses multi-step elementwise chains into `fused_elementwise_chain` |
-| `fission-loops` | Fusion | Splits oversized `fused_elementwise_chain` ops at `max_steps` |
+| `split-loops` | Fusion | Splits oversized `fused_elementwise_chain` ops at `max_steps` |
 | `fuse-gemm` | Fusion | Single-traversal horizontal QKV/MLP dot, dequant+GEMM & epilogue |
 | `fuse-norm` | Fusion | Norm & Softmax (`rmsnorm\|residual_rmsnorm\|layernorm\|softmax\|ce`) |
 | `fuse-attention` | Fusion | Single-traversal `RoPE`/`SDPA` + `mla\|ssm\|kv_cache\|paged\|flash` |
@@ -78,7 +78,7 @@ support.
 | `schedule-loops` | Loops | Single-traversal tiling, permutation, unrolling, SIMD & Tensor Cores |
 | `lower-conv-to-gemm` | Loops | Lowers `1x1` NHWC 2D convolutions into `reshape + dot_general` |
 | `split-large-gemm` | Loops | Splits wide `dot_general` RHS weights along $N$ into cache chunks |
-| `ir-edit` | Tooling | Single-traversal op rename/annotate, freeze/unfreeze, tap & SSA |
+| `normalize-ir` | Tooling | Single-traversal op rename/annotate, freeze/unfreeze, tap & SSA |
 | `inline-calls` | Tooling | Inlines `func.call` sites by cloning callee operations into caller |
 | `outline-subgraphs` | Tooling | Outlines composite/GEMM ops into reusable functions & dedups |
 | `extract-subgraph` | Tooling | Slices the backward dependency cone of target SSA values |

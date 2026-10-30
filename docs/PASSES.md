@@ -36,14 +36,14 @@ pass modules and sub-packages (`src/passes/<pass>/`) under `src/passes/`.
   separate forward use-counting pass) and eliminates unreachable private `func.func` symbols when
   `symbols=true`.
 
-### 1.2 `cse` (`UnifiedCsePass` — `cse.rs`)
+### 1.2 `cse` (`CsePass` — `cse.rs`)
 - **Options:** `gvn=true|false` (default: `true`), `licm=true|false` (default: `true`),
   `hoist_constants=true|false` (default: `false`)
 - **Explanation:** Unified Common Subexpression Elimination (`CSE`), dominator-aware cross-region
   Global Value Numbering (`GVN`), Loop/Region-Invariant Code Motion (`LICM`), and optional
   block-entry constant hoisting/deduplication.
 
-### 1.3 `simplify-algebraic` (`UnifiedSimplifyAlgebraicPass` — `simplify_algebraic.rs`)
+### 1.3 `simplify-algebraic` (`SimplifyAlgebraicPass` — `simplify_algebraic.rs`)
 - **Options:** `fold_constants=true|false` (default: `true`), `conditional=true|false`
   (default: `true`), `egraph=true|false` (default: `true`), `fuse_fma=true|false` (default: `true`),
   `mode=constants|all`
@@ -77,7 +77,7 @@ pass modules and sub-packages (`src/passes/<pass>/`) under `src/passes/`.
   `broadcast_in_dim`, `slice`/`concatenate`, round-trip `convert` casts, and spatial/matrix layout
   conversion & global layout propagation (`layout=nhwc,propagate=true`).
 
-### 2.2 `specialize-shapes` (`UnifiedSpecializeShapesPass` — `specialize_shapes.rs`)
+### 2.2 `specialize-shapes` (`SpecializeShapesPass` — `specialize_shapes.rs`)
 - **Options:** `B=val,S=val,default=val`, `batch=N`, `buckets=1;4;8`, `token_prune_ratio=0.5`
 - **Explanation:** Unified shape specialization engine supporting symbolic dimension binding
   (`B=4`), static batch resizing across activations (`batch=8`), multi-bucket shape-specialized
@@ -102,7 +102,7 @@ pass modules and sub-packages (`src/passes/<pass>/`) under `src/passes/`.
   (`scheme=hadamard` or `hadamard=true`), and **QAT Straight-Through Estimator**
   (`scheme=qat_ste`).
 
-### 3.2 `merge-weights` (`UnifiedMergeWeightsPass` — `merge_weights.rs`)
+### 3.2 `merge-weights` (`MergeWeightsPass` — `merge_weights.rs`)
 - **Options:** `method=linear|slerp|ties|dare|lora|dora`, `t=0.5`, `alpha=1.0`, `lambda=1.0`,
   `drop_rate=0.0`
 - **Explanation:** Unified model merging and adapter baking pass supporting Linear, SLERP, TIES,
@@ -132,7 +132,7 @@ pass modules and sub-packages (`src/passes/<pass>/`) under `src/passes/`.
 
 ## 4. Transformer, GEMM & Operator Fusion Passes (`src/passes/`, 7 Passes)
 
-### 4.1 `fuse-elementwise` (`UnifiedFuseElementwisePass` — `fuse_elementwise/mod.rs`)
+### 4.1 `fuse-elementwise` (`FuseElementwisePass` — `fuse_elementwise/mod.rs`)
 - **Options:** `mode=all|composites|map_reduce|activations|swiglu|gelu|gated_mlp|moe|megakernel`
   (default: `composites`), `shared_expert=true|false`, `top_k=2`, `capacity_factor=1.25`
 - **Explanation:** Single-traversal elementwise, activation, Gated-MLP, MoE, and map-reduce fusion
@@ -148,9 +148,9 @@ pass modules and sub-packages (`src/passes/<pass>/`) under `src/passes/`.
 - **Explanation:** Single-traversal loop-chain fusion pass collapsing linear single-use elementwise
   producer-consumer chains into register-pipelined `castforge.fused_elementwise_chain` composites.
 
-### 4.4 `fission-loops` (`FissionLoopsPass` — `fuse_elementwise/loops.rs`)
+### 4.4 `split-loops` (`SplitLoopsPass` — `fuse_elementwise/loops.rs`)
 - **Options:** `max_steps=3`
-- **Explanation:** Single-traversal register-pressure loop fission pass splitting oversized
+- **Explanation:** Single-traversal register-pressure loop splitting pass splitting oversized
   `castforge.fused_elementwise_chain` composites into chunks of at most `max_steps` operations.
 
 ### 4.5 `fuse-gemm` (`FuseGemmPass` — `fuse_gemm.rs`)
@@ -168,7 +168,7 @@ pass modules and sub-packages (`src/passes/<pass>/`) under `src/passes/`.
   `LayerNorm`, `Softmax`, `LogSoftmax`, and **Liger-Kernel / Flash-Cross-Entropy**
   (`kind=cross_entropy`, `castforge.fused_linear_cross_entropy = true`).
 
-### 4.7 `fuse-attention` (`UnifiedFuseAttentionPass` — `fuse_attention/mod.rs`)
+### 4.7 `fuse-attention` (`FuseAttentionPass` — `fuse_attention/mod.rs`)
 - **Options:** `kind=all|sdpa|rope|mla|ssm|mamba2|kv_cache|paged|flash_decoding|tree|sliding_window`
   (`kv_lora_rank=512`, `state_dim=128`, `chunk_size=64`, `max_seq_len=2048`, `page_block_size=16`,
   `max_blocks=64`, `split_kv=4`, `draft_tokens=4`, `tree_depth=2`, `window_size=4096`,
@@ -232,19 +232,19 @@ pass modules and sub-packages (`src/passes/<pass>/`) under `src/passes/`.
 
 ## 8. IR Surgery, Verification, Profiling & Tooling (`src/passes/` & `src/ir/`, 8 Passes)
 
-1. **`ir-edit` (`IrEditPass` — `ir_edit/mod.rs`):** Single-traversal surgical IR editor and
-   canonicalizer (`rename_op=from:to`, `annotate_op=op:k=v`, `freeze=true,args=arg0:1.0`,
+1. **`normalize-ir` (`NormalizeIrPass` — `normalize_ir/mod.rs`):** Single-traversal surgical IR
+   normalizer and editor (`rename_op=from:to`, `annotate_op=op:k=v`, `freeze=true,args=arg0:1.0`,
    `unfreeze=true,min_elements=2`, `tap=%0;%1`, `ssa=true,prefix=v`, `debuginfo=true,
    attributes=true`, `first=...`, `second=...`, `repeat=N`).
-2. **`inline-calls` (`InlinerPass` — `ir_edit/inliner.rs`):** Single-traversal function inliner
-   replacing `func.call` sites with cloned callee body operations.
-3. **`outline-subgraphs` (`UnifiedOutlineSubgraphsPass` — `ir_edit/outline.rs`):**
+2. **`inline-calls` (`InlineCallsPass` — `normalize_ir/inliner.rs`):** Single-traversal function
+   inliner replacing `func.call` sites with cloned callee body operations.
+3. **`outline-subgraphs` (`OutlineSubgraphsPass` — `normalize_ir/outline.rs`):**
    Single-traversal subgraph outliner and structural deduplicator (`mode=all|gemm|composites`).
-4. **`extract-subgraph` (`ExtractSubgraphPass` — `ir_edit/inliner.rs`):** Single-traversal
+4. **`extract-subgraph` (`ExtractSubgraphPass` — `normalize_ir/inliner.rs`):** Single-traversal
    backward dependency cone slicer (`target=%v,stop_at=%in`).
-5. **`reduce-ir` (`ReduceIrPass` — `ir_edit/inliner.rs`):** Single-traversal delta-debugging IR
-   reducer (`max_ops=N` or `keep_op=...`).
-6. **`verify-ir` (`UnifiedVerifyIrPass` — `src/ir/verify_ir.rs`):** Read-only IR verifier,
+5. **`reduce-ir` (`ReduceIrPass` — `normalize_ir/inliner.rs`):** Single-traversal delta-debugging
+   IR reducer (`max_ops=N` or `keep_op=...`).
+6. **`verify-ir` (`VerifyIrPass` — `src/ir/verify_ir.rs`):** Read-only IR verifier,
    structural FNV-1a hasher, numerical equivalence checker, pass bisector, and Roofline profiler
    (`shapes=true,equiv=true,tol=1e-4,hash=true,bisect=N,profile=true,ridge=10.0`).
 7. **`sanitize-numerics` (`SanitizeNumericsPass` — `src/ir/verify_ir.rs`):** Single-traversal

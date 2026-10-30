@@ -36,7 +36,7 @@ impl PassRegistry {
                     .get("licm")
                     .map(|v| v != "false" && v != "0")
                     .unwrap_or(true);
-                Ok(Box::new(UnifiedCsePass {
+                Ok(Box::new(CsePass {
                     gvn,
                     hoist_constants,
                     licm,
@@ -79,7 +79,7 @@ impl PassRegistry {
                     .get("fuse_fma")
                     .map(|s| s != "false" && s != "0")
                     .unwrap_or(!const_only);
-                Ok(Box::new(UnifiedSimplifyAlgebraicPass {
+                Ok(Box::new(SimplifyAlgebraicPass {
                     fold_constants,
                     include_conditional,
                     egraph,
@@ -213,7 +213,7 @@ impl PassRegistry {
                     .get("drop_rate")
                     .and_then(|s| s.parse::<f32>().ok())
                     .unwrap_or(0.0);
-                Ok(Box::new(UnifiedMergeWeightsPass {
+                Ok(Box::new(MergeWeightsPass {
                     method,
                     t,
                     alpha,
@@ -329,7 +329,7 @@ impl PassRegistry {
                     .get("capacity_factor")
                     .and_then(|s| s.parse::<f32>().ok())
                     .unwrap_or(1.25);
-                Ok(Box::new(UnifiedFuseElementwisePass {
+                Ok(Box::new(FuseElementwisePass {
                     mode,
                     max_steps,
                     shared_expert,
@@ -349,14 +349,14 @@ impl PassRegistry {
             |_opts| Ok(Box::new(FuseLoopsPass)),
         );
         reg.register(
-            "fission-loops",
+            "split-loops",
             "Splits oversized fused_elementwise_chain ops at max_steps register-pressure limits",
             |opts| {
                 let max_steps = opts
                     .get("max_steps")
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(3);
-                Ok(Box::new(FissionLoopsPass { max_steps }))
+                Ok(Box::new(SplitLoopsPass { max_steps }))
             },
         );
         reg.register(
@@ -508,7 +508,7 @@ impl PassRegistry {
                     .or_else(|| opts.get("ssm_chunk_size"))
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(64);
-                Ok(Box::new(UnifiedFuseAttentionPass {
+                Ok(Box::new(FuseAttentionPass {
                     kind,
                     kv_lora_rank,
                     max_seq_len,

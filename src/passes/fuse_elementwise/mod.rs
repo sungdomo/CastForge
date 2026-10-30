@@ -2,8 +2,8 @@
 //! (`fuse-elementwise`).
 //!
 //! Organized into cohesive submodules:
-//! - [`mod.rs`](self): `UnifiedFuseElementwisePass`, `FuseMapReducePass`, `FuseElementwisePass`
-//! - [`loops`]: `FuseLoopsPass`, `FissionLoopsPass`, `FuseMegakernelPass`
+//! - [`mod.rs`](self): `FuseElementwisePass`, `FuseMapReducePass`, `FuseAddMaxPass`
+//! - [`loops`]: `FuseLoopsPass`, `SplitLoopsPass`, `FuseMegakernelPass`
 //! - [`decompose`]: `DecomposeCompositesPass`
 //! - [`decompose_helpers`]: Primitive StableHLO expansion builders for composite decomposition
 //! - [`activations`]: `FuseActivationsPass`, `FuseSwiGluPass`, `FuseGeluPass`, `FuseGatedMlpPass`,
@@ -27,7 +27,7 @@ use smallvec::SmallVec;
 
 /// Unified Elementwise, Activation, Gated-MLP, MoE, Map-Reduce, Loop-Chain Fusion & Composite
 /// Decomposition Pass (`fuse-elementwise`).
-pub struct UnifiedFuseElementwisePass {
+pub struct FuseElementwisePass {
     pub mode: String,
     pub max_steps: usize,
     pub shared_expert: bool,
@@ -35,7 +35,7 @@ pub struct UnifiedFuseElementwisePass {
     pub capacity_factor: f32,
 }
 
-impl Default for UnifiedFuseElementwisePass {
+impl Default for FuseElementwisePass {
     fn default() -> Self {
         Self {
             mode: "composites".to_string(),
@@ -47,7 +47,7 @@ impl Default for UnifiedFuseElementwisePass {
     }
 }
 
-impl Pass for UnifiedFuseElementwisePass {
+impl Pass for FuseElementwisePass {
     fn name(&self) -> &'static str {
         "fuse-elementwise"
     }
@@ -67,7 +67,7 @@ impl Pass for UnifiedFuseElementwisePass {
             let mut steps = vec![FuseLoopsPass.run(module)?];
             if self.max_steps > 0 {
                 steps.push(
-                    FissionLoopsPass {
+                    SplitLoopsPass {
                         max_steps: self.max_steps,
                     }
                     .run(module)?,
@@ -232,10 +232,10 @@ fn match_map_producer(module: &Module, val_id: ValueId) -> Option<(ValueId, &'st
     }
 }
 
-/// Fuse Elementwise Pass (`stablehlo.add` + `stablehlo.maximum` -> `stablehlo.composite`).
-pub struct FuseElementwisePass;
+/// Fuse Elementwise Add+Max helper (`stablehlo.add` + `stablehlo.maximum` -> composite).
+pub struct FuseAddMaxPass;
 
-impl Pass for FuseElementwisePass {
+impl Pass for FuseAddMaxPass {
     fn name(&self) -> &'static str {
         "fuse-elementwise"
     }
