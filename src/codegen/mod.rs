@@ -8,11 +8,7 @@ pub mod backend;
 pub mod cost_model;
 pub mod eval;
 pub mod memory_plan;
-pub mod target_c;
-pub mod target_cuda;
-pub mod target_msl;
-pub mod target_rust;
-pub mod target_wgsl;
+pub mod targets;
 
 pub use crate::codegen::autotune::{
     AutotuneCandidate, AutotuneReport, AutotuneScheduleTranslator, JitBenchmarkResult,
@@ -35,17 +31,16 @@ pub use crate::codegen::memory_plan::{
     BufferAllocation, LiveInterval, MemoryPlan, build_memory_plan, compute_block_liveness,
     compute_module_liveness,
 };
-pub use crate::codegen::target_c::{
+pub use crate::codegen::targets::{
     CHeaderTranslator, SharedLibTranslator, compile_shared_lib, emit_c_header, emit_c_module,
-    emit_c_module_with_config,
+    emit_c_module_with_config, emit_cuda_from_loop_ir, emit_cuda_module_with_config,
+    emit_hip_from_loop_ir, emit_hip_module_with_config, emit_msl_from_loop_ir,
+    emit_msl_module_with_config, emit_opencl_from_loop_ir, emit_opencl_module_with_config,
+    emit_rust_module, emit_rust_module_with_config, emit_wgsl_module, emit_wgsl_module_with_config,
 };
-pub use crate::codegen::target_cuda::{emit_cuda_from_loop_ir, emit_cuda_module_with_config};
-pub use crate::codegen::target_msl::{emit_msl_from_loop_ir, emit_msl_module_with_config};
-pub use crate::codegen::target_rust::{emit_rust_module, emit_rust_module_with_config};
-pub use crate::codegen::target_wgsl::{emit_wgsl_module, emit_wgsl_module_with_config};
-pub use crate::ir::loop_ir::{LoopKernel, LoopModule, LoopStmt};
+pub use crate::ir::loops::{LoopKernel, LoopModule, LoopStmt};
 use crate::ir::{Dim, Module, TensorType, ValueId};
-pub use crate::passes::schedule_loops::loop_opt::{
+pub use crate::passes::schedule_loops::lower_loops::{
     LoopPass, OptimizeLoopIrPass, OptimizeLoopIrTranslator, TensorToLoopTranslator,
     lower_to_loop_ir,
 };

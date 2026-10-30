@@ -1,6 +1,6 @@
 //! Apple Metal Shading Language (`.metal`) GPU Kernel Code Generator (`CodegenTarget::Msl`).
 
-use crate::codegen::target_cuda::emit_cuda_stmt_seq;
+use crate::codegen::targets::cuda::emit_cuda_stmt_seq;
 use crate::codegen::{LoopModule, LoopStmt, TargetConfig, lower_to_loop_ir};
 use crate::ir::Module;
 use anyhow::Result;

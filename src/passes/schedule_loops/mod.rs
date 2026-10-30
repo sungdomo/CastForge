@@ -5,11 +5,11 @@
 //! `permute-loops`, `unroll-loops`, `vectorize-loops`, and `lower-tensor-cores`
 //! (`tensor_cores=wgmma|wmma|mfma|simdgroup`) into [`ScheduleLoopsPass`].
 
-pub mod loop_opt;
-pub mod lowering;
+pub mod gemm_conv;
+pub mod lower_loops;
 
-pub use loop_opt::*;
-pub use lowering::*;
+pub use gemm_conv::*;
+pub use lower_loops::*;
 
 use crate::ir::{Attribute, BlockId, Module};
 use crate::passes::{Pass, PassResult};
