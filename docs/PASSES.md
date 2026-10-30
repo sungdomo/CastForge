@@ -1,11 +1,11 @@
 # CastForge — Complete Reference of All 21 Graph IR Passes (+ Unified LoopIR Pass)
 
 CastForge provides **21 built-in modular A-to-B IR passes & presets** (`18 passes + 3 presets
-O1/O2/O3`) across `src/passes/` and `src/ir/verify_ir/` (plus the unified **`OptimizeLoopIrPass`**
+O1/O2/O3`) across `src/passes/` and `src/ir/verify_ir.rs` (plus the unified **`OptimizeLoopIrPass`**
 (`optimize-loop-ir`) in `src/codegen/`). Core pass execution infrastructure (`Pass`, `PassManager`,
-`PassRegistry`) and `verify-ir` live in `src/ir/`, while all transformation passes and
-`PassRegistry::with_builtin_passes()` are organized into focused pass modules and sub-packages
-(`src/passes/<pass>/`) under `src/passes/`.
+`PassRegistry`) and `verify-ir` (`src/ir/verify_ir.rs`) live in `src/ir/`, while all transformation
+passes and `PassRegistry::with_builtin_passes()` are organized into focused pass modules and
+sub-packages (`src/passes/<pass>/`) under `src/passes/`.
 
 ---
 

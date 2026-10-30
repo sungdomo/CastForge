@@ -20,7 +20,7 @@ support.
 - [`src/ir`](src/ir): Arena-allocated MLIR-compatible Dual-Plane IR (`Module`, `Operation`, `Value`,
   `Block`, `Region`, `Type`, `Attribute`, `Location`), core pass & pipeline infrastructure (`Pass`,
   `PassManager`, `PassRegistry`, `PipelineConfig` in `pass_manager.rs`), unified IR verification,
-  structural hashing, equivalence, sanitization & Roofline profiling (`verify_ir/`), `TensorStore`
+  structural hashing, equivalence, sanitization & Roofline profiling (`verify_ir.rs`), `TensorStore`
   weight plane & `.safetensors` zero-copy I/O (`tensor_store.rs`), strongly-typed `StableHloOp` and
   `FuncView` dialect views (`stablehlo.rs`), zero-C++ MLIR parser (`parser.rs`) & printer
   (`mlir.rs`), symmetric **GGUF v2/v3**, **ONNX-JSON**, and **SafeTensors** model importers &

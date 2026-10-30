@@ -90,7 +90,7 @@ CastForge is built around three foundational design principles:
 
 - **`src/ir`**: Core arena-backed SSA data structures (`Module`, `Operation`, `Value`, `Block`,
   `Region`), `Type`/`DType`/`Dim`, `Pass`/`PassManager`/`PassRegistry`/`PipelineConfig`
-  (`pass_manager.rs`), unified IR verifier/hasher/profiler (`verify_ir/`), `TensorStore`
+  (`pass_manager.rs`), unified IR verifier/hasher/profiler (`verify_ir.rs`), `TensorStore`
   (`tensor_store.rs`), strongly-typed `StableHloOp` dialect views (`stablehlo.rs`), MLIR
   parser/printer (`parser.rs`, `mlir.rs`), ONNX/GGUF importers/exporters (`import.rs`),
   Mermaid/DOT/JSON/HTML/Diff graph visualizers (`viz.rs`), and
@@ -192,7 +192,7 @@ target-independent `LoopModule` consisting of `LoopKernel`s and recursive `LoopS
 
 ## 7. Verification, Bisection & Roofline Cost Modeling
 
-- **Shape & Dominance Verification (`src/ir/verify_ir/`, `src/ir/stablehlo.rs`):** Every pass
+- **Shape & Dominance Verification (`src/ir/verify_ir.rs`, `src/ir/stablehlo.rs`):** Every pass
   in `PassManager` can automatically invoke `module.verify()` + `verify_stablehlo_shapes(&module)`
   after execution.
 - **Reference Interpreter (`src/codegen/eval.rs`):** Evaluates all StableHLO operations and all
