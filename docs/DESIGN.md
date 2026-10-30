@@ -90,12 +90,12 @@ CastForge is built around three foundational design principles:
 ## 3. Source Module Topology (`src/`)
 
 - **`src/ir`**: Core arena-backed SSA data structures (`Module`, `Operation`, `Value`, `Block`,
-  `Region`), `Type`/`DType`/`Dim`, `Pass`/`PassManager`/`PassRegistry`/`PipelineConfig`
-  (`pass_manager.rs`), unified IR verifier/hasher/profiler (`verify.rs`), `TensorStore`
-  (`tensor_store.rs`), strongly-typed `StableHloOp` dialect views (`stablehlo.rs`), MLIR
-  parser/printer (`parser.rs`, `printer.rs`), ONNX/GGUF/HF importers/exporters (`src/ir/formats/`),
-  Mermaid/DOT/JSON/HTML/Diff graph visualizers (`viz.rs`), and
-  `Payload`/`Translator`/`TranslatorChain`.
+  `Region`) and `Type`/`DType`/`Dim`/`Attribute` (`mlir.rs`),
+  `Pass`/`PassManager`/`PassRegistry`/`PipelineConfig` (`pass_manager.rs`), unified IR
+  verifier/hasher/profiler (`verify.rs`), `TensorStore` (`tensor_store.rs`), strongly-typed
+  `StableHloOp` dialect views (`stablehlo.rs`), MLIR parser/printer (`parser.rs`, `printer.rs`),
+  ONNX/GGUF/HF importers/exporters (`src/ir/formats/`), Mermaid/DOT/JSON/HTML/Diff graph
+  visualizers (`viz.rs`), and `Payload`/`Translator`/`TranslatorChain`.
 - **`src/passes`**: `PassRegistry::with_builtin_passes()` (`src/passes/registry/`) and **115
   built-in hierarchical Graph IR transformation passes and presets** (`38` top-level/composite
   passes & presets + `77` single-optimization leaf passes) across 18 modular pass subdirectories.

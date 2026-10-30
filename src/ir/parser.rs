@@ -1,3 +1,5 @@
+//! Zero-C++ MLIR & StableHLO text parser and [`MlirParseTranslator`] (`castforge::ir::parser`).
+
 use crate::ir::{
     Attribute, BlockId, DType, Dim, Location, Module, OpName, TensorType, Type, ValueId,
 };
@@ -177,39 +179,6 @@ impl MlirParser {
         // Special case: `stablehlo.reduce(%in init: %init) applies <op> across dimensions = [...]`
         if op_name.dialect == "stablehlo" && op_name.name == "reduce" && rest.starts_with('(') {
             return self.parse_reduce_short_op(module, block, lhs_names, rest, location, line_no);
-        }
-
-        // Special case: `stablehlo.iota dim = 0 : tensor<...>`
-        if op_name.dialect == "stablehlo" && op_name.name == "iota" && rest.starts_with("dim") {
-            let colon_idx = find_top_level_colon(rest).ok_or_else(|| ParseError::Syntax {
-                line: line_no,
-                message: "Expected `: <type>` in `stablehlo.iota`".to_string(),
-            })?;
-            let dim_part = rest[..colon_idx]
-                .trim()
-                .trim_start_matches("dim")
-                .trim()
-                .trim_start_matches('=')
-                .trim();
-            let dim_val = dim_part.parse::<i64>().unwrap_or(0);
-            let ty = parse_type(rest[colon_idx + 1..].trim(), line_no)?;
-            let mut attrs = IndexMap::new();
-            attrs.insert("iota_dimension".to_string(), Attribute::Int(dim_val));
-            let res_name = lhs_names.into_iter().next();
-            let op_id = module.add_operation(
-                block,
-                op_name,
-                SmallVec::new(),
-                vec![(res_name.clone(), ty)],
-                attrs,
-                Vec::new(),
-                true,
-                location,
-            );
-            if let Some(name) = res_name {
-                self.value_map.insert(name, module.ops[op_id].results[0]);
-            }
-            return Ok(());
         }
 
         // Special case: `func.call @callee(%a, %b) : (...) -> ...`
@@ -1090,10 +1059,18 @@ pub fn parse_type(s: &str, line_no: usize) -> Result<Type, ParseError> {
         }));
     }
 
-    Ok(Type::Scalar(parse_dtype(s)))
+    if let Some(dt) = try_parse_dtype(s) {
+        Ok(Type::Scalar(dt))
+    } else {
+        Ok(Type::Opaque(s.to_string()))
+    }
 }
 
 pub(crate) fn parse_dtype(s: &str) -> DType {
+    try_parse_dtype(s).unwrap_or(DType::F32)
+}
+
+pub(crate) fn try_parse_dtype(s: &str) -> Option<DType> {
     let s = s.trim();
     if let Some(q_inner) = s
         .strip_prefix("!quant.uniform<")
@@ -1102,32 +1079,32 @@ pub(crate) fn parse_dtype(s: &str) -> DType {
     {
         let (st_str, ex_str) = types_part.split_once(':').unwrap_or(("i8", "f32"));
         let (sc_str, zp_str) = scale_part.trim().split_once(':').unwrap_or(("1.0", "0"));
-        return DType::QuantUniform {
+        return Some(DType::QuantUniform {
             storage_type: Box::new(parse_dtype(st_str.trim())),
             expressed_type: Box::new(parse_dtype(ex_str.trim())),
             scale: sc_str.trim().to_string(),
             zero_point: zp_str.trim().parse::<i64>().unwrap_or(0),
-        };
+        });
     }
     match s {
-        "i1" => DType::I1,
-        "i4" => DType::I4,
-        "i8" => DType::I8,
-        "i16" => DType::I16,
-        "i32" => DType::I32,
-        "i64" => DType::I64,
-        "ui8" => DType::U8,
-        "ui16" => DType::U16,
-        "ui32" => DType::U32,
-        "ui64" => DType::U64,
-        "f8E4M3FN" => DType::F8E4M3FN,
-        "f8E5M2" => DType::F8E5M2,
-        "f16" => DType::F16,
-        "bf16" => DType::BF16,
-        "f32" => DType::F32,
-        "f64" => DType::F64,
-        "index" => DType::Index,
-        _ => DType::F32,
+        "i1" => Some(DType::I1),
+        "i4" => Some(DType::I4),
+        "i8" => Some(DType::I8),
+        "i16" => Some(DType::I16),
+        "i32" => Some(DType::I32),
+        "i64" => Some(DType::I64),
+        "ui8" => Some(DType::U8),
+        "ui16" => Some(DType::U16),
+        "ui32" => Some(DType::U32),
+        "ui64" => Some(DType::U64),
+        "f8E4M3FN" => Some(DType::F8E4M3FN),
+        "f8E5M2" => Some(DType::F8E5M2),
+        "f16" => Some(DType::F16),
+        "bf16" => Some(DType::BF16),
+        "f32" => Some(DType::F32),
+        "f64" => Some(DType::F64),
+        "index" => Some(DType::Index),
+        _ => None,
     }
 }
 

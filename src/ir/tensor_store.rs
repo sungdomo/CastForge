@@ -1,3 +1,7 @@
+//! Weight Plane (`TensorStore`), `TensorEntry`, `TensorBacking`, IEEE `f16`/`bf16` conversion
+//! helpers, N-D dense literal formatting, and binary `.safetensors` serialization
+//! (`castforge::ir::tensor_store`).
+
 use crate::ir::{Attribute, DType, Dim, TensorType};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
