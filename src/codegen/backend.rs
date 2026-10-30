@@ -12,7 +12,7 @@ use crate::codegen::loop_ir::{
 use crate::codegen::target_c::emit_c_module_with_config;
 use crate::codegen::target_rust::emit_rust_module_with_config;
 use crate::codegen::{TargetConfig, build_memory_plan, tensor_len, tensor_shape_dims, value_ident};
-use crate::ir::{DType, Module, OpId, Payload, Translator, ValueId};
+use crate::ir::{Attribute, DType, Module, OpId, Payload, Translator, ValueId};
 use crate::stablehlo::StableHloOp;
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
@@ -728,6 +728,29 @@ fn emit_wgsl_func(
                 "        {res_name}[i] = f32({src_name}[i] - {zp}i) * {scale:.6};"
             )?;
             writeln!(out, "    }}")?;
+            continue;
+        }
+
+        if op.is_op("func", "call") {
+            let callee = match op.attributes.get("callee") {
+                Some(Attribute::SymbolRef(s)) | Some(Attribute::String(s)) => {
+                    s.trim_start_matches('@').to_string()
+                }
+                _ => "outlined_fn".to_string(),
+            };
+            writeln!(
+                out,
+                "    // func.call @{callee} ({} args)",
+                op.operands.len()
+            )?;
+            writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+            if let Some(&arg0) = op.operands.first() {
+                let a = value_ident(module, arg0, &mut names, &mut counter);
+                let a_len = tensor_len(module, arg0).max(1);
+                writeln!(out, "    for (var i = 0u; i < {res_len}u; i = i + 1u) {{")?;
+                writeln!(out, "        {res_name}[i] = {a}[i % {a_len}u];")?;
+                writeln!(out, "    }}")?;
+            }
             continue;
         }
 

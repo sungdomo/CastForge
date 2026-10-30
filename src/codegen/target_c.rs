@@ -110,7 +110,31 @@ pub fn emit_c_module_with_config(module: &Module, base_cfg: &TargetConfig) -> Re
         SimdIsa::Scalar => writeln!(out)?,
     }
 
-    for fn_op_id in module.functions() {
+    let funcs = module.functions();
+    if funcs.len() > 1 {
+        for &fn_op_id in &funcs {
+            let fn_op = &module.ops[fn_op_id];
+            let fn_name = sanitize_ident(
+                fn_op
+                    .attributes
+                    .get("sym_name")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("forward"),
+            );
+            if let Some(&reg_id) = fn_op.regions.first()
+                && let Some(&blk_id) = module.regions[reg_id].blocks.first()
+            {
+                let mut proto_params: Vec<String> = (0..module.blocks[blk_id].arguments.len())
+                    .map(|i| format!("const float* restrict arg_{i}"))
+                    .collect();
+                proto_params.push("float* restrict out_buf".to_string());
+                writeln!(out, "void {fn_name}({});", proto_params.join(", "))?;
+            }
+        }
+        writeln!(out)?;
+    }
+
+    for fn_op_id in funcs {
         emit_c_func(module, fn_op_id, &plan, config, &mut out)?;
     }
 
@@ -243,6 +267,23 @@ fn emit_c_func(
                 "        {res_name}[i] = ((float)((int32_t){src_name}[i] - {zp})) * {scale:.6}f;"
             )?;
             writeln!(out, "    }}")?;
+            continue;
+        }
+
+        if op.is_op("func", "call") {
+            let callee = sanitize_ident(
+                op.attributes
+                    .get("callee")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("callee"),
+            );
+            let mut call_args: Vec<String> = op
+                .operands
+                .iter()
+                .map(|&v| value_ident(module, v, &mut names, &mut counter))
+                .collect();
+            call_args.push(res_name.clone());
+            writeln!(out, "    {callee}({});", call_args.join(", "))?;
             continue;
         }
 

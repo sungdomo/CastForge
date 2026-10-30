@@ -267,6 +267,14 @@ fn profile_single_op(module: &Module, op_id: OpId, roofline: &HardwareRoofline) 
         } else {
             (op.name.full_name(), op.name.name.clone())
         }
+    } else if op.is_op("func", "call") {
+        let callee = match op.attributes.get("callee") {
+            Some(Attribute::SymbolRef(s)) | Some(Attribute::String(s)) => {
+                s.trim_start_matches('@').to_string()
+            }
+            _ => "callee".to_string(),
+        };
+        (format!("func.call(@{callee})"), "call".to_string())
     } else {
         (op.name.full_name(), op.name.name.clone())
     };
@@ -315,6 +323,34 @@ fn profile_single_op(module: &Module, op_id: OpId, roofline: &HardwareRoofline) 
         .unwrap_or(0);
 
     let flops = match short {
+        "call" => {
+            let callee_sym = match op.attributes.get("callee") {
+                Some(Attribute::SymbolRef(s)) | Some(Attribute::String(s)) => {
+                    s.trim_start_matches('@')
+                }
+                _ => "",
+            };
+            let mut callee_flops = 0u64;
+            for fn_id in module.functions() {
+                let sym = match module.ops[fn_id].attributes.get("sym_name") {
+                    Some(Attribute::SymbolRef(s)) | Some(Attribute::String(s)) => {
+                        s.trim_start_matches('@')
+                    }
+                    _ => "",
+                };
+                if sym == callee_sym
+                    && let Some(&reg) = module.ops[fn_id].regions.first()
+                    && let Some(&blk) = module.regions[reg].blocks.first()
+                {
+                    for &inner_id in &module.blocks[blk].ops {
+                        if inner_id != op_id && !module.ops[inner_id].is_op("func", "call") {
+                            callee_flops += profile_single_op(module, inner_id, roofline).flops;
+                        }
+                    }
+                }
+            }
+            callee_flops.max(out_elems)
+        }
         "dot_general" | "fused_matmul_bias" | "fused_matmul_epilogue" | "fused_qmatmul" => {
             let lhs_dims = op
                 .operands

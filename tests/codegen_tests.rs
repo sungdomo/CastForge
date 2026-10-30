@@ -1277,6 +1277,23 @@ module @ir_tools_demo {
     let out_rep = verify_module_numerics(&base, &outlined, 1e-5).expect("verify outlined");
     assert!(out_rep.passed);
 
+    // Verify Rust, C99, WGSL codegen and Roofline cost model on multi-function `func.call` module
+    let out_rust = generate_code(&outlined, CodegenTarget::Rust).expect("rust outlined");
+    assert!(out_rust.contains("outlined_kernel_0("));
+    let out_c = generate_code(&outlined, CodegenTarget::C).expect("c outlined");
+    assert!(out_c.contains("void outlined_kernel_0("));
+    assert!(out_c.contains("outlined_kernel_0("));
+    let out_wgsl = generate_code(&outlined, CodegenTarget::Wgsl).expect("wgsl outlined");
+    assert!(out_wgsl.contains("// func.call @outlined_kernel_0"));
+    let out_cost = analyze_module_cost_with_roofline(&outlined, &HardwareRoofline::default());
+    assert!(out_cost.total_flops > 0);
+    assert!(
+        out_cost
+            .ops
+            .iter()
+            .any(|o| o.op_name.contains("func.call(@outlined_kernel_0)"))
+    );
+
     let mut re_inlined = outlined.clone();
     let mut inl_pm = PassManager::from_pipeline_str(&registry, "normalize-ir(mode=inline) | dce")
         .expect("inline-calls");

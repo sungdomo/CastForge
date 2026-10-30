@@ -267,6 +267,55 @@ fn emit_rust_func(
             continue;
         }
 
+        if op.is_op("func", "call") {
+            let callee = sanitize_ident(
+                op.attributes
+                    .get("callee")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("callee"),
+            );
+            let mut call_args = Vec::new();
+            for (arg_i, &opnd) in op.operands.iter().enumerate() {
+                let opnd_len = tensor_len(module, opnd);
+                if let Some(off) = plan.arena_f32_offset(opnd) {
+                    let tmp = format!("{res_name}_arg{arg_i}");
+                    writeln!(out, "    let mut {tmp} = [0.0_f32; {opnd_len}];")?;
+                    writeln!(
+                        out,
+                        "    {tmp}.copy_from_slice(&arena[{off}..{}]);",
+                        off + opnd_len
+                    )?;
+                    call_args.push(format!("&{tmp}"));
+                } else {
+                    let n = value_ident(module, opnd, &mut names, &mut counter);
+                    if block.arguments.contains(&opnd) {
+                        call_args.push(n);
+                    } else {
+                        call_args.push(format!("&{n}"));
+                    }
+                }
+            }
+            if let Some(off) = plan.arena_f32_offset(res_val) {
+                writeln!(
+                    out,
+                    "    let {res_name}_ret = {callee}({});",
+                    call_args.join(", ")
+                )?;
+                writeln!(
+                    out,
+                    "    arena[{off}..{}].copy_from_slice(&{res_name}_ret);",
+                    off + res_len
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "    let {res_name}: [f32; {res_len}] = {callee}({});",
+                    call_args.join(", ")
+                )?;
+            }
+            continue;
+        }
+
         emit_rust_hlo_op(
             module,
             plan,
