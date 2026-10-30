@@ -17,7 +17,10 @@ use crate::mlir::{
     OnnxExportTranslator, OnnxImportTranslator, PrintOptions, SafetensorsExportTranslator,
     import_gguf_file, import_onnx_file, parse_mlir, print_mlir, print_mlir_with_options,
 };
-use crate::passes::{PassManager, PassRegistry, parse_pass_spec_item, split_pipeline_spec};
+use crate::passes::{
+    ComposeFunctionsPass, Pass, PassManager, PassRegistry, link_modules, parse_pass_spec_item,
+    split_pipeline_spec,
+};
 use crate::viz::{
     IrDiffTranslator, SnapshotIrTranslator, TimelineFrame, VizFormat, VizTranslator,
     build_graph_json, render_module, render_timeline_html,
@@ -205,6 +208,10 @@ pub enum Commands {
         /// Hardware SIMD ISA for explicit intrinsics: scalar, avx2, or neon
         #[arg(long = "simd-isa", default_value = "scalar")]
         simd_isa: String,
+
+        /// Optional hardware architecture profile (e.g. x86_64-avx2, apple-m-series, cuda-sm80)
+        #[arg(long = "arch")]
+        arch: Option<String>,
     },
 
     /// Analyze FLOPs, memory bandwidth traffic, arithmetic intensity, and Roofline bottlenecks
@@ -223,6 +230,10 @@ pub enum Commands {
         /// Peak hardware memory bandwidth in GB/s
         #[arg(long = "peak-bw-gbps", default_value_t = 100.0)]
         peak_bw_gbps: f64,
+
+        /// Optional hardware architecture Roofline preset (e.g. nvidia-hopper, apple-m-series)
+        #[arg(long = "arch")]
+        arch: Option<String>,
     },
 
     /// Auto-tune polyhedral/HPC loop schedules using the Roofline & cache model
@@ -249,6 +260,10 @@ pub enum Commands {
         /// Compile and empirically benchmark top schedules via native JIT
         #[arg(long = "bench-jit")]
         bench_jit: bool,
+
+        /// Optional hardware architecture Roofline preset (e.g. x86_64-avx512, nvidia-hopper)
+        #[arg(long = "arch")]
+        arch: Option<String>,
     },
 
     /// Import an external model (GGUF v2/v3, ONNX JSON, or HuggingFace config.json) into IR
@@ -311,8 +326,31 @@ pub enum Commands {
         output: Option<PathBuf>,
     },
 
+    /// Link two or more MLIR modules into a single module and optionally compose entry functions
+    Link {
+        /// Input MLIR file paths to link in order
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
+
+        /// Optional pair of functions `first,second` to chain via `compose-functions`
+        #[arg(long = "compose")]
+        compose: Option<String>,
+
+        /// Optional pass pipeline to run after linking
+        #[arg(short = 'p', long = "passes")]
+        passes: Option<String>,
+
+        /// Optional output MLIR file path (defaults to stdout)
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
+    },
+
     /// List all registered transformation and optimization passes
-    ListPasses,
+    ListPasses {
+        /// Display composite pass hierarchy (`child_passes`) as a tree
+        #[arg(short = 't', long = "tree")]
+        tree: bool,
+    },
 
     /// Dynamically invoke a single pass or preset directly by subcommand name
     /// (e.g., `castforge canonicalize model.mlir` or `castforge fold-views model.mlir`)
@@ -551,6 +589,7 @@ pub fn run() -> Result<()> {
             loop_skew,
             double_buffer,
             simd_isa,
+            arch,
         } => {
             let src = read_input_text(input.as_ref())?;
             let mut module = parse_mlir(&src)?;
@@ -580,25 +619,29 @@ pub fn run() -> Result<()> {
                 plan.reusable_slot_count
             );
 
-            let cfg = TargetConfig {
-                tile_m: tile_size,
-                tile_n: tile_size,
-                tile_k: tile_size,
-                simd_width: 8,
-                wgsl_workgroup_size: workgroup_size,
-                loop_order: GemmLoopOrder::parse(&loop_order),
-                unroll_factor: unroll.max(1),
-                vectorize,
-                reg_tile_m: reg_tile,
-                reg_tile_n: reg_tile,
-                collapse_loops,
-                parallel,
-                l2_tile_size,
-                prefetch_distance: prefetch,
-                split_k: split_k.max(1),
-                loop_skew,
-                double_buffer,
-                simd_isa: crate::codegen::SimdIsa::parse(&simd_isa),
+            let cfg = if let Some(arch_name) = arch {
+                TargetConfig::for_arch(&arch_name)
+            } else {
+                TargetConfig {
+                    tile_m: tile_size,
+                    tile_n: tile_size,
+                    tile_k: tile_size,
+                    simd_width: 8,
+                    wgsl_workgroup_size: workgroup_size,
+                    loop_order: GemmLoopOrder::parse(&loop_order),
+                    unroll_factor: unroll.max(1),
+                    vectorize,
+                    reg_tile_m: reg_tile,
+                    reg_tile_n: reg_tile,
+                    collapse_loops,
+                    parallel,
+                    l2_tile_size,
+                    prefetch_distance: prefetch,
+                    split_k: split_k.max(1),
+                    loop_skew,
+                    double_buffer,
+                    simd_isa: crate::codegen::SimdIsa::parse(&simd_isa),
+                }
             };
             let code = generate_code_with_config(&module, tgt, &cfg)?;
             if let Some(out_path) = output {
@@ -613,10 +656,14 @@ pub fn run() -> Result<()> {
             passes,
             peak_gflops,
             peak_bw_gbps,
+            arch,
         } => {
             let src = read_input_text(input.as_ref())?;
             let mut module = parse_mlir(&src)?;
-            let roofline = HardwareRoofline::new(peak_gflops, peak_bw_gbps);
+            let roofline = match arch {
+                Some(a) => HardwareRoofline::for_arch(&a),
+                None => HardwareRoofline::new(peak_gflops, peak_bw_gbps),
+            };
             let before = analyze_module_cost_with_roofline(&module, &roofline);
             if let Some(spec) = passes {
                 println!("=== Baseline Cost Profile ===");
@@ -656,6 +703,7 @@ pub fn run() -> Result<()> {
             peak_bw_gbps,
             top_k,
             bench_jit,
+            arch,
         } => {
             let src = read_input_text(input.as_ref())?;
             let mut module = parse_mlir(&src)?;
@@ -663,7 +711,10 @@ pub fn run() -> Result<()> {
                 let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
                 pm.run(&mut module)?;
             }
-            let roofline = HardwareRoofline::new(peak_gflops, peak_bw_gbps);
+            let roofline = match arch {
+                Some(a) => HardwareRoofline::for_arch(&a),
+                None => HardwareRoofline::new(peak_gflops, peak_bw_gbps),
+            };
             let report = if bench_jit {
                 autotune_module_jit(&module, &roofline, top_k)?
             } else {
@@ -793,12 +844,61 @@ pub fn run() -> Result<()> {
             }
         }
 
-        Commands::ListPasses => {
+        Commands::Link {
+            inputs,
+            compose,
+            passes,
+            output,
+        } => {
+            let first_src = read_input_text(inputs.first())?;
+            let mut base = parse_mlir(&first_src)?;
+            for path in inputs.iter().skip(1) {
+                let src = read_input_text(Some(path))?;
+                let other = parse_mlir(&src)?;
+                link_modules(&mut base, &other)?;
+            }
+            if let Some(pair) = compose
+                && let Some((f1, f2)) = pair.split_once(',')
+            {
+                let mut comp = ComposeFunctionsPass {
+                    first: f1.trim().to_string(),
+                    second: f2.trim().to_string(),
+                    entry_name: "composed_main".to_string(),
+                };
+                comp.run(&mut base)?;
+            }
+            if let Some(spec) = passes {
+                let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
+                pm.run(&mut base)?;
+            }
+            let formatted = print_mlir(&base);
+            if let Some(out_path) = output {
+                fs::write(&out_path, formatted)?;
+            } else {
+                print!("{formatted}");
+            }
+        }
+
+        Commands::ListPasses { tree } => {
             println!("Available CastForge Passes:");
-            println!("{:<20} DESCRIPTION", "PASS NAME");
-            println!("{}", "-".repeat(78));
+            println!("{:<28} DESCRIPTION", "PASS NAME");
+            println!("{}", "-".repeat(86));
             for (name, desc) in registry.list() {
-                println!("{:<20} {}", name, desc);
+                println!("{:<28} {}", name, desc);
+                if tree
+                    && let Ok(instance) = registry.create_pass(name, &Default::default())
+                    && instance.is_composite()
+                {
+                    let children = instance.child_passes();
+                    for (idx, child) in children.iter().enumerate() {
+                        let branch = if idx + 1 == children.len() {
+                            "└─"
+                        } else {
+                            "├─"
+                        };
+                        println!("  {branch} {child}");
+                    }
+                }
             }
         }
 

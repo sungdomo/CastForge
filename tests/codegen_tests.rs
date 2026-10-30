@@ -2331,4 +2331,14 @@ module @gather_scatter_mod {
     assert!((bmm_outs[0][1] - 1.5).abs() < 1e-5);
     // Batch 1, row 1 dot row 1 = 1^2 + 2^2 + 1^2 = 6.0; + bias[1] (-0.5) = 5.5
     assert!((bmm_outs[0][7] - 5.5).abs() < 1e-5);
+
+    // Verify HardwareRoofline::for_arch presets and composite Pass::child_passes hierarchy
+    let hopper_rf = HardwareRoofline::for_arch("nvidia-hopper");
+    assert!(hopper_rf.peak_gflops >= 60_000.0);
+    assert!(hopper_rf.ridge_point() > 10.0);
+    let apple_rf = HardwareRoofline::for_arch("apple-m-series");
+    assert!(apple_rf.peak_bandwidth_gbps >= 400.0);
+    let o3_pass = registry.create_pass("O3", &Default::default()).expect("O3");
+    assert!(o3_pass.is_composite());
+    assert!(!o3_pass.child_passes().is_empty());
 }

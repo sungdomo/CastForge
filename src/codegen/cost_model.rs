@@ -36,6 +36,24 @@ impl HardwareRoofline {
     pub fn ridge_point(&self) -> f64 {
         self.peak_gflops / self.peak_bandwidth_gbps.max(1e-9)
     }
+
+    /// Creates a pre-configured [`HardwareRoofline`] for a named CPU or GPU architecture profile.
+    pub fn for_arch(arch: &str) -> Self {
+        match arch.trim().to_ascii_lowercase().as_str() {
+            "x86_64-avx512" | "avx512" => Self::new(2048.0, 200.0),
+            "x86_64-avx2" | "x86_64" | "avx2" => Self::new(1024.0, 100.0),
+            "aarch64-sve" | "sve" => Self::new(1536.0, 160.0),
+            "aarch64-neon" | "aarch64" | "arm64" | "neon" => Self::new(768.0, 100.0),
+            "metal-apple" | "apple-m-series" | "metal" | "msl" => Self::new(14000.0, 400.0),
+            "cuda-sm80" | "nvidia-ampere" | "cuda" => Self::new(19500.0, 1555.0),
+            "nvidia-hopper" | "hopper" | "sm90" => Self::new(67000.0, 3350.0),
+            "nvidia-blackwell" | "blackwell" | "sm100" => Self::new(140000.0, 8000.0),
+            "rocm-gfx90a" | "amd-cdna3" | "hip" | "rocm" => Self::new(45000.0, 3200.0),
+            "riscv64-rvv" | "riscv64" | "rvv" => Self::new(512.0, 64.0),
+            "wasm32-simd128" | "wasm32" | "wasm" => Self::new(256.0, 32.0),
+            _ => Self::default(),
+        }
+    }
 }
 
 /// Roofline bottleneck classification for an operation or module.
