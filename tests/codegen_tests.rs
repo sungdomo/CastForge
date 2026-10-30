@@ -2218,4 +2218,18 @@ module @gather_scatter_mod {
     assert!(ad_printed.contains("adamw"));
     let ad_outs = evaluate_module(&ad_mod, &[vec![2.0; 8], vec![1.0; 8]]).expect("eval adamw");
     assert_eq!(ad_outs[0].len(), 8);
+
+    // Verify WebGPU WGSL operator coverage & emit_from_loop_ir across all 7 backends
+    let wgsl_fused = generate_code(&fused_mod, CodegenTarget::Wgsl).expect("wgsl fused_mod");
+    assert!(wgsl_fused.contains("inverseSqrt(sq / f32("));
+    let wgsl_gather = generate_code(&module, CodegenTarget::Wgsl).expect("wgsl gather_mod");
+    assert!(wgsl_gather.contains("clamp("));
+    let backend_reg = castforge::codegen::BackendRegistry::with_builtin_backends();
+    for (tgt_name, _, _) in backend_reg.list() {
+        let b = backend_reg.get(tgt_name).expect("get backend");
+        let loop_src = b
+            .emit_from_loop_ir(&loop_mod, &castforge::codegen::TargetConfig::default())
+            .expect("emit_from_loop_ir");
+        assert!(loop_src.contains("forward"));
+    }
 }
