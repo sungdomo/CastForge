@@ -1,14 +1,19 @@
 //! Command execution handlers (`run`) for all `castforge` CLI subcommands.
 
 use crate::cli::args::{Cli, Commands};
-use crate::cli::chain::build_translator_chain;
+use crate::cli::chain::{
+    build_translator_chain_with_weights, parse_codegen_target_strict, parse_viz_format_strict,
+};
 use crate::codegen::{
-    CodegenTarget, GemmLoopOrder, HardwareRoofline, SimdIsa, TargetConfig,
-    analyze_module_cost_with_roofline, autotune_module, autotune_module_jit, build_memory_plan,
-    evaluate_module, generate_code_with_config, generate_synthetic_inputs, verify_module_numerics,
+    GemmLoopOrder, HardwareRoofline, OptimizeLoopIrPass, SimdIsa, TargetConfig,
+    analyze_module_cost_with_roofline, apply_schedule_to_module, autotune_module,
+    autotune_module_jit, build_memory_plan, compare_output_tensors, compile_shared_lib,
+    emit_c_header, evaluate_module, generate_code_with_config, generate_synthetic_inputs,
+    lower_to_loop_ir,
 };
 use crate::ir::{
-    Payload, collect_module_tensors, export_gguf_file, export_onnx_file, import_hf_model_dir,
+    Module, PassResult, Payload, collect_module_tensors, export_gguf_file, export_onnx_file,
+    import_hf_model_dir,
 };
 use crate::mlir::{
     PrintOptions, import_gguf_file, import_onnx_file, parse_mlir, print_mlir,
@@ -26,7 +31,6 @@ use std::path::PathBuf;
 
 /// Parses CLI arguments and executes the requested `castforge` subcommand.
 pub fn run() -> Result<()> {
-    let registry = PassRegistry::with_builtin_passes();
     let cli = Cli::parse();
 
     match cli.command {
@@ -39,25 +43,25 @@ pub fn run() -> Result<()> {
             save_weights,
             generic,
             stats,
+            quiet,
             verify_numerics,
+            bisect,
             tolerance,
         } => {
+            let show_stats = stats && !quiet;
+            let registry = PassRegistry::with_builtin_passes();
             let src = read_input_text(input.as_ref())?;
             let mut module = parse_mlir(&src)?;
-            if let Some(w_path) = weights {
-                let count = module
-                    .tensor_store
-                    .load_safetensors_file(&w_path)
-                    .with_context(|| format!("Failed to load weights {}", w_path.display()))?;
-                if stats {
-                    eprintln!(
-                        "[castforge:weights] Loaded {} tensors from {}",
-                        count,
-                        w_path.display()
-                    );
-                }
-            }
-            let before_snapshot = verify_numerics.then(|| module.clone());
+            load_optional_weights(&mut module, weights.as_ref(), show_stats)?;
+
+            let need_verify = verify_numerics || bisect;
+            let baseline_eval = if need_verify {
+                let inputs = generate_synthetic_inputs(&module, None)?;
+                let out_before = evaluate_module(&module, &inputs)?;
+                Some((inputs, out_before))
+            } else {
+                None
+            };
 
             let mut pm = if let Some(cfg_path) = config {
                 let toml_str = fs::read_to_string(&cfg_path)
@@ -69,29 +73,36 @@ pub fn run() -> Result<()> {
                 PassManager::from_pipeline_str(&registry, "canonicalize")?
             };
 
-            let results = pm.run(&mut module)?;
-            if stats {
-                for r in &results {
-                    eprintln!(
-                        "[castforge:pass] {:<18} | changed: {:<5} | \
-                         removed: {:<3} | modified: {:<3} | created: {:<3}",
-                        r.pass_name, r.changed, r.ops_removed, r.ops_modified, r.ops_created
-                    );
+            if bisect {
+                let (inputs, out_before) = baseline_eval.as_ref().expect("baseline initialized");
+                run_pipeline_with_bisect(
+                    &mut pm,
+                    &mut module,
+                    inputs,
+                    out_before,
+                    tolerance,
+                    show_stats,
+                )?;
+            } else {
+                let results = pm.run(&mut module)?;
+                if show_stats {
+                    log_pass_results(&results);
                 }
-            }
-            if let Some(before_mod) = &before_snapshot {
-                let rep = verify_module_numerics(before_mod, &module, tolerance)?;
-                eprintln!(
-                    "[castforge:verify] passed: {} | max_abs_diff: {:.6e} (tol: {:.2e}, \
-                     checked {} elements)",
-                    rep.passed, rep.max_abs_diff, rep.tolerance, rep.num_outputs_checked
-                );
-                if !rep.passed {
-                    anyhow::bail!(
-                        "Numerical verification failed: max_abs_diff {:.6e} > tolerance {:.2e}",
-                        rep.max_abs_diff,
-                        rep.tolerance
+                if let Some((inputs, out_before)) = &baseline_eval {
+                    let out_after = evaluate_module(&module, inputs)?;
+                    let rep = compare_output_tensors(out_before, &out_after, tolerance)?;
+                    eprintln!(
+                        "[castforge:verify] passed: {} | max_abs_diff: {:.6e} (tol: {:.2e}, \
+                         checked {} elements)",
+                        rep.passed, rep.max_abs_diff, rep.tolerance, rep.num_outputs_checked
                     );
+                    if !rep.passed {
+                        anyhow::bail!(
+                            "Numerical verification failed: max_abs_diff {:.6e} > tol {:.2e}",
+                            rep.max_abs_diff,
+                            rep.tolerance
+                        );
+                    }
                 }
             }
 
@@ -100,7 +111,7 @@ pub fn run() -> Result<()> {
                     .tensor_store
                     .save_safetensors_file(&sw_path)
                     .with_context(|| format!("Failed to save weights {}", sw_path.display()))?;
-                if stats {
+                if show_stats {
                     eprintln!(
                         "[castforge:weights] Saved {} tensors to {}",
                         module.tensor_store.len(),
@@ -116,7 +127,6 @@ pub fn run() -> Result<()> {
                     print_locations: false,
                 },
             );
-
             write_text_output(output.as_ref(), &formatted)?;
         }
 
@@ -124,34 +134,55 @@ pub fn run() -> Result<()> {
             input,
             passes,
             weights,
+            bisect,
             tolerance,
         } => {
             let src = read_input_text(input.as_ref())?;
             let mut module = parse_mlir(&src)?;
-            if let Some(w_path) = weights {
-                module.tensor_store.load_safetensors_file(&w_path)?;
-            }
+            load_optional_weights(&mut module, weights.as_ref(), false)?;
             let inputs = generate_synthetic_inputs(&module, None)?;
             let baseline = evaluate_module(&module, &inputs)?;
             if let Some(spec) = passes {
-                let before_mod = module.clone();
+                let registry = PassRegistry::with_builtin_passes();
                 let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
-                pm.run(&mut module)?;
-                let rep = verify_module_numerics(&before_mod, &module, tolerance)?;
+                if bisect {
+                    run_pipeline_with_bisect(
+                        &mut pm,
+                        &mut module,
+                        &inputs,
+                        &baseline,
+                        tolerance,
+                        true,
+                    )?;
+                } else {
+                    pm.run(&mut module)?;
+                }
+                let optimized_out = evaluate_module(&module, &inputs)?;
+                let rep = compare_output_tensors(&baseline, &optimized_out, tolerance)?;
                 println!(
                     "Numerical verification: {} (max_abs_diff = {:.6e}, tol = {:.2e})",
                     if rep.passed { "PASSED" } else { "FAILED" },
                     rep.max_abs_diff,
                     rep.tolerance
                 );
-                let optimized_out = evaluate_module(&module, &inputs)?;
                 println!("Outputs: {optimized_out:?}");
+                if !rep.passed {
+                    anyhow::bail!(
+                        "Numerical verification failed: max_abs_diff {:.6e} > tol {:.2e}",
+                        rep.max_abs_diff,
+                        rep.tolerance
+                    );
+                }
             } else {
                 println!("Outputs: {baseline:?}");
             }
         }
 
-        Commands::Parse { input, generic } => {
+        Commands::Parse {
+            input,
+            output,
+            generic,
+        } => {
             let src = read_input_text(input.as_ref())?;
             let module = parse_mlir(&src)?;
             module.verify()?;
@@ -162,27 +193,24 @@ pub fn run() -> Result<()> {
                     print_locations: false,
                 },
             );
-            print!("{formatted}");
+            write_text_output(output.as_ref(), &formatted)?;
         }
 
         Commands::Viz {
             input,
             format,
             passes,
+            weights,
             output,
         } => {
+            let fmt = parse_viz_format_strict(&format)?;
             let src = read_input_text(input.as_ref())?;
             let mut module = parse_mlir(&src)?;
-
-            let fmt = match format.to_lowercase().as_str() {
-                "dot" | "graphviz" => VizFormat::Dot,
-                "json" => VizFormat::Json,
-                "html" => VizFormat::Html,
-                _ => VizFormat::Mermaid,
-            };
+            load_optional_weights(&mut module, weights.as_ref(), false)?;
 
             let rendered = if fmt == VizFormat::Html {
                 let trace_steps = if let Some(spec) = passes {
+                    let registry = PassRegistry::with_builtin_passes();
                     let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
                     pm.run_with_trace(&mut module)?
                 } else {
@@ -213,6 +241,7 @@ pub fn run() -> Result<()> {
                 render_timeline_html(&frames)
             } else {
                 if let Some(spec) = passes {
+                    let registry = PassRegistry::with_builtin_passes();
                     let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
                     pm.run(&mut module)?;
                 }
@@ -237,6 +266,8 @@ pub fn run() -> Result<()> {
             passes,
             weights,
             output,
+            emit_header,
+            autotune,
             tile_size,
             workgroup_size,
             loop_order,
@@ -255,36 +286,30 @@ pub fn run() -> Result<()> {
         } => {
             let src = read_input_text(input.as_ref())?;
             let mut module = parse_mlir(&src)?;
-            if let Some(w_path) = weights {
-                module
-                    .tensor_store
-                    .load_safetensors_file(&w_path)
-                    .with_context(|| format!("Failed to load weights {}", w_path.display()))?;
-            }
+            load_optional_weights(&mut module, weights.as_ref(), false)?;
 
             if let Some(spec) = passes {
+                let registry = PassRegistry::with_builtin_passes();
                 let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
                 pm.run(&mut module)?;
             }
 
-            let tgt = CodegenTarget::parse(&target);
-
-            let plan = build_memory_plan(&module);
-            eprintln!(
-                "[castforge:codegen] Target: {:?} | Constant Weights: {} B | \
-                 Activation Workspace: {} B (Naive: {} B, Saved: {} B across {} slots)",
-                tgt,
-                plan.total_constant_bytes,
-                plan.total_activation_bytes,
-                plan.naive_activation_bytes,
-                plan.saved_activation_bytes(),
-                plan.reusable_slot_count
-            );
-
-            let mut cfg = match arch {
-                Some(arch_name) => TargetConfig::for_arch(&arch_name),
+            let mut cfg = match &arch {
+                Some(arch_name) => TargetConfig::for_arch(arch_name),
                 None => TargetConfig::default(),
             };
+            if autotune {
+                let roofline = build_roofline(arch.as_deref(), None, None);
+                let report = autotune_module(&module, &roofline);
+                apply_schedule_to_module(&mut module, &report.best.config);
+                let simd_isa_base = cfg.simd_isa;
+                let simd_w_base = cfg.simd_width;
+                cfg = report.best.config;
+                if arch.is_some() {
+                    cfg.simd_isa = simd_isa_base;
+                    cfg.simd_width = simd_w_base;
+                }
+            }
             if let Some(ts) = tile_size {
                 cfg.tile_m = ts;
                 cfg.tile_n = ts;
@@ -299,18 +324,18 @@ pub fn run() -> Result<()> {
             if let Some(uf) = unroll {
                 cfg.unroll_factor = uf.max(1);
             }
-            if vectorize {
-                cfg.vectorize = true;
+            if let Some(vec_flag) = vectorize {
+                cfg.vectorize = vec_flag;
             }
             if let Some(rt) = reg_tile {
                 cfg.reg_tile_m = rt;
                 cfg.reg_tile_n = rt;
             }
-            if collapse_loops {
-                cfg.collapse_loops = true;
+            if let Some(col_flag) = collapse_loops {
+                cfg.collapse_loops = col_flag;
             }
-            if parallel {
-                cfg.parallel = true;
+            if let Some(par_flag) = parallel {
+                cfg.parallel = par_flag;
             }
             if let Some(l2) = l2_tile_size {
                 cfg.l2_tile_size = l2;
@@ -321,11 +346,11 @@ pub fn run() -> Result<()> {
             if let Some(sk) = split_k {
                 cfg.split_k = sk.max(1);
             }
-            if loop_skew {
-                cfg.loop_skew = true;
+            if let Some(skew_flag) = loop_skew {
+                cfg.loop_skew = skew_flag;
             }
-            if double_buffer {
-                cfg.double_buffer = true;
+            if let Some(db_flag) = double_buffer {
+                cfg.double_buffer = db_flag;
             }
             if let Some(isa_str) = simd_isa {
                 let parsed = SimdIsa::parse(&isa_str);
@@ -333,80 +358,155 @@ pub fn run() -> Result<()> {
                 cfg.simd_width = parsed.default_lanes().max(1);
             }
 
-            let code = generate_code_with_config(&module, tgt, &cfg)?;
-            write_text_output(output.as_ref(), &code)?;
+            if let Some(hdr_path) = emit_header {
+                let hdr = emit_c_header(&module)?;
+                fs::write(&hdr_path, hdr)
+                    .with_context(|| format!("Failed to write header {}", hdr_path.display()))?;
+            }
+
+            let plan = build_memory_plan(&module);
+            let target_lower = target.trim().to_ascii_lowercase();
+            match target_lower.as_str() {
+                "header" | "c-header" => {
+                    let hdr = emit_c_header(&module)?;
+                    write_text_output(output.as_ref(), &hdr)?;
+                }
+                "loop-ir" | "loops" => {
+                    let mut loop_mod = lower_to_loop_ir(&module, &cfg);
+                    let mut loop_pass = OptimizeLoopIrPass {
+                        fuse_loops: true,
+                        vectorize: cfg.vectorize,
+                        unroll_factor: cfg.unroll_factor.max(1),
+                        parallel: cfg.parallel,
+                        interchange: cfg.loop_order == GemmLoopOrder::Mkn,
+                    };
+                    use crate::codegen::LoopPass;
+                    let _ = loop_pass.run(&mut loop_mod);
+                    write_text_output(output.as_ref(), &loop_mod.to_string())?;
+                }
+                "lib" | "shared-lib" | "so" | "dylib" => {
+                    let bytes = compile_shared_lib(&module, &cfg)?;
+                    write_binary_output(output.as_ref(), &bytes)?;
+                }
+                _ => {
+                    let tgt = parse_codegen_target_strict(&target)?;
+                    eprintln!(
+                        "[castforge:codegen] Target: {:?} | Constant Weights: {} B | \
+                         Activation Workspace: {} B (Naive: {} B, Saved: {} B across {} slots)",
+                        tgt,
+                        plan.total_constant_bytes,
+                        plan.total_activation_bytes,
+                        plan.naive_activation_bytes,
+                        plan.saved_activation_bytes(),
+                        plan.reusable_slot_count
+                    );
+                    let code = generate_code_with_config(&module, tgt, &cfg)?;
+                    write_text_output(output.as_ref(), &code)?;
+                }
+            }
         }
 
         Commands::Profile {
             input,
             passes,
+            weights,
             peak_gflops,
             peak_bw_gbps,
             arch,
+            json,
+            output,
         } => {
             let src = read_input_text(input.as_ref())?;
             let mut module = parse_mlir(&src)?;
-            let roofline = match arch {
-                Some(a) => HardwareRoofline::for_arch(&a),
-                None => HardwareRoofline::new(peak_gflops, peak_bw_gbps),
-            };
+            load_optional_weights(&mut module, weights.as_ref(), false)?;
+            let roofline = build_roofline(arch.as_deref(), peak_gflops, peak_bw_gbps);
             let before = analyze_module_cost_with_roofline(&module, &roofline);
             if let Some(spec) = passes {
-                println!("=== Baseline Cost Profile ===");
-                print!("{}", before.summary_table());
+                let registry = PassRegistry::with_builtin_passes();
                 let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
                 pm.run(&mut module)?;
                 let after = analyze_module_cost_with_roofline(&module, &roofline);
-                println!("\n=== Optimized Cost Profile ({spec}) ===");
-                print!("{}", after.summary_table());
-                let traffic_saved = before
-                    .total_memory_traffic_bytes
-                    .saturating_sub(after.total_memory_traffic_bytes);
-                println!(
-                    "\nMemory Traffic Saved: {} B ({:.1}% reduction) | \
-                     Est. Speedup: {:.2}x",
-                    traffic_saved,
-                    if before.total_memory_traffic_bytes > 0 {
-                        100.0 * traffic_saved as f64 / before.total_memory_traffic_bytes as f64
-                    } else {
-                        0.0
-                    },
-                    if after.estimated_latency_ns > 0.0 {
-                        before.estimated_latency_ns / after.estimated_latency_ns
-                    } else {
-                        1.0
-                    }
-                );
+                if json {
+                    let payload = serde_json::json!({
+                        "baseline": before,
+                        "optimized": after,
+                    });
+                    let formatted = serde_json::to_string_pretty(&payload)?;
+                    write_text_output(output.as_ref(), &format!("{formatted}\n"))?;
+                } else {
+                    use std::fmt::Write as _;
+                    let mut report = String::new();
+                    let _ = writeln!(report, "=== Baseline Cost Profile ===");
+                    report.push_str(&before.summary_table());
+                    let _ = writeln!(report, "\n=== Optimized Cost Profile ({spec}) ===");
+                    report.push_str(&after.summary_table());
+                    let traffic_saved = before
+                        .total_memory_traffic_bytes
+                        .saturating_sub(after.total_memory_traffic_bytes);
+                    let _ = writeln!(
+                        report,
+                        "\nMemory Traffic Saved: {} B ({:.1}% reduction) | \
+                         Est. Speedup: {:.2}x",
+                        traffic_saved,
+                        if before.total_memory_traffic_bytes > 0 {
+                            100.0 * traffic_saved as f64 / before.total_memory_traffic_bytes as f64
+                        } else {
+                            0.0
+                        },
+                        if after.estimated_latency_ns > 0.0 {
+                            before.estimated_latency_ns / after.estimated_latency_ns
+                        } else {
+                            1.0
+                        }
+                    );
+                    write_text_output(output.as_ref(), &report)?;
+                }
+            } else if json {
+                let formatted = serde_json::to_string_pretty(&before)?;
+                write_text_output(output.as_ref(), &format!("{formatted}\n"))?;
             } else {
-                print!("{}", before.summary_table());
+                write_text_output(output.as_ref(), &before.summary_table())?;
             }
         }
 
         Commands::Autotune {
             input,
             passes,
+            weights,
             peak_gflops,
             peak_bw_gbps,
             top_k,
             bench_jit,
             arch,
+            json,
+            output,
         } => {
             let src = read_input_text(input.as_ref())?;
             let mut module = parse_mlir(&src)?;
+            load_optional_weights(&mut module, weights.as_ref(), false)?;
             if let Some(spec) = passes {
+                let registry = PassRegistry::with_builtin_passes();
                 let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
                 pm.run(&mut module)?;
             }
-            let roofline = match arch {
-                Some(a) => HardwareRoofline::for_arch(&a),
-                None => HardwareRoofline::new(peak_gflops, peak_bw_gbps),
-            };
+            let roofline = build_roofline(arch.as_deref(), peak_gflops, peak_bw_gbps);
             let report = if bench_jit {
                 autotune_module_jit(&module, &roofline, top_k)?
             } else {
                 autotune_module(&module, &roofline)
             };
-            print!("{}", report.summary_table(top_k));
+            if json {
+                let formatted = serde_json::to_string_pretty(&report)?;
+                write_text_output(output.as_ref(), &format!("{formatted}\n"))?;
+            } else if let Some(out_path) = output {
+                eprint!("{}", report.summary_table(top_k));
+                apply_schedule_to_module(&mut module, &report.best.config);
+                let mlir_out = print_mlir(&module);
+                fs::write(&out_path, mlir_out)
+                    .with_context(|| format!("Failed to write {}", out_path.display()))?;
+            } else {
+                print!("{}", report.summary_table(top_k));
+            }
         }
 
         Commands::Import {
@@ -416,22 +516,29 @@ pub fn run() -> Result<()> {
             output,
             save_weights,
         } => {
-            let fmt = format.unwrap_or_else(|| {
-                let s = input.to_string_lossy().to_ascii_lowercase();
-                if s.ends_with(".gguf") {
-                    "gguf".to_string()
-                } else if input.is_dir() || s.ends_with("config.json") {
-                    "hf".to_string()
-                } else {
-                    "onnx".to_string()
+            let fmt = match format {
+                Some(f) => f,
+                None => {
+                    let s = input.to_string_lossy().to_ascii_lowercase();
+                    if s.ends_with(".gguf") {
+                        "gguf".to_string()
+                    } else if input.is_dir() || s.ends_with("config.json") {
+                        "hf".to_string()
+                    } else {
+                        "onnx".to_string()
+                    }
                 }
-            });
-            let mut module = match fmt.to_ascii_lowercase().as_str() {
+            };
+            let mut module = match fmt.trim().to_ascii_lowercase().as_str() {
                 "gguf" => import_gguf_file(&input)?,
                 "hf" | "huggingface" | "config.json" => import_hf_model_dir(&input)?,
-                _ => import_onnx_file(&input)?,
+                "onnx" | "onnx.json" | "json" => import_onnx_file(&input)?,
+                other => anyhow::bail!(
+                    "Unknown import format `{other}` (expected: gguf, onnx, or hf)"
+                ),
             };
             if let Some(spec) = passes {
+                let registry = PassRegistry::with_builtin_passes();
                 let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
                 pm.run(&mut module)?;
             }
@@ -451,39 +558,47 @@ pub fn run() -> Result<()> {
         } => {
             let src = read_input_text(input.as_ref())?;
             let mut module = parse_mlir(&src)?;
-            if let Some(w_path) = weights {
-                module.tensor_store.load_safetensors_file(&w_path)?;
-            }
+            load_optional_weights(&mut module, weights.as_ref(), false)?;
             if let Some(spec) = passes {
+                let registry = PassRegistry::with_builtin_passes();
                 let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
                 pm.run(&mut module)?;
             }
-            let fmt = format.unwrap_or_else(|| {
-                let s = output.to_string_lossy().to_ascii_lowercase();
-                if s.ends_with(".gguf") {
-                    "gguf".to_string()
-                } else if s.ends_with(".safetensors") {
-                    "safetensors".to_string()
-                } else {
-                    "onnx".to_string()
+            let fmt = match format {
+                Some(f) => f,
+                None => {
+                    let s = output.to_string_lossy().to_ascii_lowercase();
+                    if s.ends_with(".gguf") {
+                        "gguf".to_string()
+                    } else if s.ends_with(".safetensors") {
+                        "safetensors".to_string()
+                    } else {
+                        "onnx".to_string()
+                    }
                 }
-            });
-            match fmt.to_ascii_lowercase().as_str() {
+            };
+            match fmt.trim().to_ascii_lowercase().as_str() {
                 "gguf" => export_gguf_file(&module, &output)?,
                 "safetensors" | "st" => {
                     let store = collect_module_tensors(&module);
                     store.save_safetensors_file(&output)?;
                 }
-                _ => export_onnx_file(&module, &output)?,
+                "onnx" | "onnx.json" | "json" => export_onnx_file(&module, &output)?,
+                other => anyhow::bail!(
+                    "Unknown export format `{other}` (expected: onnx, gguf, or safetensors)"
+                ),
             }
         }
 
         Commands::Chain {
             input,
             stages,
+            weights,
             output,
         } => {
-            let (mut chain, first_in, last_out) = build_translator_chain(&registry, &stages)?;
+            let registry = PassRegistry::with_builtin_passes();
+            let (mut chain, first_in, last_out) =
+                build_translator_chain_with_weights(&registry, &stages, weights)?;
             for (idx, desc) in chain.describe_stages().iter().enumerate() {
                 eprintln!("[castforge:chain] stage #{}: {desc}", idx + 1);
             }
@@ -503,26 +618,17 @@ pub fn run() -> Result<()> {
                 Payload::Text(read_input_text(input.as_ref())?)
             };
             let result = chain.execute(initial)?;
-            match (result, output) {
-                (Payload::Bytes(b), Some(out_path)) => {
-                    fs::write(&out_path, &b)?;
+            match result {
+                Payload::Bytes(b) => {
+                    write_binary_output(output.as_ref(), &b)?;
                 }
-                (Payload::Bytes(b), None) => {
-                    let mut stdout = std::io::stdout();
-                    if stdout.is_terminal() {
-                        println!("({} bytes — use -o <FILE> to save binary output)", b.len());
-                    } else {
-                        stdout.write_all(&b)?;
-                        stdout.flush()?;
-                    }
+                Payload::Text(s) => {
+                    write_text_output(output.as_ref(), &s)?;
                 }
-                (Payload::Text(s), out_path) => {
-                    write_text_output(out_path.as_ref(), &s)?;
-                }
-                (Payload::Ir(m), out_path) => {
+                Payload::Ir(m) => {
                     let _ = last_out;
                     let text = print_mlir(&m);
-                    write_text_output(out_path.as_ref(), &text)?;
+                    write_text_output(output.as_ref(), &text)?;
                 }
             }
         }
@@ -531,6 +637,7 @@ pub fn run() -> Result<()> {
             inputs,
             compose,
             passes,
+            weights,
             output,
         } => {
             let first_src = read_input_text(inputs.first())?;
@@ -540,17 +647,30 @@ pub fn run() -> Result<()> {
                 let other = parse_mlir(&src)?;
                 link_modules(&mut base, &other)?;
             }
-            if let Some(pair) = compose
-                && let Some((f1, f2)) = pair.split_once(',')
-            {
+            load_optional_weights(&mut base, weights.as_ref(), false)?;
+            if let Some(pair) = compose {
+                let Some((f1, rest)) = pair.split_once(',') else {
+                    anyhow::bail!(
+                        "Invalid --compose `{pair}`: expected `first_fn,second_fn` \
+                         or `first_fn,second_fn:entry_name`"
+                    );
+                };
+                let (f2, entry_name) = match rest.split_once(':') {
+                    Some((second, entry)) => (second.trim(), entry.trim()),
+                    None => (rest.trim(), "composed_main"),
+                };
+                if f1.trim().is_empty() || f2.is_empty() || entry_name.is_empty() {
+                    anyhow::bail!("Invalid --compose `{pair}`: function names must be non-empty");
+                }
                 let mut comp = ComposeFunctionsPass {
                     first: f1.trim().to_string(),
-                    second: f2.trim().to_string(),
-                    entry_name: "composed_main".to_string(),
+                    second: f2.to_string(),
+                    entry_name: entry_name.to_string(),
                 };
                 comp.run(&mut base)?;
             }
             if let Some(spec) = passes {
+                let registry = PassRegistry::with_builtin_passes();
                 let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
                 pm.run(&mut base)?;
             }
@@ -559,6 +679,7 @@ pub fn run() -> Result<()> {
         }
 
         Commands::ListPasses { tree } => {
+            let registry = PassRegistry::with_builtin_passes();
             println!("Available CastForge Passes:");
             println!("{:<28} DESCRIPTION", "PASS NAME");
             println!("{}", "-".repeat(86));
@@ -582,6 +703,7 @@ pub fn run() -> Result<()> {
         }
 
         Commands::DirectPass(args) => {
+            let registry = PassRegistry::with_builtin_passes();
             run_direct_pass(&registry, &args)?;
         }
     }
@@ -600,33 +722,47 @@ fn run_direct_pass(registry: &PassRegistry, args: &[String]) -> Result<()> {
     let mut weights_path: Option<PathBuf> = None;
     let mut save_weights_path: Option<PathBuf> = None;
     let mut generic = false;
+    let mut quiet = false;
+    let mut verify_numerics = false;
 
     let mut idx = 1usize;
     while idx < args.len() {
         match args[idx].as_str() {
             "-o" | "--output" => {
                 idx += 1;
-                if let Some(val) = args.get(idx) {
-                    output_path = Some(PathBuf::from(val));
-                }
+                let val = args
+                    .get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("Missing file path after `-o`/`--output`"))?;
+                output_path = Some(PathBuf::from(val));
             }
             "-w" | "--weights" => {
                 idx += 1;
-                if let Some(val) = args.get(idx) {
-                    weights_path = Some(PathBuf::from(val));
-                }
+                let val = args
+                    .get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("Missing file path after `-w`/`--weights`"))?;
+                weights_path = Some(PathBuf::from(val));
             }
             "--save-weights" => {
                 idx += 1;
-                if let Some(val) = args.get(idx) {
-                    save_weights_path = Some(PathBuf::from(val));
-                }
+                let val = args
+                    .get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("Missing file path after `--save-weights`"))?;
+                save_weights_path = Some(PathBuf::from(val));
             }
             "--generic" => {
                 generic = true;
             }
-            positional if input_path.is_none() => {
+            "-q" | "--quiet" => {
+                quiet = true;
+            }
+            "--verify-numerics" => {
+                verify_numerics = true;
+            }
+            positional if !positional.starts_with('-') && input_path.is_none() => {
                 input_path = Some(PathBuf::from(positional));
+            }
+            "-" if input_path.is_none() => {
+                input_path = Some(PathBuf::from("-"));
             }
             other => {
                 anyhow::bail!("Unrecognized argument `{other}` for pass `{pass_name}`");
@@ -637,20 +773,30 @@ fn run_direct_pass(registry: &PassRegistry, args: &[String]) -> Result<()> {
 
     let src = read_input_text(input_path.as_ref())?;
     let mut module = parse_mlir(&src)?;
-    if let Some(w_path) = weights_path {
-        module
-            .tensor_store
-            .load_safetensors_file(&w_path)
-            .with_context(|| format!("Failed to load weights {}", w_path.display()))?;
-    }
+    load_optional_weights(&mut module, weights_path.as_ref(), !quiet)?;
+    let baseline_eval = if verify_numerics {
+        let inputs = generate_synthetic_inputs(&module, None)?;
+        let out_before = evaluate_module(&module, &inputs)?;
+        Some((inputs, out_before))
+    } else {
+        None
+    };
+
     let mut pm = PassManager::from_pipeline_str(registry, pass_name)?;
     let results = pm.run(&mut module)?;
-    for r in &results {
-        eprintln!(
-            "[castforge:pass] {:<18} | changed: {:<5} | \
-             removed: {:<3} | modified: {:<3} | created: {:<3}",
-            r.pass_name, r.changed, r.ops_removed, r.ops_modified, r.ops_created
-        );
+    if !quiet {
+        log_pass_results(&results);
+    }
+    if let Some((inputs, out_before)) = &baseline_eval {
+        let out_after = evaluate_module(&module, inputs)?;
+        let rep = compare_output_tensors(out_before, &out_after, 1e-4)?;
+        if !rep.passed {
+            anyhow::bail!(
+                "Numerical verification failed: max_abs_diff {:.6e} > tol {:.2e}",
+                rep.max_abs_diff,
+                rep.tolerance
+            );
+        }
     }
     if let Some(sw_path) = save_weights_path {
         module
@@ -666,6 +812,97 @@ fn run_direct_pass(registry: &PassRegistry, args: &[String]) -> Result<()> {
         },
     );
     write_text_output(output_path.as_ref(), &formatted)
+}
+
+fn load_optional_weights(
+    module: &mut Module,
+    weights: Option<&PathBuf>,
+    log_stats: bool,
+) -> Result<()> {
+    if let Some(w_path) = weights {
+        let count = module
+            .tensor_store
+            .load_safetensors_file(w_path)
+            .with_context(|| format!("Failed to load weights {}", w_path.display()))?;
+        if log_stats {
+            eprintln!(
+                "[castforge:weights] Loaded {} tensors from {}",
+                count,
+                w_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn log_pass_results(results: &[PassResult]) {
+    for r in results {
+        eprintln!(
+            "[castforge:pass] {:<18} | changed: {:<5} | \
+             removed: {:<3} | modified: {:<3} | created: {:<3}",
+            r.pass_name, r.changed, r.ops_removed, r.ops_modified, r.ops_created
+        );
+    }
+}
+
+fn run_pipeline_with_bisect(
+    pm: &mut PassManager,
+    module: &mut Module,
+    inputs: &[Vec<f32>],
+    out_before: &[Vec<f32>],
+    tolerance: f32,
+    show_stats: bool,
+) -> Result<()> {
+    let trace_steps = pm.run_with_trace(module)?;
+    let mut first_failing: Option<(usize, String, f32)> = None;
+    for step in &trace_steps {
+        if let Some(r) = &step.result
+            && show_stats
+        {
+            eprintln!(
+                "[castforge:pass] {:<18} | changed: {:<5} | \
+                 removed: {:<3} | modified: {:<3} | created: {:<3}",
+                r.pass_name, r.changed, r.ops_removed, r.ops_modified, r.ops_created
+            );
+        }
+        if step.step_index == 0 {
+            continue;
+        }
+        let out_step = evaluate_module(&step.module, inputs)?;
+        let rep = compare_output_tensors(out_before, &out_step, tolerance)?;
+        eprintln!(
+            "[castforge:bisect] step #{:<2} {:<22} | passed: {:<5} | max_abs_diff: {:.6e}",
+            step.step_index, step.label, rep.passed, rep.max_abs_diff
+        );
+        if !rep.passed && first_failing.is_none() {
+            first_failing = Some((step.step_index, step.label.clone(), rep.max_abs_diff));
+        }
+    }
+    if let Some((idx, name, diff)) = first_failing {
+        anyhow::bail!(
+            "Pass bisection identified numerical failure at step #{idx} (`{name}`): \
+             max_abs_diff {diff:.6e} > tol {tolerance:.2e}"
+        );
+    }
+    Ok(())
+}
+
+fn build_roofline(
+    arch: Option<&str>,
+    peak_gflops: Option<f64>,
+    peak_bw_gbps: Option<f64>,
+) -> HardwareRoofline {
+    let mut roofline = match arch {
+        Some(a) => HardwareRoofline::for_arch(a),
+        None => HardwareRoofline::default(),
+    };
+    if let Some(g) = peak_gflops {
+        roofline.peak_gflops = g.max(1e-3);
+    }
+    if let Some(bw) = peak_bw_gbps {
+        roofline.peak_bandwidth_gbps = bw.max(1e-3);
+    }
+    roofline
 }
 
 fn read_input_text(input: Option<&PathBuf>) -> Result<String> {
@@ -689,6 +926,25 @@ fn write_text_output(output: Option<&PathBuf>, content: &str) -> Result<()> {
             .with_context(|| format!("Failed to write {}", out_path.display()))?;
     } else {
         print!("{content}");
+    }
+    Ok(())
+}
+
+fn write_binary_output(output: Option<&PathBuf>, bytes: &[u8]) -> Result<()> {
+    if let Some(out_path) = output {
+        fs::write(out_path, bytes)
+            .with_context(|| format!("Failed to write {}", out_path.display()))?;
+    } else {
+        let mut stdout = std::io::stdout();
+        if stdout.is_terminal() {
+            println!(
+                "({} bytes — use -o <FILE> to save binary output)",
+                bytes.len()
+            );
+        } else {
+            stdout.write_all(bytes)?;
+            stdout.flush()?;
+        }
     }
     Ok(())
 }

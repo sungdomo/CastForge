@@ -5,21 +5,90 @@ use crate::codegen::{
     HardwareRoofline, MemoryPlanTranslator, OptimizeLoopIrPass, OptimizeLoopIrTranslator,
     RooflineReportTranslator, SharedLibTranslator, SimdIsa, TargetConfig, TensorToLoopTranslator,
 };
-use crate::ir::{HfConfigImportTranslator, TranslatorChain};
+use crate::ir::{HfConfigImportTranslator, Payload, Translator, TranslatorChain};
 use crate::mlir::{
     GgufExportTranslator, GgufImportTranslator, MlirParseTranslator, MlirPrintTranslator,
     OnnxExportTranslator, OnnxImportTranslator, PrintOptions, SafetensorsExportTranslator,
 };
 use crate::passes::{PassRegistry, parse_pass_spec_item, split_pipeline_spec};
 use crate::viz::{IrDiffTranslator, SnapshotIrTranslator, VizFormat, VizTranslator};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use indexmap::IndexMap;
+use std::path::PathBuf;
+
+/// Translator stage that loads a `.safetensors` file into `Module::tensor_store` (`Ir -> Ir`).
+pub struct LoadWeightsTranslator {
+    pub path: PathBuf,
+}
+
+impl Translator for LoadWeightsTranslator {
+    fn name(&self) -> &str {
+        "load-weights"
+    }
+
+    fn input_kind(&self) -> &'static str {
+        "ir"
+    }
+
+    fn output_kind(&self) -> &'static str {
+        "ir"
+    }
+
+    fn translate(&mut self, input: Payload) -> Result<Payload> {
+        let mut module = input.into_ir()?;
+        module
+            .tensor_store
+            .load_safetensors_file(&self.path)
+            .with_context(|| format!("Failed to load weights {}", self.path.display()))?;
+        Ok(Payload::from_ir(module))
+    }
+}
+
+/// Strictly validates and parses a [`CodegenTarget`] name, returning an error on unknown targets.
+pub(crate) fn parse_codegen_target_strict(s: &str) -> Result<CodegenTarget> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "rust" | "rs" => Ok(CodegenTarget::Rust),
+        "c" | "c99" => Ok(CodegenTarget::C),
+        "wgsl" | "webgpu" => Ok(CodegenTarget::Wgsl),
+        "cuda" | "cu" | "nvptx" => Ok(CodegenTarget::Cuda),
+        "msl" | "metal" => Ok(CodegenTarget::Msl),
+        "hip" | "rocm" => Ok(CodegenTarget::Hip),
+        "opencl" | "cl" => Ok(CodegenTarget::OpenCl),
+        other => anyhow::bail!(
+            "Unknown codegen target `{other}` \
+             (expected: rust, c, wgsl, cuda, msl, hip, opencl, header, loop-ir, or lib)"
+        ),
+    }
+}
+
+/// Strictly validates and parses a [`VizFormat`] name, returning an error on unknown formats.
+pub(crate) fn parse_viz_format_strict(s: &str) -> Result<VizFormat> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "mermaid" | "mmd" => Ok(VizFormat::Mermaid),
+        "dot" | "graphviz" => Ok(VizFormat::Dot),
+        "json" => Ok(VizFormat::Json),
+        "html" | "timeline" => Ok(VizFormat::Html),
+        other => anyhow::bail!(
+            "Unknown visualization format `{other}` (expected: mermaid, dot, json, or html)"
+        ),
+    }
+}
 
 /// Parses a `|`- or `,`-delimited translator chain specification into a validated
 /// [`TranslatorChain`], returning `(chain, initial_input_kind, final_output_kind)`.
 pub fn build_translator_chain(
     registry: &PassRegistry,
     spec: &str,
+) -> Result<(TranslatorChain, &'static str, &'static str)> {
+    build_translator_chain_with_weights(registry, spec, None)
+}
+
+/// Parses a translator chain specification and optionally injects a [`LoadWeightsTranslator`]
+/// right after the initial frontend import/parse stage.
+pub fn build_translator_chain_with_weights(
+    registry: &PassRegistry,
+    spec: &str,
+    weights: Option<PathBuf>,
 ) -> Result<(TranslatorChain, &'static str, &'static str)> {
     let mut chain = TranslatorChain::new();
     let items: Vec<&str> = split_pipeline_spec(spec)
@@ -39,6 +108,9 @@ pub fn build_translator_chain(
     let mut first_in = "text";
     if !starts_with_frontend {
         chain.push(Box::new(MlirParseTranslator));
+        if let Some(w_path) = weights.clone() {
+            chain.push(Box::new(LoadWeightsTranslator { path: w_path }));
+        }
     }
 
     let mut last_out = "ir";
@@ -50,6 +122,11 @@ pub fn build_translator_chain(
                     first_in = "text";
                 }
                 chain.push(Box::new(MlirParseTranslator));
+                if idx == 0
+                    && let Some(w_path) = weights.clone()
+                {
+                    chain.push(Box::new(LoadWeightsTranslator { path: w_path }));
+                }
                 last_out = "ir";
             }
             "import-onnx" => {
@@ -57,6 +134,11 @@ pub fn build_translator_chain(
                     first_in = "text";
                 }
                 chain.push(Box::new(OnnxImportTranslator));
+                if idx == 0
+                    && let Some(w_path) = weights.clone()
+                {
+                    chain.push(Box::new(LoadWeightsTranslator { path: w_path }));
+                }
                 last_out = "ir";
             }
             "import-hf-config" => {
@@ -64,6 +146,11 @@ pub fn build_translator_chain(
                     first_in = "text";
                 }
                 chain.push(Box::new(HfConfigImportTranslator));
+                if idx == 0
+                    && let Some(w_path) = weights.clone()
+                {
+                    chain.push(Box::new(LoadWeightsTranslator { path: w_path }));
+                }
                 last_out = "ir";
             }
             "import-gguf" => {
@@ -71,6 +158,21 @@ pub fn build_translator_chain(
                     first_in = "bytes";
                 }
                 chain.push(Box::new(GgufImportTranslator));
+                if idx == 0
+                    && let Some(w_path) = weights.clone()
+                {
+                    chain.push(Box::new(LoadWeightsTranslator { path: w_path }));
+                }
+                last_out = "ir";
+            }
+            "load-weights" => {
+                let path_str = opts
+                    .get("path")
+                    .or_else(|| opts.get("file"))
+                    .ok_or_else(|| anyhow::anyhow!("`load-weights` requires `path=<file>`"))?;
+                chain.push(Box::new(LoadWeightsTranslator {
+                    path: PathBuf::from(path_str),
+                }));
                 last_out = "ir";
             }
             "export-onnx" => {
@@ -103,31 +205,36 @@ pub fn build_translator_chain(
             "optimize-loop-ir" => {
                 let config = parse_target_config_opts(&opts);
                 let mut pass = OptimizeLoopIrPass::default();
-                if let Some(v) = opts.get("fuse").or_else(|| opts.get("fuse_loops")) {
-                    pass.fuse_loops = v == "true" || v == "1";
+                if opts.contains_key("fuse") || opts.contains_key("fuse_loops") {
+                    let key = if opts.contains_key("fuse") {
+                        "fuse"
+                    } else {
+                        "fuse_loops"
+                    };
+                    pass.fuse_loops = parse_bool_opt(&opts, key, pass.fuse_loops);
                 }
-                if let Some(v) = opts.get("vectorize") {
-                    pass.vectorize = v == "true" || v == "1";
+                if opts.contains_key("vectorize") {
+                    pass.vectorize = parse_bool_opt(&opts, "vectorize", pass.vectorize);
                 }
                 if let Some(v) = opts.get("unroll").or_else(|| opts.get("unroll_factor"))
                     && let Ok(n) = v.parse::<usize>()
                 {
                     pass.unroll_factor = n.max(1);
                 }
-                if let Some(v) = opts.get("parallel") {
-                    pass.parallel = v == "true" || v == "1";
+                if opts.contains_key("parallel") {
+                    pass.parallel = parse_bool_opt(&opts, "parallel", pass.parallel);
                 }
-                if let Some(v) = opts.get("interchange") {
-                    pass.interchange = v == "true" || v == "1";
+                if opts.contains_key("interchange") {
+                    pass.interchange = parse_bool_opt(&opts, "interchange", pass.interchange);
                 }
                 chain.push(Box::new(OptimizeLoopIrTranslator { config, pass }));
                 last_out = "text";
             }
-            "codegen-header" => {
+            "codegen-header" | "c-header" | "emit-header" => {
                 chain.push(Box::new(CHeaderTranslator));
                 last_out = "text";
             }
-            "compile-lib" => {
+            "compile-lib" | "shared-lib" => {
                 let config = parse_target_config_opts(&opts);
                 chain.push(Box::new(SharedLibTranslator { config }));
                 last_out = "bytes";
@@ -169,7 +276,7 @@ pub fn build_translator_chain(
                             "codegen-opencl" | "codegen-cl" => "opencl",
                             _ => "rust",
                         });
-                let tgt = CodegenTarget::parse(tgt_str);
+                let tgt = parse_codegen_target_strict(tgt_str)?;
                 let cfg = parse_target_config_opts(&opts);
                 chain.push(Box::new(CodegenTranslator::with_config(tgt, cfg)));
                 last_out = "text";
@@ -184,12 +291,7 @@ pub fn build_translator_chain(
                             "viz-html" => "html",
                             _ => "mermaid",
                         });
-                let fmt = match fmt_str.to_ascii_lowercase().as_str() {
-                    "dot" | "graphviz" => VizFormat::Dot,
-                    "json" => VizFormat::Json,
-                    "html" => VizFormat::Html,
-                    _ => VizFormat::Mermaid,
-                };
+                let fmt = parse_viz_format_strict(fmt_str)?;
                 chain.push(Box::new(VizTranslator { format: fmt }));
                 last_out = "text";
             }
@@ -304,4 +406,73 @@ pub(crate) fn parse_roofline_opts(opts: &IndexMap<String, String>) -> HardwareRo
         roofline.peak_bandwidth_gbps = bw.max(1e-3);
     }
     roofline
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::args::{Cli, Commands};
+    use clap::Parser;
+
+    #[test]
+    fn test_cli_arg_parsing_and_chain_options() {
+        let cli = Cli::try_parse_from([
+            "castforge",
+            "opt",
+            "model.mlir",
+            "-p",
+            "canonicalize",
+            "--stats=false",
+            "--bisect",
+        ])
+        .expect("opt flags parse cleanly");
+        if let Commands::Opt { stats, bisect, .. } = cli.command {
+            assert!(!stats);
+            assert!(bisect);
+        } else {
+            panic!("expected Commands::Opt");
+        }
+
+        let cli_cg = Cli::try_parse_from([
+            "castforge",
+            "codegen",
+            "model.mlir",
+            "--arch",
+            "x86_64-avx512",
+            "--tile-size",
+            "128",
+            "--vectorize=false",
+            "--autotune",
+        ])
+        .expect("codegen flags parse cleanly");
+        if let Commands::Codegen {
+            arch,
+            tile_size,
+            vectorize,
+            autotune,
+            ..
+        } = cli_cg.command
+        {
+            assert_eq!(arch.as_deref(), Some("x86_64-avx512"));
+            assert_eq!(tile_size, Some(128));
+            assert_eq!(vectorize, Some(false));
+            assert!(autotune);
+        } else {
+            panic!("expected Commands::Codegen");
+        }
+
+        let reg = PassRegistry::with_builtin_passes();
+        let (chain, first_in, last_out) = build_translator_chain(
+            &reg,
+            "autotune-schedule(arch=nvidia-hopper,peak_gflops=80000) | \
+             codegen-c(arch=x86_64-avx512,tile_size=64,unroll=4)",
+        )
+        .expect("chain builds");
+        assert_eq!(first_in, "text");
+        assert_eq!(last_out, "text");
+        assert_eq!(chain.describe_stages().len(), 3);
+
+        assert!(build_translator_chain(&reg, "codegen(target=invalid_target)").is_err());
+        assert!(build_translator_chain(&reg, "viz(format=invalid_format)").is_err());
+    }
 }

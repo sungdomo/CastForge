@@ -27,7 +27,8 @@ pub use crate::codegen::cost_model::{
 };
 pub use crate::codegen::eval::{
     BisectReport, BisectStep, NumericVerificationReport, bisect_module_snapshots,
-    evaluate_function, evaluate_module, generate_synthetic_inputs, verify_module_numerics,
+    compare_output_tensors, evaluate_function, evaluate_module, generate_synthetic_inputs,
+    verify_module_numerics,
 };
 pub use crate::codegen::loop_ir::{
     CHeaderTranslator, LoopKernel, LoopModule, LoopPass, LoopStmt, OptimizeLoopIrPass,

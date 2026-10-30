@@ -1,6 +1,6 @@
 //! Clap command-line argument definitions (`Cli` and `Commands`) for `castforge`.
 
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use std::path::PathBuf;
 
 /// Top-level `castforge` command-line parser.
@@ -47,15 +47,29 @@ pub enum Commands {
         #[arg(long)]
         generic: bool,
 
-        /// Print pass execution statistics to stderr
-        #[arg(long, default_value_t = true)]
+        /// Print pass execution statistics to stderr (--stats=false or -q to suppress)
+        #[arg(
+            long,
+            default_value_t = true,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            action = ArgAction::Set
+        )]
         stats: bool,
+
+        /// Suppress pass statistics logging to stderr
+        #[arg(short = 'q', long = "quiet")]
+        quiet: bool,
 
         /// Verify numerical equivalence before vs. after optimization passes
         #[arg(long = "verify-numerics")]
         verify_numerics: bool,
 
-        /// Maximum allowed absolute difference when --verify-numerics is enabled
+        /// Bisect the pass pipeline step-by-step to pinpoint numerical drift
+        #[arg(long = "bisect")]
+        bisect: bool,
+
+        /// Maximum allowed absolute difference when --verify-numerics or --bisect is enabled
         #[arg(long = "tolerance", default_value_t = 1e-4)]
         tolerance: f32,
     },
@@ -73,7 +87,11 @@ pub enum Commands {
         #[arg(short = 'w', long = "weights")]
         weights: Option<PathBuf>,
 
-        /// Numerical verification tolerance when -p/--passes is used
+        /// Bisect the pass pipeline step-by-step to pinpoint numerical drift
+        #[arg(long = "bisect")]
+        bisect: bool,
+
+        /// Numerical verification tolerance when -p/--passes or --bisect is used
         #[arg(long = "tolerance", default_value_t = 1e-4)]
         tolerance: f32,
     },
@@ -82,6 +100,10 @@ pub enum Commands {
     Parse {
         /// Input MLIR file path (reads from stdin if omitted or "-")
         input: Option<PathBuf>,
+
+        /// Output MLIR file path (defaults to stdout)
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
 
         /// Emit canonical MLIR Generic Form
         #[arg(long)]
@@ -101,17 +123,21 @@ pub enum Commands {
         #[arg(short = 'p', long = "passes")]
         passes: Option<String>,
 
+        /// Optional input `.safetensors` file to load into TensorStore before passes
+        #[arg(short = 'w', long = "weights")]
+        weights: Option<PathBuf>,
+
         /// Optional output file path (e.g., trace.html)
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
     },
 
-    /// Generate executable source code (rust, c, wgsl, cuda, msl, hip, opencl) from an MLIR module
+    /// Generate executable source code (rust, c, wgsl, cuda, msl, hip, opencl, header, loop-ir)
     Codegen {
         /// Input MLIR file path (reads from stdin if omitted or "-")
         input: Option<PathBuf>,
 
-        /// Codegen target: rust, c, wgsl, cuda, msl (metal), hip (rocm), or opencl
+        /// Codegen target: rust, c, wgsl, cuda, msl, hip, opencl, header, loop-ir, or lib
         #[arg(short = 't', long = "target", default_value = "rust")]
         target: String,
 
@@ -126,6 +152,14 @@ pub enum Commands {
         /// Optional output file path
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
+
+        /// Optional path to emit a companion C/C++ `.h` FFI header alongside codegen
+        #[arg(long = "emit-header")]
+        emit_header: Option<PathBuf>,
+
+        /// Automatically search and apply the Roofline-optimal loop schedule before codegen
+        #[arg(long = "autotune")]
+        autotune: bool,
 
         /// Optional cache/register tile size for GEMM loops (0 = untiled)
         #[arg(long = "tile-size")]
@@ -143,21 +177,21 @@ pub enum Commands {
         #[arg(long = "unroll")]
         unroll: Option<usize>,
 
-        /// Emit explicit SIMD vectorization pragmas/annotations
-        #[arg(long = "vectorize")]
-        vectorize: bool,
+        /// Emit explicit SIMD vectorization pragmas/annotations (--vectorize or --vectorize=false)
+        #[arg(long = "vectorize", num_args = 0..=1, default_missing_value = "true")]
+        vectorize: Option<bool>,
 
         /// Register micro-kernel Unroll-and-Jam tile size (0 = disabled, e.g. 2 for 2x2)
         #[arg(long = "reg-tile")]
         reg_tile: Option<usize>,
 
         /// Collapse/coalesce nested 2D loops into 1D loops
-        #[arg(long = "collapse-loops")]
-        collapse_loops: bool,
+        #[arg(long = "collapse-loops", num_args = 0..=1, default_missing_value = "true")]
+        collapse_loops: Option<bool>,
 
-        /// Emit multicore parallel outer-loop work-sharing
-        #[arg(long = "parallel")]
-        parallel: bool,
+        /// Emit multicore parallel outer-loop work-sharing (--parallel or --parallel=false)
+        #[arg(long = "parallel", num_args = 0..=1, default_missing_value = "true")]
+        parallel: Option<bool>,
 
         /// Outer L2 cache tile size (0 = disabled)
         #[arg(long = "l2-tile-size")]
@@ -172,12 +206,12 @@ pub enum Commands {
         split_k: Option<usize>,
 
         /// Enable polyhedral wavefront loop skewing (w = m + n)
-        #[arg(long = "loop-skew")]
-        loop_skew: bool,
+        #[arg(long = "loop-skew", num_args = 0..=1, default_missing_value = "true")]
+        loop_skew: Option<bool>,
 
         /// Enable 2-stage software-pipelined ping-pong tile double-buffering
-        #[arg(long = "double-buffer")]
-        double_buffer: bool,
+        #[arg(long = "double-buffer", num_args = 0..=1, default_missing_value = "true")]
+        double_buffer: Option<bool>,
 
         /// Hardware SIMD ISA: scalar, avx2, avx512, neon, sve, rvv, or wasm
         #[arg(long = "simd-isa")]
@@ -197,17 +231,29 @@ pub enum Commands {
         #[arg(short = 'p', long = "passes")]
         passes: Option<String>,
 
-        /// Peak hardware compute throughput in GFLOP/s
-        #[arg(long = "peak-gflops", default_value_t = 1000.0)]
-        peak_gflops: f64,
+        /// Optional input `.safetensors` file to load into TensorStore before passes
+        #[arg(short = 'w', long = "weights")]
+        weights: Option<PathBuf>,
 
-        /// Peak hardware memory bandwidth in GB/s
-        #[arg(long = "peak-bw-gbps", default_value_t = 100.0)]
-        peak_bw_gbps: f64,
+        /// Peak hardware compute throughput in GFLOP/s (default: 1000.0 or --arch preset)
+        #[arg(long = "peak-gflops")]
+        peak_gflops: Option<f64>,
+
+        /// Peak hardware memory bandwidth in GB/s (default: 100.0 or --arch preset)
+        #[arg(long = "peak-bw-gbps")]
+        peak_bw_gbps: Option<f64>,
 
         /// Optional hardware architecture Roofline preset (e.g. nvidia-hopper, apple-m-series)
         #[arg(long = "arch")]
         arch: Option<String>,
+
+        /// Emit Roofline cost report as formatted JSON instead of an ASCII table
+        #[arg(long = "json")]
+        json: bool,
+
+        /// Optional output file path (defaults to stdout)
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
     },
 
     /// Auto-tune polyhedral/HPC loop schedules using the Roofline & cache model
@@ -219,13 +265,17 @@ pub enum Commands {
         #[arg(short = 'p', long = "passes")]
         passes: Option<String>,
 
-        /// Peak hardware compute throughput in GFLOP/s
-        #[arg(long = "peak-gflops", default_value_t = 1000.0)]
-        peak_gflops: f64,
+        /// Optional input `.safetensors` file to load into TensorStore before passes
+        #[arg(short = 'w', long = "weights")]
+        weights: Option<PathBuf>,
 
-        /// Peak hardware memory bandwidth in GB/s
-        #[arg(long = "peak-bw-gbps", default_value_t = 100.0)]
-        peak_bw_gbps: f64,
+        /// Peak hardware compute throughput in GFLOP/s (default: 1000.0 or --arch preset)
+        #[arg(long = "peak-gflops")]
+        peak_gflops: Option<f64>,
+
+        /// Peak hardware memory bandwidth in GB/s (default: 100.0 or --arch preset)
+        #[arg(long = "peak-bw-gbps")]
+        peak_bw_gbps: Option<f64>,
 
         /// Number of top-ranked schedule candidates to display
         #[arg(long = "top-k", default_value_t = 5)]
@@ -238,6 +288,14 @@ pub enum Commands {
         /// Optional hardware architecture Roofline preset (e.g. x86_64-avx512, nvidia-hopper)
         #[arg(long = "arch")]
         arch: Option<String>,
+
+        /// Emit auto-tuning report as JSON instead of an ASCII table
+        #[arg(long = "json")]
+        json: bool,
+
+        /// Optional output file path to write the schedule-stamped MLIR module (or JSON if --json)
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
     },
 
     /// Import an external model (GGUF v2/v3, ONNX JSON, or HuggingFace config.json) into IR
@@ -295,6 +353,10 @@ pub enum Commands {
         #[arg(short = 's', long = "stages")]
         stages: String,
 
+        /// Optional input `.safetensors` file to preload into TensorStore when starting from IR
+        #[arg(short = 'w', long = "weights")]
+        weights: Option<PathBuf>,
+
         /// Optional output file path (defaults to stdout)
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
@@ -306,13 +368,17 @@ pub enum Commands {
         #[arg(required = true)]
         inputs: Vec<PathBuf>,
 
-        /// Optional pair of functions `first,second` to chain via `compose-functions`
+        /// Optional pair of functions `first,second` (or `first,second:entry`) to compose
         #[arg(long = "compose")]
         compose: Option<String>,
 
         /// Optional pass pipeline to run after linking
         #[arg(short = 'p', long = "passes")]
         passes: Option<String>,
+
+        /// Optional input `.safetensors` file to load into TensorStore before passes
+        #[arg(short = 'w', long = "weights")]
+        weights: Option<PathBuf>,
 
         /// Optional output MLIR file path (defaults to stdout)
         #[arg(short = 'o', long = "output")]

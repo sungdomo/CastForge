@@ -6,5 +6,7 @@ pub mod chain;
 pub mod commands;
 
 pub use args::{Cli, Commands};
-pub use chain::build_translator_chain;
+pub use chain::{
+    LoadWeightsTranslator, build_translator_chain, build_translator_chain_with_weights,
+};
 pub use commands::run;

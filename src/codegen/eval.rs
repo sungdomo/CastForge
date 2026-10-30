@@ -57,7 +57,8 @@ pub fn verify_module_numerics(
     compare_output_tensors(&out_before, &out_after, tolerance)
 }
 
-fn compare_output_tensors(
+/// Compares two sets of evaluated output tensors and returns a [`NumericVerificationReport`].
+pub fn compare_output_tensors(
     out_before: &[Vec<f32>],
     out_after: &[Vec<f32>],
     tolerance: f32,
