@@ -11,8 +11,8 @@ impl Default for PassRegistry {
 }
 
 impl PassRegistry {
-    /// Create a registry pre-populated with all 21 built-in CastForge passes (`18` passes + `3`
-    /// presets `O1`/`O2`/`O3`).
+    /// Create a registry pre-populated with all built-in single-traversal CastForge passes and
+    /// `O1`/`O2`/`O3` optimization presets.
     pub fn with_builtin_passes() -> Self {
         let mut reg = Self::new();
         reg.register(
@@ -259,6 +259,37 @@ impl PassRegistry {
             },
         );
         reg.register(
+            "prune-weights",
+            "Compile-time weight pruning (mode=structured|2to4|activation_sparse, sparsity)",
+            |opts| {
+                let mode = opts
+                    .get("mode")
+                    .or_else(|| opts.get("kind"))
+                    .cloned()
+                    .unwrap_or_else(|| "structured".to_string());
+                let sparsity = opts
+                    .get("sparsity")
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(0.5);
+                Ok(Box::new(PruneWeightsPass { mode, sparsity }))
+            },
+        );
+        reg.register(
+            "externalize-weights",
+            "Externalize or inline weight constants between IR and SafeTensors TensorStore",
+            |opts| {
+                let min_elements = opts
+                    .get("min_elements")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(2);
+                let inline = opts.get("inline").is_some_and(|v| v == "true" || v == "1");
+                Ok(Box::new(ExternalizeWeightsPass {
+                    min_elements,
+                    inline,
+                }))
+            },
+        );
+        reg.register(
             "fuse-elementwise",
             "Unified elementwise, activation (SwiGLU/GELU/GeGLU/MoE), map-reduce & loop fusion",
             |opts| {
@@ -305,6 +336,27 @@ impl PassRegistry {
                     top_k,
                     capacity_factor,
                 }))
+            },
+        );
+        reg.register(
+            "decompose-composites",
+            "Expands castforge.* composite operations into primitive StableHLO ops",
+            |_opts| Ok(Box::new(DecomposeCompositesPass)),
+        );
+        reg.register(
+            "fuse-loops",
+            "Fuses multi-step elementwise chains into castforge.fused_elementwise_chain",
+            |_opts| Ok(Box::new(FuseLoopsPass)),
+        );
+        reg.register(
+            "fission-loops",
+            "Splits oversized fused_elementwise_chain ops at max_steps register-pressure limits",
+            |opts| {
+                let max_steps = opts
+                    .get("max_steps")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(3);
+                Ok(Box::new(FissionLoopsPass { max_steps }))
             },
         );
         reg.register(

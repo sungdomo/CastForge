@@ -89,23 +89,16 @@ impl Pass for FoldWeightsPass {
             modified += r.ops_modified;
             removed += r.ops_removed;
             created += r.ops_created;
-        } else if matches!(m.as_str(), "norm" | "fold_norm") {
-            let r = FoldNormWeightsPass.run(module)?;
-            modified += r.ops_modified;
-            removed += r.ops_removed;
-            created += r.ops_created;
-        } else if matches!(m.as_str(), "batchnorm" | "bn" | "all") {
-            let r = FoldBatchNormPass.run(module)?;
-            modified += r.ops_modified;
-            removed += r.ops_removed;
-            created += r.ops_created;
-        }
-
-        if matches!(m.as_str(), "pack" | "pack_weights" | "all") {
-            let r = PackWeightsPass.run(module)?;
-            modified += r.ops_modified;
-            removed += r.ops_removed;
-            created += r.ops_created;
+        } else {
+            let do_norm = matches!(
+                m.as_str(),
+                "norm" | "fold_norm" | "batchnorm" | "bn" | "all"
+            );
+            let do_bn = matches!(m.as_str(), "batchnorm" | "bn" | "all");
+            let do_pack = matches!(m.as_str(), "pack" | "pack_weights" | "all");
+            let (m_cnt, r_cnt) = fold_weights_single_traversal(module, do_norm, do_bn, do_pack)?;
+            modified += m_cnt;
+            removed += r_cnt;
         }
 
         Ok(PassResult {
@@ -116,6 +109,40 @@ impl Pass for FoldWeightsPass {
             ops_created: created,
         })
     }
+}
+
+fn fold_weights_single_traversal(
+    module: &mut Module,
+    do_norm: bool,
+    do_bn: bool,
+    do_pack: bool,
+) -> Result<(usize, usize)> {
+    let mut modified = 0usize;
+    let mut removed = 0usize;
+    let mut packed_const_ops: HashSet<OpId> = HashSet::new();
+    let blocks: Vec<BlockId> = module.blocks.keys().collect();
+
+    for block_id in blocks {
+        let ops = module.block_ops(block_id);
+        for op_id in ops {
+            if do_norm && try_fold_norm_weight_at_op(module, op_id) {
+                modified += 2;
+            }
+            if do_bn && try_fold_bn_at_op(module, op_id) {
+                modified += 1;
+            }
+            if do_pack {
+                modified += try_pack_weight_at_op(module, op_id, &mut packed_const_ops);
+            }
+        }
+    }
+
+    if (do_norm || do_bn) && modified > 0 {
+        let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
+        removed += dce_res.ops_removed;
+    }
+
+    Ok((modified, removed))
 }
 
 /// Normalization Scale Weight Folding Pass (`fold-norm-weights`).
@@ -131,119 +158,7 @@ impl Pass for FoldNormWeightsPass {
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let mut modified = 0usize;
-        let mut removed = 0usize;
-        let blocks: Vec<BlockId> = module.blocks.keys().collect();
-
-        for block_id in blocks {
-            let ops = module.block_ops(block_id);
-            for op_id in ops {
-                let Some(op) = module.ops.get(op_id) else {
-                    continue;
-                };
-                let Some(StableHloOp::DotGeneral {
-                    lhs,
-                    rhs,
-                    dimension_numbers,
-                    ..
-                }) = StableHloOp::from_op(op)
-                else {
-                    continue;
-                };
-
-                if dimension_numbers.lhs_contracting_dimensions != vec![1]
-                    || dimension_numbers.rhs_contracting_dimensions != vec![0]
-                {
-                    continue;
-                }
-
-                if module.use_count(rhs) != 1 {
-                    continue;
-                }
-                let ValueDef::OpResult { op: w_op_id, .. } = module.values[rhs].def else {
-                    continue;
-                };
-                let Some(w_ty) = module.values[rhs].ty.as_tensor().cloned() else {
-                    continue;
-                };
-                if w_ty.dtype != DType::F32 || w_ty.shape.len() != 2 {
-                    continue;
-                }
-                let (Dim::Static(k_dim), Dim::Static(n_dim)) = (&w_ty.shape[0], &w_ty.shape[1])
-                else {
-                    continue;
-                };
-                let (k, n) = (*k_dim as usize, *n_dim as usize);
-
-                let ValueDef::OpResult { op: mul_op_id, .. } = module.values[lhs].def else {
-                    continue;
-                };
-                let Some(mul_op) = module.ops.get(mul_op_id) else {
-                    continue;
-                };
-                let Some(StableHloOp::Multiply {
-                    lhs: mul_a,
-                    rhs: mul_b,
-                    ..
-                }) = StableHloOp::from_op(mul_op)
-                else {
-                    continue;
-                };
-
-                let Some((x_val, scale_vec)) = extract_x_and_scale(module, mul_a, mul_b, k)
-                    .or_else(|| extract_x_and_scale(module, mul_b, mul_a, k))
-                else {
-                    continue;
-                };
-
-                let Some(w_op) = module.ops.get(w_op_id) else {
-                    continue;
-                };
-                if !w_op.is_op("stablehlo", "constant") {
-                    continue;
-                }
-                let Some(w_attr) = w_op.attributes.get("value").cloned() else {
-                    continue;
-                };
-                let Some(mut w_vals) = module.tensor_store.resolve_f32_attr(&w_attr, k * n) else {
-                    continue;
-                };
-
-                for row in 0..k {
-                    let s = scale_vec[row];
-                    for col in 0..n {
-                        w_vals[row * n + col] *= s;
-                    }
-                }
-
-                match &w_attr {
-                    Attribute::TensorRef { key, .. } => {
-                        if let Some(entry) = module.tensor_store.get_mut(key) {
-                            entry.backing = TensorBacking::F32Data(w_vals);
-                        }
-                    }
-                    _ => {
-                        let raw_literal = format_dense_f32_literal(&w_vals, &w_ty.shape);
-                        module.ops[w_op_id].attributes.insert(
-                            "value".to_string(),
-                            Attribute::DenseElements {
-                                ty: w_ty,
-                                raw_literal,
-                            },
-                        );
-                    }
-                }
-
-                module.ops[op_id].operands[0] = x_val;
-                modified += 2;
-            }
-        }
-
-        if modified > 0 {
-            let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
-            removed += dce_res.ops_removed;
-        }
-
+        let (modified, removed) = fold_weights_single_traversal(module, true, false, false)?;
         Ok(PassResult {
             pass_name: self.name().to_string(),
             changed: modified > 0 || removed > 0,
@@ -252,6 +167,106 @@ impl Pass for FoldNormWeightsPass {
             ops_created: 0,
         })
     }
+}
+
+fn try_fold_norm_weight_at_op(module: &mut Module, op_id: OpId) -> bool {
+    let Some(op) = module.ops.get(op_id) else {
+        return false;
+    };
+    let Some(StableHloOp::DotGeneral {
+        lhs,
+        rhs,
+        dimension_numbers,
+        ..
+    }) = StableHloOp::from_op(op)
+    else {
+        return false;
+    };
+
+    if dimension_numbers.lhs_contracting_dimensions != vec![1]
+        || dimension_numbers.rhs_contracting_dimensions != vec![0]
+    {
+        return false;
+    }
+
+    if module.use_count(rhs) != 1 {
+        return false;
+    }
+    let ValueDef::OpResult { op: w_op_id, .. } = module.values[rhs].def else {
+        return false;
+    };
+    let Some(w_ty) = module.values[rhs].ty.as_tensor().cloned() else {
+        return false;
+    };
+    if w_ty.dtype != DType::F32 || w_ty.shape.len() != 2 {
+        return false;
+    }
+    let (Dim::Static(k_dim), Dim::Static(n_dim)) = (&w_ty.shape[0], &w_ty.shape[1]) else {
+        return false;
+    };
+    let (k, n) = (*k_dim as usize, *n_dim as usize);
+
+    let ValueDef::OpResult { op: mul_op_id, .. } = module.values[lhs].def else {
+        return false;
+    };
+    let Some(mul_op) = module.ops.get(mul_op_id) else {
+        return false;
+    };
+    let Some(StableHloOp::Multiply {
+        lhs: mul_a,
+        rhs: mul_b,
+        ..
+    }) = StableHloOp::from_op(mul_op)
+    else {
+        return false;
+    };
+
+    let Some((x_val, scale_vec)) = extract_x_and_scale(module, mul_a, mul_b, k)
+        .or_else(|| extract_x_and_scale(module, mul_b, mul_a, k))
+    else {
+        return false;
+    };
+
+    let Some(w_op) = module.ops.get(w_op_id) else {
+        return false;
+    };
+    if !w_op.is_op("stablehlo", "constant") {
+        return false;
+    }
+    let Some(w_attr) = w_op.attributes.get("value").cloned() else {
+        return false;
+    };
+    let Some(mut w_vals) = module.tensor_store.resolve_f32_attr(&w_attr, k * n) else {
+        return false;
+    };
+
+    for row in 0..k {
+        let s = scale_vec[row];
+        for col in 0..n {
+            w_vals[row * n + col] *= s;
+        }
+    }
+
+    match &w_attr {
+        Attribute::TensorRef { key, .. } => {
+            if let Some(entry) = module.tensor_store.get_mut(key) {
+                entry.backing = TensorBacking::F32Data(w_vals);
+            }
+        }
+        _ => {
+            let raw_literal = format_dense_f32_literal(&w_vals, &w_ty.shape);
+            module.ops[w_op_id].attributes.insert(
+                "value".to_string(),
+                Attribute::DenseElements {
+                    ty: w_ty,
+                    raw_literal,
+                },
+            );
+        }
+    }
+
+    module.ops[op_id].operands[0] = x_val;
+    true
 }
 
 fn extract_x_and_scale(
@@ -321,46 +336,32 @@ impl Pass for FoldBatchNormPass {
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let pre_norm_res = FoldNormWeightsPass.run(module)?;
-        let mut modified = pre_norm_res.ops_modified;
-        let mut removed = pre_norm_res.ops_removed;
-        let blocks: Vec<BlockId> = module.blocks.keys().collect();
-
-        for block_id in blocks {
-            let ops = module.block_ops(block_id);
-            for op_id in ops {
-                let Some(op) = module.ops.get(op_id).cloned() else {
-                    continue;
-                };
-                let Some(StableHloOp::Multiply {
-                    lhs: a,
-                    rhs: b,
-                    result: mul_out,
-                }) = StableHloOp::from_op(&op)
-                else {
-                    continue;
-                };
-                if let Some(()) = try_fold_bn_scale(module, a, b, mul_out)
-                    .or_else(|| try_fold_bn_scale(module, b, a, mul_out))
-                {
-                    modified += 1;
-                }
-            }
-        }
-
-        if modified > 0 {
-            let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
-            removed += dce_res.ops_removed;
-        }
-
+        let (modified, removed) = fold_weights_single_traversal(module, true, true, false)?;
         Ok(PassResult {
             pass_name: self.name().to_string(),
-            changed: modified > 0 || removed > 0 || pre_norm_res.changed,
+            changed: modified > 0 || removed > 0,
             ops_removed: removed,
             ops_modified: modified,
             ops_created: 0,
         })
     }
+}
+
+fn try_fold_bn_at_op(module: &mut Module, op_id: OpId) -> bool {
+    let Some(op) = module.ops.get(op_id).cloned() else {
+        return false;
+    };
+    let Some(StableHloOp::Multiply {
+        lhs: a,
+        rhs: b,
+        result: mul_out,
+    }) = StableHloOp::from_op(&op)
+    else {
+        return false;
+    };
+    try_fold_bn_scale(module, a, b, mul_out)
+        .or_else(|| try_fold_bn_scale(module, b, a, mul_out))
+        .is_some()
 }
 
 fn try_fold_bn_scale(
@@ -378,6 +379,10 @@ fn try_fold_bn_scale(
     if (!is_dot && !is_conv) || lin_op.operands.len() < 2 {
         return None;
     }
+    let packed_rhs = matches!(
+        lin_op.attributes.get("packed_rhs"),
+        Some(Attribute::Bool(true))
+    );
 
     let w_val = lin_op.operands[1];
     let ValueDef::OpResult { op: w_op_id, .. } = module.values[w_val].def else {
@@ -415,18 +420,32 @@ fn try_fold_bn_scale(
     let sc_attr = sc_op.attributes.get("value")?.clone();
     let sc_data = module.tensor_store.resolve_f32_attr(&sc_attr, sc_elems)?;
 
-    let out_channels = match w_ty.shape.last()? {
-        Dim::Static(c) if *c > 0 => *c as usize,
-        _ => return None,
-    };
-    if !w_elems.is_multiple_of(out_channels) {
-        return None;
-    }
-    let rows = w_elems / out_channels;
-    for r in 0..rows {
+    if packed_rhs && w_ty.shape.len() == 2 {
+        let out_channels = match w_ty.shape.first()? {
+            Dim::Static(c) if *c > 0 => *c as usize,
+            _ => return None,
+        };
+        let k_cols = w_elems / out_channels;
         for c in 0..out_channels {
             let s = sc_data[c % sc_data.len()];
-            w_data[r * out_channels + c] *= s;
+            for r in 0..k_cols {
+                w_data[c * k_cols + r] *= s;
+            }
+        }
+    } else {
+        let out_channels = match w_ty.shape.last()? {
+            Dim::Static(c) if *c > 0 => *c as usize,
+            _ => return None,
+        };
+        if !w_elems.is_multiple_of(out_channels) {
+            return None;
+        }
+        let rows = w_elems / out_channels;
+        for r in 0..rows {
+            for c in 0..out_channels {
+                let s = sc_data[c % sc_data.len()];
+                w_data[r * out_channels + c] *= s;
+            }
         }
     }
 
@@ -466,138 +485,7 @@ impl Pass for PackWeightsPass {
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let mut modified = 0usize;
-        let mut packed_const_ops: HashSet<OpId> = HashSet::new();
-        let blocks: Vec<BlockId> = module.blocks.keys().collect();
-
-        for block_id in blocks {
-            let ops = module.block_ops(block_id);
-            for op_id in ops {
-                let Some(op) = module.ops.get(op_id) else {
-                    continue;
-                };
-
-                let is_cand = match StableHloOp::from_op(op) {
-                    Some(StableHloOp::DotGeneral {
-                        dimension_numbers: dims,
-                        ..
-                    }) => {
-                        dims.lhs_batching_dimensions.is_empty()
-                            && dims.rhs_batching_dimensions.is_empty()
-                            && dims.lhs_contracting_dimensions == [1]
-                            && dims.rhs_contracting_dimensions == [0]
-                    }
-                    Some(StableHloOp::Composite { name, inputs, .. })
-                        if name == "castforge.fused_matmul_epilogue" && inputs.len() >= 3 =>
-                    {
-                        let rhs_c = op
-                            .attributes
-                            .get("rhs_contracting_dimensions")
-                            .and_then(|a| match a {
-                                Attribute::DenseIntArray(v) => Some(v.as_slice()),
-                                _ => None,
-                            })
-                            .unwrap_or(&[0]);
-                        rhs_c == [0]
-                    }
-                    _ => false,
-                };
-                if !is_cand {
-                    continue;
-                }
-
-                let Some(&rhs_val) = module.ops[op_id].operands.get(1) else {
-                    continue;
-                };
-                let ValueDef::OpResult { op: w_op_id, .. } = module.values[rhs_val].def else {
-                    continue;
-                };
-
-                if !packed_const_ops.contains(&w_op_id) {
-                    let Some(w_op) = module.ops.get(w_op_id) else {
-                        continue;
-                    };
-                    if !w_op.is_op("stablehlo", "constant") {
-                        continue;
-                    }
-                    let Some(w_ty) = module.values[rhs_val].ty.as_tensor().cloned() else {
-                        continue;
-                    };
-                    if w_ty.dtype != DType::F32 || w_ty.shape.len() != 2 {
-                        continue;
-                    }
-                    let (Dim::Static(k_i64), Dim::Static(n_i64)) = (&w_ty.shape[0], &w_ty.shape[1])
-                    else {
-                        continue;
-                    };
-                    let (k, n) = (*k_i64 as usize, *n_i64 as usize);
-                    let Some(w_attr) = w_op.attributes.get("value").cloned() else {
-                        continue;
-                    };
-                    let Some(w_vals) = module.tensor_store.resolve_f32_attr(&w_attr, k * n) else {
-                        continue;
-                    };
-
-                    let mut packed_vals = vec![0.0_f32; n * k];
-                    for row_k in 0..k {
-                        for col_n in 0..n {
-                            packed_vals[col_n * k + row_k] = w_vals[row_k * n + col_n];
-                        }
-                    }
-
-                    let packed_ty = TensorType {
-                        shape: vec![Dim::Static(n as i64), Dim::Static(k as i64)],
-                        dtype: DType::F32,
-                        encoding: w_ty.encoding.clone(),
-                    };
-
-                    match &w_attr {
-                        Attribute::TensorRef { key, .. } => {
-                            if let Some(entry) = module.tensor_store.get_mut(key) {
-                                entry.ty = packed_ty.clone();
-                                entry.backing = TensorBacking::F32Data(packed_vals);
-                            }
-                            module.ops[w_op_id].attributes.insert(
-                                "value".to_string(),
-                                Attribute::TensorRef {
-                                    key: key.clone(),
-                                    ty: packed_ty.clone(),
-                                },
-                            );
-                        }
-                        _ => {
-                            let raw_literal =
-                                format_dense_f32_literal(&packed_vals, &packed_ty.shape);
-                            module.ops[w_op_id].attributes.insert(
-                                "value".to_string(),
-                                Attribute::DenseElements {
-                                    ty: packed_ty.clone(),
-                                    raw_literal,
-                                },
-                            );
-                        }
-                    }
-                    module.values[rhs_val].ty = Type::Tensor(packed_ty);
-                    packed_const_ops.insert(w_op_id);
-                    modified += 1;
-                }
-
-                let op_mut = &mut module.ops[op_id];
-                op_mut.attributes.insert(
-                    "lhs_contracting_dimensions".to_string(),
-                    Attribute::DenseIntArray(vec![1]),
-                );
-                op_mut.attributes.insert(
-                    "rhs_contracting_dimensions".to_string(),
-                    Attribute::DenseIntArray(vec![1]),
-                );
-                op_mut
-                    .attributes
-                    .insert("packed_rhs".to_string(), Attribute::Bool(true));
-                modified += 1;
-            }
-        }
-
+        let (modified, _) = fold_weights_single_traversal(module, false, false, true)?;
         Ok(PassResult {
             pass_name: self.name().to_string(),
             changed: modified > 0,
@@ -606,4 +494,133 @@ impl Pass for PackWeightsPass {
             ops_created: 0,
         })
     }
+}
+
+fn try_pack_weight_at_op(
+    module: &mut Module,
+    op_id: OpId,
+    packed_const_ops: &mut HashSet<OpId>,
+) -> usize {
+    let Some(op) = module.ops.get(op_id) else {
+        return 0;
+    };
+
+    let is_cand = match StableHloOp::from_op(op) {
+        Some(StableHloOp::DotGeneral {
+            dimension_numbers: dims,
+            ..
+        }) => {
+            dims.lhs_batching_dimensions.is_empty()
+                && dims.rhs_batching_dimensions.is_empty()
+                && dims.lhs_contracting_dimensions == [1]
+                && dims.rhs_contracting_dimensions == [0]
+        }
+        Some(StableHloOp::Composite { name, inputs, .. })
+            if name == "castforge.fused_matmul_epilogue" && inputs.len() >= 3 =>
+        {
+            let rhs_c = op
+                .attributes
+                .get("rhs_contracting_dimensions")
+                .and_then(|a| match a {
+                    Attribute::DenseIntArray(v) => Some(v.as_slice()),
+                    _ => None,
+                })
+                .unwrap_or(&[0]);
+            rhs_c == [0]
+        }
+        _ => false,
+    };
+    if !is_cand {
+        return 0;
+    }
+
+    let Some(&rhs_val) = module.ops[op_id].operands.get(1) else {
+        return 0;
+    };
+    let ValueDef::OpResult { op: w_op_id, .. } = module.values[rhs_val].def else {
+        return 0;
+    };
+
+    let mut modified = 0usize;
+    if !packed_const_ops.contains(&w_op_id) {
+        let Some(w_op) = module.ops.get(w_op_id) else {
+            return 0;
+        };
+        if !w_op.is_op("stablehlo", "constant") {
+            return 0;
+        }
+        let Some(w_ty) = module.values[rhs_val].ty.as_tensor().cloned() else {
+            return 0;
+        };
+        if w_ty.dtype != DType::F32 || w_ty.shape.len() != 2 {
+            return 0;
+        }
+        let (Dim::Static(k_i64), Dim::Static(n_i64)) = (&w_ty.shape[0], &w_ty.shape[1]) else {
+            return 0;
+        };
+        let (k, n) = (*k_i64 as usize, *n_i64 as usize);
+        let Some(w_attr) = w_op.attributes.get("value").cloned() else {
+            return 0;
+        };
+        let Some(w_vals) = module.tensor_store.resolve_f32_attr(&w_attr, k * n) else {
+            return 0;
+        };
+
+        let mut packed_vals = vec![0.0_f32; n * k];
+        for row_k in 0..k {
+            for col_n in 0..n {
+                packed_vals[col_n * k + row_k] = w_vals[row_k * n + col_n];
+            }
+        }
+
+        let packed_ty = TensorType {
+            shape: vec![Dim::Static(n as i64), Dim::Static(k as i64)],
+            dtype: DType::F32,
+            encoding: w_ty.encoding.clone(),
+        };
+
+        match &w_attr {
+            Attribute::TensorRef { key, .. } => {
+                if let Some(entry) = module.tensor_store.get_mut(key) {
+                    entry.ty = packed_ty.clone();
+                    entry.backing = TensorBacking::F32Data(packed_vals);
+                }
+                module.ops[w_op_id].attributes.insert(
+                    "value".to_string(),
+                    Attribute::TensorRef {
+                        key: key.clone(),
+                        ty: packed_ty.clone(),
+                    },
+                );
+            }
+            _ => {
+                let raw_literal = format_dense_f32_literal(&packed_vals, &packed_ty.shape);
+                module.ops[w_op_id].attributes.insert(
+                    "value".to_string(),
+                    Attribute::DenseElements {
+                        ty: packed_ty.clone(),
+                        raw_literal,
+                    },
+                );
+            }
+        }
+        module.values[rhs_val].ty = Type::Tensor(packed_ty);
+        packed_const_ops.insert(w_op_id);
+        modified += 1;
+    }
+
+    let op_mut = &mut module.ops[op_id];
+    op_mut.attributes.insert(
+        "lhs_contracting_dimensions".to_string(),
+        Attribute::DenseIntArray(vec![1]),
+    );
+    op_mut.attributes.insert(
+        "rhs_contracting_dimensions".to_string(),
+        Attribute::DenseIntArray(vec![1]),
+    );
+    op_mut
+        .attributes
+        .insert("packed_rhs".to_string(), Attribute::Bool(true));
+    modified += 1;
+    modified
 }

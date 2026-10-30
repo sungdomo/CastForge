@@ -1,11 +1,11 @@
-# CastForge — Complete Reference of All 21 Graph IR Passes (+ Unified LoopIR Pass)
+# CastForge — Complete Reference of All 38 Graph IR Passes (+ Unified LoopIR Pass)
 
-CastForge provides **21 built-in modular A-to-B IR passes & presets** (`18 passes + 3 presets
-O1/O2/O3`) across `src/passes/` and `src/ir/verify_ir.rs` (plus the unified **`OptimizeLoopIrPass`**
-(`optimize-loop-ir`) in `src/codegen/`). Core pass execution infrastructure (`Pass`, `PassManager`,
-`PassRegistry`) and `verify-ir` (`src/ir/verify_ir.rs`) live in `src/ir/`, while all transformation
-passes and `PassRegistry::with_builtin_passes()` are organized into focused pass modules and
-sub-packages (`src/passes/<pass>/`) under `src/passes/`.
+CastForge provides **38 built-in modular single-traversal A-to-B IR passes & presets** (`35 passes +
+3 presets O1/O2/O3`) across `src/passes/` and `src/ir/verify_ir.rs` (plus the unified
+**`OptimizeLoopIrPass`** (`optimize-loop-ir`) in `src/codegen/`). Core pass execution infrastructure
+(`Pass`, `PassManager`, `PassRegistry`) and `verify-ir` (`src/ir/verify_ir.rs`) live in `src/ir/`,
+while all transformation passes and `PassRegistry::with_builtin_passes()` are organized into focused
+pass modules and sub-packages (`src/passes/<pass>/`) under `src/passes/`.
 
 ---
 
@@ -15,15 +15,15 @@ sub-packages (`src/passes/<pass>/`) under `src/passes/`.
 | :--- | :---: | :--- |
 | **1. General MLIR & Algebraic Passes (+ `O1`/`O2`/`O3`)** | 7 | Section 1 |
 | **2. Views, Shape Specialization & Layout** | 2 | Section 2 |
-| **3. Weight Surgery, Pruning & Quantization** | 3 | Section 3 |
-| **4. Transformer, GEMM & Operator Fusions** | 4 | Section 4 |
-| **5. Memory Planning, Remat & Offload** | 1 | Section 5 |
-| **6. Distributed Parallelism, Streams & Autodiff** | 1 | Section 6 |
-| **7. Polyhedral Loop Scheduling & Tensor Cores** | 1 | Section 7 |
-| **8. IR Surgery, Verification & Tooling** | 2 | Section 8 |
+| **3. Weight Surgery, Pruning & Quantization** | 5 | Section 3 |
+| **4. Transformer, GEMM & Operator Fusions** | 7 | Section 4 |
+| **5. Memory Planning, Remat & Offload** | 3 | Section 5 |
+| **6. Distributed Parallelism, Streams & Autodiff** | 3 | Section 6 |
+| **7. Polyhedral Loop Scheduling & Tensor Cores** | 3 | Section 7 |
+| **8. IR Surgery, Verification & Tooling** | 8 | Section 8 |
 | **9. Polyhedral / Imperative LoopIR** | +1 | `src/codegen/` (Section 9) |
 
-*(Total: **21 registered Graph IR passes/presets** in `PassRegistry` + **`OptimizeLoopIrPass`**.)*
+*(Total: **38 registered Graph IR passes/presets** in `PassRegistry` + **`OptimizeLoopIrPass`**.)*
 
 ---
 
@@ -86,9 +86,9 @@ sub-packages (`src/passes/<pass>/`) under `src/passes/`.
 
 ---
 
-## 3. Weight Surgery, Pruning & Quantization Passes (`src/passes/`, 3 Passes)
+## 3. Weight Surgery, Pruning & Quantization Passes (`src/passes/`, 5 Passes)
 
-### 3.1 `quantize` (`QuantizePass` — `quantize.rs`)
+### 3.1 `quantize` (`QuantizePass` — `quantize/mod.rs`)
 - **Options:** `scheme=weight|groupwise|awq|fp8|nvfp4|f16|bf16|w8a8|smoothquant|hadamard|qat_ste`
   (`dtype=f16|bf16`, `bits=8|4`, `group_size=32`, `salient_ratio=0.01`, `format=e4m3|e5m2`,
   `mxfp8=true`, `block_size=32`, `samples=4`, `alpha=0.5`, `hadamard=true|false`)
@@ -109,117 +109,149 @@ sub-packages (`src/passes/<pass>/`) under `src/passes/`.
   **DoRA (Weight-Decomposed Low-Rank Adaptation)** directional column normalization & magnitude
   baking (`method=dora`, `castforge.dora_baked = true`).
 
-### 3.3 `fold-weights` (`FoldWeightsPass` — `fold_weights.rs`)
-- **Options:** `mode=batchnorm|norm|pack|externalize|inline|prune|structured|2to4|activation_sparse`
-  (default: `batchnorm`), `min_elements=2`, `inline=true|false`, `sparsity=0.5`
-- **Explanation:** Unified compile-time weight folding, pre-packing, SafeTensors storage &
-  sparsity pass absorbing pre-GEMM RMSNorm/LayerNorm scales (`mode=norm`), post-Conv/GEMM BatchNorm
-  scales (`mode=batchnorm`), pre-transposing 2D constant RHS weights `[K, N] -> [N, K]`
-  (`mode=pack`), externalizing inline `dense<...>` constants to `dense_resource<key>` in
-  `TensorStore` (`mode=externalize` / `inline`), L1 structured column pruning
-  (`mode=prune|structured`), NVIDIA Ampere/Hopper 2:4 structured sparsity (`mode=2to4`), and
-  **dynamic top-$k$ activation sparsity** (`mode=activation_sparse`).
+### 3.3 `fold-weights` (`FoldWeightsPass` — `fold_weights/mod.rs`)
+- **Options:** `mode=all|batchnorm|norm|pack` (default: `batchnorm`)
+- **Explanation:** Single-traversal compile-time weight folding & SIMD pre-packing pass absorbing
+  pre-GEMM RMSNorm/LayerNorm scales (`mode=norm`), post-Conv/GEMM BatchNorm scales
+  (`mode=batchnorm`), and pre-transposing 2D constant RHS weights `[K, N] -> [N, K]` (`mode=pack` or
+  `mode=all`).
+
+### 3.4 `prune-weights` (`PruneWeightsPass` — `fold_weights/prune.rs`)
+- **Options:** `mode=structured|2to4|activation_sparse` (default: `structured`), `sparsity=0.5`
+- **Explanation:** Single-traversal compile-time L1 structured column pruning (`mode=structured`),
+  NVIDIA Ampere/Hopper 2:4 semi-structured sparsity (`mode=2to4`), and **TEAL / CATS dynamic
+  top-$k$ activation sparsity** (`mode=activation_sparse`).
+
+### 3.5 `externalize-weights` (`ExternalizeWeightsPass` — `fold_weights/prune.rs`)
+- **Options:** `min_elements=2`, `inline=true|false`
+- **Explanation:** Single-traversal weight storage pass externalizing inline `dense<...>` constants
+  into `dense_resource<key>` handles in `TensorStore` (or inlining back with `inline=true`).
 
 ---
 
-## 4. Transformer, GEMM & Operator Fusion Passes (`src/passes/`, 4 Passes)
+## 4. Transformer, GEMM & Operator Fusion Passes (`src/passes/`, 7 Passes)
 
-### 4.1 `fuse-elementwise` (`UnifiedFuseElementwisePass` — `fuse_elementwise.rs`)
-- **Options:** `mode=composites|map_reduce|loops|megakernel|decompose|activations|swiglu|gelu|moe`
-  (default: `composites`), `max_steps=N`, `decompose=true|false`, `shared_expert=true|false`,
-  `top_k=2`, `capacity_factor=1.25`
-- **Explanation:** Unified elementwise, activation, Gated-MLP, and MoE fusion engine supporting
-  composite producer-consumer pair fusion (`mode=composites`), `SwiGLU` / `GELU` / `GeGLU` /
-  `FusedGatedMLP` (`mode=activations|swiglu|gelu|gated_mlp`), routed/shared-expert **Mixture of
-  Experts (`mode=moe`)**, map-into-reduce fusion (`mode=map_reduce`), register-pipelined loop chain
-  fusion/fission (`mode=loops`), persistent cooperative-grid megakernel fusion (`mode=megakernel`),
-  and composite-to-primitive decomposition (`mode=decompose`).
+### 4.1 `fuse-elementwise` (`UnifiedFuseElementwisePass` — `fuse_elementwise/mod.rs`)
+- **Options:** `mode=all|composites|map_reduce|activations|swiglu|gelu|gated_mlp|moe|megakernel`
+  (default: `composites`), `shared_expert=true|false`, `top_k=2`, `capacity_factor=1.25`
+- **Explanation:** Single-traversal elementwise, activation, Gated-MLP, MoE, and map-reduce fusion
+  engine supporting `add+max` (`mode=composites`), horizontal gate/up `dot_general` + `SwiGLU` /
+  `GELU` / `GeGLU` / `FusedGatedMLP` (`mode=activations|swiglu|gelu|gated_mlp`), routed/shared
+  **Mixture of Experts (`mode=moe`)**, and map-into-reduce fusion (`mode=map_reduce`).
 
-### 4.2 `fuse-gemm` (`FuseGemmPass` — `fuse_gemm.rs`)
+### 4.2 `decompose-composites` (`DecomposeCompositesPass` — `fuse_elementwise/decompose.rs`)
+- **Explanation:** Single-traversal composite-to-primitive lowering pass expanding all
+  `castforge.*` `stablehlo.composite` operations back into canonical primitive StableHLO operations.
+
+### 4.3 `fuse-loops` (`FuseLoopsPass` — `fuse_elementwise/loops.rs`)
+- **Explanation:** Single-traversal loop-chain fusion pass collapsing linear single-use elementwise
+  producer-consumer chains into register-pipelined `castforge.fused_elementwise_chain` composites.
+
+### 4.4 `fission-loops` (`FissionLoopsPass` — `fuse_elementwise/loops.rs`)
+- **Options:** `max_steps=3`
+- **Explanation:** Single-traversal register-pressure loop fission pass splitting oversized
+  `castforge.fused_elementwise_chain` composites into chunks of at most `max_steps` operations.
+
+### 4.5 `fuse-gemm` (`FuseGemmPass` — `fuse_gemm.rs`)
 - **Options:** `kind=all|horizontal|dequant|epilogue` (default: `all`)
-- **Explanation:** Unified GEMM fusion combining horizontal parallel QKV/MLP dot fusion with
-  **compile-time constant weight concatenation** (`castforge.horizontal_weights_folded = true`),
+- **Explanation:** Single-traversal GEMM fusion combining horizontal parallel QKV/MLP dot fusion
+  with **compile-time constant weight concatenation**
+  (`castforge.horizontal_weights_folded = true`),
   on-the-fly dequant+GEMM (`fused_qmatmul`), and chained GEMM + bias + activation + **residual
   add** epilogue fusion (`epilogue = "bias_relu_residual"`, `castforge.has_residual = true`).
 
-### 4.3 `fuse-norm` (`FuseNormPass` — `fuse_norm.rs`)
+### 4.6 `fuse-norm` (`FuseNormPass` — `fuse_norm/mod.rs`)
 - **Options:** `kind=all|rmsnorm|residual_rmsnorm|layernorm|softmax|log_softmax|cross_entropy`
   (default: `all`), `chunk_size=1024`
 - **Explanation:** Unified normalization & softmax fusion combining `Residual+RMSNorm`, `RMSNorm`,
   `LayerNorm`, `Softmax`, `LogSoftmax`, and **Liger-Kernel / Flash-Cross-Entropy**
   (`kind=cross_entropy`, `castforge.fused_linear_cross_entropy = true`).
 
-### 4.4 `fuse-attention` (`UnifiedFuseAttentionPass` — `fuse_attention.rs`)
+### 4.7 `fuse-attention` (`UnifiedFuseAttentionPass` — `fuse_attention/mod.rs`)
 - **Options:** `kind=all|sdpa|rope|mla|ssm|mamba2|kv_cache|paged|flash_decoding|tree|sliding_window`
   (`kv_lora_rank=512`, `state_dim=128`, `chunk_size=64`, `max_seq_len=2048`, `page_block_size=16`,
   `max_blocks=64`, `split_kv=4`, `draft_tokens=4`, `tree_depth=2`, `window_size=4096`,
   `sink_tokens=4`, `share_every=2`, `rope_scaling=yarn|ntk|llama3`, `rope_factor=8.0`,
   `logit_softcap=50.0`, `qk_norm=true`, `kv_dtype=fp8|int4`)
-- **Explanation:** Unified attention & state-space subgraph fusion pass combining `RoPE` (with
-  **YaRN / NTK-Aware / Llama-3 frequency scaling**), `SDPA`/`GQA` (with **Gemma-2/Grok logit
-  soft-capping & QK-Norm**), **DeepSeek MLA** (`kind=mla`), **Mamba-2 SSD / RWKV-6 / Gated-DeltaNet
-  Linear Attention chunk-scan fusion** (`kind=ssm|mamba2|linear_attn,state_dim=128,chunk_size=64`),
-  stateful KV-cache injection with **FP8 / INT4 KV-cache quantization** (`kv_dtype=fp8|int4`), vLLM
-  PagedAttention (`kind=paged`), Split-KV FlashDecoding (`kind=flash_decoding`), speculative tree
-  attention (`kind=tree`), **Sliding-Window + Attention Sinks** (`kind=sliding_window`), and **YOCO
-  / CLA Cross-Layer KV-Cache Sharing** (`kind=kv_sharing`).
+- **Explanation:** Single-traversal `RoPE` + `Softmax` + `SDPA`/`GQA` fusion pass (with **YaRN /
+  NTK-Aware / Llama-3 frequency scaling**, **Gemma-2/Grok logit soft-capping & QK-Norm**), plus
+  **DeepSeek MLA** (`kind=mla`), **Mamba-2 SSD / RWKV-6 / Gated-DeltaNet Linear Attention**
+  (`kind=ssm|mamba2`), stateful KV-cache injection with **FP8 / INT4 KV-cache quantization**
+  (`kv_dtype=fp8|int4`), vLLM PagedAttention (`kind=paged`), Split-KV FlashDecoding
+  (`kind=flash_decoding`), speculative tree attention (`kind=tree`), **Sliding-Window + Attention
+  Sinks** (`kind=sliding_window`), and **YOCO / CLA Cross-Layer KV-Cache Sharing**
+  (`kind=kv_sharing`).
 
 ---
 
-## 5. Memory Planning, Rematerialization & Offloading (`src/passes/`, 1 Pass)
+## 5. Memory Planning, Rematerialization & Offloading (`src/passes/`, 3 Passes)
 
-- **`optimize-memory` (`OptimizeMemoryPass` — `optimize_memory.rs`):** Unified memory
-  optimization pass (`mode=all|inplace|zero_copy|remat|selective_remat|offload`, `min_distance=3`,
-  `min_span=2`) consolidating in-place arena buffer donation (`inplace`), destination-passing
-  zero-copy `concatenate` elimination (`zero_copy`), activation rematerialization (`remat`),
-  **Selective Activation Checkpointing** (`mode=selective_remat`, checkpointing compute-heavy GEMMs
-  while recomputing memory-bound activations/norms), and pinned host-memory D2H/H2D offloading
-  (`offload`).
-
----
-
-## 6. Distributed Parallelism, Streams & Autodiff (`src/passes/`, 1 Pass)
-
-- **`shard-distributed` (`ShardDistributedPass` — `shard_distributed.rs`):** Unified
-  distributed parallelism, stream & reverse-mode AD pass
-  (`mode=tp|ring_cp|pp|fsdp|zero3|ep|streams|autodiff`, `devices=2`, `ring_size=4`, `coalesce=true`,
-  `stages=2`, `microbatches=4`, `schedule=1f1b`, `streams=2`, `lr=0.0`) consolidating 1D Megatron
-  Tensor Parallelism (`tp`), RingAttention Context Parallelism (`ring_cp`), **Expert Parallelism
-  (`mode=ep`) with `all_to_all` dispatch/combine**, **ZeRO-3 / FSDP parameter sharding**
-  (`mode=fsdp|zero3`), `all_reduce` coalescing, 1F1B/Zero-Bubble Pipeline Parallelism (`pp`),
-  multi-stream async execution, and **reverse-mode VJP automatic differentiation & SGD updates**
-  (`mode=autodiff`).
+1. **`optimize-memory` (`OptimizeMemoryPass` — `optimize_memory.rs`):** Single-traversal in-place
+   arena buffer donation (`inplace`) and destination-passing zero-copy `concatenate` elimination
+   (`zero_copy`), plus **Selective Activation Checkpointing** (`mode=selective_remat`).
+2. **`rematerialize` (`RematerializePass` — `optimize_memory.rs`):** Single-traversal activation
+   rematerialization / checkpointing (`min_distance=3`) recomputing cheap elementwise producers
+   before late consumers.
+3. **`offload-activations` (`OffloadActivationsPass` — `optimize_memory.rs`):** Single-traversal
+   pinned host-memory D2H/H2D offloading (`min_span=2`) inserting `castforge.host_offload` markers.
 
 ---
 
-## 7. Polyhedral Loop Scheduling & Tensor Cores (`src/passes/`, 1 Pass)
+## 6. Distributed Parallelism, Streams & Autodiff (`src/passes/`, 3 Passes)
 
-- **`schedule-loops` (`ScheduleLoopsPass` — `schedule_loops.rs`):** Unified loop schedule,
-  2D `convolution` to `im2col + dot_general` lowering (`lower_conv=true`), wide GEMM column
-  splitting (`max_n=256`), tile alignment padding (`align=8`), L1/L2/register tiling (`size=16,
-  l2_size=64,reg_tile=4`), loop permutation/skewing (`order=mkn,collapse=true,skew=true`),
-  unrolling/pipelining/Split-K/double-buffering (`factor=4,prefetch=2,split_k=2,
-  double_buffer=true`), multi-arch SIMD vectorization (`isa=avx2|avx512|neon|sve|rvv|wasm`), and GPU
-  Tensor/Matrix Core lowering (`tensor_cores=wgmma|tcgen05|blackwell|wmma|mfma|simdgroup,
-  mma_tile=16x16x16,warp_specialized=true,tmem_columns=512`), including **NVIDIA Blackwell
-  `tcgen05.mma` Tensor Memory (`TMEM`) allocation and TMA producer/consumer warp specialization**.
+1. **`shard-distributed` (`ShardDistributedPass` — `shard_distributed/mod.rs`):** Single-traversal
+   distributed parallelism & stream pass (`mode=tp|ring_cp|pp|fsdp|zero3|ep|streams`, `devices=2`,
+   `ring_size=4`, `stages=2`, `microbatches=4`, `schedule=1f1b`, `streams=2`) consolidating 1D
+   Megatron Tensor Parallelism (`tp`), RingAttention Context Parallelism (`ring_cp`), **Expert
+   Parallelism (`mode=ep`)**, **ZeRO-3 / FSDP parameter sharding** (`mode=fsdp|zero3`), 1F1B/
+   Zero-Bubble Pipeline Parallelism (`pp`), and multi-stream async execution (`streams`).
+2. **`autodiff` (`AutodiffPass` — `shard_distributed/autodiff.rs`):** Single-traversal
+   reverse-mode VJP automatic differentiation & in-place SGD weight update synthesis (`lr=0.01`).
+3. **`hoist-all-reduce` (`HoistAllReducePass` — `shard_distributed/autodiff.rs`):**
+   Single-traversal `all_reduce` coalescer and compute-communication overlap scheduler.
 
 ---
 
-## 8. IR Surgery, Verification, Profiling & Tooling (`src/passes/`, 2 Passes)
+## 7. Polyhedral Loop Scheduling & Tensor Cores (`src/passes/`, 3 Passes)
 
-1. **`ir-edit` (`IrEditPass` — `ir_edit.rs`):** Unified surgical IR editor, canonicalizer
-   and subgraph outliner (`mode=edit|outline|all|gemm|composites|inline|extract|reduce|dedup|
-   compose|unroll`, `rename_op=from:to`, `annotate_op=op:k=v`, `freeze=true,args=arg0:1.0`,
+1. **`schedule-loops` (`ScheduleLoopsPass` — `schedule_loops/mod.rs`):** Single-traversal loop
+   schedule, tile alignment padding (`align=8`), L1/L2/register tiling (`size=16,l2_size=64,
+   reg_tile=4`), loop permutation/skewing (`order=mkn,collapse=true,skew=true`), unrolling/
+   pipelining/Split-K/double-buffering (`factor=4,prefetch=2,split_k=2,double_buffer=true`),
+   multi-arch SIMD vectorization (`isa=avx2|avx512|neon|sve|rvv|wasm`), and GPU Tensor/Matrix Core
+   lowering (`tensor_cores=wgmma|tcgen05|blackwell|wmma|mfma|simdgroup,mma_tile=16x16x16,
+   warp_specialized=true,tmem_columns=512`).
+2. **`lower-conv-to-gemm` (`LowerConvToGemmPass` — `schedule_loops/conv_gemm.rs`):**
+   Single-traversal lowering of `1x1` NHWC 2D `stablehlo.convolution` operations into `reshape +
+   dot_general + reshape`.
+3. **`split-large-gemm` (`SplitLargeGemmPass` — `schedule_loops/conv_gemm.rs`):** Single-traversal
+   wide GEMM column splitter (`max_n=256`) partitioning wide `dot_general` RHS weights along $N$.
+
+---
+
+## 8. IR Surgery, Verification, Profiling & Tooling (`src/passes/` & `src/ir/`, 8 Passes)
+
+1. **`ir-edit` (`IrEditPass` — `ir_edit/mod.rs`):** Single-traversal surgical IR editor and
+   canonicalizer (`rename_op=from:to`, `annotate_op=op:k=v`, `freeze=true,args=arg0:1.0`,
    `unfreeze=true,min_elements=2`, `tap=%0;%1`, `ssa=true,prefix=v`, `debuginfo=true,
-   attributes=true`, `target=%v`, `stop_at=%in`, `max_ops=1`, `keep_op=...`, `dedup=true`,
-   `first=...`, `second=...`, `repeat=N`).
-2. **`verify-ir` (`UnifiedVerifyIrPass` — `verify_ir.rs`):** Unified IR verification,
-   numerical sanitizer, structural hashing & Roofline profiling pass (`shapes=true,equiv=true,
-   tol=1e-4,hash=true,bisect=N,sanitize=true,clamp_max=65504.0,profile=true,instrument=true,
-   filter=gemm,ridge=10.0`) consolidating shape verification, signature equivalence, 64-bit FNV-1a
-   structural hashing, `castforge.nan_guard` finite clamps, pass bisection, Roofline
-   FLOPs/arithmetic-intensity analysis, and `castforge.profile_region` timer instrumentation.
+   attributes=true`, `first=...`, `second=...`, `repeat=N`).
+2. **`inline-calls` (`InlinerPass` — `ir_edit/inliner.rs`):** Single-traversal function inliner
+   replacing `func.call` sites with cloned callee body operations.
+3. **`outline-subgraphs` (`UnifiedOutlineSubgraphsPass` — `ir_edit/outline.rs`):**
+   Single-traversal subgraph outliner and structural deduplicator (`mode=all|gemm|composites`).
+4. **`extract-subgraph` (`ExtractSubgraphPass` — `ir_edit/inliner.rs`):** Single-traversal
+   backward dependency cone slicer (`target=%v,stop_at=%in`).
+5. **`reduce-ir` (`ReduceIrPass` — `ir_edit/inliner.rs`):** Single-traversal delta-debugging IR
+   reducer (`max_ops=N` or `keep_op=...`).
+6. **`verify-ir` (`UnifiedVerifyIrPass` — `src/ir/verify_ir.rs`):** Read-only IR verifier,
+   structural FNV-1a hasher, numerical equivalence checker, pass bisector, and Roofline profiler
+   (`shapes=true,equiv=true,tol=1e-4,hash=true,bisect=N,profile=true,ridge=10.0`).
+7. **`sanitize-numerics` (`SanitizeNumericsPass` — `src/ir/verify_ir.rs`):** Single-traversal
+   numerical sanitizer inserting `castforge.nan_guard` finite clamps and division-by-zero guards
+   (`clamp_max=65504.0,eps=1e-6`).
+8. **`instrument-profiling` (`InstrumentProfilingPass` — `src/ir/verify_ir.rs`):**
+   Single-traversal profiling instrumenter wrapping target ops in `castforge.profile_region`
+   (`filter=gemm|all`).
 
 ---
 

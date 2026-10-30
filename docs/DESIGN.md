@@ -11,9 +11,9 @@ CastForge is built around three foundational design principles:
 
 1. **Everything is a Modular A-to-B Translator (`Translator` + `Payload`)**
    Every compiler component—frontend model importers (`.mlir`, `.safetensors`, `.onnx.json`,
-   `.gguf`), each of the **21 Graph IR passes & presets** (`18` passes + `3` presets `O1`/`O2`/
-   `O3`), the unified **`OptimizeLoopIrPass`** (`optimize-loop-ir`), lowering stages
-   (`ir -> loop-ir`), and backend code emitters (`loop-ir -> code`)—implements the unified
+   `.gguf`), each of the **38 Graph IR passes & presets** (`35` single-traversal passes + `3`
+   presets `O1`/`O2`/`O3`), the unified **`OptimizeLoopIrPass`** (`optimize-loop-ir`), lowering
+   stages (`ir -> loop-ir`), and backend code emitters (`loop-ir -> code`)—implements the unified
    `castforge::ir::Translator` trait over a polymorphic `castforge::ir::Payload`. Any stage can be
    composed into a `TranslatorChain` via CLI (`castforge chain -s "A | B | C"`) or Rust API.
 2. **Dual-Plane Intermediate Representation (SSA Compute Graph + Weight Plane)**
@@ -51,7 +51,7 @@ CastForge is built around three foundational design principles:
                      +---------------+---------------+
                                      |
                +---------------------+---------------------+
-               |  21 Graph IR Passes & Presets (O1/O2/O3)  |
+               |  38 Graph IR Passes & Presets (O1/O2/O3)  |
                |  - Algebraic / Canonicalization / SCCP    |
                |  - Weight Surgery (Quant/Prune/Merge/LoRA)|
                |  - LLM & Transformer Operator Fusions     |
@@ -95,8 +95,8 @@ CastForge is built around three foundational design principles:
   parser/printer (`parser.rs`, `mlir.rs`), ONNX/GGUF importers/exporters (`import.rs`),
   Mermaid/DOT/JSON/HTML/Diff graph visualizers (`viz.rs`), and
   `Payload`/`Translator`/`TranslatorChain`.
-- **`src/passes`**: `PassRegistry::with_builtin_passes()` (`src/passes/registry/`) and **21 built-in
-  Graph IR transformation passes and presets**.
+- **`src/passes`**: `PassRegistry::with_builtin_passes()` (`src/passes/registry/`) and **38 built-in
+  single-traversal Graph IR transformation passes and presets**.
 - **`src/codegen`**: Liveness analysis, static arena memory planner (`MemoryPlan`), Roofline cost
   model, reference interpreter (`evaluate_module`), `LoopModule` + **`OptimizeLoopIrPass`**,
   `CodegenBackend` + `BackendRegistry` (7 built-in targets + 7 CPU SIMD ISAs), autotuner, and

@@ -44,13 +44,19 @@ impl Pass for OptimizeMemoryPass {
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let m = self.mode.to_ascii_lowercase();
+        let do_inplace = m == "all" || m == "inplace";
+        let do_zero_copy = m == "all" || m == "zero_copy" || m == "concat";
+        if do_inplace || do_zero_copy {
+            let modified = optimize_memory_inplace_and_zero_copy(module, do_inplace, do_zero_copy);
+            return Ok(PassResult {
+                pass_name: self.name().to_string(),
+                changed: modified > 0,
+                ops_removed: 0,
+                ops_modified: modified,
+                ops_created: 0,
+            });
+        }
         let mut steps = Vec::new();
-        if m == "all" || m == "inplace" {
-            steps.push(BufferizeInplacePass.run(module)?);
-        }
-        if m == "all" || m == "zero_copy" || m == "concat" {
-            steps.push(EliminateConcatCopiesPass.run(module)?);
-        }
         if m == "remat" || m == "rematerialize" {
             steps.push(
                 RematerializePass {
@@ -80,6 +86,25 @@ impl Pass for OptimizeMemoryPass {
     }
 }
 
+fn optimize_memory_inplace_and_zero_copy(
+    module: &mut Module,
+    do_inplace: bool,
+    do_zero_copy: bool,
+) -> usize {
+    let mut modified = 0usize;
+    let blocks: Vec<BlockId> = module.blocks.keys().collect();
+    for block_id in blocks {
+        if do_inplace {
+            modified += annotate_block_inplace_and_concat(module, block_id, do_zero_copy);
+        } else if do_zero_copy {
+            for op_id in module.block_ops(block_id) {
+                modified += try_eliminate_concat_copy_at_op(module, op_id);
+            }
+        }
+    }
+    modified
+}
+
 /// In-Place Buffer Donation Pass (`bufferize-inplace`).
 pub struct BufferizeInplacePass;
 
@@ -93,13 +118,7 @@ impl Pass for BufferizeInplacePass {
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let mut modified = 0usize;
-        let blocks: Vec<BlockId> = module.blocks.keys().collect();
-
-        for block_id in blocks {
-            modified += annotate_block_inplace(module, block_id);
-        }
-
+        let modified = optimize_memory_inplace_and_zero_copy(module, true, false);
         Ok(PassResult {
             pass_name: self.name().to_string(),
             changed: modified > 0,
@@ -110,7 +129,11 @@ impl Pass for BufferizeInplacePass {
     }
 }
 
-fn annotate_block_inplace(module: &mut Module, block_id: BlockId) -> usize {
+fn annotate_block_inplace_and_concat(
+    module: &mut Module,
+    block_id: BlockId,
+    do_zero_copy: bool,
+) -> usize {
     let op_ids = module.blocks[block_id].ops.clone();
     let num_ops = op_ids.len();
     let mut first_def: HashMap<ValueId, usize> = HashMap::new();
@@ -147,6 +170,9 @@ fn annotate_block_inplace(module: &mut Module, block_id: BlockId) -> usize {
     let mut modified = 0usize;
     for (idx, &op_id) in op_ids.iter().enumerate() {
         let step = idx + 1;
+        if do_zero_copy {
+            modified += try_eliminate_concat_copy_at_op(module, op_id);
+        }
         if !is_inplace_eligible_op(module, op_id) {
             continue;
         }
@@ -227,71 +253,7 @@ impl Pass for EliminateConcatCopiesPass {
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let mut modified = 0usize;
-        let blocks: Vec<BlockId> = module.blocks.keys().collect();
-
-        for block_id in blocks {
-            let ops = module.block_ops(block_id);
-            for op_id in ops {
-                let Some(op) = module.ops.get(op_id).cloned() else {
-                    continue;
-                };
-                let Some(StableHloOp::Concatenate {
-                    inputs,
-                    dimension,
-                    result,
-                }) = StableHloOp::from_op(&op)
-                else {
-                    continue;
-                };
-                if inputs.is_empty() {
-                    continue;
-                }
-
-                let dest_name = module.values[result]
-                    .ssa_name
-                    .clone()
-                    .unwrap_or_else(|| format!("{result:?}"));
-                let mut elem_offset = 0i64;
-                let mut routed_any = false;
-                for &inp in &inputs {
-                    let inp_elems = module.values[inp]
-                        .ty
-                        .as_tensor()
-                        .and_then(|t| t.num_elements())
-                        .unwrap_or(0);
-                    if let ValueDef::OpResult { op: prod_id, .. } = module.values[inp].def
-                        && let Some(prod_op) = module.ops.get_mut(prod_id)
-                        && prod_op.is_pure()
-                        && !prod_op.is_op("stablehlo", "constant")
-                    {
-                        prod_op.attributes.insert(
-                            "castforge.concat_dest".to_string(),
-                            Attribute::String(dest_name.clone()),
-                        );
-                        prod_op.attributes.insert(
-                            "castforge.concat_axis".to_string(),
-                            Attribute::Int(dimension),
-                        );
-                        prod_op.attributes.insert(
-                            "castforge.concat_elem_offset".to_string(),
-                            Attribute::Int(elem_offset),
-                        );
-                        routed_any = true;
-                        modified += 1;
-                    }
-                    elem_offset += inp_elems;
-                }
-
-                if routed_any && let Some(cat_op) = module.ops.get_mut(op_id) {
-                    cat_op.attributes.insert(
-                        "castforge.zero_copy_concat".to_string(),
-                        Attribute::Bool(true),
-                    );
-                }
-            }
-        }
-
+        let modified = optimize_memory_inplace_and_zero_copy(module, false, true);
         Ok(PassResult {
             pass_name: self.name().to_string(),
             changed: modified > 0,
@@ -300,6 +262,67 @@ impl Pass for EliminateConcatCopiesPass {
             ops_created: 0,
         })
     }
+}
+
+fn try_eliminate_concat_copy_at_op(module: &mut Module, op_id: OpId) -> usize {
+    let Some(op) = module.ops.get(op_id).cloned() else {
+        return 0;
+    };
+    let Some(StableHloOp::Concatenate {
+        inputs,
+        dimension,
+        result,
+    }) = StableHloOp::from_op(&op)
+    else {
+        return 0;
+    };
+    if inputs.is_empty() {
+        return 0;
+    }
+
+    let dest_name = module.values[result]
+        .ssa_name
+        .clone()
+        .unwrap_or_else(|| format!("{result:?}"));
+    let mut elem_offset = 0i64;
+    let mut routed_any = false;
+    let mut modified = 0usize;
+    for &inp in &inputs {
+        let inp_elems = module.values[inp]
+            .ty
+            .as_tensor()
+            .and_then(|t| t.num_elements())
+            .unwrap_or(0);
+        if let ValueDef::OpResult { op: prod_id, .. } = module.values[inp].def
+            && let Some(prod_op) = module.ops.get_mut(prod_id)
+            && prod_op.is_pure()
+            && !prod_op.is_op("stablehlo", "constant")
+        {
+            prod_op.attributes.insert(
+                "castforge.concat_dest".to_string(),
+                Attribute::String(dest_name.clone()),
+            );
+            prod_op.attributes.insert(
+                "castforge.concat_axis".to_string(),
+                Attribute::Int(dimension),
+            );
+            prod_op.attributes.insert(
+                "castforge.concat_elem_offset".to_string(),
+                Attribute::Int(elem_offset),
+            );
+            routed_any = true;
+            modified += 1;
+        }
+        elem_offset += inp_elems;
+    }
+
+    if routed_any && let Some(cat_op) = module.ops.get_mut(op_id) {
+        cat_op.attributes.insert(
+            "castforge.zero_copy_concat".to_string(),
+            Attribute::Bool(true),
+        );
+    }
+    modified
 }
 
 /// Activation Rematerialization / Gradient Checkpointing Pass (`rematerialize`).

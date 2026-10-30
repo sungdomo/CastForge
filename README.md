@@ -11,9 +11,10 @@ support.
   CastForge's Dual-Plane IR (`Module` + `TensorStore`), modular A-to-B `Translator` architecture,
   static arena memory planning, polyhedral `LoopModule` IR, multi-architecture SIMD profiles, and
   pluggable `CodegenBackend` registry.
-- [**Complete Reference of All 21 Passes (`docs/PASSES.md`)**](docs/PASSES.md):
-  Detailed explanation, CLI options, and IR transformation rules for all 21 Graph IR passes/presets
-  (`18 passes + 3 presets O1/O2/O3`) and unified `OptimizeLoopIrPass` (`optimize-loop-ir`).
+- [**Complete Reference of All 38 Passes (`docs/PASSES.md`)**](docs/PASSES.md):
+  Detailed explanation, CLI options, and IR transformation rules for all 38 Graph IR passes/presets
+  (`35 single-traversal passes + 3 presets O1/O2/O3`) and unified `OptimizeLoopIrPass`
+  (`optimize-loop-ir`).
 
 ## Project Directory Structure (`src/`)
 
@@ -27,8 +28,8 @@ support.
   exporters (`import.rs`), and computation graph visualization exporters (**Mermaid**, **Graphviz
   DOT**, **JSON**, **IR Diff**, and **Interactive HTML Pass Timeline Debugger** in `viz.rs`).
 - [`src/passes`](src/passes): Built-in `PassRegistry::with_builtin_passes()`
-  (`src/passes/registry/`) and **21 canonical single-traversal A-to-B IR translator modules &
-  presets** (`18 passes + 3 presets`), organized into modular pass packages (`src/passes/<pass>/`)
+  (`src/passes/registry/`) and **38 built-in single-traversal A-to-B IR translator passes &
+  presets** (`35 passes + 3 presets`), organized into modular pass packages (`src/passes/<pass>/`)
   and concise pass modules under `src/passes/`, supporting static Rust construction, CLI pipeline
   strings (`-p`), Unix pipes (`stdin -> stdout`), declarative TOML config files (`--config`), and
   step-by-step tracing.
@@ -46,7 +47,7 @@ support.
 - [`tests/`](tests): End-to-end integration test suites (`ai_opt_tests.rs`, `codegen_tests.rs`,
   `pipeline_tests.rs`).
 
-## Built-in A-to-B Translator Modules & Presets (21 Canonical Entries)
+## Built-in Single-Traversal A-to-B Translator Passes & Presets (38 Entries)
 
 | Pass Name | Category | Description |
 | :--- | :--- | :--- |
@@ -55,19 +56,36 @@ support.
 | `canonicalize` | General IR | Fixed-point canonicalizer & `toposort` / `min_memory` scheduler |
 | `simplify-algebraic` | General IR | Identities, constant folding, SCCP, reassociation & FMA |
 | `fold-views` | Views & Shapes | Folds `transpose`, `reshape`, `broadcast`, `slice` & layout |
-| `specialize-shapes` | Views & Shapes | Symbolic shape bind, batch resize, buckets & token prune |
+| `specialize-shapes` | Views & Shapes | Single-traversal symbolic bind, resize, buckets & prune |
 | `quantize` | Weights | Quantize (`weight\|awq\|fp8\|nvfp4\|f16\|bf16\|w8a8\|smooth\|qat_ste`) |
 | `merge-weights` | Weights | Model merging & adapters (`linear\|slerp\|ties\|dare\|lora\|dora`) |
-| `fold-weights` | Weights | Norm/BatchNorm folding, `[N,K]` pack, `externalize` & `prune\|2to4` |
-| `fuse-elementwise` | Fusion | Composites, activations/MoE, map-reduce, loops & `decompose` |
-| `fuse-gemm` | Fusion | Unified GEMM (`horizontal\|dequant\|epilogue` + constant weight concat) |
+| `fold-weights` | Weights | Single-traversal Norm/BatchNorm weight folding & `[N,K]` SIMD pack |
+| `prune-weights` | Weights | Structured L1 column pruning, NVIDIA 2:4 & activation sparsity |
+| `externalize-weights` | Weights | Externalize or inline weight constants with `TensorStore` |
+| `fuse-elementwise` | Fusion | Single-traversal `SwiGLU`/`GELU`/`GeGLU`/`GatedMLP`/`MoE` fusion |
+| `decompose-composites` | Fusion | Expands `castforge.*` composites into primitive StableHLO ops |
+| `fuse-loops` | Fusion | Fuses multi-step elementwise chains into `fused_elementwise_chain` |
+| `fission-loops` | Fusion | Splits oversized `fused_elementwise_chain` ops at `max_steps` |
+| `fuse-gemm` | Fusion | Single-traversal horizontal QKV/MLP dot, dequant+GEMM & epilogue |
 | `fuse-norm` | Fusion | Norm & Softmax (`rmsnorm\|residual_rmsnorm\|layernorm\|softmax\|ce`) |
-| `fuse-attention` | Fusion | Attn (`sdpa\|rope\|mla\|ssm\|kv_cache\|paged\|flash\|sliding`) |
-| `optimize-memory` | Memory | Unified memory (`all\|inplace\|zero_copy\|remat\|selective_remat`) |
-| `shard-distributed` | Distributed | TP, Ring CP, EP, ZeRO-3/FSDP, 1F1B PP, streams & `autodiff` |
-| `schedule-loops` | Loops | Unified tiling, permutation, unrolling, SIMD, conv & `wgmma\|tcgen05` |
-| `ir-edit` | Tooling | Op rename/annotate, freeze/unfreeze, tap, SSA normalize, outline & inline |
-| `verify-ir` | Tooling | Shape/equiv verifier, FNV-1a hasher, NaN sanitizer, bisector & profiler |
+| `fuse-attention` | Fusion | Single-traversal `RoPE`/`SDPA` + `mla\|ssm\|kv_cache\|paged\|flash` |
+| `optimize-memory` | Memory | Single-traversal in-place arena donation & zero-copy concat |
+| `rematerialize` | Memory | Activation rematerialization / checkpointing for long-lived tensors |
+| `offload-activations` | Memory | Inserts `castforge.host_offload` markers on long-lived tensors |
+| `shard-distributed` | Distributed | TP, Ring CP, EP, ZeRO-3/FSDP, 1F1B PP & multi-stream |
+| `autodiff` | Distributed | Reverse-mode VJP automatic differentiation & in-place SGD updates |
+| `hoist-all-reduce` | Distributed | Coalesces adjacent `all_reduce` ops & compute overlap |
+| `schedule-loops` | Loops | Single-traversal tiling, permutation, unrolling, SIMD & Tensor Cores |
+| `lower-conv-to-gemm` | Loops | Lowers `1x1` NHWC 2D convolutions into `reshape + dot_general` |
+| `split-large-gemm` | Loops | Splits wide `dot_general` RHS weights along $N$ into cache chunks |
+| `ir-edit` | Tooling | Single-traversal op rename/annotate, freeze/unfreeze, tap & SSA |
+| `inline-calls` | Tooling | Inlines `func.call` sites by cloning callee operations into caller |
+| `outline-subgraphs` | Tooling | Outlines composite/GEMM ops into reusable functions & dedups |
+| `extract-subgraph` | Tooling | Slices the backward dependency cone of target SSA values |
+| `reduce-ir` | Tooling | Delta-debugging IR reducer (`max_ops` / `keep_op`) |
+| `verify-ir` | Tooling | Shape/equiv verifier, FNV-1a hasher, bisector & Roofline profiler |
+| `sanitize-numerics` | Tooling | Inserts FP16/BF16 finite clamps and non-zero division guards |
+| `instrument-profiling` | Tooling | Wraps target ops in `castforge.profile_region` timing markers |
 | `O1` | Preset | Inlining, SCCP, LICM, view/algebraic canonicalization, DCE |
 | `O2` | Preset | `O1` + LoRA/BatchNorm folding + Transformer/GEMM fusions |
 | `O3` | Preset | Shape specialization + `O2` + MoE/FMA/zero-copy + weight packing |
@@ -94,7 +112,7 @@ support.
 ## Quick Start
 
 ```bash
-# 1. List all 21 registered A-to-B translator passes and pipeline presets
+# 1. List all 38 registered A-to-B translator passes and pipeline presets
 cargo run --bin castforge -- list-passes
 
 # 2. Concatenate simple A-to-B translators via standard Unix pipes (stdin -> stdout)

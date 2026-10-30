@@ -5,7 +5,8 @@ pub mod serving;
 pub use serving::*;
 
 use crate::ir::{Attribute, BlockId, Module, OpName, ValueDef, ValueId};
-use crate::passes::{DeadCodeEliminationPass, FuseSoftmaxPass, Pass, PassResult};
+use crate::passes::fuse_norm::try_fuse_softmax_at_op;
+use crate::passes::{DeadCodeEliminationPass, Pass, PassResult};
 use crate::stablehlo::StableHloOp;
 use anyhow::Result;
 use indexmap::IndexMap;
@@ -81,10 +82,8 @@ impl Pass for UnifiedFuseAttentionPass {
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let k = self.kind.to_ascii_lowercase();
         let mut steps = Vec::new();
-        if k == "all" || k == "rope" {
-            steps.push(FuseRopePass.run(module)?);
-        }
-        if matches!(
+        let do_rope = k == "all" || k == "rope";
+        let do_sdpa = matches!(
             k.as_str(),
             "all"
                 | "sdpa"
@@ -102,8 +101,22 @@ impl Pass for UnifiedFuseAttentionPass {
                 | "yoco"
                 | "cla"
                 | "serving"
-        ) {
-            steps.push(FuseAttentionPass.run(module)?);
+        );
+        if do_rope || do_sdpa {
+            let (rope_c, sdpa_c) = fuse_rope_and_sdpa_single_traversal(module, do_rope, do_sdpa);
+            let created = rope_c + sdpa_c;
+            let mut removed = 0usize;
+            if created > 0 {
+                let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
+                removed += dce_res.ops_removed;
+            }
+            steps.push(PassResult {
+                pass_name: self.name().to_string(),
+                changed: created > 0,
+                ops_removed: removed,
+                ops_modified: 0,
+                ops_created: created,
+            });
         }
         if self.rope_scaling.is_some() || self.rope_factor > 1.0 {
             let scaling = self.rope_scaling.as_deref().unwrap_or("yarn");
@@ -215,22 +228,74 @@ impl Pass for FuseAttentionPass {
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let softmax_res = FuseSoftmaxPass::default().run(module)?;
-        let mut created = 0usize;
-        let mut removed = softmax_res.ops_removed;
-        let blocks: Vec<BlockId> = module.blocks.keys().collect();
+        let (_, created) = fuse_rope_and_sdpa_single_traversal(module, false, true);
+        let mut removed = 0usize;
+        if created > 0 {
+            let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
+            removed += dce_res.ops_removed;
+        }
 
-        for block_id in blocks {
-            let ops = module.block_ops(block_id);
-            for op_id in ops {
-                let Some(op) = module.ops.get(op_id) else {
+        Ok(PassResult {
+            pass_name: self.name().to_string(),
+            changed: created > 0,
+            ops_removed: removed,
+            ops_modified: 0,
+            ops_created: created,
+        })
+    }
+}
+
+/// Fuses RoPE (`castforge.fused_rope`), Softmax (`castforge.fused_softmax`), and SDPA/GQA
+/// (`castforge.fused_attention`) in a **single top-down forward traversal** per block.
+fn fuse_rope_and_sdpa_single_traversal(
+    module: &mut Module,
+    do_rope: bool,
+    do_sdpa: bool,
+) -> (usize, usize) {
+    let mut rope_created = 0usize;
+    let mut sdpa_created = 0usize;
+    let blocks: Vec<BlockId> = module.blocks.keys().collect();
+
+    for block_id in blocks {
+        let ops = module.block_ops(block_id);
+        for op_id in ops {
+            let Some(op) = module.ops.get(op_id).cloned() else {
+                continue;
+            };
+
+            if do_rope
+                && let Some(StableHloOp::Add { lhs, rhs, .. }) = StableHloOp::from_op(&op)
+                && let Some(RopeMatch { x, cos, sin }) =
+                    match_rope_pair(module, lhs, rhs).or_else(|| match_rope_pair(module, rhs, lhs))
+            {
+                let mut attrs = IndexMap::new();
+                attrs.insert(
+                    "name".to_string(),
+                    Attribute::String("castforge.fused_rope".to_string()),
+                );
+                attrs.insert(
+                    "decomposition".to_string(),
+                    Attribute::SymbolRef("fused_rope_impl".to_string()),
+                );
+
+                let op_mut = &mut module.ops[op_id];
+                op_mut.name = OpName::new("stablehlo", "composite");
+                op_mut.operands = SmallVec::from_slice(&[x, cos, sin]);
+                op_mut.attributes = attrs;
+                rope_created += 1;
+                continue;
+            }
+
+            if do_sdpa {
+                if try_fuse_softmax_at_op(module, op_id, &op) {
                     continue;
-                };
+                }
+
                 let Some(StableHloOp::DotGeneral {
                     lhs: probs_val,
                     rhs: v_val,
                     ..
-                }) = StableHloOp::from_op(op)
+                }) = StableHloOp::from_op(&op)
                 else {
                     continue;
                 };
@@ -277,23 +342,12 @@ impl Pass for FuseAttentionPass {
                 op_mut.name = OpName::new("stablehlo", "composite");
                 op_mut.operands = operands;
                 op_mut.attributes = attrs;
-                created += 1;
+                sdpa_created += 1;
             }
         }
-
-        if created > 0 {
-            let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
-            removed += dce_res.ops_removed;
-        }
-
-        Ok(PassResult {
-            pass_name: self.name().to_string(),
-            changed: created > 0,
-            ops_removed: removed,
-            ops_modified: 0,
-            ops_created: created,
-        })
     }
+
+    (rope_created, sdpa_created)
 }
 
 fn match_sdpa_chain(module: &Module, probs_val: ValueId, v_val: ValueId) -> Option<AttentionMatch> {

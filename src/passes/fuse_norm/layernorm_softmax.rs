@@ -383,6 +383,44 @@ impl Pass for FuseLinearCrossEntropyPass {
     }
 }
 
+pub(crate) fn try_fuse_softmax_at_op(
+    module: &mut Module,
+    op_id: crate::ir::OpId,
+    op: &crate::ir::Operation,
+) -> bool {
+    if let Some(StableHloOp::Divide {
+        lhs: exp_val,
+        rhs: denom_val,
+        ..
+    }) = StableHloOp::from_op(op)
+        && let ValueDef::OpResult { op: exp_op_id, .. } = module.values[exp_val].def
+        && let Some(exp_op) = module.ops.get(exp_op_id)
+        && let Some(StableHloOp::Exp {
+            operand: exp_in, ..
+        }) = StableHloOp::from_op(exp_op)
+        && let Some((reduce_axis, _, _)) = match_broadcast_reduce_of_exp(module, denom_val, exp_val)
+    {
+        let x_input = unwrap_optional_max_sub(module, exp_in).unwrap_or(exp_in);
+        let mut attrs = IndexMap::new();
+        attrs.insert(
+            "name".to_string(),
+            Attribute::String("castforge.fused_softmax".to_string()),
+        );
+        attrs.insert(
+            "decomposition".to_string(),
+            Attribute::SymbolRef("fused_softmax_impl".to_string()),
+        );
+        attrs.insert("axis".to_string(), Attribute::Int(reduce_axis));
+
+        let op_mut = &mut module.ops[op_id];
+        op_mut.name = OpName::new("stablehlo", "composite");
+        op_mut.operands = SmallVec::from_slice(&[x_input]);
+        op_mut.attributes = attrs;
+        return true;
+    }
+    false
+}
+
 pub(super) fn rewrite_to_log_softmax(
     module: &mut Module,
     op_id: crate::ir::OpId,

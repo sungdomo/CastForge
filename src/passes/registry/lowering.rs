@@ -74,6 +74,29 @@ pub(super) fn register_lowering_passes(reg: &mut PassRegistry) {
         },
     );
     reg.register(
+        "rematerialize",
+        "Activation rematerialization / checkpointing for long-lived intermediates",
+        |opts| {
+            let min_distance = opts
+                .get("min_distance")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(3);
+            Ok(Box::new(RematerializePass { min_distance }))
+        },
+    );
+    reg.register(
+        "offload-activations",
+        "Inserts host-device DRAM offload markers on long-lived activations",
+        |opts| {
+            let min_span = opts
+                .get("min_span")
+                .or_else(|| opts.get("min_distance"))
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(2);
+            Ok(Box::new(OffloadActivationsPass { min_span }))
+        },
+    );
+    reg.register(
         "shard-distributed",
         "Unified distributed parallelism (TP, Ring-CP, PP, FSDP, EP, streams, & reverse VJP)",
         |opts| {
@@ -141,6 +164,23 @@ pub(super) fn register_lowering_passes(reg: &mut PassRegistry) {
                 learning_rate,
             }))
         },
+    );
+    reg.register(
+        "autodiff",
+        "Reverse-mode automatic differentiation (VJP backward graph + SGD update)",
+        |opts| {
+            let learning_rate = opts
+                .get("lr")
+                .or_else(|| opts.get("learning_rate"))
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(0.0);
+            Ok(Box::new(AutodiffPass { learning_rate }))
+        },
+    );
+    reg.register(
+        "hoist-all-reduce",
+        "Coalesces adjacent all_reduce ops and annotates compute-communication overlap",
+        |_opts| Ok(Box::new(HoistAllReducePass)),
     );
     reg.register(
         "schedule-loops",
@@ -271,6 +311,23 @@ pub(super) fn register_lowering_passes(reg: &mut PassRegistry) {
         },
     );
     reg.register(
+        "lower-conv-to-gemm",
+        "Lowers 1x1 NHWC 2D convolutions into reshape + dot_general GEMMs",
+        |_opts| Ok(Box::new(LowerConvToGemmPass)),
+    );
+    reg.register(
+        "split-large-gemm",
+        "Splits wide dot_general RHS weights along N into cache-friendly chunks",
+        |opts| {
+            let max_n = opts
+                .get("max_n")
+                .or_else(|| opts.get("limit"))
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(2);
+            Ok(Box::new(SplitLargeGemmPass { max_n }))
+        },
+    );
+    reg.register(
         "ir-edit",
         "Unified IR surgery, subgraph outlining/inlining/extraction, freezing, tapping & ssa",
         |opts| {
@@ -390,6 +447,63 @@ pub(super) fn register_lowering_passes(reg: &mut PassRegistry) {
         },
     );
     reg.register(
+        "inline-calls",
+        "Inlines func.call sites by cloning callee body operations into the caller",
+        |_opts| Ok(Box::new(InlinerPass)),
+    );
+    reg.register(
+        "outline-subgraphs",
+        "Outlines composite/GEMM ops into reusable private functions and deduplicates",
+        |opts| {
+            let mode = opts
+                .get("mode")
+                .cloned()
+                .unwrap_or_else(|| "all".to_string());
+            let dedup = opts
+                .get("dedup")
+                .map(|s| s != "false" && s != "0")
+                .unwrap_or(true);
+            Ok(Box::new(UnifiedOutlineSubgraphsPass {
+                mode,
+                dedup,
+                ..Default::default()
+            }))
+        },
+    );
+    reg.register(
+        "extract-subgraph",
+        "Slices the backward dependency cone of target SSA values",
+        |opts| {
+            let target = opts
+                .get("target")
+                .or_else(|| opts.get("output"))
+                .cloned()
+                .unwrap_or_default();
+            let stop_at = opts
+                .get("stop_at")
+                .or_else(|| opts.get("inputs"))
+                .cloned()
+                .unwrap_or_default();
+            Ok(Box::new(ExtractSubgraphPass {
+                target,
+                stop_at,
+                ..Default::default()
+            }))
+        },
+    );
+    reg.register(
+        "reduce-ir",
+        "Delta-debugging IR reducer (truncates function body to max_ops or keep_op)",
+        |opts| {
+            let max_ops = opts
+                .get("max_ops")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(2);
+            let keep_op = opts.get("keep_op").cloned().unwrap_or_default();
+            Ok(Box::new(ReduceIrPass { max_ops, keep_op }))
+        },
+    );
+    reg.register(
         "verify-ir",
         "Unified IR verifier, structural hasher, equivalence, sanitizer, bisection & profiling",
         |opts| {
@@ -458,6 +572,33 @@ pub(super) fn register_lowering_passes(reg: &mut PassRegistry) {
                 filter,
                 ridge_flops_per_byte,
             }))
+        },
+    );
+    reg.register(
+        "sanitize-numerics",
+        "Inserts FP16/BF16 finite clamps and non-zero division guards",
+        |opts| {
+            let clamp_max = opts
+                .get("clamp_max")
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(65504.0);
+            let eps = opts
+                .get("eps")
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(1e-6);
+            Ok(Box::new(SanitizeNumericsPass { clamp_max, eps }))
+        },
+    );
+    reg.register(
+        "instrument-profiling",
+        "Wraps target ops in castforge.profile_region timing markers",
+        |opts| {
+            let filter = opts
+                .get("filter")
+                .or_else(|| opts.get("ops"))
+                .cloned()
+                .unwrap_or_else(|| "gemm".to_string());
+            Ok(Box::new(InstrumentProfilingPass { filter }))
         },
     );
     reg.register(
