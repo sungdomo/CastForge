@@ -9,9 +9,8 @@ use crate::ir::{
     Attribute, BlockId, DType, Dim, Location, Module, OpId, OpName, Operation, TensorType, Type,
     Value, ValueDef, ValueId,
 };
-use crate::passes::{
-    DeadCodeEliminationPass, FoldConstantsPass, FuseHorizontalDotPass, Pass, PassResult,
-};
+use crate::passes::fuse_gemm::fuse_horizontal_dot_no_dce;
+use crate::passes::{DeadCodeEliminationPass, FoldConstantsPass, Pass, PassResult};
 use crate::stablehlo::StableHloOp;
 use anyhow::Result;
 use indexmap::IndexMap;
@@ -1854,32 +1853,49 @@ impl Pass for FuseActivationsPass {
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let k = self.kind.to_ascii_lowercase();
-        let mut steps = Vec::new();
-        if k == "all" || k == "swiglu" {
-            steps.push(FuseSwiGluPass.run(module)?);
+        let do_mlp = k == "all" || k == "gated_mlp" || k == "mlp";
+        let do_swiglu = do_mlp || k == "swiglu";
+        let do_gelu = do_mlp || k == "gelu" || k == "geglu";
+        let do_moe = k == "all" || k == "moe" || self.shared_expert;
+
+        let mut created = 0usize;
+        let mut modified = 0usize;
+        let mut removed = 0usize;
+
+        if do_mlp {
+            let (hc, hm) = fuse_horizontal_dot_no_dce(module);
+            created += hc;
+            modified += hm;
         }
-        if k == "all" || k == "gelu" || k == "geglu" {
-            steps.push(FuseGeluPass.run(module)?);
+        if do_swiglu {
+            created += fuse_swiglu_no_dce(module);
         }
-        if k == "all" || k == "gated_mlp" || k == "mlp" {
-            steps.push(FuseGatedMlpPass.run(module)?);
+        if do_gelu {
+            created += fuse_gelu_no_dce(module);
         }
-        if k == "all" || k == "moe" || self.shared_expert {
-            steps.push(
-                FuseMoePass {
-                    shared_expert: self.shared_expert,
-                    top_k: self.top_k,
-                    capacity_factor: self.capacity_factor,
-                }
-                .run(module)?,
-            );
+        if do_mlp {
+            let mlp_c = fuse_gated_mlp_no_dce(module);
+            created += mlp_c;
+            modified += mlp_c;
         }
+        if do_moe {
+            let moe_c =
+                fuse_moe_no_dce(module, self.shared_expert, self.top_k, self.capacity_factor);
+            created += moe_c;
+            modified += moe_c;
+        }
+
+        if created > 0 || modified > 0 {
+            let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
+            removed += dce_res.ops_removed;
+        }
+
         Ok(PassResult {
             pass_name: self.name().to_string(),
-            changed: steps.iter().any(|r| r.changed),
-            ops_removed: steps.iter().map(|r| r.ops_removed).sum(),
-            ops_modified: steps.iter().map(|r| r.ops_modified).sum(),
-            ops_created: steps.iter().map(|r| r.ops_created).sum(),
+            changed: created > 0 || modified > 0,
+            ops_removed: removed,
+            ops_modified: modified,
+            ops_created: created,
         })
     }
 }
@@ -1897,45 +1913,8 @@ impl Pass for FuseSwiGluPass {
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let mut created = 0usize;
+        let created = fuse_swiglu_no_dce(module);
         let mut removed = 0usize;
-        let blocks: Vec<BlockId> = module.blocks.keys().collect();
-
-        for block_id in blocks {
-            let ops = module.block_ops(block_id);
-            for op_id in ops {
-                let Some(op) = module.ops.get(op_id) else {
-                    continue;
-                };
-                let Some(StableHloOp::Multiply { lhs, rhs, .. }) = StableHloOp::from_op(op) else {
-                    continue;
-                };
-
-                let matched = match_silu_val(module, lhs)
-                    .map(|g| (g, rhs))
-                    .or_else(|| match_silu_val(module, rhs).map(|g| (g, lhs)));
-                let Some((gate_val, up_val)) = matched else {
-                    continue;
-                };
-
-                let mut attrs = IndexMap::new();
-                attrs.insert(
-                    "name".to_string(),
-                    Attribute::String("castforge.fused_swiglu".to_string()),
-                );
-                attrs.insert(
-                    "decomposition".to_string(),
-                    Attribute::SymbolRef("fused_swiglu_impl".to_string()),
-                );
-
-                let op_mut = &mut module.ops[op_id];
-                op_mut.name = OpName::new("stablehlo", "composite");
-                op_mut.operands = SmallVec::from_slice(&[gate_val, up_val]);
-                op_mut.attributes = attrs;
-                created += 1;
-            }
-        }
-
         if created > 0 {
             let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
             removed += dce_res.ops_removed;
@@ -1949,6 +1928,47 @@ impl Pass for FuseSwiGluPass {
             ops_created: created,
         })
     }
+}
+
+fn fuse_swiglu_no_dce(module: &mut Module) -> usize {
+    let mut created = 0usize;
+    let blocks: Vec<BlockId> = module.blocks.keys().collect();
+
+    for block_id in blocks {
+        let ops = module.block_ops(block_id);
+        for op_id in ops {
+            let Some(op) = module.ops.get(op_id) else {
+                continue;
+            };
+            let Some(StableHloOp::Multiply { lhs, rhs, .. }) = StableHloOp::from_op(op) else {
+                continue;
+            };
+
+            let matched = match_silu_val(module, lhs)
+                .map(|g| (g, rhs))
+                .or_else(|| match_silu_val(module, rhs).map(|g| (g, lhs)));
+            let Some((gate_val, up_val)) = matched else {
+                continue;
+            };
+
+            let mut attrs = IndexMap::new();
+            attrs.insert(
+                "name".to_string(),
+                Attribute::String("castforge.fused_swiglu".to_string()),
+            );
+            attrs.insert(
+                "decomposition".to_string(),
+                Attribute::SymbolRef("fused_swiglu_impl".to_string()),
+            );
+
+            let op_mut = &mut module.ops[op_id];
+            op_mut.name = OpName::new("stablehlo", "composite");
+            op_mut.operands = SmallVec::from_slice(&[gate_val, up_val]);
+            op_mut.attributes = attrs;
+            created += 1;
+        }
+    }
+    created
 }
 
 /// Matches `silu(x) = divide(x, add(1.0, exponential(subtract(0.0, x))))` and returns `Some(x)`.
@@ -2034,86 +2054,12 @@ impl Pass for FuseGeluPass {
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let mut created = 0usize;
+        let created = fuse_gelu_no_dce(module);
         let mut removed = 0usize;
-        let blocks: Vec<BlockId> = module.blocks.keys().collect();
-
-        for block_id in blocks {
-            let ops = module.block_ops(block_id);
-            for op_id in ops {
-                let Some(op) = module.ops.get(op_id) else {
-                    continue;
-                };
-                let Some(StableHloOp::Multiply { lhs, rhs, .. }) = StableHloOp::from_op(op) else {
-                    continue;
-                };
-                if match_gelu_op(module, op).is_some() {
-                    continue;
-                }
-                let matched = match_gelu_val(module, lhs)
-                    .map(|g| (g, rhs))
-                    .or_else(|| match_gelu_val(module, rhs).map(|g| (g, lhs)));
-                let Some((gate_val, up_val)) = matched else {
-                    continue;
-                };
-
-                let mut attrs = IndexMap::new();
-                attrs.insert(
-                    "name".to_string(),
-                    Attribute::String("castforge.fused_geglu".to_string()),
-                );
-                attrs.insert(
-                    "decomposition".to_string(),
-                    Attribute::SymbolRef("fused_geglu_impl".to_string()),
-                );
-
-                let op_mut = &mut module.ops[op_id];
-                op_mut.name = OpName::new("stablehlo", "composite");
-                op_mut.operands = SmallVec::from_slice(&[gate_val, up_val]);
-                op_mut.attributes = attrs;
-                created += 1;
-            }
-
-            if created > 0 {
-                let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
-                removed += dce_res.ops_removed;
-            }
-
-            let ops2 = module.block_ops(block_id);
-            let mut standalone_created = 0usize;
-            for op_id in ops2 {
-                let Some(x_val) = module
-                    .ops
-                    .get(op_id)
-                    .and_then(|op| match_gelu_op(module, op))
-                else {
-                    continue;
-                };
-
-                let mut attrs = IndexMap::new();
-                attrs.insert(
-                    "name".to_string(),
-                    Attribute::String("castforge.fused_gelu".to_string()),
-                );
-                attrs.insert(
-                    "decomposition".to_string(),
-                    Attribute::SymbolRef("fused_gelu_impl".to_string()),
-                );
-
-                let op_mut = &mut module.ops[op_id];
-                op_mut.name = OpName::new("stablehlo", "composite");
-                op_mut.operands = SmallVec::from_slice(&[x_val]);
-                op_mut.attributes = attrs;
-                standalone_created += 1;
-            }
-
-            if standalone_created > 0 {
-                let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
-                removed += dce_res.ops_removed;
-                created += standalone_created;
-            }
+        if created > 0 {
+            let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
+            removed += dce_res.ops_removed;
         }
-
         Ok(PassResult {
             pass_name: self.name().to_string(),
             changed: created > 0,
@@ -2122,6 +2068,76 @@ impl Pass for FuseGeluPass {
             ops_created: created,
         })
     }
+}
+
+fn fuse_gelu_no_dce(module: &mut Module) -> usize {
+    let mut created = 0usize;
+    let blocks: Vec<BlockId> = module.blocks.keys().collect();
+
+    for block_id in blocks {
+        let ops = module.block_ops(block_id);
+        for op_id in ops {
+            let Some(op) = module.ops.get(op_id) else {
+                continue;
+            };
+            let Some(StableHloOp::Multiply { lhs, rhs, .. }) = StableHloOp::from_op(op) else {
+                continue;
+            };
+            if match_gelu_op(module, op).is_some() {
+                continue;
+            }
+            let matched = match_gelu_val(module, lhs)
+                .map(|g| (g, rhs))
+                .or_else(|| match_gelu_val(module, rhs).map(|g| (g, lhs)));
+            let Some((gate_val, up_val)) = matched else {
+                continue;
+            };
+
+            let mut attrs = IndexMap::new();
+            attrs.insert(
+                "name".to_string(),
+                Attribute::String("castforge.fused_geglu".to_string()),
+            );
+            attrs.insert(
+                "decomposition".to_string(),
+                Attribute::SymbolRef("fused_geglu_impl".to_string()),
+            );
+
+            let op_mut = &mut module.ops[op_id];
+            op_mut.name = OpName::new("stablehlo", "composite");
+            op_mut.operands = SmallVec::from_slice(&[gate_val, up_val]);
+            op_mut.attributes = attrs;
+            created += 1;
+        }
+
+        let ops2 = module.block_ops(block_id);
+        for op_id in ops2 {
+            let Some(x_val) = module
+                .ops
+                .get(op_id)
+                .and_then(|op| match_gelu_op(module, op))
+            else {
+                continue;
+            };
+
+            let mut attrs = IndexMap::new();
+            attrs.insert(
+                "name".to_string(),
+                Attribute::String("castforge.fused_gelu".to_string()),
+            );
+            attrs.insert(
+                "decomposition".to_string(),
+                Attribute::SymbolRef("fused_gelu_impl".to_string()),
+            );
+
+            let op_mut = &mut module.ops[op_id];
+            op_mut.name = OpName::new("stablehlo", "composite");
+            op_mut.operands = SmallVec::from_slice(&[x_val]);
+            op_mut.attributes = attrs;
+            created += 1;
+        }
+    }
+    created
 }
 
 /// Matches a value defined by a Tanh-Approximation GELU subgraph and returns its input `x`.
@@ -2274,102 +2290,105 @@ impl Pass for FuseGatedMlpPass {
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let h_res = FuseHorizontalDotPass.run(module)?;
-        let sw_res = FuseSwiGluPass.run(module)?;
-        let ge_res = FuseGeluPass.run(module)?;
+        let (hc, hm) = fuse_horizontal_dot_no_dce(module);
+        let sw_c = fuse_swiglu_no_dce(module);
+        let ge_c = fuse_gelu_no_dce(module);
+        let fused_count = fuse_gated_mlp_no_dce(module);
 
-        let mut created = h_res.ops_created + sw_res.ops_created + ge_res.ops_created;
-        let mut removed = h_res.ops_removed + sw_res.ops_removed + ge_res.ops_removed;
-        let mut fused_count = 0usize;
-        let blocks: Vec<BlockId> = module.blocks.keys().collect();
-
-        for block_id in blocks {
-            let ops = module.block_ops(block_id);
-            for op_id in ops {
-                let Some(op) = module.ops.get(op_id).cloned() else {
-                    continue;
-                };
-                let Some(StableHloOp::Composite { name, inputs, .. }) = StableHloOp::from_op(&op)
-                else {
-                    continue;
-                };
-                let act_kind = if name == "castforge.fused_swiglu" {
-                    "swiglu"
-                } else if name == "castforge.fused_geglu" {
-                    "geglu"
-                } else {
-                    continue;
-                };
-                if inputs.len() < 2 {
-                    continue;
-                }
-
-                let Some((dot_val_0, start_col_0)) = match_2d_col_slice(module, inputs[0]) else {
-                    continue;
-                };
-                let Some((dot_val_1, start_col_1)) = match_2d_col_slice(module, inputs[1]) else {
-                    continue;
-                };
-                if dot_val_0 != dot_val_1 || start_col_0 != 0 || start_col_1 <= 0 {
-                    continue;
-                }
-
-                let ValueDef::OpResult { op: dot_op_id, .. } = module.values[dot_val_0].def else {
-                    continue;
-                };
-                let Some(dot_op) = module.ops.get(dot_op_id) else {
-                    continue;
-                };
-                let Some(StableHloOp::DotGeneral {
-                    lhs: x_val,
-                    rhs: w_gate_up,
-                    dimension_numbers: dims,
-                    ..
-                }) = StableHloOp::from_op(dot_op)
-                else {
-                    continue;
-                };
-                let packed = dims.rhs_contracting_dimensions == [1];
-
-                let mut attrs = IndexMap::new();
-                attrs.insert(
-                    "name".to_string(),
-                    Attribute::String("castforge.fused_gated_mlp".to_string()),
-                );
-                attrs.insert(
-                    "decomposition".to_string(),
-                    Attribute::SymbolRef("fused_gated_mlp_impl".to_string()),
-                );
-                attrs.insert(
-                    "activation".to_string(),
-                    Attribute::String(act_kind.to_string()),
-                );
-                if packed {
-                    attrs.insert("packed_rhs".to_string(), Attribute::Bool(true));
-                }
-
-                let op_mut = &mut module.ops[op_id];
-                op_mut.name = OpName::new("stablehlo", "composite");
-                op_mut.operands = SmallVec::from_slice(&[x_val, w_gate_up]);
-                op_mut.attributes = attrs;
-                fused_count += 1;
-            }
-        }
-
-        if fused_count > 0 {
+        let created = hc + sw_c + ge_c + fused_count;
+        let mut removed = 0usize;
+        if created > 0 || hm > 0 {
             let dce_res = DeadCodeEliminationPass::ssa_only().run(module)?;
             removed += dce_res.ops_removed;
-            created += fused_count;
         }
 
         Ok(PassResult {
             pass_name: self.name().to_string(),
-            changed: created > 0 || fused_count > 0,
+            changed: created > 0 || hm > 0,
             ops_removed: removed,
-            ops_modified: fused_count,
+            ops_modified: fused_count + hm,
             ops_created: created,
         })
     }
+}
+
+fn fuse_gated_mlp_no_dce(module: &mut Module) -> usize {
+    let mut fused_count = 0usize;
+    let blocks: Vec<BlockId> = module.blocks.keys().collect();
+
+    for block_id in blocks {
+        let ops = module.block_ops(block_id);
+        for op_id in ops {
+            let Some(op) = module.ops.get(op_id).cloned() else {
+                continue;
+            };
+            let Some(StableHloOp::Composite { name, inputs, .. }) = StableHloOp::from_op(&op)
+            else {
+                continue;
+            };
+            let act_kind = if name == "castforge.fused_swiglu" {
+                "swiglu"
+            } else if name == "castforge.fused_geglu" {
+                "geglu"
+            } else {
+                continue;
+            };
+            if inputs.len() < 2 {
+                continue;
+            }
+
+            let Some((dot_val_0, start_col_0)) = match_2d_col_slice(module, inputs[0]) else {
+                continue;
+            };
+            let Some((dot_val_1, start_col_1)) = match_2d_col_slice(module, inputs[1]) else {
+                continue;
+            };
+            if dot_val_0 != dot_val_1 || start_col_0 != 0 || start_col_1 <= 0 {
+                continue;
+            }
+
+            let ValueDef::OpResult { op: dot_op_id, .. } = module.values[dot_val_0].def else {
+                continue;
+            };
+            let Some(dot_op) = module.ops.get(dot_op_id) else {
+                continue;
+            };
+            let Some(StableHloOp::DotGeneral {
+                lhs: x_val,
+                rhs: w_gate_up,
+                dimension_numbers: dims,
+                ..
+            }) = StableHloOp::from_op(dot_op)
+            else {
+                continue;
+            };
+            let packed = dims.rhs_contracting_dimensions == [1];
+
+            let mut attrs = IndexMap::new();
+            attrs.insert(
+                "name".to_string(),
+                Attribute::String("castforge.fused_gated_mlp".to_string()),
+            );
+            attrs.insert(
+                "decomposition".to_string(),
+                Attribute::SymbolRef("fused_gated_mlp_impl".to_string()),
+            );
+            attrs.insert(
+                "activation".to_string(),
+                Attribute::String(act_kind.to_string()),
+            );
+            if packed {
+                attrs.insert("packed_rhs".to_string(), Attribute::Bool(true));
+            }
+
+            let op_mut = &mut module.ops[op_id];
+            op_mut.name = OpName::new("stablehlo", "composite");
+            op_mut.operands = SmallVec::from_slice(&[x_val, w_gate_up]);
+            op_mut.attributes = attrs;
+            fused_count += 1;
+        }
+    }
+    fused_count
 }
 
 fn match_2d_col_slice(module: &Module, val_id: ValueId) -> Option<(ValueId, i64)> {
@@ -2419,62 +2438,8 @@ impl Pass for FuseMoePass {
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let mut created = 0usize;
+        let created = fuse_moe_no_dce(module, self.shared_expert, self.top_k, self.capacity_factor);
         let mut removed = 0usize;
-        let blocks: Vec<BlockId> = module.blocks.keys().collect();
-
-        for block_id in blocks {
-            let ops = module.block_ops(block_id);
-            for op_id in ops {
-                let Some(op) = module.ops.get(op_id).cloned() else {
-                    continue;
-                };
-                let Some(StableHloOp::Add { lhs, rhs, .. }) = StableHloOp::from_op(&op) else {
-                    continue;
-                };
-                let Some((x0, w0, g0)) = match_gated_expert(module, lhs) else {
-                    continue;
-                };
-                let Some((x1, w1, g1)) = match_gated_expert(module, rhs) else {
-                    continue;
-                };
-                if x0 != x1 {
-                    continue;
-                }
-
-                let mut attrs = IndexMap::new();
-                attrs.insert(
-                    "name".to_string(),
-                    Attribute::String("castforge.fused_moe".to_string()),
-                );
-                attrs.insert(
-                    "decomposition".to_string(),
-                    Attribute::SymbolRef("fused_moe_impl".to_string()),
-                );
-                attrs.insert("num_experts".to_string(), Attribute::Int(2));
-                attrs.insert(
-                    "castforge.moe_top_k".to_string(),
-                    Attribute::Int(self.top_k.max(1) as i64),
-                );
-                attrs.insert(
-                    "castforge.moe_capacity_factor".to_string(),
-                    Attribute::Float(self.capacity_factor.max(0.5) as f64),
-                );
-                if self.shared_expert {
-                    attrs.insert(
-                        "castforge.moe_shared_expert".to_string(),
-                        Attribute::Bool(true),
-                    );
-                }
-
-                let op_mut = &mut module.ops[op_id];
-                op_mut.name = OpName::new("stablehlo", "composite");
-                op_mut.operands = SmallVec::from_slice(&[x0, w0, w1, g0, g1]);
-                op_mut.attributes = attrs;
-                created += 1;
-            }
-        }
-
         if created > 0 {
             let dce = DeadCodeEliminationPass::ssa_only().run(module)?;
             removed += dce.ops_removed;
@@ -2488,6 +2453,69 @@ impl Pass for FuseMoePass {
             ops_created: created,
         })
     }
+}
+
+fn fuse_moe_no_dce(
+    module: &mut Module,
+    shared_expert: bool,
+    top_k: usize,
+    capacity_factor: f32,
+) -> usize {
+    let mut created = 0usize;
+    let blocks: Vec<BlockId> = module.blocks.keys().collect();
+
+    for block_id in blocks {
+        let ops = module.block_ops(block_id);
+        for op_id in ops {
+            let Some(op) = module.ops.get(op_id).cloned() else {
+                continue;
+            };
+            let Some(StableHloOp::Add { lhs, rhs, .. }) = StableHloOp::from_op(&op) else {
+                continue;
+            };
+            let Some((x0, w0, g0)) = match_gated_expert(module, lhs) else {
+                continue;
+            };
+            let Some((x1, w1, g1)) = match_gated_expert(module, rhs) else {
+                continue;
+            };
+            if x0 != x1 {
+                continue;
+            }
+
+            let mut attrs = IndexMap::new();
+            attrs.insert(
+                "name".to_string(),
+                Attribute::String("castforge.fused_moe".to_string()),
+            );
+            attrs.insert(
+                "decomposition".to_string(),
+                Attribute::SymbolRef("fused_moe_impl".to_string()),
+            );
+            attrs.insert("num_experts".to_string(), Attribute::Int(2));
+            attrs.insert(
+                "castforge.moe_top_k".to_string(),
+                Attribute::Int(top_k.max(1) as i64),
+            );
+            attrs.insert(
+                "castforge.moe_capacity_factor".to_string(),
+                Attribute::Float(capacity_factor.max(0.5) as f64),
+            );
+            if shared_expert {
+                attrs.insert(
+                    "castforge.moe_shared_expert".to_string(),
+                    Attribute::Bool(true),
+                );
+            }
+
+            let op_mut = &mut module.ops[op_id];
+            op_mut.name = OpName::new("stablehlo", "composite");
+            op_mut.operands = SmallVec::from_slice(&[x0, w0, w1, g0, g1]);
+            op_mut.attributes = attrs;
+            created += 1;
+        }
+    }
+    created
 }
 
 fn match_gated_expert(module: &Module, val_id: ValueId) -> Option<(ValueId, ValueId, ValueId)> {
