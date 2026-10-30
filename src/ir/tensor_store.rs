@@ -50,6 +50,61 @@ impl TensorEntry {
     }
 }
 
+/// Converts an IEEE 754 `f16` 16-bit pattern to `f32`.
+pub fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let mant = (bits & 0x03ff) as u32;
+    let f32_bits = if exp == 0 {
+        if mant == 0 {
+            sign << 31
+        } else {
+            let mut m = mant;
+            let mut e = 127 - 14;
+            while (m & 0x0400) == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            m &= 0x03ff;
+            (sign << 31) | (e << 23) | (m << 13)
+        }
+    } else if exp == 0x1f {
+        (sign << 31) | 0x7f80_0000 | (mant << 13)
+    } else {
+        (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13)
+    };
+    f32::from_bits(f32_bits)
+}
+
+/// Converts an `f32` value to an IEEE 754 `f16` 16-bit pattern.
+pub fn f32_to_f16_bits(val: f32) -> u16 {
+    let bits = val.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x007f_ffff;
+    if exp == 255 {
+        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 };
+    }
+    let new_exp = exp - 127 + 15;
+    if new_exp >= 31 {
+        sign | 0x7c00
+    } else if new_exp <= 0 {
+        0
+    } else {
+        sign | ((new_exp as u16) << 10) | ((mant >> 13) as u16)
+    }
+}
+
+/// Converts a `bf16` 16-bit pattern to `f32`.
+pub fn bf16_bits_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
+/// Converts an `f32` value to a `bf16` 16-bit pattern.
+pub fn f32_to_bf16_bits(val: f32) -> u16 {
+    (val.to_bits() >> 16) as u16
+}
+
 /// Parse a flat or nested MLIR dense literal (e.g., `[[1.0, 2.0], [3.0, 4.0]]` or `0.5`)
 /// into a vector of `f32` of length `expected_len` (expanding splats automatically).
 pub fn parse_dense_f32_literal(raw_literal: &str, expected_len: usize) -> Option<Vec<f32>> {
@@ -209,23 +264,59 @@ impl TensorStore {
                             .collect(),
                     ),
                     TensorBacking::InMemory(bytes) => {
-                        if bytes.len() == expected_len * 4 {
-                            Some(
-                                bytes
-                                    .as_chunks::<4>()
-                                    .0
-                                    .iter()
-                                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                                    .collect(),
-                            )
-                        } else {
-                            None
-                        }
+                        Self::decode_raw_bytes_to_f32(bytes, &entry.ty.dtype, expected_len)
+                    }
+                    TensorBacking::ExternalFile {
+                        path,
+                        offset,
+                        length,
+                    } => {
+                        let file_bytes = std::fs::read(path).ok()?;
+                        let start = *offset as usize;
+                        let end = start.saturating_add(*length as usize);
+                        let slice = file_bytes.get(start..end)?;
+                        Self::decode_raw_bytes_to_f32(slice, &entry.ty.dtype, expected_len)
                     }
                     _ => None,
                 }
             }
             _ => None,
+        }
+    }
+
+    fn decode_raw_bytes_to_f32(
+        bytes: &[u8],
+        dtype: &DType,
+        expected_len: usize,
+    ) -> Option<Vec<f32>> {
+        if bytes.len() == expected_len * 4 {
+            Some(
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            )
+        } else if bytes.len() == expected_len * 2 {
+            let is_bf16 = matches!(dtype, DType::BF16);
+            Some(
+                bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| {
+                        let bits = u16::from_le_bytes([c[0], c[1]]);
+                        if is_bf16 {
+                            bf16_bits_to_f32(bits)
+                        } else {
+                            f16_bits_to_f32(bits)
+                        }
+                    })
+                    .collect(),
+            )
+        } else {
+            None
         }
     }
 
@@ -270,14 +361,31 @@ impl TensorStore {
             let start = data_buf.len();
             match &entry.backing {
                 TensorBacking::F32Data(vals) => {
-                    for &v in vals {
-                        data_buf.extend_from_slice(&v.to_le_bytes());
-                    }
+                    let dtype_str = match entry.ty.dtype {
+                        DType::F16 => {
+                            for &v in vals {
+                                data_buf.extend_from_slice(&f32_to_f16_bits(v).to_le_bytes());
+                            }
+                            "F16"
+                        }
+                        DType::BF16 => {
+                            for &v in vals {
+                                data_buf.extend_from_slice(&f32_to_bf16_bits(v).to_le_bytes());
+                            }
+                            "BF16"
+                        }
+                        _ => {
+                            for &v in vals {
+                                data_buf.extend_from_slice(&v.to_le_bytes());
+                            }
+                            "F32"
+                        }
+                    };
                     let end = data_buf.len();
                     headers.insert(
                         name.clone(),
                         SafeTensorEntryHeader {
-                            dtype: "F32".to_string(),
+                            dtype: dtype_str.to_string(),
                             shape,
                             data_offsets: [start, end],
                             scale: None,
@@ -389,6 +497,28 @@ impl TensorStore {
                         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                         .collect();
                     let ty = TensorType::new(shape, DType::F32);
+                    self.insert(TensorEntry::from_f32(name, ty, vals));
+                    loaded += 1;
+                }
+                "F16" => {
+                    let vals: Vec<f32> = slice
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|c| f16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                        .collect();
+                    let ty = TensorType::new(shape, DType::F16);
+                    self.insert(TensorEntry::from_f32(name, ty, vals));
+                    loaded += 1;
+                }
+                "BF16" => {
+                    let vals: Vec<f32> = slice
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|c| bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                        .collect();
+                    let ty = TensorType::new(shape, DType::BF16);
                     self.insert(TensorEntry::from_f32(name, ty, vals));
                     loaded += 1;
                 }

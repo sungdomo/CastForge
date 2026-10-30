@@ -30,8 +30,8 @@ pub use parser::{MlirParser, ParseError, parse_type};
 pub use pass_manager::*;
 pub use stablehlo::{DotDimensionNumbers, FuncView, StableHloOp, verify_stablehlo_shapes};
 pub use tensor_store::{
-    TensorBacking, TensorEntry, TensorStore, format_dense_f32_literal, format_dense_i8_literal,
-    parse_dense_f32_literal,
+    TensorBacking, TensorEntry, TensorStore, bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits,
+    f32_to_f16_bits, format_dense_f32_literal, format_dense_i8_literal, parse_dense_f32_literal,
 };
 pub use verify_ir::*;
 pub use viz::*;

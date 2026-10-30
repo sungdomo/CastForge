@@ -365,4 +365,61 @@ fn test_externalize_safetensors_roundtrip_and_weight_surgery() {
     let inlined_mlir = print_mlir(&final_mod);
     assert!(!inlined_mlir.contains("dense_resource<"));
     assert!(inlined_mlir.contains("dense<[["));
+
+    // 5. Verify F16/BF16 SafeTensors round-trip and ExternalFile lazy resolution
+    use castforge::ir::{
+        Attribute, DType, Dim, TensorBacking, TensorEntry, TensorStore, TensorType,
+    };
+    let mut half_store = TensorStore::new();
+    half_store.insert(TensorEntry::from_f32(
+        "f16_w",
+        TensorType::new(vec![Dim::Static(4)], DType::F16),
+        vec![1.0, -0.5, 2.0, 0.25],
+    ));
+    half_store.insert(TensorEntry::from_f32(
+        "bf16_w",
+        TensorType::new(vec![Dim::Static(4)], DType::BF16),
+        vec![3.0, -1.5, 0.5, 4.0],
+    ));
+    let half_bytes = half_store
+        .to_safetensors_bytes()
+        .expect("serialize f16/bf16");
+    let mut loaded_half = TensorStore::new();
+    let cnt = loaded_half
+        .load_safetensors_bytes(&half_bytes)
+        .expect("load f16/bf16");
+    assert_eq!(cnt, 2);
+    assert_eq!(loaded_half.get("f16_w").unwrap().ty.dtype, DType::F16);
+    assert_eq!(loaded_half.get("bf16_w").unwrap().ty.dtype, DType::BF16);
+    let f16_vals = loaded_half.get("f16_w").unwrap().as_f32_slice().unwrap();
+    assert!((f16_vals[0] - 1.0).abs() < 1e-3 && (f16_vals[1] + 0.5).abs() < 1e-3);
+    let bf16_vals = loaded_half.get("bf16_w").unwrap().as_f32_slice().unwrap();
+    assert!((bf16_vals[0] - 3.0).abs() < 1e-2 && (bf16_vals[1] + 1.5).abs() < 1e-2);
+
+    let tmp_path = std::env::temp_dir().join("castforge_ext_slice_test.bin");
+    let raw_floats: Vec<u8> = [10.0f32, 20.0, 30.0, 40.0]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    std::fs::write(&tmp_path, &raw_floats).expect("write ext bin");
+    loaded_half.insert(TensorEntry {
+        name: "ext_w".to_string(),
+        ty: TensorType::new(vec![Dim::Static(2)], DType::F32),
+        backing: TensorBacking::ExternalFile {
+            path: tmp_path.clone(),
+            offset: 4,
+            length: 8,
+        },
+    });
+    let resolved_ext = loaded_half
+        .resolve_f32_attr(
+            &Attribute::TensorRef {
+                key: "ext_w".to_string(),
+                ty: TensorType::new(vec![Dim::Static(2)], DType::F32),
+            },
+            2,
+        )
+        .expect("resolve ExternalFile slice");
+    assert_eq!(resolved_ext, vec![20.0, 30.0]);
+    let _ = std::fs::remove_file(&tmp_path);
 }
