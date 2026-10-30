@@ -2,7 +2,7 @@
 //!
 //! Consolidates `prune-structured` (`mode=structured`) and `sparsify-2to4` (`mode=2to4`).
 
-use crate::{Pass, PassResult, prune_2d_columns_by_l1};
+use crate::{Pass, PassResult};
 use anyhow::Result;
 use castforge_dialect_stablehlo::StableHloOp;
 use castforge_ir::{
@@ -358,4 +358,44 @@ pub fn apply_2to4_mask(vals: &mut [f32]) {
         chunk[indexed[0].0] = 0.0;
         chunk[indexed[1].0] = 0.0;
     }
+}
+
+/// Structured pruning of a 2D weight matrix `[rows, cols]` along its output columns (`dim = 1`),
+/// keeping the top `keep_cols` columns with highest L1 importance norm.
+/// Returns `(pruned_f32_data, kept_column_indices)`.
+pub fn prune_2d_columns_by_l1(
+    values: &[f32],
+    rows: usize,
+    cols: usize,
+    keep_cols: usize,
+) -> (Vec<f32>, Vec<usize>) {
+    if rows == 0 || cols == 0 || values.len() < rows * cols {
+        return (values.to_vec(), (0..cols).collect());
+    }
+    let keep_cols = keep_cols.clamp(1, cols);
+    let mut col_scores: Vec<(usize, f32)> = (0..cols)
+        .map(|c| {
+            let mut l1 = 0.0f32;
+            for r in 0..rows {
+                l1 += values[r * cols + c].abs();
+            }
+            (c, l1)
+        })
+        .collect();
+
+    col_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut kept_indices: Vec<usize> = col_scores
+        .into_iter()
+        .take(keep_cols)
+        .map(|(idx, _)| idx)
+        .collect();
+    kept_indices.sort_unstable();
+
+    let mut pruned = Vec::with_capacity(rows * keep_cols);
+    for r in 0..rows {
+        for &c in &kept_indices {
+            pruned.push(values[r * cols + c]);
+        }
+    }
+    (pruned, kept_indices)
 }

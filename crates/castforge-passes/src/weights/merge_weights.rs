@@ -1,8 +1,6 @@
 //! Unified Weight Merging, Task Arithmetic/DARE, and LoRA Baking (`merge-weights`).
 
-use crate::{
-    DeadCodeEliminationPass, FoldConstantsPass, MergeMethod, Pass, PassResult, merge_f32_tensors,
-};
+use crate::{DeadCodeEliminationPass, FoldConstantsPass, Pass, PassResult};
 use anyhow::Result;
 use castforge_dialect_stablehlo::StableHloOp;
 use castforge_ir::{
@@ -626,4 +624,61 @@ fn apply_dare_pruning(delta: &[f32], drop_rate: f32) -> Vec<f32> {
         }
     }
     out
+}
+
+/// Model Merging algorithms on two equal-length `f32` weight slices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeMethod {
+    /// `(1 - t) * a + t * b`
+    Linear,
+    /// Spherical Linear Interpolation (SLERP)
+    Slerp,
+    /// TIES-Merging (Trim, Elect Sign, Disjoint Merge)
+    Ties,
+}
+
+pub fn merge_f32_tensors(a: &[f32], b: &[f32], method: MergeMethod, t: f32) -> Vec<f32> {
+    let len = a.len().min(b.len());
+    match method {
+        MergeMethod::Linear => (0..len).map(|i| (1.0 - t) * a[i] + t * b[i]).collect(),
+        MergeMethod::Slerp => {
+            let norm_a: f32 = a.iter().take(len).map(|x| x * x).sum::<f32>().sqrt();
+            let norm_b: f32 = b.iter().take(len).map(|x| x * x).sum::<f32>().sqrt();
+            if norm_a < 1e-8 || norm_b < 1e-8 {
+                return merge_f32_tensors(a, b, MergeMethod::Linear, t);
+            }
+            let dot: f32 = (0..len).map(|i| (a[i] / norm_a) * (b[i] / norm_b)).sum();
+            let dot_clamped = dot.clamp(-0.9995, 0.9995);
+            let omega = dot_clamped.acos();
+            let sin_omega = omega.sin();
+            if sin_omega.abs() < 1e-6 {
+                return merge_f32_tensors(a, b, MergeMethod::Linear, t);
+            }
+            let coeff_a = ((1.0 - t) * omega).sin() / sin_omega;
+            let coeff_b = (t * omega).sin() / sin_omega;
+            (0..len).map(|i| coeff_a * a[i] + coeff_b * b[i]).collect()
+        }
+        MergeMethod::Ties => (0..len)
+            .map(|i| {
+                let va = a[i];
+                let vb = b[i];
+                let elected_sign = ((1.0 - t) * va + t * vb).signum();
+                let mut sum = 0.0f32;
+                let mut weight_sum = 0.0f32;
+                if va.signum() == elected_sign || va == 0.0 {
+                    sum += (1.0 - t) * va;
+                    weight_sum += 1.0 - t;
+                }
+                if vb.signum() == elected_sign || vb == 0.0 {
+                    sum += t * vb;
+                    weight_sum += t;
+                }
+                if weight_sum > 0.0 {
+                    sum / weight_sum
+                } else {
+                    (1.0 - t) * va + t * vb
+                }
+            })
+            .collect(),
+    }
 }

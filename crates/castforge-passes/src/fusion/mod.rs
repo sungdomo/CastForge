@@ -1,5 +1,5 @@
 //! Operator and subgraph fusion passes (`fuse-attention`, `fuse-norm`, `fuse-activations`,
-//! `fuse-gemm`, `fuse-elementwise`, `fuse-softmax`, `decompose-composites`).
+//! `fuse-gemm`, `fuse-elementwise`, `decompose-composites`).
 
 pub mod decompose_composites;
 pub mod fuse_activations;
@@ -7,7 +7,6 @@ pub mod fuse_attention;
 pub mod fuse_elementwise;
 pub mod fuse_gemm;
 pub mod fuse_norm;
-pub mod fuse_softmax;
 
 pub use decompose_composites::DecomposeCompositesPass;
 pub use fuse_activations::{
@@ -25,5 +24,7 @@ pub use fuse_elementwise::{
 pub use fuse_gemm::{
     FuseDequantMatmulPass, FuseGemmPass, FuseHorizontalDotPass, FuseMatmulEpiloguePass,
 };
-pub use fuse_norm::{FuseLayerNormPass, FuseNormPass, FuseResidualNormPass, FuseRmsNormPass};
-pub use fuse_softmax::{FuseLinearCrossEntropyPass, FuseSoftmaxPass};
+pub use fuse_norm::{
+    FuseLayerNormPass, FuseLinearCrossEntropyPass, FuseNormPass, FuseResidualNormPass,
+    FuseRmsNormPass, FuseSoftmaxPass,
+};

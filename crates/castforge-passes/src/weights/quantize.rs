@@ -3,7 +3,7 @@
 //! Consolidates `quantize-weights`, `quantize-groupwise`, `quantize-fp8`, `calibrate-quantize`,
 //! **SmoothQuant** (`scheme=smoothquant`), and `hadamard-quant-rotation`.
 
-use crate::{Pass, PassResult, quantize_symmetric_f32};
+use crate::{Pass, PassResult};
 use anyhow::Result;
 use castforge_dialect_stablehlo::StableHloOp;
 use castforge_ir::{
@@ -1269,4 +1269,43 @@ fn insert_convert_before(
         block_ops.push(new_op_id);
     }
     val_id
+}
+
+/// Symmetric per-tensor quantization of `f32` weights to `i8` or `i4`.
+/// Returns `(quantized_values, scale, zero_point, quantized_dtype)`.
+pub fn quantize_symmetric_f32(
+    values: &[f32],
+    bits: u8,
+    expressed_dtype: DType,
+) -> (Vec<i8>, f32, i64, DType) {
+    let qmax = if bits == 4 { 7.0f32 } else { 127.0f32 };
+    let qmin = if bits == 4 { -8.0f32 } else { -128.0f32 };
+
+    let max_abs = values.iter().fold(0.0f32, |acc, &v| acc.max(v.abs()));
+    let scale = if max_abs < 1e-12 { 1.0 } else { max_abs / qmax };
+
+    let q_data: Vec<i8> = values
+        .iter()
+        .map(|&v| (v / scale).round().clamp(qmin, qmax) as i8)
+        .collect();
+
+    let storage_type = if bits == 4 { DType::I4 } else { DType::I8 };
+    let scale_str = format!("{:.6}", scale)
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string();
+    let scale_str = if scale_str.contains('.') {
+        scale_str
+    } else {
+        format!("{scale_str}.0")
+    };
+
+    let q_dtype = DType::QuantUniform {
+        storage_type: Box::new(storage_type),
+        expressed_type: Box::new(expressed_dtype),
+        scale: scale_str,
+        zero_point: 0,
+    };
+
+    (q_data, scale, 0, q_dtype)
 }
