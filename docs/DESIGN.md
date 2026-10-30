@@ -88,13 +88,10 @@ CastForge is built around three foundational design principles:
 
 ## 3. Source Module Topology (`src/`)
 
-- **`src/ir`**: Core arena-backed SSA data structures (`Module`, `Operation`, `Value`,
-  `Block`, `Region`), `Type`/`DType`/`Dim`, `TensorStore`, and `Payload`/`Translator`/
-  `TranslatorChain`.
-- **`src/stablehlo`**: Strongly-typed `StableHloOp` pattern-matching view over generic MLIR
-  operations, `FuncView`, and `verify_stablehlo_shapes`.
-- **`src/mlir`**: Zero-dependency recursive-descent MLIR parser (`parse_mlir`) and deterministic
-  pretty-printer (`print_module`) supporting both custom assembly and generic MLIR.
+- **`src/ir`**: Core arena-backed SSA data structures (`Module`, `Operation`, `Value`, `Block`,
+  `Region`), `Type`/`DType`/`Dim`, `TensorStore` (`tensor_store.rs`), strongly-typed `StableHloOp`
+  dialect views (`stablehlo.rs`), MLIR parser/printer (`parser.rs`, `mlir.rs`), ONNX/GGUF
+  importers/exporters (`import.rs`), and `Payload`/`Translator`/`TranslatorChain`.
 - **`src/passes`**: `Pass` trait, `PassManager`, `PassRegistry`, declarative TOML/JSON
   `PipelineConfig`, and **21 built-in Graph IR transformation passes and presets**.
 - **`src/codegen`**: Liveness analysis, static arena memory planner (`MemoryPlan`), Roofline cost

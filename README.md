@@ -17,15 +17,11 @@ support.
 
 ## Project Directory Structure (`src/`)
 
-- [`src/ir`](src/ir): Arena-allocated MLIR-compatible IR (`Module`, `Operation`, `Value`, `Block`,
-  `Region`, `Type`, `Attribute`, `Location`), structural verifier, binary `.safetensors` zero-copy
-  reader/writer, and the `TensorStore` weight plane (`mod.rs` and `tensor_store.rs`).
-- [`src/stablehlo`](src/stablehlo): Strongly-typed `stablehlo` and `func` dialect views
-  (`StableHloOp`, `DotDimensionNumbers`, `FuncView`) and shape verifiers (`mod.rs`).
-- [`src/mlir`](src/mlir): Zero-C++ MLIR parser & printer supporting both **MLIR Generic Form**
-  (`"stablehlo.add"(...)`) and **Pretty/Custom Syntax** (`stablehlo.add %0, %1 : tensor<...>`),
-  `!quant.uniform` quantized tensor types, `dense_resource<key>` external weight references, plus
-  symmetric **GGUF v2/v3**, **ONNX-JSON**, and **SafeTensors** model importers & exporters.
+- [`src/ir`](src/ir): Arena-allocated MLIR-compatible Dual-Plane IR (`Module`, `Operation`, `Value`,
+  `Block`, `Region`, `Type`, `Attribute`, `Location`), `TensorStore` weight plane & `.safetensors`
+  zero-copy I/O (`tensor_store.rs`), strongly-typed `StableHloOp` and `FuncView` dialect views
+  (`stablehlo.rs`), zero-C++ MLIR parser (`parser.rs`) & printer (`mlir.rs`), and symmetric
+  **GGUF v2/v3**, **ONNX-JSON**, and **SafeTensors** model importers & exporters (`import.rs`).
 - [`src/passes`](src/passes): Unified `Pass`, `PassRegistry`, and `PassManager` with **21 canonical
   A-to-B IR translator modules & presets** (`18 passes + 3 presets`) organized with **100% 1-to-1
   pass-to-file mapping** (`18` pass `.rs` files + `mod.rs` directly under `src/passes/`), supporting

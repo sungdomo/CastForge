@@ -1,5 +1,5 @@
 //! Strongly-typed `stablehlo` and `func` dialect views and shape verifiers
-//! (`castforge::stablehlo`).
+//! (`castforge::ir::stablehlo`).
 
 use crate::ir::{Attribute, Dim, Module, OpId, Operation, Type, ValueId};
 use serde::{Deserialize, Serialize};

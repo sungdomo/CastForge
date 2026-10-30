@@ -4,7 +4,7 @@
 pub mod cli;
 pub mod codegen;
 pub mod ir;
-pub mod mlir;
 pub mod passes;
-pub mod stablehlo;
 pub mod viz;
+
+pub use ir::{mlir, stablehlo};

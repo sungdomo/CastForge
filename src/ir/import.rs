@@ -2,9 +2,8 @@
 //! CastForge's Dual-Plane StableHLO IR (`Module` + `TensorStore`).
 
 use crate::ir::{
-    DType, Dim, Module, TensorEntry, TensorStore, TensorType, format_dense_f32_literal,
+    DType, Dim, Module, TensorEntry, TensorStore, TensorType, format_dense_f32_literal, parse_mlir,
 };
-use crate::mlir::parse_mlir;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

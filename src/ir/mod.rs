@@ -2,11 +2,28 @@
 //!
 //! Provides arena-allocated SSA IR data structures ([`Module`], [`Operation`], [`Value`],
 //! [`Block`], [`Region`], [`Type`], [`Attribute`], [`Location`]), the [`TensorStore`] weight
-//! plane, SafeTensors binary I/O, and the composable [`Translator`] / [`TranslatorChain`]
-//! A-to-B pipeline abstraction.
+//! plane, SafeTensors binary I/O, strongly-typed [`StableHloOp`] dialect views, the MLIR
+//! parser/printer, ONNX/GGUF importers/exporters, and the composable [`Translator`] /
+//! [`TranslatorChain`] A-to-B pipeline abstraction.
 
+pub mod import;
+pub mod mlir;
+pub mod parser;
+pub mod stablehlo;
 pub mod tensor_store;
 
+pub use import::{
+    GgmlType, GgufExportTranslator, OnnxExportTranslator, OnnxJsonInitializer, OnnxJsonModel,
+    OnnxJsonNode, OnnxJsonValueInfo, SafetensorsExportTranslator, collect_module_tensors,
+    export_gguf_bytes, export_gguf_file, export_onnx_file, export_onnx_json, import_gguf_bytes,
+    import_gguf_file, import_onnx_file, import_onnx_json,
+};
+pub use mlir::{
+    GgufImportTranslator, MlirParseTranslator, MlirPrintTranslator, MlirPrinter,
+    OnnxImportTranslator, PrintOptions, parse_mlir, print_mlir, print_mlir_with_options,
+};
+pub use parser::{MlirParser, ParseError, parse_type};
+pub use stablehlo::{DotDimensionNumbers, FuncView, StableHloOp, verify_stablehlo_shapes};
 pub use tensor_store::{
     TensorBacking, TensorEntry, TensorStore, format_dense_f32_literal, format_dense_i8_literal,
     parse_dense_f32_literal,
