@@ -30,7 +30,7 @@ fn test_externalize_safetensors_roundtrip_and_weight_surgery() {
     let mut module = parse_mlir(SURGERY_INLINE_MLIR).expect("parse failed");
 
     // 1. Externalize inline `dense<...>` constants to `dense_resource<...>`
-    let mut ext_pm = PassManager::from_pipeline_str(&registry, "externalize-weights")
+    let mut ext_pm = PassManager::from_pipeline_str(&registry, "fold-weights(mode=externalize)")
         .expect("pipeline build failed");
     ext_pm.run(&mut module).expect("externalize failed");
 
@@ -83,9 +83,8 @@ fn test_externalize_safetensors_roundtrip_and_weight_surgery() {
         .load_safetensors_bytes(&q_st_bytes)
         .expect("load quantized safetensors failed");
 
-    let mut inline_pm =
-        PassManager::from_pipeline_str(&registry, "externalize-weights(inline=true)")
-            .expect("inline pipeline build failed");
+    let mut inline_pm = PassManager::from_pipeline_str(&registry, "fold-weights(mode=inline)")
+        .expect("inline pipeline build failed");
     inline_pm.run(&mut final_mod).expect("inline run failed");
 
     let inlined_mlir = print_mlir(&final_mod);

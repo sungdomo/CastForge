@@ -194,7 +194,10 @@ module @general_passes {
 
     let mut pm = PassManager::from_pipeline_str(
         &registry,
-        "inliner,dce,fold-constants,topological-sort,normalize-ir(debuginfo=true),profile-ir",
+        concat!(
+            "outline-subgraphs(mode=inline),dce,fold-constants,",
+            "topological-sort,ir-edit(debuginfo=true),profile-ir"
+        ),
     )
     .expect("pipeline build failed");
 
@@ -256,8 +259,11 @@ module @unified_passes {
     // 2. Fold dense<[1,2,3,4]> + dense<[10,20,30,40]> -> dense<[11,22,33,44]>
     // 3. Fold compare(2.0 > 1.0) and select -> %vsum
     // 4. Eliminate both dead private functions (@add_vec and @dead_private) via unified `dce`
-    let mut pm = PassManager::from_pipeline_str(&registry, "inliner,fold-constants,dce")
-        .expect("pipeline build failed");
+    let mut pm = PassManager::from_pipeline_str(
+        &registry,
+        "outline-subgraphs(mode=inline),fold-constants,dce",
+    )
+    .expect("pipeline build failed");
     pm.run(&mut module).expect("pipeline execution failed");
 
     assert_eq!(module.functions().len(), 1);

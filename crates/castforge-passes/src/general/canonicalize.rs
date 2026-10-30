@@ -110,6 +110,7 @@ impl Pass for OptO2Pass {
             .run(module)?,
             FoldWeightsPass {
                 mode: "batchnorm".to_string(),
+                ..Default::default()
             }
             .run(module)?,
             FuseNormPass::default().run(module)?,
@@ -204,6 +205,7 @@ impl Pass for OptO3Pass {
             .run(module)?,
             FoldWeightsPass {
                 mode: "pack".to_string(),
+                ..Default::default()
             }
             .run(module)?,
             OptimizeMemoryPass {

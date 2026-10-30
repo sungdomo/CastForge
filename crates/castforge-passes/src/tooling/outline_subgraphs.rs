@@ -9,11 +9,13 @@ use smallvec::{SmallVec, smallvec};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
-/// Unified Subgraph Outlining, Function Deduplication, Composition & Call Unrolling Pass
+/// Unified Subgraph Outlining, Inlining, Extraction, Deduplication, Composition & Unrolling
 /// (`outline-subgraphs`).
 ///
 /// Consolidates:
 /// - `mode=all|gemm|composites` (`OutlineSubgraphsPass`)
+/// - `mode=inline` (`InlinerPass`)
+/// - `mode=extract|reduce` (`ExtractSubgraphPass` / `ReduceIrPass`)
 /// - `mode=dedup` or `dedup=true` (`DedupFunctionsPass`)
 /// - `mode=compose` (`ComposeFuncsPass`)
 /// - `mode=unroll` or `repeat > 1` (`UnrollCallsPass`)
@@ -24,6 +26,10 @@ pub struct UnifiedOutlineSubgraphsPass {
     pub second: String,
     pub entry_name: String,
     pub repeat: usize,
+    pub target: String,
+    pub stop_at: String,
+    pub max_ops: Option<usize>,
+    pub keep_op: String,
 }
 
 impl Default for UnifiedOutlineSubgraphsPass {
@@ -35,6 +41,10 @@ impl Default for UnifiedOutlineSubgraphsPass {
             second: String::new(),
             entry_name: "composed_main".to_string(),
             repeat: 1,
+            target: String::new(),
+            stop_at: String::new(),
+            max_ops: None,
+            keep_op: String::new(),
         }
     }
 }
@@ -45,13 +55,27 @@ impl Pass for UnifiedOutlineSubgraphsPass {
     }
 
     fn description(&self) -> &'static str {
-        "Unified subgraph outlining, function dedup, pipeline composition, and call unrolling"
+        "Unified subgraph outlining, inlining, extraction, function dedup, composition & unrolling"
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let m = self.mode.to_ascii_lowercase();
         let mut steps = Vec::new();
         match m.as_str() {
+            "inline" | "inliner" => {
+                steps.push(crate::InlinerPass.run(module)?);
+            }
+            "extract" | "reduce" => {
+                steps.push(
+                    crate::ExtractSubgraphPass {
+                        target: self.target.clone(),
+                        stop_at: self.stop_at.clone(),
+                        max_ops: self.max_ops,
+                        keep_op: self.keep_op.clone(),
+                    }
+                    .run(module)?,
+                );
+            }
             "dedup" => {
                 steps.push(DedupFunctionsPass.run(module)?);
             }
@@ -74,22 +98,38 @@ impl Pass for UnifiedOutlineSubgraphsPass {
                 );
             }
             _ => {
-                steps.push(
-                    OutlineSubgraphsPass {
-                        mode: self.mode.clone(),
-                    }
-                    .run(module)?,
-                );
-                if self.dedup {
-                    steps.push(DedupFunctionsPass.run(module)?);
-                }
-                if self.repeat > 1 {
+                if !self.target.is_empty()
+                    || !self.stop_at.is_empty()
+                    || self.max_ops.is_some()
+                    || !self.keep_op.is_empty()
+                {
                     steps.push(
-                        UnrollCallsPass {
-                            repeat: self.repeat,
+                        crate::ExtractSubgraphPass {
+                            target: self.target.clone(),
+                            stop_at: self.stop_at.clone(),
+                            max_ops: self.max_ops,
+                            keep_op: self.keep_op.clone(),
                         }
                         .run(module)?,
                     );
+                } else {
+                    steps.push(
+                        OutlineSubgraphsPass {
+                            mode: self.mode.clone(),
+                        }
+                        .run(module)?,
+                    );
+                    if self.dedup {
+                        steps.push(DedupFunctionsPass.run(module)?);
+                    }
+                    if self.repeat > 1 {
+                        steps.push(
+                            UnrollCallsPass {
+                                repeat: self.repeat,
+                            }
+                            .run(module)?,
+                        );
+                    }
                 }
             }
         }

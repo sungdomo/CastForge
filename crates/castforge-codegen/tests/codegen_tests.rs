@@ -438,7 +438,7 @@ module @complete_fusion_and_polyhedral {
     let registry = PassRegistry::with_builtin_passes();
     let mut pm = PassManager::from_pipeline_str(
         &registry,
-        "fuse-softmax,fuse-attention,fuse-elementwise(mode=map_reduce)",
+        "fuse-norm(kind=softmax),fuse-attention,fuse-elementwise(mode=map_reduce)",
     )
     .expect("complete fusion pipeline");
     let res = pm.run(&mut fused).expect("run complete fusion");
@@ -1240,10 +1240,10 @@ module @ir_tools_demo {
     let base = parse_mlir(mlir).expect("parse ir_tools_demo");
     let registry = PassRegistry::with_builtin_passes();
 
-    // 1. Subgraph Extractor (`extract-subgraph`): slice backward cone up to %mm
+    // 1. Subgraph Extractor (`outline-subgraphs(target=mm)`): slice backward cone up to %mm
     let mut sliced = base.clone();
-    let mut slice_pm = PassManager::from_pipeline_str(&registry, "extract-subgraph(target=mm)")
-        .expect("extract-subgraph");
+    let mut slice_pm = PassManager::from_pipeline_str(&registry, "outline-subgraphs(target=mm)")
+        .expect("outline-subgraphs(target=mm)");
     let slice_res = slice_pm.run(&mut sliced).expect("run extract-subgraph");
     assert!(slice_res[0].changed);
     let sliced_ir = print_mlir(&sliced);
@@ -1253,8 +1253,8 @@ module @ir_tools_demo {
     // Also test cutting at `stop_at=mm` to promote `%mm` to a function input argument
     let mut cut_sliced = base.clone();
     let mut cut_pm =
-        PassManager::from_pipeline_str(&registry, "extract-subgraph(target=act,stop_at=mm)")
-            .expect("cut extract-subgraph");
+        PassManager::from_pipeline_str(&registry, "outline-subgraphs(target=act,stop_at=mm)")
+            .expect("cut outline-subgraphs");
     cut_pm
         .run(&mut cut_sliced)
         .expect("run cut extract-subgraph");
@@ -1263,7 +1263,7 @@ module @ir_tools_demo {
     assert!(cut_ir.contains("stablehlo.add"));
     assert!(cut_ir.contains("stablehlo.exponential"));
 
-    // 2. Subgraph Outliner (`outline-subgraphs`) <-> Inliner (`inliner`) symmetric round-trip
+    // 2. Subgraph Outliner (`outline-subgraphs`) <-> Inliner (`mode=inline`) symmetric round-trip
     let mut outlined = base.clone();
     let mut out_pm =
         PassManager::from_pipeline_str(&registry, "outline-subgraphs(mode=gemm)").expect("outline");
@@ -1276,20 +1276,22 @@ module @ir_tools_demo {
     assert!(out_rep.passed);
 
     let mut re_inlined = outlined.clone();
-    let mut inl_pm = PassManager::from_pipeline_str(&registry, "inliner | dce").expect("inliner");
+    let mut inl_pm =
+        PassManager::from_pipeline_str(&registry, "outline-subgraphs(mode=inline) | dce")
+            .expect("inliner");
     inl_pm.run(&mut re_inlined).expect("run inliner");
     let inl_ir = print_mlir(&re_inlined);
     assert!(!inl_ir.contains("func.call"));
     let inl_rep = verify_module_numerics(&base, &re_inlined, 1e-5).expect("verify re-inlined");
     assert!(inl_rep.passed);
 
-    // 3. Delta IR Reducer (`extract-subgraph(max_ops=1)`) & Pass Bisector (`verify-ir(bisect=2)`)
+    // 3. Delta IR Reducer (`outline-subgraphs(max_ops=1)`) & Pass Bisector (`verify-ir(bisect=2)`)
     let mut reduced = base.clone();
     let mut red_pm = PassManager::from_pipeline_str(
         &registry,
-        "extract-subgraph(max_ops=1,keep_op=exponential)",
+        "outline-subgraphs(max_ops=1,keep_op=exponential)",
     )
-    .expect("extract-subgraph(max_ops=1)");
+    .expect("outline-subgraphs(max_ops=1)");
     let red_res = red_pm.run(&mut reduced).expect("run reduce-ir");
     assert!(red_res[0].changed);
     let red_ir = print_mlir(&reduced);
@@ -1440,11 +1442,11 @@ module @two_layer_gemm {
     let dedup_rep = verify_module_numerics(&base, &deduped, 1e-5).expect("verify deduped");
     assert!(dedup_rep.passed);
 
-    // 5. Canonical SSA Renamer & Attribute Sorter (`normalize-ir(prefix=t)`)
+    // 5. Canonical SSA Renamer & Attribute Sorter (`ir-edit(prefix=t)`)
     let mut norm = base.clone();
-    let mut norm_pm = PassManager::from_pipeline_str(&registry, "normalize-ir(prefix=t)")
-        .expect("normalize-ir(prefix=t)");
-    let norm_res = norm_pm.run(&mut norm).expect("run normalize-ir");
+    let mut norm_pm =
+        PassManager::from_pipeline_str(&registry, "ir-edit(prefix=t)").expect("ir-edit(prefix=t)");
+    let norm_res = norm_pm.run(&mut norm).expect("run ir-edit(prefix=t)");
     assert!(norm_res[0].changed);
     let norm_ir = print_mlir(&norm);
     assert!(norm_ir.contains("%arg0: tensor<2x4xf32>"));
@@ -1543,7 +1545,7 @@ module @advanced_ir_tools {
 #[test]
 fn test_pad_for_tiling_split_gemm_unroll_calls_hoist_all_reduce_instrument_and_strip() {
     let registry = PassRegistry::with_builtin_passes();
-    assert_eq!(registry.list().count(), 35);
+    assert_eq!(registry.list().count(), 29);
 
     let mlir = r#"
 module @final_ninety_suite {
@@ -1556,7 +1558,7 @@ module @final_ninety_suite {
 "#;
     let base = parse_mlir(mlir).expect("parse final_ninety_suite");
 
-    // 1. Tile-alignment padding (`schedule-loops(align=8)`) + metadata stripping (`normalize-ir`)
+    // 1. Tile-alignment padding (`schedule-loops(align=8)`) + metadata stripping (`ir-edit`)
     let mut padded = base.clone();
     let mut pad_pm = PassManager::from_pipeline_str(&registry, "schedule-loops(align=8)")
         .expect("schedule-loops(align=8)");
@@ -1570,9 +1572,9 @@ module @final_ninety_suite {
 
     let mut stripped = padded.clone();
     let mut strip_pm =
-        PassManager::from_pipeline_str(&registry, "normalize-ir(attributes=true,ssa=false)")
-            .expect("normalize-ir(attributes=true)");
-    let strip_res = strip_pm.run(&mut stripped).expect("run normalize-ir");
+        PassManager::from_pipeline_str(&registry, "ir-edit(attributes=true,ssa=false)")
+            .expect("ir-edit(attributes=true)");
+    let strip_res = strip_pm.run(&mut stripped).expect("run ir-edit");
     assert!(strip_res[0].changed);
     let strip_ir = print_mlir(&stripped);
     assert!(!strip_ir.contains("pad_align"));
@@ -1851,9 +1853,9 @@ fn test_consolidated_and_sota_passes_groupwise_batchnorm_concat_paged_gvn() {
     assert!(print_mlir(&module).contains("awq_groupwise"));
     assert!(print_mlir(&module).contains("castforge.awq_salient_channels = 1"));
 
-    let mut pm_strip = PassManager::from_pipeline_str(&registry, "normalize-ir(attributes=true)")
-        .expect("normalize-ir(attributes=true)");
-    pm_strip.run(&mut module).expect("run normalize-ir");
+    let mut pm_strip = PassManager::from_pipeline_str(&registry, "ir-edit(attributes=true)")
+        .expect("ir-edit(attributes=true)");
+    pm_strip.run(&mut module).expect("run ir-edit");
     assert!(!print_mlir(&module).contains("castforge.batchnorm_folded"));
 
     // 3. Test fuse-norm, fuse-activations, and fuse-attention(mode=paged)
@@ -1913,7 +1915,7 @@ fn test_consolidated_and_sota_passes_groupwise_batchnorm_concat_paged_gvn() {
     assert!(print_mlir(&fp8_mod).contains("fp8_e4m3"));
 
     // 5. Test the 5 SOTA passes via unified entrypoints: fuse-attention(kind=mla),
-    //    quantize(scheme=hadamard), fuse-softmax(kind=cross_entropy),
+    //    quantize(scheme=hadamard), fuse-norm(kind=cross_entropy),
     //    shard-distributed(mode=pp), and schedule-loops(tensor_cores=wgmma)
     let mut new5_mod = parse_mlir(mlir).expect("parse mlir for new5");
     let mut pm_new5 = PassManager::from_pipeline_str(
@@ -1921,7 +1923,7 @@ fn test_consolidated_and_sota_passes_groupwise_batchnorm_concat_paged_gvn() {
         concat!(
             "fuse-attention(kind=mla,kv_lora_rank=512),",
             "quantize(scheme=hadamard,block_size=64),",
-            "fuse-softmax(kind=cross_entropy,chunk_size=4096),",
+            "fuse-norm(kind=cross_entropy,chunk_size=4096),",
             "shard-distributed(mode=pp,stages=2,microbatches=4,schedule=1f1b),",
             "schedule-loops(tensor_cores=wgmma,mma_tile=64x128x16),",
             "topological-sort(mode=min_memory)"

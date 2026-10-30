@@ -3,10 +3,11 @@ use anyhow::Result;
 use castforge_ir::{BlockId, Module, OpId, Operation, RegionId, Type, ValueId};
 use std::collections::HashMap;
 
-/// Unified Common Subexpression Elimination, Dominator GVN & Constant Hoisting Pass (`cse`).
+/// Unified Common Subexpression Elimination, Dominator GVN, LICM & Constant Hoisting (`cse`).
 pub struct UnifiedCsePass {
     pub gvn: bool,
     pub hoist_constants: bool,
+    pub licm: bool,
 }
 
 impl Default for UnifiedCsePass {
@@ -14,6 +15,7 @@ impl Default for UnifiedCsePass {
         Self {
             gvn: true,
             hoist_constants: false,
+            licm: true,
         }
     }
 }
@@ -24,13 +26,16 @@ impl Pass for UnifiedCsePass {
     }
 
     fn description(&self) -> &'static str {
-        "Unified CSE, cross-region Dominator GVN, and constant hoisting/deduplication"
+        "Unified CSE, cross-region Dominator GVN, LICM, and constant hoisting/deduplication"
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let mut steps = Vec::new();
         if self.hoist_constants {
             steps.push(HoistConstantsPass.run(module)?);
+        }
+        if self.licm {
+            steps.push(crate::LicmPass.run(module)?);
         }
         if self.gvn {
             steps.push(GlobalValueNumberingPass.run(module)?);

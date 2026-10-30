@@ -12,22 +12,28 @@ use castforge_ir::{
 };
 use std::collections::HashSet;
 
-/// Unified Compile-Time Weight Folding & Pre-Packing Pass (`fold-weights`).
+/// Unified Compile-Time Weight Folding, Pre-Packing & Externalization Pass (`fold-weights`).
 ///
 /// - `mode = "batchnorm"` (default): Absorbs pre-GEMM RMSNorm/LayerNorm scales and post-Conv/GEMM
 ///   BatchNorm scales into constant weight tensors.
 /// - `mode = "norm"`: Absorbs pre-GEMM RMSNorm/LayerNorm scales only.
 /// - `mode = "pack"`: Pre-packs 2D constant RHS weights from `[K, N]` to `[N, K]` (`packed_rhs =
 ///   true`) for unit-stride SIMD dot products.
+/// - `mode = "externalize"` / `mode = "inline"`: Externalizes inline `dense<...>` constants to
+///   `dense_resource<key>` in `TensorStore` (or inlines `dense_resource<key>` back to `dense<...>`).
 /// - `mode = "all"`: Runs both BatchNorm/Norm folding and weight pre-packing.
 pub struct FoldWeightsPass {
     pub mode: String,
+    pub min_elements: usize,
+    pub inline: bool,
 }
 
 impl Default for FoldWeightsPass {
     fn default() -> Self {
         Self {
             mode: "batchnorm".to_string(),
+            min_elements: 2,
+            inline: false,
         }
     }
 }
@@ -38,7 +44,7 @@ impl Pass for FoldWeightsPass {
     }
 
     fn description(&self) -> &'static str {
-        "Unified compile-time weight folding & SIMD pre-packing (mode=batchnorm|norm|pack|all)"
+        "Unified weight folding, SIMD pre-packing & SafeTensors externalization"
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
@@ -47,7 +53,16 @@ impl Pass for FoldWeightsPass {
         let mut removed = 0usize;
         let mut created = 0usize;
 
-        if matches!(m.as_str(), "norm" | "fold_norm") {
+        if matches!(m.as_str(), "externalize" | "ext" | "inline") || self.inline {
+            let r = crate::ExternalizeWeightsPass {
+                min_elements: self.min_elements,
+                inline: self.inline || m == "inline",
+            }
+            .run(module)?;
+            modified += r.ops_modified;
+            removed += r.ops_removed;
+            created += r.ops_created;
+        } else if matches!(m.as_str(), "norm" | "fold_norm") {
             let r = FoldNormWeightsPass.run(module)?;
             modified += r.ops_modified;
             removed += r.ops_removed;

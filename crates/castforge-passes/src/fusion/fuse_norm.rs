@@ -7,15 +7,17 @@ use castforge_ir::{Attribute, BlockId, Module, OpName, ValueDef, ValueId};
 use indexmap::IndexMap;
 use smallvec::SmallVec;
 
-/// Unified Normalization Fusion Pass (`fuse-norm`).
+/// Unified Normalization & Softmax/Cross-Entropy Fusion Pass (`fuse-norm`).
 pub struct FuseNormPass {
     pub kind: String,
+    pub chunk_size: i64,
 }
 
 impl Default for FuseNormPass {
     fn default() -> Self {
         Self {
             kind: "all".to_string(),
+            chunk_size: 1024,
         }
     }
 }
@@ -26,7 +28,7 @@ impl Pass for FuseNormPass {
     }
 
     fn description(&self) -> &'static str {
-        "Unified normalization fusion (Residual+RMSNorm, RMSNorm, and LayerNorm)"
+        "Unified normalization & softmax fusion (RMSNorm, LayerNorm, Softmax, Cross-Entropy)"
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
@@ -40,6 +42,23 @@ impl Pass for FuseNormPass {
         }
         if k == "all" || k == "layernorm" || k == "ln" {
             steps.push(FuseLayerNormPass.run(module)?);
+        }
+        if k == "all" || k == "softmax" || k == "log_softmax" {
+            steps.push(
+                crate::FuseSoftmaxPass {
+                    kind: "all".to_string(),
+                    chunk_size: self.chunk_size,
+                }
+                .run(module)?,
+            );
+        } else if k == "cross_entropy" || k == "ce" || k == "linear_cross_entropy" {
+            steps.push(
+                crate::FuseSoftmaxPass {
+                    kind: "cross_entropy".to_string(),
+                    chunk_size: self.chunk_size,
+                }
+                .run(module)?,
+            );
         }
         Ok(PassResult {
             pass_name: self.name().to_string(),

@@ -1,8 +1,7 @@
 use crate::{
     AutodiffPass, CanonicalizePass, DeadCodeEliminationPass, DecomposeCompositesPass,
-    ExternalizeWeightsPass, ExtractSubgraphPass, FoldConstantsPass, FoldViewsPass, FoldWeightsPass,
-    FuseActivationsPass, FuseGemmPass, FuseNormPass, FuseSoftmaxPass, InlinerPass, IrEditPass,
-    LicmPass, NormalizeIrPass, OptO1Pass, OptO2Pass, OptO3Pass, OptimizeMemoryPass, Pass,
+    FoldConstantsPass, FoldViewsPass, FoldWeightsPass, FuseActivationsPass, FuseGemmPass,
+    FuseNormPass, IrEditPass, OptO1Pass, OptO2Pass, OptO3Pass, OptimizeMemoryPass, Pass,
     PassOptions, PruneWeightsPass, QuantizePass, ScheduleLoopsPass, ShardDistributedPass,
     TopologicalSortPass, UnifiedCsePass, UnifiedFuseAttentionPass, UnifiedFuseElementwisePass,
     UnifiedMergeWeightsPass, UnifiedOutlineSubgraphsPass, UnifiedProfileIrPass,
@@ -37,7 +36,7 @@ impl PassRegistry {
         }
     }
 
-    /// Create a registry pre-populated with all 35 built-in CastForge passes and presets.
+    /// Create a registry pre-populated with all 29 built-in CastForge passes and presets.
     pub fn with_builtin_passes() -> Self {
         let mut reg = Self::new();
         reg.register(
@@ -50,16 +49,21 @@ impl PassRegistry {
         );
         reg.register(
             "cse",
-            "Unified CSE, dominator-aware GVN, and entry constant hoisting",
+            "Unified CSE, dominator-aware GVN, LICM, and entry constant hoisting",
             |opts| {
                 let gvn = opts.get("gvn").map(|v| v != "false").unwrap_or(true);
                 let hoist_constants = opts
                     .get("hoist_constants")
                     .or_else(|| opts.get("hoist"))
                     .is_some_and(|v| v == "true" || v == "1");
+                let licm = opts
+                    .get("licm")
+                    .map(|v| v != "false" && v != "0")
+                    .unwrap_or(true);
                 Ok(Box::new(UnifiedCsePass {
                     gvn,
                     hoist_constants,
+                    licm,
                 }))
             },
         );
@@ -255,26 +259,28 @@ impl PassRegistry {
         );
         reg.register(
             "fold-weights",
-            "Unified compile-time weight folding & SIMD pre-packing (mode=batchnorm|norm|pack|all)",
+            "Unified weight folding, SIMD pre-packing & SafeTensors externalization",
             |opts| {
+                let inline = opts.get("inline").is_some_and(|v| v == "true" || v == "1");
                 let mode = opts
                     .get("mode")
                     .or_else(|| opts.get("kind"))
                     .cloned()
-                    .unwrap_or_else(|| "batchnorm".to_string());
-                Ok(Box::new(FoldWeightsPass { mode }))
-            },
-        );
-        reg.register(
-            "externalize-weights",
-            "Converts inline dense<...> weights to dense_resource<key> in TensorStore",
-            |opts| {
+                    .unwrap_or_else(|| {
+                        if inline {
+                            "inline".to_string()
+                        } else if opts.contains_key("min_elements") {
+                            "externalize".to_string()
+                        } else {
+                            "batchnorm".to_string()
+                        }
+                    });
                 let min_elements = opts
                     .get("min_elements")
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(2);
-                let inline = opts.get("inline").is_some_and(|v| v == "true");
-                Ok(Box::new(ExternalizeWeightsPass {
+                Ok(Box::new(FoldWeightsPass {
+                    mode,
                     min_elements,
                     inline,
                 }))
@@ -311,13 +317,25 @@ impl PassRegistry {
         );
         reg.register(
             "fuse-norm",
-            "Unified normalization fusion (Residual+RMSNorm, RMSNorm, and LayerNorm)",
+            "Unified normalization & softmax fusion (RMSNorm, LayerNorm, Softmax, Cross-Entropy)",
             |opts| {
                 let kind = opts
                     .get("kind")
+                    .or_else(|| opts.get("mode"))
                     .cloned()
-                    .unwrap_or_else(|| "all".to_string());
-                Ok(Box::new(FuseNormPass { kind }))
+                    .unwrap_or_else(|| {
+                        if opts.contains_key("chunk_size") || opts.contains_key("chunk") {
+                            "cross_entropy".to_string()
+                        } else {
+                            "all".to_string()
+                        }
+                    });
+                let chunk_size = opts
+                    .get("chunk_size")
+                    .or_else(|| opts.get("chunk"))
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(1024);
+                Ok(Box::new(FuseNormPass { kind, chunk_size }))
             },
         );
         reg.register(
@@ -356,25 +374,6 @@ impl PassRegistry {
                     top_k,
                     capacity_factor,
                 }))
-            },
-        );
-        reg.register(
-            "fuse-softmax",
-            "Unified Softmax, LogSoftmax, and chunked Linear Cross-Entropy fusion",
-            |opts| {
-                let kind = opts.get("kind").cloned().unwrap_or_else(|| {
-                    if opts.contains_key("chunk_size") || opts.contains_key("chunk") {
-                        "cross_entropy".to_string()
-                    } else {
-                        "all".to_string()
-                    }
-                });
-                let chunk_size = opts
-                    .get("chunk_size")
-                    .or_else(|| opts.get("chunk"))
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or(1024);
-                Ok(Box::new(FuseSoftmaxPass { kind, chunk_size }))
             },
         );
         reg.register(
@@ -489,11 +488,6 @@ impl PassRegistry {
             |_opts| Ok(Box::new(CanonicalizePass)),
         );
         reg.register(
-            "inliner",
-            "Inlines func.call operations by splicing callee bodies into caller blocks",
-            |_opts| Ok(Box::new(InlinerPass)),
-        );
-        reg.register(
             "topological-sort",
             "Reorders operations for SSA def-before-use and optional peak-memory minimization",
             |opts| {
@@ -503,11 +497,6 @@ impl PassRegistry {
                     .unwrap_or_else(|| "standard".to_string());
                 Ok(Box::new(TopologicalSortPass { mode }))
             },
-        );
-        reg.register(
-            "licm",
-            "Loop/Region-Invariant Code Motion (hoists invariant pure ops out of nested regions)",
-            |_opts| Ok(Box::new(LicmPass)),
         );
         reg.register(
             "specialize-shapes",
@@ -762,7 +751,7 @@ impl PassRegistry {
         );
         reg.register(
             "ir-edit",
-            "Unified IR surgery (rename_op, annotate_op, freeze/unfreeze args, tap outputs)",
+            "Unified IR surgery, freezing, tapping, SSA normalization, and metadata stripping",
             |opts| {
                 let rename_op = opts.get("rename_op").cloned();
                 let annotate_op = opts
@@ -791,6 +780,22 @@ impl PassRegistry {
                     .or_else(|| opts.get("values"))
                     .or_else(|| opts.get("targets"))
                     .cloned();
+                let ssa = opts
+                    .get("ssa")
+                    .map(|s| s == "true" || s == "1")
+                    .unwrap_or_else(|| opts.contains_key("prefix"));
+                let prefix = opts
+                    .get("prefix")
+                    .cloned()
+                    .unwrap_or_else(|| "v".to_string());
+                let debuginfo = opts
+                    .get("debuginfo")
+                    .map(|s| s == "true" || s == "1")
+                    .unwrap_or(false);
+                let attributes = opts
+                    .get("attributes")
+                    .map(|s| s == "true" || s == "1")
+                    .unwrap_or(false);
                 Ok(Box::new(IrEditPass {
                     rename_op,
                     annotate_op,
@@ -800,12 +805,16 @@ impl PassRegistry {
                     value,
                     min_elements,
                     tap,
+                    ssa,
+                    prefix,
+                    debuginfo,
+                    attributes,
                 }))
             },
         );
         reg.register(
-            "extract-subgraph",
-            "Extracts backward dataflow slice or delta-reduces function to a minimal reproducer",
+            "outline-subgraphs",
+            "Unified kernel outlining, inlining, extraction, dedup, composition & call unrolling",
             |opts| {
                 let target = opts
                     .get("target")
@@ -819,22 +828,17 @@ impl PassRegistry {
                     .unwrap_or_default();
                 let max_ops = opts.get("max_ops").and_then(|s| s.parse::<usize>().ok());
                 let keep_op = opts.get("keep_op").cloned().unwrap_or_default();
-                Ok(Box::new(ExtractSubgraphPass {
-                    target,
-                    stop_at,
-                    max_ops,
-                    keep_op,
-                }))
-            },
-        );
-        reg.register(
-            "outline-subgraphs",
-            "Unified kernel outlining, function deduplication, composition, and call unrolling",
-            |opts| {
-                let mode = opts
-                    .get("mode")
-                    .cloned()
-                    .unwrap_or_else(|| "all".to_string());
+                let mode = opts.get("mode").cloned().unwrap_or_else(|| {
+                    if max_ops.is_some() || !keep_op.is_empty() {
+                        "reduce".to_string()
+                    } else if !target.is_empty() || !stop_at.is_empty() {
+                        "extract".to_string()
+                    } else if opts.get("inline").is_some_and(|v| v == "true" || v == "1") {
+                        "inline".to_string()
+                    } else {
+                        "all".to_string()
+                    }
+                });
                 let dedup = opts
                     .get("dedup")
                     .map(|s| s != "false" && s != "0")
@@ -858,36 +862,10 @@ impl PassRegistry {
                     second,
                     entry_name,
                     repeat,
-                }))
-            },
-        );
-        reg.register(
-            "normalize-ir",
-            "Unified canonical SSA renaming, attribute sorting, and debug/schedule stripping",
-            |opts| {
-                let has_strip_flag =
-                    opts.contains_key("debuginfo") || opts.contains_key("attributes");
-                let ssa = opts
-                    .get("ssa")
-                    .map(|s| s != "false" && s != "0")
-                    .unwrap_or(!has_strip_flag || opts.contains_key("prefix"));
-                let prefix = opts
-                    .get("prefix")
-                    .cloned()
-                    .unwrap_or_else(|| "v".to_string());
-                let debuginfo = opts
-                    .get("debuginfo")
-                    .map(|s| s != "false" && s != "0")
-                    .unwrap_or(has_strip_flag);
-                let attributes = opts
-                    .get("attributes")
-                    .map(|s| s != "false" && s != "0")
-                    .unwrap_or(has_strip_flag);
-                Ok(Box::new(NormalizeIrPass {
-                    ssa,
-                    prefix,
-                    debuginfo,
-                    attributes,
+                    target,
+                    stop_at,
+                    max_ops,
+                    keep_op,
                 }))
             },
         );

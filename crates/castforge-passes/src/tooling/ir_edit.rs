@@ -9,7 +9,7 @@ use indexmap::IndexMap;
 use smallvec::SmallVec;
 use std::collections::HashSet;
 
-/// Surgical IR Edit, Input Freezing, Parameterization & Activation Tapping Pass (`ir-edit`).
+/// Surgical IR Edit, Input Freezing, Parameterization, Tapping & Normalization Pass (`ir-edit`).
 #[derive(Debug, Clone, Default)]
 pub struct IrEditPass {
     /// Format: `"old_dialect.old_op:new_dialect.new_op"`
@@ -28,6 +28,14 @@ pub struct IrEditPass {
     pub min_elements: usize,
     /// Tap intermediate SSA values into `func.return` (`Some("")` = all compute values).
     pub tap: Option<String>,
+    /// Normalize SSA names in topological order and sort operation attributes (`ssa=true`).
+    pub ssa: bool,
+    /// Prefix for normalized SSA names (`prefix=v`).
+    pub prefix: String,
+    /// Strip debug location metadata (`debuginfo=true`).
+    pub debuginfo: bool,
+    /// Strip transient `castforge.*` and schedule attributes (`attributes=true`).
+    pub attributes: bool,
 }
 
 impl Pass for IrEditPass {
@@ -36,7 +44,7 @@ impl Pass for IrEditPass {
     }
 
     fn description(&self) -> &'static str {
-        "Unified IR surgery (rename_op, annotate_op, freeze/unfreeze args, tap outputs)"
+        "Unified IR surgery, freezing, tapping, SSA normalization, and metadata stripping"
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
@@ -94,6 +102,19 @@ impl Pass for IrEditPass {
         if let Some(ref tap_vals) = self.tap {
             let r = TapIntermediatesPass {
                 values: tap_vals.clone(),
+            }
+            .run(module)?;
+            modified += r.ops_modified;
+            created += r.ops_created;
+            removed += r.ops_removed;
+        }
+
+        if self.ssa || self.debuginfo || self.attributes {
+            let r = crate::NormalizeIrPass {
+                ssa: self.ssa,
+                prefix: self.prefix.clone(),
+                debuginfo: self.debuginfo,
+                attributes: self.attributes,
             }
             .run(module)?;
             modified += r.ops_modified;

@@ -123,9 +123,9 @@ fn test_fuse_softmax_and_decompose_composites() {
     let mut fused = before.clone();
     let registry = PassRegistry::with_builtin_passes();
 
-    let mut pm =
-        PassManager::from_pipeline_str(&registry, "fuse-softmax").expect("fuse-softmax pipeline");
-    let res = pm.run(&mut fused).expect("run fuse-softmax");
+    let mut pm = PassManager::from_pipeline_str(&registry, "fuse-norm(kind=softmax)")
+        .expect("fuse-norm(kind=softmax) pipeline");
+    let res = pm.run(&mut fused).expect("run fuse-norm(kind=softmax)");
     assert!(res[0].changed);
 
     let printed = print_mlir(&fused);
@@ -353,8 +353,8 @@ fn test_fold_convert_and_hoist_constants() {
     let mut module = parse_mlir(CONVERT_AND_HOIST_MLIR).expect("parse convert/hoist MLIR");
     let registry = PassRegistry::with_builtin_passes();
     let mut pm =
-        PassManager::from_pipeline_str(&registry, "fold-views,cse(hoist_constants=true),licm")
-            .expect("fold-views/cse/licm pipeline");
+        PassManager::from_pipeline_str(&registry, "fold-views,cse(hoist_constants=true,licm=true)")
+            .expect("fold-views/cse pipeline");
     let res = pm
         .run(&mut module)
         .expect("run fold-views/hoist-constants/licm");
