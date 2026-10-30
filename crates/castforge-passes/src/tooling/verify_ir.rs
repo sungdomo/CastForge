@@ -500,62 +500,6 @@ impl Pass for SanitizeNumericsPass {
     }
 }
 
-/// Unified IR Profiling, Op Stats, Roofline Analysis & Instrumentation Pass (`profile-ir`).
-pub struct UnifiedProfileIrPass {
-    pub stats: bool,
-    pub instrument: bool,
-    pub filter: String,
-    pub ridge_flops_per_byte: f64,
-}
-
-impl Default for UnifiedProfileIrPass {
-    fn default() -> Self {
-        Self {
-            stats: true,
-            instrument: false,
-            filter: "gemm".to_string(),
-            ridge_flops_per_byte: 10.0,
-        }
-    }
-}
-
-impl Pass for UnifiedProfileIrPass {
-    fn name(&self) -> &'static str {
-        "profile-ir"
-    }
-
-    fn description(&self) -> &'static str {
-        "Unified Roofline op-stats analyzer and per-op profiling region instrumentor"
-    }
-
-    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let mut steps = Vec::new();
-        if self.instrument {
-            steps.push(
-                InstrumentProfilingPass {
-                    filter: self.filter.clone(),
-                }
-                .run(module)?,
-            );
-        }
-        if self.stats || !self.instrument {
-            steps.push(
-                PrintOpStatsPass {
-                    ridge_flops_per_byte: self.ridge_flops_per_byte,
-                }
-                .run(module)?,
-            );
-        }
-        Ok(PassResult {
-            pass_name: self.name().to_string(),
-            changed: steps.iter().any(|r| r.changed),
-            ops_removed: steps.iter().map(|r| r.ops_removed).sum(),
-            ops_modified: steps.iter().map(|r| r.ops_modified).sum(),
-            ops_created: steps.iter().map(|r| r.ops_created).sum(),
-        })
-    }
-}
-
 /// Roofline & Operation Statistics Summary for a `Module`.
 #[derive(Debug, Clone, Default)]
 pub struct RooflineSummary {

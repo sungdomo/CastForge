@@ -396,11 +396,11 @@ fn test_fuse_swiglu_and_generalized_matmul_epilogue() {
     let before = parse_mlir(SWIGLU_AND_EPILOGUE_MLIR).expect("parse swiglu MLIR");
     let registry = PassRegistry::with_builtin_passes();
 
-    // 1. Test `fuse-activations(kind=swiglu)` + `fuse-gemm(kind=epilogue)` + `decompose-composites`
+    // 1. Test `fuse-elementwise(mode=swiglu)` + `fuse-gemm(kind=epilogue)` + `decompose-composites`
     let mut swiglu_mod = before.clone();
     let mut pm = PassManager::from_pipeline_str(
         &registry,
-        "fuse-activations(kind=swiglu),fuse-gemm(kind=epilogue)",
+        "fuse-elementwise(mode=swiglu),fuse-gemm(kind=epilogue)",
     )
     .expect("swiglu pipeline");
     let res = pm.run(&mut swiglu_mod).expect("run swiglu pipeline");
@@ -769,12 +769,14 @@ fn test_fuse_dequant_matmul_residual_norm_layernorm_gelu_and_gated_mlp() {
     let c_q = generate_code(&mod_q, CodegenTarget::C).expect("c qmatmul codegen");
     assert!(c_q.contains("[qmatmul:on-the-fly dequant"));
 
-    // 2. Test `fuse-norm(kind=layernorm),fuse-activations` (exercises GELU + GeGLU)
+    // 2. Test `fuse-norm(kind=layernorm),fuse-elementwise(mode=activations)` (GELU + GeGLU)
     let before_ln = parse_mlir(LAYERNORM_GELU_AND_GATED_MLP_MLIR).expect("parse ln+geglu mlir");
     let mut fused_ln = before_ln.clone();
-    let mut pm_ln =
-        PassManager::from_pipeline_str(&registry, "fuse-norm(kind=layernorm),fuse-activations")
-            .expect("fuse-norm,fuse-activations");
+    let mut pm_ln = PassManager::from_pipeline_str(
+        &registry,
+        "fuse-norm(kind=layernorm),fuse-elementwise(mode=activations)",
+    )
+    .expect("fuse-norm,fuse-elementwise(mode=activations)");
     let res_ln = pm_ln.run(&mut fused_ln).expect("run ln+gated_mlp");
     assert!(res_ln[0].changed);
     assert!(res_ln[1].changed);

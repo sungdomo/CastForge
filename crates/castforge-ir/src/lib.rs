@@ -5,25 +5,483 @@
 //! plane, SafeTensors binary I/O, and the composable [`Translator`] / [`TranslatorChain`]
 //! A-to-B pipeline abstraction.
 
-pub mod attr;
 pub mod tensor_store;
-pub mod translator;
-pub mod types;
 
-pub use attr::Attribute;
 pub use tensor_store::{
     TensorBacking, TensorEntry, TensorStore, format_dense_f32_literal, format_dense_i8_literal,
     parse_dense_f32_literal,
 };
-pub use translator::{Payload, Translator, TranslatorChain};
-pub use types::{DType, Dim, TensorType, Type};
 
+use anyhow::{Result, anyhow};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use slotmap::{SlotMap, new_key_type};
 use smallvec::SmallVec;
 use std::fmt;
 use thiserror::Error;
+
+/// Element data types supported in tensor and scalar types.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DType {
+    I1,
+    I4,
+    I8,
+    I16,
+    I32,
+    I64,
+    U8,
+    U16,
+    U32,
+    U64,
+    F8E4M3FN,
+    F8E5M2,
+    F16,
+    BF16,
+    F32,
+    F64,
+    Index,
+    QuantUniform {
+        storage_type: Box<DType>,
+        expressed_type: Box<DType>,
+        scale: String,
+        zero_point: i64,
+    },
+}
+
+impl DType {
+    pub fn bit_width(&self) -> usize {
+        match self {
+            DType::I1 => 1,
+            DType::I4 => 4,
+            DType::I8 | DType::U8 | DType::F8E4M3FN | DType::F8E5M2 => 8,
+            DType::I16 | DType::U16 | DType::F16 | DType::BF16 => 16,
+            DType::I32 | DType::U32 | DType::F32 => 32,
+            DType::I64 | DType::U64 | DType::F64 | DType::Index => 64,
+            DType::QuantUniform { storage_type, .. } => storage_type.bit_width(),
+        }
+    }
+}
+
+impl fmt::Display for DType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DType::I1 => write!(f, "i1"),
+            DType::I4 => write!(f, "i4"),
+            DType::I8 => write!(f, "i8"),
+            DType::I16 => write!(f, "i16"),
+            DType::I32 => write!(f, "i32"),
+            DType::I64 => write!(f, "i64"),
+            DType::U8 => write!(f, "ui8"),
+            DType::U16 => write!(f, "ui16"),
+            DType::U32 => write!(f, "ui32"),
+            DType::U64 => write!(f, "ui64"),
+            DType::F8E4M3FN => write!(f, "f8E4M3FN"),
+            DType::F8E5M2 => write!(f, "f8E5M2"),
+            DType::F16 => write!(f, "f16"),
+            DType::BF16 => write!(f, "bf16"),
+            DType::F32 => write!(f, "f32"),
+            DType::F64 => write!(f, "f64"),
+            DType::Index => write!(f, "index"),
+            DType::QuantUniform {
+                storage_type,
+                expressed_type,
+                scale,
+                zero_point,
+            } => write!(
+                f,
+                "!quant.uniform<{}:{},{}:{}>",
+                storage_type, expressed_type, scale, zero_point
+            ),
+        }
+    }
+}
+
+/// Tensor dimension (static, dynamic `?`, or symbolic).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Dim {
+    Static(i64),
+    Dynamic,
+    Symbolic(String),
+}
+
+impl fmt::Display for Dim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Dim::Static(d) => write!(f, "{d}"),
+            Dim::Dynamic => write!(f, "?"),
+            Dim::Symbolic(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+/// Ranked or unranked tensor type (`tensor<4x8xf32>`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TensorType {
+    pub shape: Vec<Dim>,
+    pub dtype: DType,
+    pub encoding: Option<String>,
+}
+
+impl TensorType {
+    pub fn new(shape: Vec<Dim>, dtype: DType) -> Self {
+        Self {
+            shape,
+            dtype,
+            encoding: None,
+        }
+    }
+
+    pub fn static_shape(dims: &[i64], dtype: DType) -> Self {
+        Self {
+            shape: dims.iter().copied().map(Dim::Static).collect(),
+            dtype,
+            encoding: None,
+        }
+    }
+
+    pub fn rank(&self) -> usize {
+        self.shape.len()
+    }
+
+    pub fn num_elements(&self) -> Option<i64> {
+        let mut prod = 1i64;
+        for d in &self.shape {
+            match d {
+                Dim::Static(n) => prod = prod.checked_mul(*n)?,
+                _ => return None,
+            }
+        }
+        Some(prod)
+    }
+}
+
+impl fmt::Display for TensorType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "tensor<")?;
+        for d in &self.shape {
+            write!(f, "{d}x")?;
+        }
+        write!(f, "{}", self.dtype)?;
+        if let Some(enc) = &self.encoding {
+            write!(f, ", {enc}")?;
+        }
+        write!(f, ">")
+    }
+}
+
+/// IR Type representation (compatible with MLIR type system).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Type {
+    Tensor(TensorType),
+    Scalar(DType),
+    Tuple(Vec<Type>),
+    Function {
+        inputs: Vec<Type>,
+        results: Vec<Type>,
+    },
+    Opaque(String),
+}
+
+impl Type {
+    pub fn as_tensor(&self) -> Option<&TensorType> {
+        match self {
+            Type::Tensor(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Type {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Type::Tensor(t) => write!(f, "{t}"),
+            Type::Scalar(d) => write!(f, "{d}"),
+            Type::Tuple(items) => {
+                write!(f, "tuple<")?;
+                for (i, ty) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{ty}")?;
+                }
+                write!(f, ">")
+            }
+            Type::Function { inputs, results } => {
+                write!(f, "(")?;
+                for (i, inp) in inputs.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{inp}")?;
+                }
+                write!(f, ") -> ")?;
+                if results.len() == 1 {
+                    write!(f, "{}", results[0])
+                } else {
+                    write!(f, "(")?;
+                    for (i, res) in results.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{res}")?;
+                    }
+                    write!(f, ")")
+                }
+            }
+            Type::Opaque(raw) => write!(f, "{raw}"),
+        }
+    }
+}
+
+/// Compile-time attributes attached to MLIR/StableHLO operations.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Attribute {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(String),
+    SymbolRef(String),
+    Type(Type),
+    Array(Vec<Attribute>),
+    DenseIntArray(Vec<i64>),
+    DenseF64Array(Vec<f64>),
+    DenseElements {
+        ty: TensorType,
+        raw_literal: String,
+    },
+    /// Reference to a weight tensor stored in the Module's `TensorStore`
+    TensorRef {
+        key: String,
+        ty: TensorType,
+    },
+    Dictionary(IndexMap<String, Attribute>),
+    Opaque(String),
+}
+
+impl Attribute {
+    pub fn as_int_slice(&self) -> Option<&[i64]> {
+        match self {
+            Attribute::DenseIntArray(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Attribute::String(s) | Attribute::SymbolRef(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    /// If this attribute is a scalar/splat `DenseElements` constant (e.g., `dense<0.0>`),
+    /// parses and returns its scalar `f64` value.
+    pub fn as_splat_f64(&self) -> Option<f64> {
+        match self {
+            Attribute::DenseElements { raw_literal, .. } => {
+                let s = raw_literal.trim();
+                if s.starts_with('[') {
+                    return None;
+                }
+                s.parse::<f64>().ok()
+            }
+            Attribute::Float(f) => Some(*f),
+            Attribute::Int(i) => Some(*i as f64),
+            _ => None,
+        }
+    }
+
+    pub fn is_splat_zero(&self) -> bool {
+        self.as_splat_f64().map(|v| v == 0.0).unwrap_or(false)
+    }
+
+    pub fn is_splat_one(&self) -> bool {
+        self.as_splat_f64()
+            .map(|v| (v - 1.0).abs() < f64::EPSILON)
+            .unwrap_or(false)
+    }
+}
+
+impl fmt::Display for Attribute {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Attribute::Bool(b) => write!(f, "{b}"),
+            Attribute::Int(i) => write!(f, "{i}"),
+            Attribute::Float(v) => write!(f, "{v:?}"),
+            Attribute::String(s) => write!(f, "\"{}\"", s.escape_default()),
+            Attribute::SymbolRef(s) => write!(f, "@{s}"),
+            Attribute::Type(ty) => write!(f, "{ty}"),
+            Attribute::Array(items) => {
+                write!(f, "[")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{item}")?;
+                }
+                write!(f, "]")
+            }
+            Attribute::DenseIntArray(vals) => {
+                write!(f, "array<i64: ")?;
+                for (i, v) in vals.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{v}")?;
+                }
+                write!(f, ">")
+            }
+            Attribute::DenseF64Array(vals) => {
+                write!(f, "array<f64: ")?;
+                for (i, v) in vals.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{v:?}")?;
+                }
+                write!(f, ">")
+            }
+            Attribute::DenseElements { ty, raw_literal } => {
+                write!(f, "dense<{raw_literal}> : {ty}")
+            }
+            Attribute::TensorRef { key, ty } => {
+                write!(f, "dense_resource<{key}> : {ty}")
+            }
+            Attribute::Dictionary(map) => {
+                write!(f, "{{")?;
+                for (i, (k, v)) in map.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{k} = {v}")?;
+                }
+                write!(f, "}}")
+            }
+            Attribute::Opaque(raw) => write!(f, "{raw}"),
+        }
+    }
+}
+
+/// Data payload flowing between concatenated A-to-B [`Translator`] modules.
+#[derive(Debug, Clone)]
+pub enum Payload {
+    /// Raw binary bytes (e.g., GGUF v2/v3 or SafeTensors binary input/output).
+    Bytes(Vec<u8>),
+    /// UTF-8 text (e.g., MLIR source text, ONNX JSON, or generated Rust / C99 / WGSL / Viz code).
+    Text(String),
+    /// In-memory Dual-Plane IR [`Module`] (`Compute Graph + TensorStore`).
+    Ir(Box<Module>),
+}
+
+impl Payload {
+    /// Constructs a [`Payload::Ir`] from a [`Module`].
+    pub fn from_ir(module: Module) -> Self {
+        Self::Ir(Box::new(module))
+    }
+
+    /// Returns the human-readable payload kind (`"bytes"`, `"text"`, `"ir"`).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Bytes(_) => "bytes",
+            Self::Text(_) => "text",
+            Self::Ir(_) => "ir",
+        }
+    }
+
+    /// Extracts the inner [`Module`] if this payload is [`Payload::Ir`].
+    pub fn into_ir(self) -> Result<Module> {
+        match self {
+            Self::Ir(m) => Ok(*m),
+            other => Err(anyhow!("Expected Payload::Ir, found {}", other.kind())),
+        }
+    }
+
+    /// Extracts the inner [`String`] if this payload is [`Payload::Text`].
+    pub fn into_text(self) -> Result<String> {
+        match self {
+            Self::Text(s) => Ok(s),
+            other => Err(anyhow!("Expected Payload::Text, found {}", other.kind())),
+        }
+    }
+
+    /// Extracts the inner `Vec<u8>` if this payload is [`Payload::Bytes`].
+    pub fn into_bytes(self) -> Result<Vec<u8>> {
+        match self {
+            Self::Bytes(b) => Ok(b),
+            other => Err(anyhow!("Expected Payload::Bytes, found {}", other.kind())),
+        }
+    }
+}
+
+/// A single-purpose modular A-to-B translator (`Input Payload -> Output Payload`).
+///
+/// Complex compiler, weight-surgery, loop-scheduling, and code-generation workflows are
+/// built by concatenating a sequence of simple [`Translator`] modules in a [`TranslatorChain`].
+pub trait Translator: Send + Sync {
+    /// Canonical identifier of this A-to-B translator module (e.g., `"parse-mlir"`,
+    /// `"fuse-attention"`, `"tile-loops"`, `"codegen-rust"`).
+    fn name(&self) -> &str;
+
+    /// Expected input representation (`"text"`, `"bytes"`, `"ir"`).
+    fn input_kind(&self) -> &'static str;
+
+    /// Produced output representation (`"text"`, `"bytes"`, `"ir"`).
+    fn output_kind(&self) -> &'static str;
+
+    /// Translates `input` (`A`) into `output` (`B`).
+    fn translate(&mut self, input: Payload) -> Result<Payload>;
+}
+
+/// Concatenated sequence of modular A-to-B [`Translator`] stages (`T_1 -> T_2 -> ... -> T_n`).
+#[derive(Default)]
+pub struct TranslatorChain {
+    stages: Vec<Box<dyn Translator>>,
+}
+
+impl TranslatorChain {
+    /// Creates an empty [`TranslatorChain`].
+    pub fn new() -> Self {
+        Self { stages: Vec::new() }
+    }
+
+    /// Appends an A-to-B [`Translator`] stage to the end of the chain.
+    pub fn push(&mut self, stage: Box<dyn Translator>) -> &mut Self {
+        self.stages.push(stage);
+        self
+    }
+
+    /// Builder-style method to append an A-to-B [`Translator`] stage.
+    pub fn then<T: Translator + 'static>(mut self, stage: T) -> Self {
+        self.stages.push(Box::new(stage));
+        self
+    }
+
+    /// Returns the number of concatenated translator stages.
+    pub fn len(&self) -> usize {
+        self.stages.len()
+    }
+
+    /// Returns `true` if the chain has no stages.
+    pub fn is_empty(&self) -> bool {
+        self.stages.is_empty()
+    }
+
+    /// Returns a summary of stage transitions (`name (A -> B)`).
+    pub fn describe_stages(&self) -> Vec<String> {
+        self.stages
+            .iter()
+            .map(|s| format!("{} ({} -> {})", s.name(), s.input_kind(), s.output_kind()))
+            .collect()
+    }
+
+    /// Executes all concatenated [`Translator`] modules sequentially on `initial`.
+    pub fn execute(&mut self, initial: Payload) -> Result<Payload> {
+        let mut current = initial;
+        for stage in &mut self.stages {
+            current = stage.translate(current)?;
+        }
+        Ok(current)
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum VerifyError {

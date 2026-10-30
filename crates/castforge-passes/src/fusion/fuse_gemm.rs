@@ -1,7 +1,7 @@
 //! Unified GEMM Fusion (`fuse-gemm`): Horizontal Dot, Quantized Dequant-MatMul, and MatMul
 //! Epilogue Fusion.
 
-use crate::fusion::fuse_activations::{match_gelu_op, match_silu_val};
+use crate::fusion::fuse_elementwise::{match_gelu_op, match_silu_val};
 use crate::{DeadCodeEliminationPass, Pass, PassResult};
 use anyhow::Result;
 use castforge_dialect_stablehlo::StableHloOp;

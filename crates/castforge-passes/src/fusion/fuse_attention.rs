@@ -655,16 +655,6 @@ impl Pass for FuseMlaPass {
     }
 }
 
-fn combine_pass_results(name: &str, steps: &[PassResult]) -> PassResult {
-    PassResult {
-        pass_name: name.to_string(),
-        changed: steps.iter().any(|r| r.changed),
-        ops_removed: steps.iter().map(|r| r.ops_removed).sum(),
-        ops_modified: steps.iter().map(|r| r.ops_modified).sum(),
-        ops_created: steps.iter().map(|r| r.ops_created).sum(),
-    }
-}
-
 /// Autoregressive KV-Cache Injection Pass (`inject-kv-cache`).
 pub struct InjectKvCachePass {
     pub max_seq_len: usize,
@@ -964,92 +954,6 @@ impl Pass for SpeculativeTreeAttentionPass {
             ops_modified: modified,
             ops_created: 0,
         })
-    }
-}
-
-/// Unified LLM Attention Decoding & KV-Cache Optimization Pass (`optimize-attention`).
-pub struct OptimizeAttentionPass {
-    pub mode: String,
-    pub max_seq_len: usize,
-    pub page_block_size: usize,
-    pub max_blocks: usize,
-    pub split_kv: usize,
-    pub draft_tokens: usize,
-    pub tree_depth: usize,
-    pub window_size: usize,
-    pub sink_tokens: usize,
-}
-
-impl Default for OptimizeAttentionPass {
-    fn default() -> Self {
-        Self {
-            mode: "all".to_string(),
-            max_seq_len: 2048,
-            page_block_size: 16,
-            max_blocks: 64,
-            split_kv: 4,
-            draft_tokens: 4,
-            tree_depth: 2,
-            window_size: 4096,
-            sink_tokens: 4,
-        }
-    }
-}
-
-impl Pass for OptimizeAttentionPass {
-    fn name(&self) -> &'static str {
-        "optimize-attention"
-    }
-
-    fn description(&self) -> &'static str {
-        "Unified LLM attention optimization (KV-cache, Paged, FlashDecode, SpecTree, SlidingWin)"
-    }
-
-    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let m = self.mode.to_ascii_lowercase();
-        let mut steps = Vec::new();
-        if m == "kv_cache" || m == "kv" {
-            steps.push(
-                InjectKvCachePass {
-                    max_seq_len: self.max_seq_len,
-                }
-                .run(module)?,
-            );
-        }
-        if m == "paged" || m == "all" {
-            steps.push(
-                LowerPagedAttentionPass {
-                    page_block_size: self.page_block_size,
-                    max_blocks: self.max_blocks,
-                }
-                .run(module)?,
-            );
-        }
-        if m == "flash_decoding" || m == "flash" || m == "all" {
-            steps.push(
-                FlashDecodingPass {
-                    split_kv: self.split_kv,
-                }
-                .run(module)?,
-            );
-        }
-        if m == "speculative_tree" || m == "tree" || m == "all" {
-            steps.push(
-                SpeculativeTreeAttentionPass {
-                    draft_tokens: self.draft_tokens,
-                    tree_depth: self.tree_depth,
-                }
-                .run(module)?,
-            );
-        }
-        if m == "sliding_window" || m == "window" || m == "sink" {
-            steps.push(run_sliding_window_attention(
-                module,
-                self.window_size,
-                self.sink_tokens,
-            )?);
-        }
-        Ok(combine_pass_results(self.name(), &steps))
     }
 }
 

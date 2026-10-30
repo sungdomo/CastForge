@@ -1,4 +1,4 @@
-use crate::types::{Dim, TensorType};
+use crate::{Attribute, DType, Dim, TensorType};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -190,12 +190,7 @@ struct SafeTensorEntryHeader {
 impl TensorStore {
     /// Resolve `f32` values from either an inline `DenseElements` literal or a `TensorRef`
     /// (`dense_resource<key>`) stored inside this `TensorStore`.
-    pub fn resolve_f32_attr(
-        &self,
-        attr: &crate::attr::Attribute,
-        expected_len: usize,
-    ) -> Option<Vec<f32>> {
-        use crate::attr::Attribute;
+    pub fn resolve_f32_attr(&self, attr: &Attribute, expected_len: usize) -> Option<Vec<f32>> {
         match attr {
             Attribute::DenseElements { raw_literal, .. } => {
                 parse_dense_f32_literal(raw_literal, expected_len)
@@ -235,12 +230,7 @@ impl TensorStore {
     }
 
     /// Resolve quantized `i8` values from a `TensorRef` or `DenseElements`.
-    pub fn resolve_i8_attr(
-        &self,
-        attr: &crate::attr::Attribute,
-        expected_len: usize,
-    ) -> Option<Vec<i8>> {
-        use crate::attr::Attribute;
+    pub fn resolve_i8_attr(&self, attr: &Attribute, expected_len: usize) -> Option<Vec<i8>> {
         match attr {
             Attribute::TensorRef { key, .. } => {
                 let entry = self.get(key)?;
@@ -349,7 +339,6 @@ impl TensorStore {
 
     /// Load tensors from a `.safetensors` byte slice into this `TensorStore`.
     pub fn load_safetensors_bytes(&mut self, bytes: &[u8]) -> Result<usize, std::io::Error> {
-        use crate::types::DType;
         use std::io;
         if bytes.len() < 8 {
             return Err(io::Error::new(

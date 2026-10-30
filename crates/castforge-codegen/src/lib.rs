@@ -10,9 +10,7 @@ pub mod eval;
 pub mod loop_ir;
 pub mod memory_plan;
 pub mod target_c;
-pub mod target_config;
 pub mod target_rust;
-pub mod target_wgsl;
 
 pub use crate::autotune::{
     AutotuneCandidate, AutotuneReport, AutotuneScheduleTranslator, JitBenchmarkResult,
@@ -20,11 +18,12 @@ pub use crate::autotune::{
 };
 pub use crate::backend::{
     BackendRegistry, C99Backend, CodegenBackend, CudaBackend, CustomBackendTranslator, HipBackend,
-    MslBackend, OpenClBackend, RustBackend, WgslBackend, emit_c_like_loop_stmt,
+    MslBackend, OpenClBackend, RustBackend, WgslBackend, emit_c_like_loop_stmt, emit_wgsl_module,
+    emit_wgsl_module_with_config,
 };
 pub use crate::cost_model::{
-    BottleneckKind, HardwareRoofline, ModuleCostReport, OpCostProfile, analyze_module_cost,
-    analyze_module_cost_with_roofline,
+    BottleneckKind, GemmLoopOrder, HardwareRoofline, ModuleCostReport, OpCostProfile, SimdIsa,
+    TargetConfig, analyze_module_cost, analyze_module_cost_with_roofline,
 };
 pub use crate::eval::{
     BisectReport, BisectStep, NumericVerificationReport, bisect_module_snapshots,
@@ -39,7 +38,6 @@ pub use crate::memory_plan::{
     BufferAllocation, LiveInterval, MemoryPlan, build_memory_plan, compute_block_liveness,
     compute_module_liveness,
 };
-pub use crate::target_config::{GemmLoopOrder, SimdIsa, TargetConfig};
 use anyhow::Result;
 use castforge_ir::{Dim, Module, TensorType, ValueId};
 use serde::{Deserialize, Serialize};

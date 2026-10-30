@@ -5,8 +5,9 @@
 //! Split-K reduction factors, SIMD vectorization, OpenMP parallelism, and software prefetching)
 //! and scores each candidate against a [`HardwareRoofline`] and the module's tensor shapes.
 
-use crate::cost_model::{HardwareRoofline, analyze_module_cost_with_roofline};
-use crate::target_config::{GemmLoopOrder, TargetConfig};
+use crate::cost_model::{
+    GemmLoopOrder, HardwareRoofline, TargetConfig, analyze_module_cost_with_roofline,
+};
 use crate::{
     CodegenTarget, evaluate_module, generate_code_with_config, generate_synthetic_inputs,
     sanitize_ident, tensor_len,
