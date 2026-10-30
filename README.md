@@ -11,9 +11,9 @@ support.
   CastForge's Dual-Plane IR (`Module` + `TensorStore`), modular A-to-B `Translator` architecture,
   static arena memory planning, polyhedral `LoopModule` IR, multi-architecture SIMD profiles, and
   pluggable `CodegenBackend` registry.
-- [**Complete Reference of All 29 Passes (`docs/PASSES.md`)**](docs/PASSES.md):
-  Detailed explanation, CLI options, and IR transformation rules for all 29 Graph IR passes/presets
-  (`26 passes + 3 presets O1/O2/O3`) and unified `OptimizeLoopIrPass` (`optimize-loop-ir`).
+- [**Complete Reference of All 25 Passes (`docs/PASSES.md`)**](docs/PASSES.md):
+  Detailed explanation, CLI options, and IR transformation rules for all 25 Graph IR passes/presets
+  (`22 passes + 3 presets O1/O2/O3`) and unified `OptimizeLoopIrPass` (`optimize-loop-ir`).
 
 ## Workspace Architecture
 
@@ -29,8 +29,8 @@ support.
   `dense_resource<key>` external weight references, plus symmetric **GGUF v2/v3**, **ONNX-JSON**,
   and **SafeTensors** model importers & exporters.
 - [`crates/castforge-passes`](crates/castforge-passes): Unified `Pass`, `PassRegistry`, and
-  `PassManager` with **29 canonical A-to-B IR translator modules & presets** (`26 passes + 3
-  presets`) organized with **100% 1-to-1 pass-to-file mapping** (`26` `.rs` files) into 8 domain
+  `PassManager` with **25 canonical A-to-B IR translator modules & presets** (`22 passes + 3
+  presets`) organized with **100% 1-to-1 pass-to-file mapping** (`22` `.rs` files) into 8 domain
   subdirectories (`general/`, `views/`, `weights/`, `fusion/`, `memory/`, `distributed/`, `loops/`,
   `tooling/`), supporting static Rust construction, CLI pipeline strings (`-p`), Unix pipes
   (`stdin -> stdout`), declarative TOML config files (`--config`), and step-by-step tracing.
@@ -49,36 +49,32 @@ support.
   `opt`, `viz`, `codegen`, `autotune`, `import`, `profile`, `run`, `list-passes`, plus direct pass
   subcommands).
 
-## Built-in A-to-B Translator Modules & Presets (29 Canonical Entries)
+## Built-in A-to-B Translator Modules & Presets (25 Canonical Entries)
 
 | Pass Name | Category | Description |
 | :--- | :--- | :--- |
 | `dce` | General IR | $O(N)$ ref-counted Dead Code Elimination (SSA ops & dead symbols) |
 | `cse` | General IR | Unified CSE, dominator-aware GVN, LICM & entry constant hoisting |
-| `canonicalize` | General IR | Fixed-point algebraic, constant, view folding, CSE, and DCE |
-| `topological-sort` | General IR | Def-before-use & peak-memory-minimizing (`min_memory`) sort |
-| `fold-constants` | General IR | Constant folding & conditional `compare`/`select` SCCP |
-| `simplify-algebraic` | General IR | Algebraic identities, reassociation & e-graph FMA/factor |
+| `canonicalize` | General IR | Fixed-point canonicalizer & `toposort` / `min_memory` scheduler |
+| `simplify-algebraic` | General IR | Identities, constant folding, SCCP, reassociation & FMA |
 | `fold-views` | Views & Shapes | Folds `transpose`, `reshape`, `broadcast`, `slice` & layout |
 | `specialize-shapes` | Views & Shapes | Symbolic shape bind, batch resize, buckets & token prune |
 | `quantize` | Weights | Quantize (`weight\|awq\|fp8\|nvfp4\|f16\|bf16\|w8a8\|smooth\|hadamard`) |
 | `prune-weights` | Weights | Unified structured L1, `2:4` & dynamic `activation_sparse` pruning |
 | `merge-weights` | Weights | Unified model merging & adapters (`linear\|slerp\|ties\|dare\|lora`) |
 | `fold-weights` | Weights | Norm/BatchNorm folding, `[N,K]` SIMD packing & `externalize` |
-| `fuse-elementwise` | Fusion | Unified elementwise composites, map-reduce, megakernel & loops |
+| `fuse-elementwise` | Fusion | Composites, map-reduce, megakernel, loop chains & `decompose` |
 | `fuse-gemm` | Fusion | Unified GEMM (`horizontal\|dequant\|epilogue` + constant weight concat) |
 | `fuse-norm` | Fusion | Norm & Softmax (`rmsnorm\|residual_rmsnorm\|layernorm\|softmax\|ce`) |
 | `fuse-activations` | Fusion | Unified Activation, Gated-MLP & routed/shared-expert MoE fusion |
 | `fuse-attention` | Fusion | Attn (`sdpa\|rope\|mla\|kv_cache\|paged\|flash\|sliding\|share`) |
-| `decompose-composites` | Fusion | Expands `stablehlo.composite` ops to primitive StableHLO |
 | `optimize-memory` | Memory | Unified memory (`mode=all\|inplace\|zero_copy\|remat\|offload`) |
-| `shard-distributed` | Distributed | Unified SPMD TP, Ring CP, ZeRO-3/FSDP, 1F1B PP & streams |
+| `shard-distributed` | Distributed | Unified SPMD TP, Ring CP, EP, ZeRO-3/FSDP, 1F1B PP & streams |
 | `autodiff` | Distributed | Synthesizes reverse-mode VJP gradients & optional SGD step |
 | `schedule-loops` | Loops | Unified tiling, permutation, unrolling, SIMD, conv & TensorCore |
 | `ir-edit` | Tooling | Op rename/annotate, freeze/unfreeze, tap, SSA normalize & strip |
 | `outline-subgraphs` | Tooling | Outlining, inlining, slice extract, delta reduce, dedup & unroll |
-| `verify-ir` | Tooling | Unified shape/equiv verifier, FNV-1a hasher, NaN sanitizer & bisector |
-| `profile-ir` | Tooling | Unified Roofline FLOPs/intensity analysis & profiling timers |
+| `verify-ir` | Tooling | Shape/equiv verifier, FNV-1a hasher, NaN sanitizer, bisector & profiler |
 | `O1` | Preset | Inlining, SCCP, LICM, view/algebraic canonicalization, DCE |
 | `O2` | Preset | `O1` + LoRA/BatchNorm folding + Transformer/GEMM fusions |
 | `O3` | Preset | Shape specialization + `O2` + MoE/FMA/zero-copy + weight packing |

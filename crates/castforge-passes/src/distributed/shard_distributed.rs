@@ -83,6 +83,9 @@ impl Pass for ShardDistributedPass {
         if m == "fsdp" || m == "zero3" || m == "zero" {
             steps.push(run_fsdp_sharding(module, self.devices)?);
         }
+        if m == "ep" || m == "expert" || m == "moe" {
+            steps.push(run_expert_parallelism(module, self.devices)?);
+        }
         if m == "streams" || m == "stream" || m == "async" {
             steps.push(
                 ScheduleStreamsPass {
@@ -693,6 +696,52 @@ fn run_fsdp_sharding(module: &mut Module, num_devices: usize) -> Result<PassResu
                 op.attributes.insert(
                     "castforge.grad_sync".to_string(),
                     Attribute::String("reduce_scatter".to_string()),
+                );
+                modified += 1;
+            }
+        }
+    }
+    Ok(PassResult {
+        pass_name: "shard-distributed".to_string(),
+        changed: modified > 0,
+        ops_removed: 0,
+        ops_modified: modified,
+        ops_created: 0,
+    })
+}
+
+fn run_expert_parallelism(module: &mut Module, num_devices: usize) -> Result<PassResult> {
+    let devices = num_devices.max(2) as i64;
+    let mut modified = 0usize;
+    let blocks: Vec<BlockId> = module.blocks.keys().collect();
+    for block_id in blocks {
+        for op_id in module.block_ops(block_id) {
+            let Some(op) = module.ops.get_mut(op_id) else {
+                continue;
+            };
+            let is_moe_or_gemm = op.is_op("stablehlo", "dot_general")
+                || (op.is_op("stablehlo", "composite")
+                    && op
+                        .attributes
+                        .get("name")
+                        .and_then(|a| a.as_str())
+                        .is_some_and(|n| {
+                            n == "castforge.fused_moe"
+                                || n == "castforge.fused_gated_mlp"
+                                || n == "castforge.fused_matmul_epilogue"
+                        }));
+            if is_moe_or_gemm {
+                op.attributes
+                    .insert("castforge.ep_sharded".to_string(), Attribute::Bool(true));
+                op.attributes
+                    .insert("castforge.ep_devices".to_string(), Attribute::Int(devices));
+                op.attributes.insert(
+                    "castforge.ep_dispatch".to_string(),
+                    Attribute::String("all_to_all".to_string()),
+                );
+                op.attributes.insert(
+                    "castforge.ep_combine".to_string(),
+                    Attribute::String("all_to_all".to_string()),
                 );
                 modified += 1;
             }

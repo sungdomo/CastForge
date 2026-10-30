@@ -2039,4 +2039,37 @@ fn test_consolidated_and_sota_passes_groupwise_batchnorm_concat_paged_gvn() {
     assert!(fsdp_ir.contains("castforge.fsdp_devices = 4"));
     assert!(fsdp_ir.contains("castforge.token_prune_ratio = 0.5"));
     assert!(fsdp_ir.contains("castforge.token_merging = \"tome_bipartite\""));
+
+    // 9. Test Expert Parallelism (EP), RoPE YaRN Scaling, Attention Logit Softcap + QK-Norm,
+    //    and FP8 KV-Cache Quantization
+    let mut ep_attn_mod = parse_mlir(attn_mlir).expect("parse attn_mlir for ep + rope + softcap");
+    let mut pm_ep = PassManager::from_pipeline_str(
+        &registry,
+        concat!(
+            "fuse-attention(rope_scaling=yarn,rope_factor=8.0,logit_softcap=50.0,qk_norm=true,",
+            "kv_dtype=fp8,max_seq_len=8192),",
+            "shard-distributed(mode=ep,devices=8)"
+        ),
+    )
+    .expect("build ep + rope_scaling + softcap + kv_dtype pipeline");
+    let ep_res = pm_ep.run(&mut ep_attn_mod).expect("run ep + attn sota");
+    assert!(ep_res[0].changed);
+    let ep_ir = print_mlir(&ep_attn_mod);
+    assert!(ep_ir.contains("castforge.rope_scaling = \"yarn\""));
+    assert!(ep_ir.contains("castforge.rope_factor = 8.0"));
+    assert!(ep_ir.contains("castforge.logit_softcap = 50.0"));
+    assert!(ep_ir.contains("castforge.qk_norm = true"));
+    assert!(ep_ir.contains("castforge.kv_cache_dtype = \"fp8\""));
+    assert!(ep_ir.contains("castforge.kv_per_head_scale = true"));
+
+    let mut moe_ep_mod = parse_mlir(mlir).expect("parse mlir for ep");
+    let mut pm_moe_ep =
+        PassManager::from_pipeline_str(&registry, "shard-distributed(mode=ep,devices=8)")
+            .expect("build shard-distributed(mode=ep)");
+    let moe_ep_res = pm_moe_ep.run(&mut moe_ep_mod).expect("run ep on gemm");
+    assert!(moe_ep_res[0].changed);
+    let moe_ep_ir = print_mlir(&moe_ep_mod);
+    assert!(moe_ep_ir.contains("castforge.ep_sharded = true"));
+    assert!(moe_ep_ir.contains("castforge.ep_devices = 8"));
+    assert!(moe_ep_ir.contains("castforge.ep_dispatch = \"all_to_all\""));
 }

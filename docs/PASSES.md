@@ -1,9 +1,9 @@
-# CastForge — Complete Reference of All 29 Graph IR Passes (+ Unified LoopIR Pass)
+# CastForge — Complete Reference of All 25 Graph IR Passes (+ Unified LoopIR Pass)
 
-CastForge provides **29 built-in modular A-to-B IR passes & presets** (`26 passes + 3 presets
+CastForge provides **25 built-in modular A-to-B IR passes & presets** (`22 passes + 3 presets
 O1/O2/O3`) in `castforge-passes` (plus the unified **`OptimizeLoopIrPass`** (`optimize-loop-ir`) in
 `castforge-codegen`). Every pass implements the unified `Pass` and `Translator` traits and maps
-**100% 1-to-1** to a dedicated source file (`26` `.rs` files) in 8 domain subdirectories under
+**100% 1-to-1** to a dedicated source file (`22` `.rs` files) in 8 domain subdirectories under
 `crates/castforge-passes/src/` (`general/`, `views/`, `weights/`, `fusion/`, `memory/`,
 `distributed/`, `loops/`, `tooling/`).
 
@@ -13,21 +13,21 @@ O1/O2/O3`) in `castforge-passes` (plus the unified **`OptimizeLoopIrPass`** (`op
 
 | Category | Count | Directory / Section |
 | :--- | :---: | :--- |
-| **1. General MLIR & Algebraic Passes (+ `O1`/`O2`/`O3`)** | 9 | `src/general/` (Section 1) |
+| **1. General MLIR & Algebraic Passes (+ `O1`/`O2`/`O3`)** | 7 | `src/general/` (Section 1) |
 | **2. Views, Shape Specialization & Layout** | 2 | `src/views/` (Section 2) |
 | **3. Weight Surgery, Pruning & Quantization** | 4 | `src/weights/` (Section 3) |
-| **4. Transformer, GEMM & Operator Fusions** | 6 | `src/fusion/` (Section 4) |
+| **4. Transformer, GEMM & Operator Fusions** | 5 | `src/fusion/` (Section 4) |
 | **5. Memory Planning, Remat & Offload** | 1 | `src/memory/` (Section 5) |
 | **6. Distributed Parallelism, Streams & Autodiff** | 2 | `src/distributed/` (Section 6) |
 | **7. Polyhedral Loop Scheduling & Tensor Cores** | 1 | `src/loops/` (Section 7) |
-| **8. IR Surgery, Verification & Tooling** | 4 | `src/tooling/` (Section 8) |
+| **8. IR Surgery, Verification & Tooling** | 3 | `src/tooling/` (Section 8) |
 | **9. Polyhedral / Imperative LoopIR** | +1 | `castforge-codegen` (Section 9) |
 
-*(Total: **29 registered Graph IR passes/presets** in `PassRegistry` + **`OptimizeLoopIrPass`**.)*
+*(Total: **25 registered Graph IR passes/presets** in `PassRegistry` + **`OptimizeLoopIrPass`**.)*
 
 ---
 
-## 1. General MLIR & Algebraic Optimization Passes (`src/general/`, 9 Entries)
+## 1. General MLIR & Algebraic Optimization Passes (`src/general/`, 7 Entries)
 
 ### 1.1 `dce` (`DeadCodeEliminationPass` — `general/dce.rs`)
 - **Options:** `symbols=true|false` (default: `true`)
@@ -43,33 +43,24 @@ O1/O2/O3`) in `castforge-passes` (plus the unified **`OptimizeLoopIrPass`** (`op
   block-entry constant hoisting/deduplication.
 
 ### 1.3 `simplify-algebraic` (`UnifiedSimplifyAlgebraicPass` — `general/simplify_algebraic.rs`)
-- **Options:** `egraph=true|false` (default: `true`), `fuse_fma=true|false` (default: `true`)
-- **Explanation:** Unified algebraic simplifier combining identity rewrites (`x + 0 -> x`,
-  `x - x -> 0`, `x * 1 -> x`, `x * 0 -> 0`, `max(x, x) -> x`), constant reassociation
-  (`(x + c1) + c2 -> x + (c1 + c2)`), distributive factoring (`a * b + a * c -> a * (b + c)`), and
-  FMA extraction (`a * b + c -> castforge.fma(a, b, c)`).
+- **Options:** `fold_constants=true|false` (default: `true`), `conditional=true|false`
+  (default: `true`), `egraph=true|false` (default: `true`), `fuse_fma=true|false` (default: `true`),
+  `mode=constants|all`
+- **Explanation:** Unified algebraic simplifier and constant evaluator combining compile-time
+  constant folding & Sparse Conditional Constant Propagation (`SCCP` on `compare`/`select`),
+  identity rewrites (`x + 0 -> x`, `x - x -> 0`, `x * 1 -> x`, `x * 0 -> 0`, `max(x, x) -> x`),
+  constant reassociation (`(x + c1) + c2 -> x + (c1 + c2)`), distributive factoring
+  (`a * b + a * c -> a * (b + c)`), and FMA extraction (`a * b + c -> castforge.fma(a, b, c)`).
 
-### 1.4 `fold-constants` (`FoldConstantsPass` — `general/fold_constants.rs`)
-- **Options:** `conditional=true|false` (default: `true`)
-- **Explanation:** Evaluates unary, binary, shape (`transpose`, `reshape`, `slice`, `concatenate`,
-  `broadcast_in_dim`), and reduction ops on compile-time constants, plus Sparse Conditional Constant
-  Propagation (`SCCP`) on constant `compare`/`select` branches.
-
-### 1.5 `canonicalize` (`CanonicalizePass` — `general/canonicalize.rs`)
-- **Options:** None
+### 1.4 `canonicalize` (`CanonicalizePass` — `general/canonicalize.rs`)
+- **Options:** `mode=all|toposort|min_memory` (default: `all`), `toposort=true|false`
 - **Explanation:** Fixed-point canonicalizer combining `fold-views`, `simplify-algebraic`, `cse`,
-  `fold-constants`, and `dce`.
+  `dce`, and topological / Sethi-Ullman minimum-live-tensor priority scheduling
+  (`mode=min_memory`, `castforge.min_memory_scheduled = true`).
 
-### 1.6 `topological-sort` (`TopologicalSortPass` — `general/topological_sort.rs`)
-- **Options:** `mode=standard|min_memory` (default: `standard`)
-- **Explanation:** Reorders operations inside each basic block for SSA def-before-use (`standard`),
-  or applies a Sethi-Ullman minimum-live-tensor priority schedule (`mode=min_memory`) that schedules
-  operations freeing large intermediate buffers before operations allocating new ones
-  (`castforge.min_memory_scheduled = true`).
-
-### 1.7–1.9 Optimization Pipeline Presets (`O1`, `O2`, `O3` — `general/canonicalize.rs`)
-- **`O1` (`OptO1Pass`):** Inlining, `fold-constants`, `cse(licm=true)`, `fold-views`,
-  `canonicalize`, `dce`, and `topological-sort`.
+### 1.5–1.7 Optimization Pipeline Presets (`O1`, `O2`, `O3` — `general/canonicalize.rs`)
+- **`O1` (`OptO1Pass`):** Inlining, `simplify-algebraic`, `cse(licm=true)`, `fold-views`,
+  `canonicalize(toposort=true)`, and `dce`.
 - **`O2` (`OptO2Pass`):** `O1` + weight folding (`merge-weights(method=lora)`, `fold-weights`) +
   unified Transformer/GEMM fusions (`fuse-norm`, `fuse-attention`, `fuse-activations`, `fuse-gemm`,
   `fuse-elementwise`).
@@ -133,15 +124,16 @@ O1/O2/O3`) in `castforge-passes` (plus the unified **`OptimizeLoopIrPass`** (`op
 
 ---
 
-## 4. Transformer, GEMM & Operator Fusion Passes (`src/fusion/`, 6 Passes)
+## 4. Transformer, GEMM & Operator Fusion Passes (`src/fusion/`, 5 Passes)
 
 ### 4.1 `fuse-elementwise` (`UnifiedFuseElementwisePass` — `fusion/fuse_elementwise.rs`)
-- **Options:** `mode=composites|map_reduce|loops|megakernel|all` (default: `composites`),
-  `max_steps=N`
-- **Explanation:** Unified elementwise fusion engine supporting composite producer-consumer pair
-  fusion (`mode=composites`), map-into-reduce fusion (`mode=map_reduce`), register-pipelined loop
-  chain fusion/fission (`mode=loops`), and persistent cooperative-grid megakernel fusion
-  (`mode=megakernel`).
+- **Options:** `mode=composites|map_reduce|loops|megakernel|decompose|all` (default: `composites`),
+  `max_steps=N`, `decompose=true|false`
+- **Explanation:** Unified elementwise fusion & decomposition engine supporting composite
+  producer-consumer pair fusion (`mode=composites`), map-into-reduce fusion (`mode=map_reduce`),
+  register-pipelined loop chain fusion/fission (`mode=loops`), persistent cooperative-grid
+  megakernel fusion (`mode=megakernel`), and composite-to-primitive decomposition
+  (`mode=decompose`).
 
 ### 4.2 `fuse-gemm` (`FuseGemmPass` — `fusion/fuse_gemm.rs`)
 - **Options:** `kind=all|horizontal|dequant|epilogue` (default: `all`)
@@ -166,16 +158,16 @@ O1/O2/O3`) in `castforge-passes` (plus the unified **`OptimizeLoopIrPass`** (`op
 ### 4.5 `fuse-attention` (`UnifiedFuseAttentionPass` — `fusion/fuse_attention.rs`)
 - **Options:** `kind=all|sdpa|rope|mla|kv_cache|paged|flash_decoding|tree|sliding_window|kv_sharing`
   (`kv_lora_rank=512`, `max_seq_len=2048`, `page_block_size=16`, `max_blocks=64`, `split_kv=4`,
-  `draft_tokens=4`, `tree_depth=2`, `window_size=4096`, `sink_tokens=4`, `share_every=2`)
-- **Explanation:** Unified attention subgraph fusion & serving pass combining `RoPE`, `SDPA`/`GQA`,
-  **DeepSeek MLA** (`kind=mla`), stateful KV-cache injection (`kind=kv_cache`), vLLM PagedAttention
-  (`kind=paged`), Split-KV FlashDecoding (`kind=flash_decoding`), speculative tree attention
-  (`kind=tree`), **Sliding-Window + Attention Sinks** (`kind=sliding_window`), and **YOCO / CLA
-  Cross-Layer KV-Cache Sharing** (`kind=kv_sharing,share_every=2`).
-
-### 4.6 `decompose-composites` (`DecomposeCompositesPass` — `fusion/decompose_composites.rs`)
-- **Options:** None
-- **Explanation:** Expands `stablehlo.composite` ops back to primitive StableHLO ops.
+  `draft_tokens=4`, `tree_depth=2`, `window_size=4096`, `sink_tokens=4`, `share_every=2`,
+  `rope_scaling=yarn|ntk|llama3`, `rope_factor=8.0`, `logit_softcap=50.0`, `qk_norm=true`,
+  `kv_dtype=fp8|int4`)
+- **Explanation:** Unified attention subgraph fusion & serving pass combining `RoPE` (with
+  **YaRN / NTK-Aware / Llama-3 long-context frequency scaling**), `SDPA`/`GQA` (with **Gemma-2/Grok
+  logit soft-capping & QK-Norm**), **DeepSeek MLA** (`kind=mla`), stateful KV-cache injection with
+  **FP8 / INT4 KV-cache quantization** (`kv_dtype=fp8|int4`), vLLM PagedAttention (`kind=paged`),
+  Split-KV FlashDecoding (`kind=flash_decoding`), speculative tree attention (`kind=tree`),
+  **Sliding-Window + Attention Sinks** (`kind=sliding_window`), and **YOCO / CLA Cross-Layer
+  KV-Cache Sharing** (`kind=kv_sharing,share_every=2`).
 
 ---
 
@@ -192,12 +184,13 @@ O1/O2/O3`) in `castforge-passes` (plus the unified **`OptimizeLoopIrPass`** (`op
 ## 6. Distributed Parallelism, Streams & Autodiff (`src/distributed/`, 2 Passes)
 
 - **`shard-distributed` (`ShardDistributedPass` — `distributed/shard_distributed.rs`):** Unified
-  distributed parallelism & stream pass (`mode=tp|ring_cp|pp|fsdp|zero3|streams`, `devices=2`,
+  distributed parallelism & stream pass (`mode=tp|ring_cp|pp|fsdp|zero3|ep|streams`, `devices=2`,
   `ring_size=4`, `coalesce=true`, `stages=2`, `microbatches=4`, `schedule=1f1b`, `streams=2`)
   consolidating 1D Megatron Tensor Parallelism (`tp`), RingAttention Context Parallelism
-  (`ring_cp`), **ZeRO-3 / FSDP parameter sharding with `all_gather` prefetch & `reduce_scatter`
-  gradient sync** (`mode=fsdp|zero3`), `all_reduce` coalescing, 1F1B/Zero-Bubble Pipeline
-  Parallelism (`pp`), and multi-stream async execution.
+  (`ring_cp`), **Expert Parallelism (`mode=ep`) with `all_to_all` token dispatch/combine**,
+  **ZeRO-3 / FSDP parameter sharding with `all_gather` prefetch & `reduce_scatter` gradient sync**
+  (`mode=fsdp|zero3`), `all_reduce` coalescing, 1F1B/Zero-Bubble Pipeline Parallelism (`pp`), and
+  multi-stream async execution.
 - **`autodiff` (`AutodiffPass` — `distributed/autodiff.rs`):** Synthesizes reverse-mode VJP
   backward gradient operations and optional in-graph SGD updates (`lr=...`).
 
@@ -215,7 +208,7 @@ O1/O2/O3`) in `castforge-passes` (plus the unified **`OptimizeLoopIrPass`** (`op
 
 ---
 
-## 8. IR Surgery, Verification, Profiling & Tooling (`src/tooling/`, 4 Passes)
+## 8. IR Surgery, Verification, Profiling & Tooling (`src/tooling/`, 3 Passes)
 
 1. **`ir-edit` (`IrEditPass` — `tooling/ir_edit.rs`):** Unified surgical IR editor & canonicalizer
    consolidating op renaming (`rename_op=from:to`), attribute injection (`annotate_op=op:k=v`),
@@ -230,12 +223,11 @@ O1/O2/O3`) in `castforge-passes` (plus the unified **`OptimizeLoopIrPass`** (`op
    (`mode=reduce`), LLVM `-mergefunc` function deduplication, function composition, and bounded
    `func.call` unrolling.
 3. **`verify-ir` (`UnifiedVerifyIrPass` — `tooling/verify_ir.rs`):** Unified IR verification,
-   numerical sanitizer & hashing pass (`shapes=true,equiv=true,tol=1e-4,hash=true,bisect=N,
-   sanitize=true,clamp_max=65504.0`) consolidating shape verification, signature equivalence,
-   64-bit FNV-1a structural hashing, `castforge.nan_guard` finite clamps, and pass bisection.
-4. **`profile-ir` (`UnifiedProfileIrPass` — `tooling/profile_ir.rs`):** Unified Roofline
-   FLOPs/arithmetic-intensity analysis (`stats=true,ridge=10.0`) and `castforge.profile_region`
-   timer instrumentation (`instrument=true,filter=gemm`).
+   numerical sanitizer, structural hashing & Roofline profiling pass (`shapes=true,equiv=true,
+   tol=1e-4,hash=true,bisect=N,sanitize=true,clamp_max=65504.0,profile=true,instrument=true,
+   filter=gemm,ridge=10.0`) consolidating shape verification, signature equivalence, 64-bit FNV-1a
+   structural hashing, `castforge.nan_guard` finite clamps, pass bisection, Roofline
+   FLOPs/arithmetic-intensity analysis, and `castforge.profile_region` timer instrumentation.
 
 ---
 

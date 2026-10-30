@@ -417,8 +417,15 @@ impl PassRegistry {
                             || opts.contains_key("depth")
                         {
                             "tree".to_string()
-                        } else if opts.contains_key("max_seq_len") || opts.contains_key("seq_len") {
+                        } else if opts.contains_key("max_seq_len")
+                            || opts.contains_key("seq_len")
+                            || opts.contains_key("kv_dtype")
+                        {
                             "kv_cache".to_string()
+                        } else if opts.contains_key("rope_scaling")
+                            || opts.contains_key("rope_factor")
+                        {
+                            "rope".to_string()
                         } else {
                             "all".to_string()
                         }
@@ -470,6 +477,17 @@ impl PassRegistry {
                     .get("share_every")
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(2);
+                let rope_scaling = opts.get("rope_scaling").cloned();
+                let rope_factor = opts
+                    .get("rope_factor")
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(1.0);
+                let logit_softcap = opts
+                    .get("logit_softcap")
+                    .or_else(|| opts.get("softcap"))
+                    .and_then(|s| s.parse::<f64>().ok());
+                let qk_norm = opts.get("qk_norm").is_some_and(|v| v == "true" || v == "1");
+                let kv_dtype = opts.get("kv_dtype").cloned();
                 Ok(Box::new(UnifiedFuseAttentionPass {
                     kind,
                     kv_lora_rank,
@@ -482,6 +500,11 @@ impl PassRegistry {
                     window_size,
                     sink_tokens,
                     share_every,
+                    rope_scaling,
+                    rope_factor,
+                    logit_softcap,
+                    qk_norm,
+                    kv_dtype,
                 }))
             },
         );

@@ -33,6 +33,11 @@ pub struct UnifiedFuseAttentionPass {
     pub window_size: usize,
     pub sink_tokens: usize,
     pub share_every: usize,
+    pub rope_scaling: Option<String>,
+    pub rope_factor: f64,
+    pub logit_softcap: Option<f64>,
+    pub qk_norm: bool,
+    pub kv_dtype: Option<String>,
 }
 
 impl Default for UnifiedFuseAttentionPass {
@@ -49,6 +54,11 @@ impl Default for UnifiedFuseAttentionPass {
             window_size: 4096,
             sink_tokens: 4,
             share_every: 2,
+            rope_scaling: None,
+            rope_factor: 1.0,
+            logit_softcap: None,
+            qk_norm: false,
+            kv_dtype: None,
         }
     }
 }
@@ -89,6 +99,17 @@ impl Pass for UnifiedFuseAttentionPass {
         ) {
             steps.push(FuseAttentionPass.run(module)?);
         }
+        if self.rope_scaling.is_some() || self.rope_factor > 1.0 {
+            let scaling = self.rope_scaling.as_deref().unwrap_or("yarn");
+            steps.push(run_rope_scaling(module, scaling, self.rope_factor)?);
+        }
+        if self.logit_softcap.is_some() || self.qk_norm {
+            steps.push(run_attention_softcap_and_qk_norm(
+                module,
+                self.logit_softcap,
+                self.qk_norm,
+            )?);
+        }
         if k == "mla" {
             steps.push(
                 FuseMlaPass {
@@ -97,13 +118,16 @@ impl Pass for UnifiedFuseAttentionPass {
                 .run(module)?,
             );
         }
-        if matches!(k.as_str(), "kv_cache" | "kv") {
+        if matches!(k.as_str(), "kv_cache" | "kv") || self.kv_dtype.is_some() {
             steps.push(
                 InjectKvCachePass {
                     max_seq_len: self.max_seq_len,
                 }
                 .run(module)?,
             );
+            if let Some(ref dtype) = self.kv_dtype {
+                steps.push(run_kv_cache_quantization(module, dtype)?);
+            }
         }
         if matches!(k.as_str(), "paged" | "serving") {
             steps.push(
@@ -1112,6 +1136,119 @@ fn run_kv_sharing(module: &mut Module, share_every: usize) -> Result<PassResult>
         let _ = DeadCodeEliminationPass::ssa_only().run(module)?;
     }
 
+    Ok(PassResult {
+        pass_name: "fuse-attention".to_string(),
+        changed: modified > 0,
+        ops_removed: 0,
+        ops_modified: modified,
+        ops_created: 0,
+    })
+}
+
+fn run_rope_scaling(module: &mut Module, scaling: &str, factor: f64) -> Result<PassResult> {
+    let mut modified = 0usize;
+    let eff_factor = factor.max(1.0);
+    let mscale = if scaling.eq_ignore_ascii_case("yarn") && eff_factor > 1.0 {
+        0.1 * eff_factor.ln() + 1.0
+    } else {
+        1.0
+    };
+    for (_, op) in module.ops.iter_mut() {
+        let is_target = op.is_op("stablehlo", "dot_general")
+            || (op.is_op("stablehlo", "composite")
+                && op
+                    .attributes
+                    .get("name")
+                    .and_then(|a| a.as_str())
+                    .is_some_and(|n| {
+                        n == "castforge.fused_rope" || n == "castforge.fused_attention"
+                    }));
+        if is_target {
+            op.attributes.insert(
+                "castforge.rope_scaling".to_string(),
+                Attribute::String(scaling.to_ascii_lowercase()),
+            );
+            op.attributes.insert(
+                "castforge.rope_factor".to_string(),
+                Attribute::Float(eff_factor),
+            );
+            op.attributes.insert(
+                "castforge.rope_mscale".to_string(),
+                Attribute::Float(mscale),
+            );
+            modified += 1;
+        }
+    }
+    Ok(PassResult {
+        pass_name: "fuse-attention".to_string(),
+        changed: modified > 0,
+        ops_removed: 0,
+        ops_modified: modified,
+        ops_created: 0,
+    })
+}
+
+fn run_attention_softcap_and_qk_norm(
+    module: &mut Module,
+    logit_softcap: Option<f64>,
+    qk_norm: bool,
+) -> Result<PassResult> {
+    let mut modified = 0usize;
+    for (_, op) in module.ops.iter_mut() {
+        let is_attn = op.is_op("stablehlo", "dot_general")
+            || (op.is_op("stablehlo", "composite")
+                && op
+                    .attributes
+                    .get("name")
+                    .and_then(|a| a.as_str())
+                    .is_some_and(|n| n == "castforge.fused_attention"));
+        if is_attn {
+            if let Some(cap) = logit_softcap {
+                op.attributes.insert(
+                    "castforge.logit_softcap".to_string(),
+                    Attribute::Float(cap.max(1.0)),
+                );
+            }
+            if qk_norm {
+                op.attributes
+                    .insert("castforge.qk_norm".to_string(), Attribute::Bool(true));
+            }
+            modified += 1;
+        }
+    }
+    Ok(PassResult {
+        pass_name: "fuse-attention".to_string(),
+        changed: modified > 0,
+        ops_removed: 0,
+        ops_modified: modified,
+        ops_created: 0,
+    })
+}
+
+fn run_kv_cache_quantization(module: &mut Module, kv_dtype: &str) -> Result<PassResult> {
+    let mut modified = 0usize;
+    let dt = kv_dtype.to_ascii_lowercase();
+    for (_, op) in module.ops.iter_mut() {
+        let is_kv_or_attn = op.is_op("stablehlo", "composite")
+            && op
+                .attributes
+                .get("name")
+                .and_then(|a| a.as_str())
+                .is_some_and(|n| {
+                    n == "castforge.kv_cache_update" || n == "castforge.fused_attention"
+                });
+        if is_kv_or_attn {
+            op.attributes.insert(
+                "castforge.kv_cache_dtype".to_string(),
+                Attribute::String(dt.clone()),
+            );
+            op.attributes.insert(
+                "castforge.kv_per_head_scale".to_string(),
+                Attribute::Bool(true),
+            );
+            modified += 1;
+        }
+    }
     Ok(PassResult {
         pass_name: "fuse-attention".to_string(),
         changed: modified > 0,
