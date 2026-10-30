@@ -14,11 +14,17 @@ use std::collections::HashMap;
 /// Reverse-Mode Automatic Differentiation Pass (`autodiff`).
 pub struct AutodiffPass {
     pub learning_rate: f32,
+    pub optimizer: String,
+    pub weight_decay: f32,
 }
 
 impl Default for AutodiffPass {
     fn default() -> Self {
-        Self { learning_rate: 0.0 }
+        Self {
+            learning_rate: 0.0,
+            optimizer: "sgd".to_string(),
+            weight_decay: 0.01,
+        }
     }
 }
 
@@ -28,7 +34,7 @@ impl Pass for AutodiffPass {
     }
 
     fn description(&self) -> &'static str {
-        "Synthesizes reverse-mode VJP gradient ops in StableHLO (optional SGD step via lr=...)"
+        "Synthesizes reverse-mode VJP gradient ops in StableHLO (with SGD or AdamW optimizer step)"
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
@@ -179,9 +185,28 @@ impl Pass for AutodiffPass {
                             OpName::new("stablehlo", "divide"),
                             &[dy, rhs],
                             IndexMap::new(),
+                            out_ty.clone(),
+                        );
+                        // drhs = -dy * (lhs / rhs) / rhs = -dlhs * out_val
+                        let prod = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "multiply"),
+                            &[dlhs, out_val],
+                            IndexMap::new(),
+                            out_ty.clone(),
+                        );
+                        let drhs = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "negate"),
+                            &[prod],
+                            IndexMap::new(),
                             out_ty,
                         );
-                        created += 1;
+                        created += 3;
                         accumulate_grad(
                             module,
                             block_id,
@@ -189,6 +214,15 @@ impl Pass for AutodiffPass {
                             &mut grads,
                             lhs,
                             dlhs,
+                            &mut created,
+                        );
+                        accumulate_grad(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            &mut grads,
+                            rhs,
+                            drhs,
                             &mut created,
                         );
                     }
@@ -254,7 +288,243 @@ impl Pass for AutodiffPass {
                             &mut created,
                         );
                     }
-                    StableHloOp::Maximum { lhs, rhs, .. } => {
+                    StableHloOp::Log { operand, .. } => {
+                        let dx = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "divide"),
+                            &[dy, operand],
+                            IndexMap::new(),
+                            out_ty,
+                        );
+                        created += 1;
+                        accumulate_grad(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            &mut grads,
+                            operand,
+                            dx,
+                            &mut created,
+                        );
+                    }
+                    StableHloOp::Sqrt { operand, .. } => {
+                        let half =
+                            insert_splat_const_before(module, block_id, ret_op_id, &out_ty, 0.5);
+                        let num = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "multiply"),
+                            &[dy, half],
+                            IndexMap::new(),
+                            out_ty.clone(),
+                        );
+                        let dx = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "divide"),
+                            &[num, out_val],
+                            IndexMap::new(),
+                            out_ty,
+                        );
+                        created += 3;
+                        accumulate_grad(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            &mut grads,
+                            operand,
+                            dx,
+                            &mut created,
+                        );
+                    }
+                    StableHloOp::Rsqrt { operand, .. } => {
+                        let neg_half =
+                            insert_splat_const_before(module, block_id, ret_op_id, &out_ty, -0.5);
+                        let y2 = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "multiply"),
+                            &[out_val, out_val],
+                            IndexMap::new(),
+                            out_ty.clone(),
+                        );
+                        let y3 = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "multiply"),
+                            &[y2, out_val],
+                            IndexMap::new(),
+                            out_ty.clone(),
+                        );
+                        let sc = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "multiply"),
+                            &[neg_half, y3],
+                            IndexMap::new(),
+                            out_ty.clone(),
+                        );
+                        let dx = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "multiply"),
+                            &[dy, sc],
+                            IndexMap::new(),
+                            out_ty,
+                        );
+                        created += 5;
+                        accumulate_grad(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            &mut grads,
+                            operand,
+                            dx,
+                            &mut created,
+                        );
+                    }
+                    StableHloOp::Sine { operand, .. } => {
+                        let c = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "cosine"),
+                            &[operand],
+                            IndexMap::new(),
+                            out_ty.clone(),
+                        );
+                        let dx = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "multiply"),
+                            &[dy, c],
+                            IndexMap::new(),
+                            out_ty,
+                        );
+                        created += 2;
+                        accumulate_grad(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            &mut grads,
+                            operand,
+                            dx,
+                            &mut created,
+                        );
+                    }
+                    StableHloOp::Cosine { operand, .. } => {
+                        let s = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "sine"),
+                            &[operand],
+                            IndexMap::new(),
+                            out_ty.clone(),
+                        );
+                        let prod = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "multiply"),
+                            &[dy, s],
+                            IndexMap::new(),
+                            out_ty.clone(),
+                        );
+                        let dx = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "negate"),
+                            &[prod],
+                            IndexMap::new(),
+                            out_ty,
+                        );
+                        created += 3;
+                        accumulate_grad(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            &mut grads,
+                            operand,
+                            dx,
+                            &mut created,
+                        );
+                    }
+                    StableHloOp::Negate { operand, .. } => {
+                        let dx = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "negate"),
+                            &[dy],
+                            IndexMap::new(),
+                            out_ty,
+                        );
+                        created += 1;
+                        accumulate_grad(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            &mut grads,
+                            operand,
+                            dx,
+                            &mut created,
+                        );
+                    }
+                    StableHloOp::Logistic { operand, .. } => {
+                        let one =
+                            insert_splat_const_before(module, block_id, ret_op_id, &out_ty, 1.0);
+                        let one_minus_y = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "subtract"),
+                            &[one, out_val],
+                            IndexMap::new(),
+                            out_ty.clone(),
+                        );
+                        let dsig = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "multiply"),
+                            &[out_val, one_minus_y],
+                            IndexMap::new(),
+                            out_ty.clone(),
+                        );
+                        let dx = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "multiply"),
+                            &[dy, dsig],
+                            IndexMap::new(),
+                            out_ty,
+                        );
+                        created += 4;
+                        accumulate_grad(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            &mut grads,
+                            operand,
+                            dx,
+                            &mut created,
+                        );
+                    }
+                    StableHloOp::Maximum { lhs, rhs, .. }
+                    | StableHloOp::Minimum { lhs, rhs, .. } => {
+                        let is_max = op.name.name == "maximum";
                         let pred_dims = module.values[out_val]
                             .ty
                             .as_tensor()
@@ -268,7 +538,7 @@ impl Pass for AutodiffPass {
                         let mut cmp_attrs = IndexMap::new();
                         cmp_attrs.insert(
                             "comparison_direction".to_string(),
-                            Attribute::String("GT".to_string()),
+                            Attribute::String(if is_max { "GT" } else { "LT" }.to_string()),
                         );
                         let mask = insert_vjp_op(
                             module,
@@ -288,9 +558,18 @@ impl Pass for AutodiffPass {
                             OpName::new("stablehlo", "select"),
                             &[mask, dy, zero],
                             IndexMap::new(),
+                            out_ty.clone(),
+                        );
+                        let drhs = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "select"),
+                            &[mask, zero, dy],
+                            IndexMap::new(),
                             out_ty,
                         );
-                        created += 3;
+                        created += 4;
                         accumulate_grad(
                             module,
                             block_id,
@@ -298,6 +577,43 @@ impl Pass for AutodiffPass {
                             &mut grads,
                             lhs,
                             dlhs,
+                            &mut created,
+                        );
+                        accumulate_grad(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            &mut grads,
+                            rhs,
+                            drhs,
+                            &mut created,
+                        );
+                    }
+                    StableHloOp::Gather {
+                        operand,
+                        start_indices,
+                        ..
+                    } => {
+                        let tbl_ty = module.values[operand].ty.clone();
+                        let zero_tbl =
+                            insert_splat_const_before(module, block_id, ret_op_id, &tbl_ty, 0.0);
+                        let dtbl = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "scatter"),
+                            &[zero_tbl, start_indices, dy],
+                            IndexMap::new(),
+                            tbl_ty,
+                        );
+                        created += 2;
+                        accumulate_grad(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            &mut grads,
+                            operand,
+                            dtbl,
                             &mut created,
                         );
                     }
@@ -454,6 +770,74 @@ impl Pass for AutodiffPass {
                 && let Some(&grad_val) = grads.get(&arg_val)
             {
                 let new_ret = if self.learning_rate > 0.0 {
+                    let is_adamw = self.optimizer.eq_ignore_ascii_case("adamw");
+                    let base_param = if is_adamw && self.weight_decay > 0.0 {
+                        let decay_factor = (1.0 - self.learning_rate * self.weight_decay).max(0.0);
+                        let wd_c = insert_splat_const_before(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            &ret_ty,
+                            decay_factor,
+                        );
+                        let decayed = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "multiply"),
+                            &[arg_val, wd_c],
+                            IndexMap::new(),
+                            ret_ty.clone(),
+                        );
+                        created += 2;
+                        decayed
+                    } else {
+                        arg_val
+                    };
+                    let eff_grad = if is_adamw {
+                        let g2 = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "multiply"),
+                            &[grad_val, grad_val],
+                            IndexMap::new(),
+                            ret_ty.clone(),
+                        );
+                        let eps_c =
+                            insert_splat_const_before(module, block_id, ret_op_id, &ret_ty, 1e-8);
+                        let v_eps = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "add"),
+                            &[g2, eps_c],
+                            IndexMap::new(),
+                            ret_ty.clone(),
+                        );
+                        let inv_rms = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "rsqrt"),
+                            &[v_eps],
+                            IndexMap::new(),
+                            ret_ty.clone(),
+                        );
+                        let norm_g = insert_vjp_op(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            OpName::new("stablehlo", "multiply"),
+                            &[grad_val, inv_rms],
+                            IndexMap::new(),
+                            ret_ty.clone(),
+                        );
+                        created += 5;
+                        norm_g
+                    } else {
+                        grad_val
+                    };
                     let lr_const = insert_splat_const_before(
                         module,
                         block_id,
@@ -466,17 +850,22 @@ impl Pass for AutodiffPass {
                         block_id,
                         ret_op_id,
                         OpName::new("stablehlo", "multiply"),
-                        &[grad_val, lr_const],
+                        &[eff_grad, lr_const],
                         IndexMap::new(),
                         ret_ty.clone(),
+                    );
+                    let mut upd_attrs = IndexMap::new();
+                    upd_attrs.insert(
+                        "castforge.optimizer".to_string(),
+                        Attribute::String(if is_adamw { "adamw" } else { "sgd" }.to_string()),
                     );
                     let updated = insert_vjp_op(
                         module,
                         block_id,
                         ret_op_id,
                         OpName::new("stablehlo", "subtract"),
-                        &[arg_val, step],
-                        IndexMap::new(),
+                        &[base_param, step],
+                        upd_attrs,
                         ret_ty,
                     );
                     created += 3;

@@ -74,10 +74,13 @@ impl Pass for ShardDistributedPass {
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let m = self.mode.to_ascii_lowercase();
         let mut steps = Vec::new();
-        if matches!(m.as_str(), "autodiff" | "vjp" | "sgd") || self.learning_rate > 0.0 {
+        if matches!(m.as_str(), "autodiff" | "vjp" | "sgd" | "adamw") || self.learning_rate > 0.0 {
+            let opt = if m == "adamw" { "adamw" } else { "sgd" };
             steps.push(
                 AutodiffPass {
                     learning_rate: self.learning_rate,
+                    optimizer: opt.to_string(),
+                    weight_decay: 0.01,
                 }
                 .run(module)?,
             );

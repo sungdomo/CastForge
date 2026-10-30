@@ -167,14 +167,28 @@ pub(super) fn register_lowering_passes(reg: &mut PassRegistry) {
     );
     reg.register(
         "autodiff",
-        "Reverse-mode automatic differentiation (VJP backward graph + SGD update)",
+        "Reverse-mode automatic differentiation (VJP backward graph + SGD/AdamW update)",
         |opts| {
             let learning_rate = opts
                 .get("lr")
                 .or_else(|| opts.get("learning_rate"))
                 .and_then(|s| s.parse::<f32>().ok())
                 .unwrap_or(0.0);
-            Ok(Box::new(AutodiffPass { learning_rate }))
+            let optimizer = opts
+                .get("optimizer")
+                .or_else(|| opts.get("opt"))
+                .cloned()
+                .unwrap_or_else(|| "sgd".to_string());
+            let weight_decay = opts
+                .get("weight_decay")
+                .or_else(|| opts.get("wd"))
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(0.01);
+            Ok(Box::new(AutodiffPass {
+                learning_rate,
+                optimizer,
+                weight_decay,
+            }))
         },
     );
     reg.register(

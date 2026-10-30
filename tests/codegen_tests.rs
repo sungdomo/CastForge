@@ -2193,4 +2193,29 @@ module @gather_scatter_mod {
     assert!(loop_txt.contains("Arena bind"));
     assert!(loop_txt.contains("Fused scaled dot-product attention"));
     assert!(loop_txt.contains("Row-wise reduction + normalization"));
+
+    // Verify extended reverse-mode autodiff (divide, log, sqrt, logistic, gather) + AdamW
+    let ad_mlir = concat!(
+        "module @ad_mod {\n",
+        "  func.func @main(%x: tensor<2x4xf32>, %w: tensor<2x4xf32>) -> tensor<2x4xf32> {\n",
+        "    %q = stablehlo.divide %x, %w : tensor<2x4xf32>\n",
+        "    %s = stablehlo.logistic %q : tensor<2x4xf32>\n",
+        "    %r = stablehlo.sqrt %s : tensor<2x4xf32>\n",
+        "    %l = stablehlo.log %r : tensor<2x4xf32>\n",
+        "    func.return %l : tensor<2x4xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut ad_mod = parse_mlir(ad_mlir).expect("parse ad_mod");
+    let mut ad_pm = PassManager::from_pipeline_str(
+        &registry,
+        "autodiff(lr=0.01,optimizer=adamw,weight_decay=0.02)",
+    )
+    .expect("adamw autodiff");
+    let ad_res = ad_pm.run(&mut ad_mod).expect("run adamw autodiff");
+    assert!(ad_res[0].changed);
+    let ad_printed = print_mlir(&ad_mod);
+    assert!(ad_printed.contains("adamw"));
+    let ad_outs = evaluate_module(&ad_mod, &[vec![2.0; 8], vec![1.0; 8]]).expect("eval adamw");
+    assert_eq!(ad_outs[0].len(), 8);
 }
