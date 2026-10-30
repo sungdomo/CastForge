@@ -5,6 +5,5 @@ pub mod cli;
 pub mod codegen;
 pub mod ir;
 pub mod passes;
-pub mod viz;
 
-pub use ir::{mlir, stablehlo};
+pub use ir::{mlir, stablehlo, viz};

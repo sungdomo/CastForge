@@ -20,16 +20,15 @@ support.
 - [`src/ir`](src/ir): Arena-allocated MLIR-compatible Dual-Plane IR (`Module`, `Operation`, `Value`,
   `Block`, `Region`, `Type`, `Attribute`, `Location`), `TensorStore` weight plane & `.safetensors`
   zero-copy I/O (`tensor_store.rs`), strongly-typed `StableHloOp` and `FuncView` dialect views
-  (`stablehlo.rs`), zero-C++ MLIR parser (`parser.rs`) & printer (`mlir.rs`), and symmetric
-  **GGUF v2/v3**, **ONNX-JSON**, and **SafeTensors** model importers & exporters (`import.rs`).
+  (`stablehlo.rs`), zero-C++ MLIR parser (`parser.rs`) & printer (`mlir.rs`), symmetric **GGUF
+  v2/v3**, **ONNX-JSON**, and **SafeTensors** model importers & exporters (`import.rs`), and
+  computation graph visualization exporters (**Mermaid**, **Graphviz DOT**, **JSON**, **IR Diff**,
+  and **Interactive HTML Pass Timeline Debugger** in `viz.rs`).
 - [`src/passes`](src/passes): Unified `Pass`, `PassRegistry`, and `PassManager` with **21 canonical
   A-to-B IR translator modules & presets** (`18 passes + 3 presets`) organized with **100% 1-to-1
   pass-to-file mapping** (`18` pass `.rs` files + `mod.rs` directly under `src/passes/`), supporting
   static Rust construction, CLI pipeline strings (`-p`), Unix pipes (`stdin -> stdout`), declarative
   TOML config files (`--config`), and step-by-step tracing.
-- [`src/viz`](src/viz): Computation graph exporter for **Mermaid**, **Graphviz DOT**, **JSON**,
-  unified **MLIR Snapshot Diffing**, and a self-contained **Interactive HTML Pass Timeline,
-  Roofline & Arena Memory Liveness Debugger**.
 - [`src/codegen`](src/codegen): Liveness analyzer (`LivenessAnalysis`), greedy interval-coloring
   arena buffer planner (`MemoryPlan`), progressive `LoopModule` IR with unified
   `OptimizeLoopIrPass`, pluggable `CodegenBackend` & `BackendRegistry`, multi-architecture SIMD

@@ -91,15 +91,14 @@ CastForge is built around three foundational design principles:
 - **`src/ir`**: Core arena-backed SSA data structures (`Module`, `Operation`, `Value`, `Block`,
   `Region`), `Type`/`DType`/`Dim`, `TensorStore` (`tensor_store.rs`), strongly-typed `StableHloOp`
   dialect views (`stablehlo.rs`), MLIR parser/printer (`parser.rs`, `mlir.rs`), ONNX/GGUF
-  importers/exporters (`import.rs`), and `Payload`/`Translator`/`TranslatorChain`.
+  importers/exporters (`import.rs`), Mermaid/DOT/JSON/HTML/Diff graph visualizers (`viz.rs`), and
+  `Payload`/`Translator`/`TranslatorChain`.
 - **`src/passes`**: `Pass` trait, `PassManager`, `PassRegistry`, declarative TOML/JSON
   `PipelineConfig`, and **21 built-in Graph IR transformation passes and presets**.
 - **`src/codegen`**: Liveness analysis, static arena memory planner (`MemoryPlan`), Roofline cost
   model, reference interpreter (`evaluate_module`), `LoopModule` + **`OptimizeLoopIrPass`**,
   `CodegenBackend` + `BackendRegistry` (7 built-in targets + 7 CPU SIMD ISAs), autotuner, and
   native C JIT runner.
-- **`src/viz`**: Graphviz DOT (`to_dot`) and self-contained interactive HTML5/SVG step-by-step pass
-  debugger (`to_interactive_trace_html`).
 - **`src/cli`**: Unified `castforge` command-line tool exposing `opt`, `translate`, `codegen`,
   `autotune`, `jit`, `verify`, `stats`, `inspect`, `viz`, `diff`, and `list-passes`.
 

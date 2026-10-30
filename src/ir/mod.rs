@@ -11,6 +11,7 @@ pub mod mlir;
 pub mod parser;
 pub mod stablehlo;
 pub mod tensor_store;
+pub mod viz;
 
 pub use import::{
     GgmlType, GgufExportTranslator, OnnxExportTranslator, OnnxJsonInitializer, OnnxJsonModel,
@@ -28,6 +29,7 @@ pub use tensor_store::{
     TensorBacking, TensorEntry, TensorStore, format_dense_f32_literal, format_dense_i8_literal,
     parse_dense_f32_literal,
 };
+pub use viz::*;
 
 use anyhow::{Result, anyhow};
 use indexmap::IndexMap;

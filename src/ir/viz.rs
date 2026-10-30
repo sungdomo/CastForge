@@ -1,9 +1,8 @@
 //! Computation graph visualization exporter (Mermaid, Graphviz DOT, JSON, Interactive HTML
-//! Pass Timeline Debugger) and IR snapshot diffing translators (`castforge::viz`).
+//! Pass Timeline Debugger) and IR snapshot diffing translators (`castforge::ir::viz`).
 
 use crate::codegen::{MemoryPlan, build_memory_plan};
-use crate::ir::{Module, OpId, ValueDef, ValueId};
-use crate::mlir::print_mlir;
+use crate::ir::{Module, OpId, ValueDef, ValueId, print_mlir};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::Write;
