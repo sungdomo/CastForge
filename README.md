@@ -22,17 +22,19 @@ support.
   `Block`, `Region`, `Type`, `Attribute`, `Location`), core pass & pipeline infrastructure (`Pass`,
   `PassManager`, `PassRegistry`, `PipelineConfig` in `pass_manager.rs`), unified IR verification,
   structural hashing, equivalence, sanitization & Roofline profiling (`verify_ir.rs`), `TensorStore`
-  weight plane & `.safetensors` zero-copy I/O (`tensor_store.rs`), strongly-typed `StableHloOp` and
-  `FuncView` dialect views (`stablehlo.rs`), zero-C++ MLIR parser (`parser.rs`) & printer
-  (`mlir.rs`), symmetric **GGUF v2/v3**, **ONNX-JSON**, and **SafeTensors** model importers &
-  exporters (`import.rs`), and computation graph visualization exporters (**Mermaid**, **Graphviz
-  DOT**, **JSON**, **IR Diff**, and **Interactive HTML Pass Timeline Debugger** in `viz.rs`).
+  weight plane & `.safetensors` (`F32`/`F16`/`BF16`/`I8`) + `ExternalFile` zero-copy I/O
+  (`tensor_store.rs`), strongly-typed `StableHloOp` and `FuncView` dialect views (`stablehlo.rs`),
+  zero-C++ MLIR parser (`parser.rs`) & printer (`mlir.rs`), symmetric **GGUF v2/v3** (`F32`/`F16`/
+  `BF16`/`Q8_0`/`Q4_0`), **ONNX-JSON**, **HuggingFace `config.json`**, and **SafeTensors** model
+  importers & exporters (`src/ir/import/`), and computation graph visualization exporters
+  (**Mermaid**, **Graphviz DOT**, **JSON**, **IR Diff**, and **Interactive HTML Pass Timeline
+  Debugger** in `viz.rs`).
 - [`src/passes`](src/passes): Built-in `PassRegistry::with_builtin_passes()`
   (`src/passes/registry/`) and **115 built-in hierarchical A-to-B IR translator passes & presets**
   (`38 top-level/composite passes & presets + 77 single-optimization leaf passes`), organized into
-  modular pass packages (`src/passes/<pass>/`) and concise pass modules under `src/passes/`,
-  supporting static Rust construction, CLI pipeline strings (`-p`), Unix pipes (`stdin -> stdout`),
-  declarative TOML config files (`--config`), and step-by-step tracing.
+  18 modular pass packages (`src/passes/<pass_family>/`), supporting static Rust construction, CLI
+  pipeline strings (`-p`), Unix pipes (`stdin -> stdout`), declarative TOML config files
+  (`--config`), and step-by-step tracing.
 - [`src/codegen`](src/codegen): Liveness analyzer (`LivenessAnalysis`), greedy interval-coloring
   arena buffer planner (`MemoryPlan`), progressive `LoopModule` IR with unified
   `OptimizeLoopIrPass`, pluggable `CodegenBackend` & `BackendRegistry`, multi-architecture SIMD
@@ -42,8 +44,9 @@ support.
   **AMD ROCm HIP (`.hip.cpp`)**, and **Khronos OpenCL (`.cl`)**, plus **C/C++ FFI Header (`.h`)**
   and **Native Shared Libraries (`.so`/`.dylib`)**.
 - [`src/cli`](src/cli): The `castforge` command-line tool (`chain`, `opt`, `viz`, `codegen`,
-  `autotune`, `import`, `profile`, `run`, `list-passes`, plus direct pass subcommands), invoked by
-  [`src/main.rs`](src/main.rs) and exported alongside all modules in [`src/lib.rs`](src/lib.rs).
+  `autotune`, `import`, `export`, `link`, `profile`, `run`, `parse`, `list-passes`, plus direct
+  pass subcommands), invoked by [`src/main.rs`](src/main.rs) and exported alongside all modules in
+  [`src/lib.rs`](src/lib.rs).
 - [`tests/`](tests): End-to-end integration test suites (`ai_opt_tests.rs`, `codegen_tests.rs`,
   `pipeline_tests.rs`).
 
@@ -77,7 +80,7 @@ passes are registered in `PassRegistry` (115 total entries).
 | `rematerialize` | Memory | Activation rematerialization / checkpointing for long-lived tensors |
 | `offload-activations` | Memory | Inserts `castforge.host_offload` markers on long-lived tensors |
 | `shard-distributed` | Distributed | Composite (`shard-spmd`, `shard-ring-attention`, streams) |
-| `autodiff` | Distributed | Reverse-mode VJP automatic differentiation & in-place SGD updates |
+| `autodiff` | Distributed | Reverse-mode VJP automatic differentiation & SGD / AdamW updates |
 | `coalesce-all-reduce` | Distributed | Coalesces adjacent `all_reduce` ops & compute overlap |
 | `schedule-loops` | Loops | Composite (`pad-for-tiling`, `tile-loops`, `permute-loops`, SIMD) |
 | `lower-conv-to-gemm` | Loops | Lowers `1x1` NHWC 2D convolutions into `reshape + dot_general` |
@@ -101,8 +104,9 @@ passes are registered in `PassRegistry` (115 total entries).
 | `parse-mlir` / `print-mlir` | `text <-> ir` | MLIR parser and printer |
 | `import-onnx` / `export-onnx` | `text <-> ir` | Symmetric ONNX-JSON graph importer & exporter |
 | `import-gguf` / `export-gguf` | `bytes <-> ir` | Symmetric GGUF v3 binary importer & exporter |
-| `export-safetensors` | `ir -> bytes` | SafeTensors weight serializer |
-| `lower-to-loops` | `ir -> text` | Progressive Tensor IR to `LoopModule` lowering |
+| `import-hf-config` | `text -> ir` | HuggingFace `config.json` Transformer importer |
+| `export-safetensors` | `ir -> bytes` | SafeTensors weight serializer (`F32`/`F16`/`BF16`/`I8`) |
+| `lower-to-loops` / `optimize-loop-ir` | `ir -> text` | Tensor IR to `LoopModule` lowering |
 | `autotune-schedule` | `ir -> ir` | Stamps winning Roofline schedule attrs onto IR |
 | `codegen-rust` / `codegen-c` | `ir -> text` | Standalone Rust & C99 kernel emitter |
 | `codegen-wgsl` / `codegen-cuda` | `ir -> text` | WebGPU WGSL & NVIDIA CUDA `.cu` GPU emitter |
@@ -116,8 +120,8 @@ passes are registered in `PassRegistry` (115 total entries).
 ## Quick Start
 
 ```bash
-# 1. List all 115 registered A-to-B translator passes (38 composite/top-level + 77 leaf passes)
-cargo run --bin castforge -- list-passes
+# 1. List all 115 registered A-to-B translator passes (or view the composite -> leaf hierarchy)
+cargo run --bin castforge -- list-passes --tree
 
 # 2. Concatenate simple A-to-B translators via standard Unix pipes (stdin -> stdout)
 cat examples/llama_block.mlir \
@@ -133,23 +137,20 @@ cargo run --bin castforge -- chain examples/llama_block.mlir \
 # 4. Optimize an end-to-end LLaMA block with automatic numerical verification
 cargo run --bin castforge -- opt examples/llama_block.mlir -p "O3" --verify-numerics
 
-# 5. Auto-tune polyhedral/HPC loop schedules (analytical Roofline or native CPU JIT)
-cargo run --bin castforge -- autotune examples/llama_block.mlir -p "O3" --bench-jit
+# 5. Auto-tune polyhedral/HPC loop schedules with hardware Roofline presets (h100|a100|m3-max)
+cargo run --bin castforge -- autotune examples/llama_block.mlir -p "O3" --arch h100
 
-# 6. End-to-End Weight Surgery + SafeTensors binary export
-cargo run --bin castforge -- opt examples/weight_surgery.mlir \
-  -p "merge-weights(method=slerp,t=0.5),fold-weights(mode=externalize)" \
-  --save-weights examples/merged_weights.safetensors
+# 6. Export an optimized MLIR module to ONNX-JSON, GGUF v3, or SafeTensors
+cargo run --bin castforge -- export examples/llama_block.mlir -p "O2" --format gguf -o model.gguf
 
-# 7. Generate an Interactive HTML Pass Timeline, Roofline & Arena Memory Debugger
+# 7. Link multiple MLIR modules into a single module + merged TensorStore
+cargo run --bin castforge -- link examples/llama_block.mlir examples/weight_surgery.mlir
+
+# 8. Generate an Interactive HTML Pass Timeline, Roofline & Arena Memory Debugger
 cargo run --bin castforge -- viz examples/weight_surgery.mlir \
   -p "merge-weights(method=slerp,t=0.5),fold-weights(mode=prune,sparsity=0.5),quantize(bits=8)" \
   --format html -o examples/weight_surgery_trace.html
 
-# 8. Lower the optimized model to standalone Rust, C99, WGSL, CUDA, or Metal
-cargo run --bin castforge -- codegen examples/weight_surgery.mlir \
-  -p "canonicalize,fuse-gemm" --target rust --tile-size 16
-
 # 9. Profile Roofline FLOPs, memory bandwidth traffic, and arithmetic intensity
-cargo run --bin castforge -- profile examples/llama_block.mlir -p "O3"
+cargo run --bin castforge -- profile examples/llama_block.mlir -p "O3" --arch a100
 ```

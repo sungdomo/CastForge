@@ -37,21 +37,21 @@ passes & presets + 77 single-optimization leaf passes`) across `src/passes/` and
 
 ## 1. General MLIR & Algebraic Optimization Passes (`src/passes/`, 7 Entries)
 
-### 1.1 `dce` (`DeadCodeEliminationPass` — `dce.rs`)
+### 1.1 `dce` (`DeadCodeEliminationPass` — `dce/mod.rs`)
 - **Options:** `symbols=true|false` (default: `true`)
 - **Explanation:** Single-traversal $O(N)$ liveness-driven Dead Code Elimination that sweeps
   operations in reverse topological order (marking operands of live ops on the fly without a
   separate forward use-counting pass) and eliminates unreachable private `func.func` symbols when
   `symbols=true`.
 
-### 1.2 `cse` (`CsePass` — `cse.rs`)
+### 1.2 `cse` (`CsePass` — `cse/mod.rs`)
 - **Options:** `gvn=true|false` (default: `true`), `licm=true|false` (default: `true`),
   `hoist_constants=true|false` (default: `false`)
 - **Explanation:** Unified Common Subexpression Elimination (`CSE`), dominator-aware cross-region
   Global Value Numbering (`GVN`), Loop/Region-Invariant Code Motion (`LICM`), and optional
   block-entry constant hoisting/deduplication.
 
-### 1.3 `simplify-algebraic` (`SimplifyAlgebraicPass` — `simplify_algebraic.rs`)
+### 1.3 `simplify-algebraic` (`SimplifyAlgebraicPass` — `simplify_algebraic/mod.rs`)
 - **Options:** `fold_constants=true|false` (default: `true`), `conditional=true|false`
   (default: `true`), `egraph=true|false` (default: `true`), `fuse_fma=true|false` (default: `true`),
   `mode=constants|all`
@@ -61,13 +61,13 @@ passes & presets + 77 single-optimization leaf passes`) across `src/passes/` and
   constant reassociation (`(x + c1) + c2 -> x + (c1 + c2)`), distributive factoring
   (`a * b + a * c -> a * (b + c)`), and FMA extraction (`a * b + c -> castforge.fma(a, b, c)`).
 
-### 1.4 `canonicalize` (`CanonicalizePass` — `canonicalize.rs`)
+### 1.4 `canonicalize` (`CanonicalizePass` — `canonicalize/mod.rs`)
 - **Options:** `mode=all|toposort|min_memory` (default: `all`), `toposort=true|false`
 - **Explanation:** Fixed-point canonicalizer combining `fold-views`, `simplify-algebraic`, `cse`,
   `dce`, and topological / Sethi-Ullman minimum-live-tensor priority scheduling
   (`mode=min_memory`, `castforge.min_memory_scheduled = true`).
 
-### 1.5–1.7 Optimization Pipeline Presets (`O1`, `O2`, `O3` — `canonicalize.rs`)
+### 1.5–1.7 Optimization Pipeline Presets (`O1`, `O2`, `O3` — `canonicalize/presets.rs`)
 - **`O1` (`OptO1Pass`):** Inlining, `simplify-algebraic`, `cse(licm=true)`, `fold-views`,
   `canonicalize(toposort=true)`, and `dce`.
 - **`O2` (`OptO2Pass`):** `O1` + weight folding (`merge-weights(method=lora)`, `fold-weights`) +
@@ -79,13 +79,13 @@ passes & presets + 77 single-optimization leaf passes`) across `src/passes/` and
 
 ## 2. Views, Shape Specialization & Layout Passes (`src/passes/`, 2 Passes)
 
-### 2.1 `fold-views` (`FoldViewsPass` — `fold_views.rs`)
+### 2.1 `fold-views` (`FoldViewsPass` — `fold_views/mod.rs`)
 - **Options:** `layout=nhwc|nchw|col_major`, `propagate=true|false`
 - **Explanation:** Unified folding of `transpose` (sinking & permutation composition), `reshape`,
   `broadcast_in_dim`, `slice`/`concatenate`, round-trip `convert` casts, and spatial/matrix layout
   conversion & global layout propagation (`layout=nhwc,propagate=true`).
 
-### 2.2 `specialize-shapes` (`SpecializeShapesPass` — `specialize_shapes.rs`)
+### 2.2 `specialize-shapes` (`SpecializeShapesPass` — `specialize_shapes/mod.rs`)
 - **Options:** `B=val,S=val,default=val`, `batch=N`, `buckets=1;4;8`, `token_prune_ratio=0.5`
 - **Explanation:** Unified shape specialization engine supporting symbolic dimension binding
   (`B=4`), static batch resizing across activations (`batch=8`), multi-bucket shape-specialized
@@ -110,7 +110,7 @@ passes & presets + 77 single-optimization leaf passes`) across `src/passes/` and
   (`scheme=hadamard` or `hadamard=true`), and **QAT Straight-Through Estimator**
   (`scheme=qat_ste`).
 
-### 3.2 `merge-weights` (`MergeWeightsPass` — `merge_weights.rs`)
+### 3.2 `merge-weights` (`MergeWeightsPass` — `merge_weights/mod.rs`)
 - **Options:** `method=linear|slerp|ties|dare|lora|dora`, `t=0.5`, `alpha=1.0`, `lambda=1.0`,
   `drop_rate=0.0`
 - **Explanation:** Unified model merging and adapter baking pass supporting Linear, SLERP, TIES,
@@ -161,7 +161,7 @@ passes & presets + 77 single-optimization leaf passes`) across `src/passes/` and
 - **Explanation:** Single-traversal register-pressure loop splitting pass splitting oversized
   `castforge.fused_elementwise_chain` composites into chunks of at most `max_steps` operations.
 
-### 4.5 `fuse-gemm` (`FuseGemmPass` — `fuse_gemm.rs`)
+### 4.5 `fuse-gemm` (`FuseGemmPass` — `fuse_gemm/mod.rs`)
 - **Options:** `kind=all|horizontal|dequant|epilogue` (default: `all`)
 - **Explanation:** Single-traversal GEMM fusion combining horizontal parallel QKV/MLP dot fusion
   with **compile-time constant weight concatenation**
@@ -195,14 +195,15 @@ passes & presets + 77 single-optimization leaf passes`) across `src/passes/` and
 
 ## 5. Memory Planning, Rematerialization & Offloading (`src/passes/`, 3 Passes)
 
-1. **`optimize-memory` (`OptimizeMemoryPass` — `optimize_memory.rs`):** Single-traversal in-place
-   arena buffer donation (`inplace`) and destination-passing zero-copy `concatenate` elimination
-   (`zero_copy`), plus **Selective Activation Checkpointing** (`mode=selective_remat`).
-2. **`rematerialize` (`RematerializePass` — `optimize_memory.rs`):** Single-traversal activation
-   rematerialization / checkpointing (`min_distance=3`) recomputing cheap elementwise producers
-   before late consumers.
-3. **`offload-activations` (`OffloadActivationsPass` — `optimize_memory.rs`):** Single-traversal
-   pinned host-memory D2H/H2D offloading (`min_span=2`) inserting `castforge.host_offload` markers.
+1. **`optimize-memory` (`OptimizeMemoryPass` — `optimize_memory/mod.rs`):** Single-traversal
+   in-place arena buffer donation (`inplace`) and destination-passing zero-copy `concatenate`
+   elimination (`zero_copy`), plus **Selective Activation Checkpointing** (`mode=selective_remat`).
+2. **`rematerialize` (`RematerializePass` — `optimize_memory/remat.rs`):** Single-traversal
+   activation rematerialization / checkpointing (`min_distance=3`) recomputing cheap elementwise
+   producers before late consumers.
+3. **`offload-activations` (`OffloadActivationsPass` — `optimize_memory/remat.rs`):**
+   Single-traversal pinned host-memory D2H/H2D offloading (`min_span=2`) inserting
+   `castforge.host_offload` markers.
 
 ---
 
@@ -215,7 +216,11 @@ passes & presets + 77 single-optimization leaf passes`) across `src/passes/` and
    Parallelism (`mode=ep`)**, **ZeRO-3 / FSDP parameter sharding** (`mode=fsdp|zero3`), 1F1B/
    Zero-Bubble Pipeline Parallelism (`pp`), and multi-stream async execution (`streams`).
 2. **`autodiff` (`AutodiffPass` — `shard_distributed/autodiff.rs`):** Single-traversal
-   reverse-mode VJP automatic differentiation & in-place SGD weight update synthesis (`lr=0.01`).
+   reverse-mode VJP automatic differentiation (`dot_general`, `add`, `subtract`, `multiply`,
+   `divide`, `tanh`, `exponential`, `log`, `sqrt`, `rsqrt`, `sine`, `cosine`, `maximum`, `minimum`,
+   `negate`, `reshape`, `transpose`, `broadcast_in_dim`, `reduce`) & in-place SGD or **AdamW**
+   weight update synthesis (`optimizer=sgd|adamw`, `lr=0.01`, `beta1=0.9`, `beta2=0.999`,
+   `weight_decay=0.01`, `eps=1e-8`).
 3. **`coalesce-all-reduce` (`CoalesceAllReducePass` — `shard_distributed/mod.rs`):**
    Single-traversal `all_reduce` coalescer and compute-communication overlap scheduler.
 
@@ -230,10 +235,10 @@ passes & presets + 77 single-optimization leaf passes`) across `src/passes/` and
    multi-arch SIMD vectorization (`isa=avx2|avx512|neon|sve|rvv|wasm`), and GPU Tensor/Matrix Core
    lowering (`tensor_cores=wgmma|tcgen05|blackwell|wmma|mfma|simdgroup,mma_tile=16x16x16,
    warp_specialized=true,tmem_columns=512`).
-2. **`lower-conv-to-gemm` (`LowerConvToGemmPass` — `schedule_loops/conv_gemm.rs`):**
+2. **`lower-conv-to-gemm` (`LowerConvToGemmPass` — `schedule_loops/lowering.rs`):**
    Single-traversal lowering of `1x1` NHWC 2D `stablehlo.convolution` operations into `reshape +
    dot_general + reshape`.
-3. **`split-large-gemm` (`SplitLargeGemmPass` — `schedule_loops/conv_gemm.rs`):** Single-traversal
+3. **`split-large-gemm` (`SplitLargeGemmPass` — `schedule_loops/lowering.rs`):** Single-traversal
    wide GEMM column splitter (`max_n=256`) partitioning wide `dot_general` RHS weights along $N$.
 
 ---
@@ -269,3 +274,40 @@ passes & presets + 77 single-optimization leaf passes`) across `src/passes/` and
 - **`optimize-loop-ir` (`OptimizeLoopIrPass`):** Unified imperative `LoopModule` transformation pass
   orchestrating `LoopFusionPass`, `LoopFissionPass`, `LoopInterchangePass`,
   `LoopCollapseParallelPass`, `LoopUnrollAndJamPass`, `LoopUnrollPass`, and `LoopVectorizePass`.
+
+---
+
+## 10. Complete Reference of All 77 Single-Optimization Leaf Passes
+
+Every composite pass (`Pass::child_passes()`) can also be invoked at the fine-grained leaf level via
+`-p "<leaf-pass>"` or inspected with `castforge list-passes --tree`:
+
+- **`cse`:** `hoist-loop-invariants`, `hoist-constants`
+- **`simplify-algebraic`:** `fold-constants`, `fuse-fma`
+- **`canonicalize`:** `topological-sort` (`mode=standard|min_memory`)
+- **`fold-views`:** `convert-layout` (`layout=nhwc|nchw|col_major,propagate=true`)
+- **`specialize-shapes`:** `resize-batch`, `bucket-shapes`, `prune-tokens`
+- **`quantize`:** `quantize-weights`, `quantize-groupwise`, `quantize-fp8`, `quantize-nvfp4`,
+  `convert-mixed-precision`, `calibrate-quantization`, `quantize-dynamic`, `smoothquant`,
+  `rotate-hadamard`, `insert-qat-ste`
+- **`merge-weights`:** `bake-lora`, `bake-dora`, `merge-task-vectors`
+- **`fold-weights`:** `fold-norm-weights`, `fold-batchnorm`, `pack-weights`
+- **`prune-weights`:** `prune-structured`, `prune-2to4`, `prune-activations`
+- **`fuse-elementwise`:** `fuse-add-max`, `fuse-activations`, `fuse-swiglu`, `fuse-gelu`,
+  `fuse-gated-mlp`, `fuse-moe`, `fuse-map-reduce`, `fuse-megakernel`
+- **`fuse-gemm`:** `fuse-horizontal-dot`, `fuse-dequant-matmul`, `fuse-matmul-epilogue`
+- **`fuse-norm`:** `fuse-rmsnorm`, `fuse-residual-norm`, `fuse-layernorm`, `fuse-softmax`,
+  `fuse-cross-entropy`
+- **`fuse-attention`:** `fuse-rope`, `fuse-sdpa`, `fuse-mla`, `fuse-ssm`, `inject-kv-cache`,
+  `rewrite-paged-attention`, `rewrite-flash-decoding`, `fuse-speculative-tree`,
+  `fuse-sliding-window`, `share-kv-cache`
+- **`optimize-memory`:** `bufferize-inplace`, `eliminate-concat-copies`
+- **`shard-distributed`:** `shard-spmd`, `shard-ring-attention`, `shard-pipeline`, `shard-fsdp`,
+  `shard-experts`, `assign-streams`
+- **`schedule-loops`:** `pad-for-tiling`, `tile-loops`, `permute-loops`, `unroll-loops`,
+  `vectorize-loops`, `lower-to-tensor-cores`
+- **`normalize-ir`:** `rename-ops`, `annotate-ops`, `freeze-inputs`, `unfreeze-constants`,
+  `tap-intermediates`, `normalize-ssa`, `strip-metadata`
+- **`outline-subgraphs`:** `outline-kernels`, `dedup-functions`, `unroll-calls`
+- **`verify-ir`:** `verify-shapes`, `verify-equiv`, `bisect-passes`, `hash-ir`,
+  `AnalyzeCostPass` (`profile-roofline`)

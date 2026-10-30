@@ -11,11 +11,12 @@ CastForge is built around three foundational design principles:
 
 1. **Everything is a Modular A-to-B Translator (`Translator` + `Payload`)**
    Every compiler component—frontend model importers (`.mlir`, `.safetensors`, `.onnx.json`,
-   `.gguf`), each of the **38 Graph IR passes & presets** (`35` single-traversal passes + `3`
-   presets `O1`/`O2`/`O3`), the unified **`OptimizeLoopIrPass`** (`optimize-loop-ir`), lowering
-   stages (`ir -> loop-ir`), and backend code emitters (`loop-ir -> code`)—implements the unified
-   `castforge::ir::Translator` trait over a polymorphic `castforge::ir::Payload`. Any stage can be
-   composed into a `TranslatorChain` via CLI (`castforge chain -s "A | B | C"`) or Rust API.
+   `.gguf`, HuggingFace `config.json`), each of the **115 Hierarchical Graph IR passes & presets**
+   (`38` top-level/composite passes & presets + `77` single-optimization leaf passes), the unified
+   **`OptimizeLoopIrPass`** (`optimize-loop-ir`), lowering stages (`ir -> loop-ir`), and backend
+   code emitters (`loop-ir -> code`)—implements the unified `castforge::ir::Translator` trait over
+   a polymorphic `castforge::ir::Payload`. Any stage can be composed into a `TranslatorChain` via
+   CLI (`castforge chain -s "A | B | C"`) or Rust API.
 2. **Dual-Plane Intermediate Representation (SSA Compute Graph + Weight Plane)**
    Traditional compilers treat multi-gigabyte model weights either as giant AST literals or as
    opaque external pointers. CastForge decouples them into two synchronized planes inside
@@ -23,8 +24,8 @@ CastForge is built around three foundational design principles:
    - **Compute Graph Plane:** Arena-allocated (`slotmap::SlotMap`) SSA operations, values, blocks,
      and regions (`OpId`, `ValueId`, `BlockId`, `RegionId`).
    - **Weight Plane (`TensorStore`):** Dedicated storage holding inline `f32`/`i64` tensors,
-     quantized `i8`/`i4` buffers (`TensorBacking::I8`), or lazy zero-copy `SafeTensors` shard
-     references.
+     quantized `i8`/`i4` buffers (`TensorBacking::QuantizedI8`), or lazy zero-copy `SafeTensors`
+     (`F32`/`F16`/`BF16`/`I8`) shard references (`TensorBacking::ExternalFile`).
 3. **Two-Tier IR Lowering (`Module` $\to$ `LoopModule` $\to$ Multi-Arch Target Source)**
    High-level algebraic, fusion, quantization, and graph surgery passes operate on the SSA
    `Module`. Schedule and loop-nest transformations (`OptimizeLoopIrPass`: fusion, fission,
@@ -38,7 +39,7 @@ CastForge is built around three foundational design principles:
 ```text
   +--------------------+   +-------------------+   +-------------------+
   |  Model Frontends   |   |   Weight Shards   |   |  StableHLO MLIR   |
-  |    ONNX / GGUF     |   |   (.safetensors)  |   |     (.mlir)       |
+  | ONNX / GGUF / HF   |   |   (.safetensors)  |   |     (.mlir)       |
   +---------+----------+   +---------+---------+   +---------+---------+
             |                        |                       |
             +------------------------+-----------------------+
@@ -51,7 +52,7 @@ CastForge is built around three foundational design principles:
                      +---------------+---------------+
                                      |
                +---------------------+---------------------+
-               |  38 Graph IR Passes & Presets (O1/O2/O3)  |
+               |  115 Hierarchical Passes (38 + 77 Leaf)   |
                |  - Algebraic / Canonicalization / SCCP    |
                |  - Weight Surgery (Quant/Prune/Merge/LoRA)|
                |  - LLM & Transformer Operator Fusions     |
@@ -92,17 +93,19 @@ CastForge is built around three foundational design principles:
   `Region`), `Type`/`DType`/`Dim`, `Pass`/`PassManager`/`PassRegistry`/`PipelineConfig`
   (`pass_manager.rs`), unified IR verifier/hasher/profiler (`verify_ir.rs`), `TensorStore`
   (`tensor_store.rs`), strongly-typed `StableHloOp` dialect views (`stablehlo.rs`), MLIR
-  parser/printer (`parser.rs`, `mlir.rs`), ONNX/GGUF importers/exporters (`import.rs`),
+  parser/printer (`parser.rs`, `mlir.rs`), ONNX/GGUF/HF importers/exporters (`src/ir/import/`),
   Mermaid/DOT/JSON/HTML/Diff graph visualizers (`viz.rs`), and
   `Payload`/`Translator`/`TranslatorChain`.
-- **`src/passes`**: `PassRegistry::with_builtin_passes()` (`src/passes/registry/`) and **38 built-in
-  single-traversal Graph IR transformation passes and presets**.
+- **`src/passes`**: `PassRegistry::with_builtin_passes()` (`src/passes/registry/`) and **115
+  built-in hierarchical Graph IR transformation passes and presets** (`38` top-level/composite
+  passes & presets + `77` single-optimization leaf passes) across 18 modular pass subdirectories.
 - **`src/codegen`**: Liveness analysis, static arena memory planner (`MemoryPlan`), Roofline cost
   model, reference interpreter (`evaluate_module`), `LoopModule` + **`OptimizeLoopIrPass`**,
   `CodegenBackend` + `BackendRegistry` (7 built-in targets + 7 CPU SIMD ISAs), autotuner, and
   native C JIT runner.
-- **`src/cli`**: Unified `castforge` command-line tool exposing `opt`, `translate`, `codegen`,
-  `autotune`, `jit`, `verify`, `stats`, `inspect`, `viz`, `diff`, and `list-passes`.
+- **`src/cli`**: Unified `castforge` command-line tool exposing `opt`, `run`, `parse`, `viz`,
+  `codegen`, `profile`, `autotune`, `import`, `export`, `chain` (`pipe`), `link`, `list-passes`,
+  and direct pass subcommands.
 
 ---
 
@@ -124,9 +127,10 @@ CastForge is built around three foundational design principles:
 - **Pure IR Storage (`src/ir`):** Small constants remain inline in MLIR attributes, while large
   weight matrices use `dense_resource<key>` handles pointing into `Module::tensor_store`.
   `src/ir/tensor_store.rs` loads and saves `TensorStore` entries directly to/from HuggingFace
-  `.safetensors` files.
+  `.safetensors` files (`F32`, `F16`, `BF16`, `I8`) and resolves lazy `ExternalFile` slices on
+  demand.
 - **Weight Surgery Kernels (`src/passes/quantize/`, `src/passes/fold_weights/`,
-  `src/passes/merge_weights.rs`):**
+  `src/passes/merge_weights/`):**
   - `quantize_symmetric_f32`: Symmetric per-tensor `i8` (`[-128, 127]`) and `i4` (`[-8, 7]`)
     quantization emitting `!quant.uniform<i8:f32, scale:zp>`.
   - `prune_2d_columns_by_l1`: Structured output-column pruning by L1 norm with zero-dimension
