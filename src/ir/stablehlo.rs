@@ -66,6 +66,85 @@ pub enum StableHloOp {
         operand: ValueId,
         result: ValueId,
     },
+    Sqrt {
+        operand: ValueId,
+        result: ValueId,
+    },
+    Log {
+        operand: ValueId,
+        result: ValueId,
+    },
+    Sine {
+        operand: ValueId,
+        result: ValueId,
+    },
+    Cosine {
+        operand: ValueId,
+        result: ValueId,
+    },
+    Abs {
+        operand: ValueId,
+        result: ValueId,
+    },
+    Negate {
+        operand: ValueId,
+        result: ValueId,
+    },
+    Logistic {
+        operand: ValueId,
+        result: ValueId,
+    },
+    Power {
+        lhs: ValueId,
+        rhs: ValueId,
+        result: ValueId,
+    },
+    Clamp {
+        min: ValueId,
+        operand: ValueId,
+        max: ValueId,
+        result: ValueId,
+    },
+    Pad {
+        operand: ValueId,
+        padding_value: ValueId,
+        edge_padding_low: Vec<i64>,
+        edge_padding_high: Vec<i64>,
+        interior_padding: Vec<i64>,
+        result: ValueId,
+    },
+    Gather {
+        operand: ValueId,
+        start_indices: ValueId,
+        slice_sizes: Vec<i64>,
+        result: ValueId,
+    },
+    Scatter {
+        operand: ValueId,
+        scatter_indices: ValueId,
+        updates: ValueId,
+        result: ValueId,
+    },
+    DynamicSlice {
+        operand: ValueId,
+        start_indices: Vec<ValueId>,
+        slice_sizes: Vec<i64>,
+        result: ValueId,
+    },
+    DynamicUpdateSlice {
+        operand: ValueId,
+        update: ValueId,
+        start_indices: Vec<ValueId>,
+        result: ValueId,
+    },
+    While {
+        operands: Vec<ValueId>,
+        results: Vec<ValueId>,
+    },
+    Case {
+        index: ValueId,
+        results: Vec<ValueId>,
+    },
     Convert {
         operand: ValueId,
         result: ValueId,
@@ -208,6 +287,121 @@ impl StableHloOp {
             "rsqrt" => Some(StableHloOp::Rsqrt {
                 operand: *op.operands.first()?,
                 result: first_res?,
+            }),
+            "sqrt" => Some(StableHloOp::Sqrt {
+                operand: *op.operands.first()?,
+                result: first_res?,
+            }),
+            "log" => Some(StableHloOp::Log {
+                operand: *op.operands.first()?,
+                result: first_res?,
+            }),
+            "sine" => Some(StableHloOp::Sine {
+                operand: *op.operands.first()?,
+                result: first_res?,
+            }),
+            "cosine" => Some(StableHloOp::Cosine {
+                operand: *op.operands.first()?,
+                result: first_res?,
+            }),
+            "abs" => Some(StableHloOp::Abs {
+                operand: *op.operands.first()?,
+                result: first_res?,
+            }),
+            "negate" => Some(StableHloOp::Negate {
+                operand: *op.operands.first()?,
+                result: first_res?,
+            }),
+            "logistic" => Some(StableHloOp::Logistic {
+                operand: *op.operands.first()?,
+                result: first_res?,
+            }),
+            "power" => Some(StableHloOp::Power {
+                lhs: *op.operands.first()?,
+                rhs: *op.operands.get(1)?,
+                result: first_res?,
+            }),
+            "clamp" => Some(StableHloOp::Clamp {
+                min: *op.operands.first()?,
+                operand: *op.operands.get(1)?,
+                max: *op.operands.get(2)?,
+                result: first_res?,
+            }),
+            "pad" => {
+                let edge_padding_low = op
+                    .attributes
+                    .get("edge_padding_low")
+                    .and_then(|a| a.as_int_slice())
+                    .map(|s| s.to_vec())
+                    .unwrap_or_default();
+                let edge_padding_high = op
+                    .attributes
+                    .get("edge_padding_high")
+                    .and_then(|a| a.as_int_slice())
+                    .map(|s| s.to_vec())
+                    .unwrap_or_default();
+                let interior_padding = op
+                    .attributes
+                    .get("interior_padding")
+                    .and_then(|a| a.as_int_slice())
+                    .map(|s| s.to_vec())
+                    .unwrap_or_default();
+                Some(StableHloOp::Pad {
+                    operand: *op.operands.first()?,
+                    padding_value: *op.operands.get(1)?,
+                    edge_padding_low,
+                    edge_padding_high,
+                    interior_padding,
+                    result: first_res?,
+                })
+            }
+            "gather" => {
+                let slice_sizes = op
+                    .attributes
+                    .get("slice_sizes")
+                    .and_then(|a| a.as_int_slice())
+                    .map(|s| s.to_vec())
+                    .unwrap_or_default();
+                Some(StableHloOp::Gather {
+                    operand: *op.operands.first()?,
+                    start_indices: *op.operands.get(1)?,
+                    slice_sizes,
+                    result: first_res?,
+                })
+            }
+            "scatter" => Some(StableHloOp::Scatter {
+                operand: *op.operands.first()?,
+                scatter_indices: *op.operands.get(1)?,
+                updates: *op.operands.get(2)?,
+                result: first_res?,
+            }),
+            "dynamic_slice" => {
+                let slice_sizes = op
+                    .attributes
+                    .get("slice_sizes")
+                    .and_then(|a| a.as_int_slice())
+                    .map(|s| s.to_vec())
+                    .unwrap_or_default();
+                Some(StableHloOp::DynamicSlice {
+                    operand: *op.operands.first()?,
+                    start_indices: op.operands.iter().skip(1).copied().collect(),
+                    slice_sizes,
+                    result: first_res?,
+                })
+            }
+            "dynamic_update_slice" => Some(StableHloOp::DynamicUpdateSlice {
+                operand: *op.operands.first()?,
+                update: *op.operands.get(1)?,
+                start_indices: op.operands.iter().skip(2).copied().collect(),
+                result: first_res?,
+            }),
+            "while" => Some(StableHloOp::While {
+                operands: op.operands.to_vec(),
+                results: op.results.to_vec(),
+            }),
+            "case" => Some(StableHloOp::Case {
+                index: *op.operands.first()?,
+                results: op.results.to_vec(),
             }),
             "convert" => Some(StableHloOp::Convert {
                 operand: *op.operands.first()?,
@@ -485,6 +679,38 @@ pub fn verify_stablehlo_shapes(module: &Module, op_id: OpId) -> Result<(), Strin
                         "stablehlo.slice axis {i} expected dim {expected}, got {actual}"
                     ));
                 }
+            }
+        }
+        StableHloOp::DynamicUpdateSlice {
+            operand, result, ..
+        } => {
+            let Some(in_ty) = module.values[operand].ty.as_tensor() else {
+                return Ok(());
+            };
+            let Some(out_ty) = module.values[result].ty.as_tensor() else {
+                return Ok(());
+            };
+            if in_ty.shape != out_ty.shape {
+                return Err(format!(
+                    "stablehlo.dynamic_update_slice result shape {:?} must match operand {:?}",
+                    out_ty.shape, in_ty.shape
+                ));
+            }
+        }
+        StableHloOp::Clamp {
+            operand, result, ..
+        } => {
+            let Some(in_ty) = module.values[operand].ty.as_tensor() else {
+                return Ok(());
+            };
+            let Some(out_ty) = module.values[result].ty.as_tensor() else {
+                return Ok(());
+            };
+            if in_ty.shape != out_ty.shape {
+                return Err(format!(
+                    "stablehlo.clamp result shape {:?} must match operand {:?}",
+                    out_ty.shape, in_ty.shape
+                ));
             }
         }
         _ => {}

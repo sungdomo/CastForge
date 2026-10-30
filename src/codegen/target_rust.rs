@@ -331,6 +331,13 @@ fn emit_rust_hlo_op(
         StableHloOp::Exp { operand, .. }
         | StableHloOp::Tanh { operand, .. }
         | StableHloOp::Rsqrt { operand, .. }
+        | StableHloOp::Sqrt { operand, .. }
+        | StableHloOp::Log { operand, .. }
+        | StableHloOp::Sine { operand, .. }
+        | StableHloOp::Cosine { operand, .. }
+        | StableHloOp::Abs { operand, .. }
+        | StableHloOp::Negate { operand, .. }
+        | StableHloOp::Logistic { operand, .. }
         | StableHloOp::Convert { operand, .. }
         | StableHloOp::Reshape { operand, .. } => {
             let x = r_idx(module, plan, operand, "i", names, counter);
@@ -339,10 +346,128 @@ fn emit_rust_hlo_op(
                 "exponential" => format!("({x}).exp()"),
                 "tanh" => format!("({x}).tanh()"),
                 "rsqrt" => format!("1.0_f32 / ({x}).sqrt()"),
+                "sqrt" => format!("({x}).sqrt()"),
+                "log" => format!("({x}).ln()"),
+                "sine" => format!("({x}).sin()"),
+                "cosine" => format!("({x}).cos()"),
+                "abs" => format!("({x}).abs()"),
+                "negate" => format!("-({x})"),
+                "logistic" => format!("1.0_f32 / (1.0_f32 + (-({x})).exp())"),
                 _ => x,
             };
             writeln!(out, "    for i in 0..{res_len} {{")?;
             writeln!(out, "        {dst} = {expr};")?;
+            writeln!(out, "    }}")?;
+        }
+        StableHloOp::Power { lhs, rhs, .. } => {
+            let a = r_idx(module, plan, lhs, "i", names, counter);
+            let b = r_idx(module, plan, rhs, "i", names, counter);
+            let dst = r_idx(module, plan, res_val, "i", names, counter);
+            writeln!(out, "    for i in 0..{res_len} {{")?;
+            writeln!(out, "        {dst} = ({a}).powf({b});")?;
+            writeln!(out, "    }}")?;
+        }
+        StableHloOp::Clamp {
+            min, operand, max, ..
+        } => {
+            let mn_len = tensor_len(module, min).max(1);
+            let mx_len = tensor_len(module, max).max(1);
+            let lo = r_idx(module, plan, min, &format!("i % {mn_len}"), names, counter);
+            let x = r_idx(module, plan, operand, "i", names, counter);
+            let hi = r_idx(module, plan, max, &format!("i % {mx_len}"), names, counter);
+            let dst = r_idx(module, plan, res_val, "i", names, counter);
+            writeln!(out, "    for i in 0..{res_len} {{")?;
+            writeln!(out, "        {dst} = ({x}).clamp({lo}, {hi});")?;
+            writeln!(out, "    }}")?;
+        }
+        StableHloOp::Gather {
+            operand,
+            start_indices,
+            ..
+        } => {
+            let tbl_dims = module.values[operand]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![res_len, 1]);
+            let num_rows = (*tbl_dims.first().unwrap_or(&1)).max(1);
+            let row_width = (tensor_len(module, operand) / num_rows).max(1);
+            let num_idx = (res_len / row_width).max(1);
+            let idx_e = r_idx(module, plan, start_indices, "k", names, counter);
+            let tbl_e = r_idx(
+                module,
+                plan,
+                operand,
+                &format!("row * {row_width} + c"),
+                names,
+                counter,
+            );
+            let dst_e = r_idx(
+                module,
+                plan,
+                res_val,
+                &format!("k * {row_width} + c"),
+                names,
+                counter,
+            );
+            writeln!(out, "    for k in 0..{num_idx} {{")?;
+            writeln!(
+                out,
+                "        let row = (({idx_e}).round() as isize)\
+                 .clamp(0, {}) as usize;",
+                (num_rows as isize) - 1
+            )?;
+            writeln!(
+                out,
+                "        for c in 0..{row_width} {{ {dst_e} = {tbl_e}; }}"
+            )?;
+            writeln!(out, "    }}")?;
+        }
+        StableHloOp::Scatter {
+            operand,
+            scatter_indices,
+            updates,
+            ..
+        } => {
+            let dst_dims = module.values[operand]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![res_len, 1]);
+            let num_rows = (*dst_dims.first().unwrap_or(&1)).max(1);
+            let row_width = (res_len / num_rows).max(1);
+            let num_idx = tensor_len(module, scatter_indices).max(1);
+            let src_e = r_idx(module, plan, operand, "i", names, counter);
+            let dst_i = r_idx(module, plan, res_val, "i", names, counter);
+            let idx_e = r_idx(module, plan, scatter_indices, "k", names, counter);
+            let upd_e = r_idx(
+                module,
+                plan,
+                updates,
+                &format!("k * {row_width} + c"),
+                names,
+                counter,
+            );
+            let dst_rc = r_idx(
+                module,
+                plan,
+                res_val,
+                &format!("row * {row_width} + c"),
+                names,
+                counter,
+            );
+            writeln!(out, "    for i in 0..{res_len} {{ {dst_i} = {src_e}; }}")?;
+            writeln!(out, "    for k in 0..{num_idx} {{")?;
+            writeln!(
+                out,
+                "        let row = (({idx_e}).round() as isize)\
+                 .clamp(0, {}) as usize;",
+                (num_rows as isize) - 1
+            )?;
+            writeln!(
+                out,
+                "        for c in 0..{row_width} {{ {dst_rc} = {upd_e}; }}"
+            )?;
             writeln!(out, "    }}")?;
         }
         StableHloOp::Transpose {

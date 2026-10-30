@@ -2116,3 +2116,35 @@ fn test_consolidated_and_sota_passes_groupwise_batchnorm_concat_paged_gvn() {
     assert!(sota4_ir.contains("castforge.qat_ste = true"));
     assert!(sota4_ir.contains("castforge.selective_remat = \"checkpoint\""));
 }
+
+#[test]
+fn test_stablehlo_gather_scatter_dynamic_slice_clamp_and_while_eval() {
+    let mlir = r#"
+module @gather_scatter_mod {
+  func.func @main(%idx: tensor<2xf32>, %upd: tensor<2x4xf32>) -> tensor<2x4xf32> {
+    %tbl = stablehlo.constant dense<[[1.0, 2.0, 3.0, 4.0],
+                                     [5.0, 6.0, 7.0, 8.0],
+                                     [9.0, 10.0, 11.0, 12.0]]> : tensor<3x4xf32>
+    %lo = stablehlo.constant dense<0.0> : tensor<2x4xf32>
+    %hi = stablehlo.constant dense<20.0> : tensor<2x4xf32>
+    %updated = "stablehlo.scatter"(%tbl, %idx, %upd)
+      : (tensor<3x4xf32>, tensor<2xf32>, tensor<2x4xf32>) -> tensor<3x4xf32>
+    %gathered = "stablehlo.gather"(%updated, %idx) {slice_sizes = array<i64: 1, 4>}
+      : (tensor<3x4xf32>, tensor<2xf32>) -> tensor<2x4xf32>
+    %clamped = "stablehlo.clamp"(%lo, %gathered, %hi)
+      : (tensor<2x4xf32>, tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+    func.return %clamped : tensor<2x4xf32>
+  }
+}
+"#;
+    let module = parse_mlir(mlir).expect("parse gather_scatter_mod");
+    let idx_in = vec![2.0_f32, 0.0_f32];
+    let upd_in = vec![15.0, 16.0, 17.0, 25.0, 1.5, 2.5, 3.5, 4.5];
+    let outs = evaluate_module(&module, &[idx_in, upd_in]).expect("eval gather_scatter");
+    assert_eq!(outs[0], vec![15.0, 16.0, 17.0, 20.0, 1.5, 2.5, 3.5, 4.5]);
+
+    let rust_code = generate_code(&module, CodegenTarget::Rust).expect("rust gather/scatter");
+    assert!(rust_code.contains(".clamp("));
+    let c_code = generate_code(&module, CodegenTarget::C).expect("c gather/scatter");
+    assert!(c_code.contains("roundf("));
+}

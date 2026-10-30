@@ -181,6 +181,18 @@ pub fn evaluate_function(
 
     let mut env: HashMap<ValueId, Vec<f32>> = HashMap::new();
     let mut q_env: HashMap<ValueId, Vec<i8>> = HashMap::new();
+    evaluate_region(module, reg_id, inputs, &mut env, &mut q_env)
+}
+
+fn evaluate_region(
+    module: &Module,
+    reg_id: crate::ir::RegionId,
+    inputs: &[Vec<f32>],
+    env: &mut HashMap<ValueId, Vec<f32>>,
+    q_env: &mut HashMap<ValueId, Vec<i8>>,
+) -> Result<Vec<Vec<f32>>> {
+    let blk_id = module.regions[reg_id].blocks[0];
+    let block = &module.blocks[blk_id];
 
     for (&arg_id, inp) in block.arguments.iter().zip(inputs.iter()) {
         env.insert(arg_id, inp.clone());
@@ -198,6 +210,52 @@ pub fn evaluate_function(
                 outs.push(v);
             }
             return Ok(outs);
+        }
+
+        if op.is_op("stablehlo", "while") && op.regions.len() >= 2 {
+            let cond_reg = op.regions[0];
+            let body_reg = op.regions[1];
+            let mut state: Vec<Vec<f32>> = op
+                .operands
+                .iter()
+                .map(|&v| {
+                    env.get(&v)
+                        .cloned()
+                        .unwrap_or_else(|| vec![0.0; tensor_len(module, v)])
+                })
+                .collect();
+            for _step in 0..64 {
+                let cond_out = evaluate_region(module, cond_reg, &state, env, q_env)?;
+                let keep_going = cond_out
+                    .first()
+                    .and_then(|v| v.first())
+                    .is_some_and(|&c| c > 0.5);
+                if !keep_going {
+                    break;
+                }
+                state = evaluate_region(module, body_reg, &state, env, q_env)?;
+            }
+            for (&res_id, vec_val) in op.results.iter().zip(state) {
+                env.insert(res_id, vec_val);
+            }
+            continue;
+        }
+
+        if op.is_op("stablehlo", "case") && !op.regions.is_empty() && !op.operands.is_empty() {
+            let idx_val = env
+                .get(&op.operands[0])
+                .and_then(|v| v.first().copied())
+                .unwrap_or(0.0);
+            let branch_idx = if idx_val < 0.0 {
+                op.regions.len() - 1
+            } else {
+                (idx_val.round() as usize).min(op.regions.len() - 1)
+            };
+            let branch_outs = evaluate_region(module, op.regions[branch_idx], &[], env, q_env)?;
+            for (&res_id, vec_val) in op.results.iter().zip(branch_outs) {
+                env.insert(res_id, vec_val);
+            }
+            continue;
         }
 
         if op.is_op("func", "call") {
@@ -281,7 +339,7 @@ pub fn evaluate_function(
             continue;
         }
 
-        eval_stablehlo_op(module, op_id, res_val, res_len, &mut env)?;
+        eval_stablehlo_op(module, op_id, res_val, res_len, env)?;
     }
 
     Ok(Vec::new())
@@ -346,6 +404,242 @@ fn eval_stablehlo_op(
         StableHloOp::Tanh { operand, .. } => get_v(operand).into_iter().map(|x| x.tanh()).collect(),
         StableHloOp::Rsqrt { operand, .. } => {
             get_v(operand).into_iter().map(|x| 1.0 / x.sqrt()).collect()
+        }
+        StableHloOp::Sqrt { operand, .. } => get_v(operand).into_iter().map(|x| x.sqrt()).collect(),
+        StableHloOp::Log { operand, .. } => get_v(operand).into_iter().map(|x| x.ln()).collect(),
+        StableHloOp::Sine { operand, .. } => get_v(operand).into_iter().map(|x| x.sin()).collect(),
+        StableHloOp::Cosine { operand, .. } => {
+            get_v(operand).into_iter().map(|x| x.cos()).collect()
+        }
+        StableHloOp::Abs { operand, .. } => get_v(operand).into_iter().map(|x| x.abs()).collect(),
+        StableHloOp::Negate { operand, .. } => get_v(operand).into_iter().map(|x| -x).collect(),
+        StableHloOp::Logistic { operand, .. } => get_v(operand)
+            .into_iter()
+            .map(|x| 1.0 / (1.0 + (-x).exp()))
+            .collect(),
+        StableHloOp::Power { lhs, rhs, .. } => get_v(lhs)
+            .iter()
+            .zip(get_v(rhs).iter())
+            .map(|(&a, &b)| a.powf(b))
+            .collect(),
+        StableHloOp::Clamp {
+            min, operand, max, ..
+        } => {
+            let mn = get_v(min);
+            let x = get_v(operand);
+            let mx = get_v(max);
+            (0..res_len)
+                .map(|i| {
+                    let lo = mn.get(i).or_else(|| mn.first()).copied().unwrap_or(0.0);
+                    let hi = mx.get(i).or_else(|| mx.first()).copied().unwrap_or(0.0);
+                    x.get(i).copied().unwrap_or(0.0).clamp(lo, hi)
+                })
+                .collect()
+        }
+        StableHloOp::Pad {
+            operand,
+            padding_value,
+            edge_padding_low,
+            edge_padding_high,
+            interior_padding,
+            ..
+        } => {
+            let x = get_v(operand);
+            let pad_v = get_v(padding_value).first().copied().unwrap_or(0.0);
+            let in_dims = module.values[operand]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![x.len()]);
+            let out_dims = module.values[res_val]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![res_len]);
+            let mut out_v = vec![pad_v; res_len];
+            if in_dims.len() == 2 && out_dims.len() == 2 {
+                let (in_r, in_c) = (in_dims[0], in_dims[1]);
+                let out_c = out_dims[1];
+                let lo0 = edge_padding_low.first().copied().unwrap_or(0) as isize;
+                let lo1 = edge_padding_low.get(1).copied().unwrap_or(0) as isize;
+                let ip0 = interior_padding.first().copied().unwrap_or(0).max(0) as isize + 1;
+                let ip1 = interior_padding.get(1).copied().unwrap_or(0).max(0) as isize + 1;
+                for r in 0..in_r {
+                    for c in 0..in_c {
+                        let dr = lo0 + (r as isize) * ip0;
+                        let dc = lo1 + (c as isize) * ip1;
+                        if dr >= 0
+                            && (dr as usize) < out_dims[0]
+                            && dc >= 0
+                            && (dc as usize) < out_c
+                        {
+                            out_v[(dr as usize) * out_c + (dc as usize)] = x[r * in_c + c];
+                        }
+                    }
+                }
+            } else {
+                let _ = edge_padding_high;
+                let lo0 = edge_padding_low.first().copied().unwrap_or(0).max(0) as usize;
+                let ip0 = interior_padding.first().copied().unwrap_or(0).max(0) as usize + 1;
+                for (i, &val) in x.iter().enumerate() {
+                    let dst_i = lo0 + i * ip0;
+                    if dst_i < out_v.len() {
+                        out_v[dst_i] = val;
+                    }
+                }
+            }
+            out_v
+        }
+        StableHloOp::Gather {
+            operand,
+            start_indices,
+            ..
+        } => {
+            let table = get_v(operand);
+            let indices = get_v(start_indices);
+            let tbl_dims = module.values[operand]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![table.len(), 1]);
+            let num_rows = (*tbl_dims.first().unwrap_or(&1)).max(1);
+            let row_width = (table.len() / num_rows).max(1);
+            let mut out_v = Vec::with_capacity(res_len);
+            for &raw_idx in &indices {
+                let row = (raw_idx.round() as isize).clamp(0, (num_rows as isize) - 1) as usize;
+                let start = row * row_width;
+                for c in 0..row_width {
+                    if out_v.len() < res_len {
+                        out_v.push(*table.get(start + c).unwrap_or(&0.0));
+                    }
+                }
+            }
+            out_v.resize(res_len, 0.0);
+            out_v
+        }
+        StableHloOp::Scatter {
+            operand,
+            scatter_indices,
+            updates,
+            ..
+        } => {
+            let mut out_v = get_v(operand);
+            out_v.resize(res_len, 0.0);
+            let indices = get_v(scatter_indices);
+            let upd = get_v(updates);
+            let dst_dims = module.values[operand]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![res_len, 1]);
+            let num_rows = (*dst_dims.first().unwrap_or(&1)).max(1);
+            let row_width = (res_len / num_rows).max(1);
+            for (k, &raw_idx) in indices.iter().enumerate() {
+                let row = (raw_idx.round() as isize).clamp(0, (num_rows as isize) - 1) as usize;
+                let dst_base = row * row_width;
+                let src_base = k * row_width;
+                for c in 0..row_width {
+                    if let (Some(dst_elem), Some(&u_val)) =
+                        (out_v.get_mut(dst_base + c), upd.get(src_base + c))
+                    {
+                        *dst_elem = u_val;
+                    }
+                }
+            }
+            out_v
+        }
+        StableHloOp::DynamicSlice {
+            operand,
+            start_indices,
+            slice_sizes,
+            ..
+        } => {
+            let x = get_v(operand);
+            let in_dims = module.values[operand]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![x.len()]);
+            let starts: Vec<usize> = start_indices
+                .iter()
+                .enumerate()
+                .map(|(axis, &vid)| {
+                    let raw = get_v(vid).first().copied().unwrap_or(0.0).round() as isize;
+                    let dim_len = in_dims.get(axis).copied().unwrap_or(1) as isize;
+                    let sz = slice_sizes.get(axis).copied().unwrap_or(1) as isize;
+                    raw.clamp(0, (dim_len - sz).max(0)) as usize
+                })
+                .collect();
+            if in_dims.len() == 2 && starts.len() >= 2 && slice_sizes.len() >= 2 {
+                let (s0, s1) = (starts[0], starts[1]);
+                let (sz0, sz1) = (slice_sizes[0] as usize, slice_sizes[1] as usize);
+                let in_cols = in_dims[1];
+                let mut out_v = Vec::with_capacity(res_len);
+                for r in s0..(s0 + sz0) {
+                    for c in s1..(s1 + sz1) {
+                        out_v.push(*x.get(r * in_cols + c).unwrap_or(&0.0));
+                    }
+                }
+                out_v.resize(res_len, 0.0);
+                out_v
+            } else {
+                let s0 = starts.first().copied().unwrap_or(0);
+                (0..res_len)
+                    .map(|i| *x.get(s0 + i).unwrap_or(&0.0))
+                    .collect()
+            }
+        }
+        StableHloOp::DynamicUpdateSlice {
+            operand,
+            update,
+            start_indices,
+            ..
+        } => {
+            let mut out_v = get_v(operand);
+            out_v.resize(res_len, 0.0);
+            let upd = get_v(update);
+            let in_dims = module.values[operand]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![res_len]);
+            let upd_dims = module.values[update]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![upd.len()]);
+            let starts: Vec<usize> = start_indices
+                .iter()
+                .enumerate()
+                .map(|(axis, &vid)| {
+                    let raw = get_v(vid).first().copied().unwrap_or(0.0).round() as isize;
+                    let dim_len = in_dims.get(axis).copied().unwrap_or(1) as isize;
+                    let sz = upd_dims.get(axis).copied().unwrap_or(1) as isize;
+                    raw.clamp(0, (dim_len - sz).max(0)) as usize
+                })
+                .collect();
+            if in_dims.len() == 2 && upd_dims.len() == 2 && starts.len() >= 2 {
+                let (s0, s1) = (starts[0], starts[1]);
+                let (u_r, u_c) = (upd_dims[0], upd_dims[1]);
+                let in_cols = in_dims[1];
+                for r in 0..u_r {
+                    for c in 0..u_c {
+                        let dst_idx = (s0 + r) * in_cols + (s1 + c);
+                        if let (Some(d), Some(&u)) = (out_v.get_mut(dst_idx), upd.get(r * u_c + c))
+                        {
+                            *d = u;
+                        }
+                    }
+                }
+            } else {
+                let s0 = starts.first().copied().unwrap_or(0);
+                for (i, &u) in upd.iter().enumerate() {
+                    if let Some(d) = out_v.get_mut(s0 + i) {
+                        *d = u;
+                    }
+                }
+            }
+            out_v
         }
         StableHloOp::Convert { operand, .. } | StableHloOp::Reshape { operand, .. } => {
             get_v(operand)
