@@ -5,9 +5,9 @@ pub mod profile;
 
 pub use profile::*;
 
+use crate::ir::verify_stablehlo_shapes;
 use crate::ir::{Attribute, Module, ValueId};
-use crate::passes::{Pass, PassResult};
-use crate::stablehlo::verify_stablehlo_shapes;
+use crate::ir::{Pass, PassResult};
 use anyhow::{Result, anyhow, bail};
 use indexmap::IndexMap;
 use std::collections::HashMap;

@@ -1,7 +1,7 @@
 //! Submodule `profile` of `verify_ir`.
 
 use crate::ir::{Attribute, Dim, Module, OpName, Operation, ValueId};
-use crate::passes::{Pass, PassResult};
+use crate::ir::{Pass, PassResult};
 use anyhow::Result;
 use indexmap::IndexMap;
 use smallvec::smallvec;

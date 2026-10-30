@@ -9,8 +9,10 @@
 pub mod import;
 pub mod mlir;
 pub mod parser;
+pub mod pass_manager;
 pub mod stablehlo;
 pub mod tensor_store;
+pub mod verify_ir;
 pub mod viz;
 
 pub use import::{
@@ -24,11 +26,13 @@ pub use mlir::{
     OnnxImportTranslator, PrintOptions, parse_mlir, print_mlir, print_mlir_with_options,
 };
 pub use parser::{MlirParser, ParseError, parse_type};
+pub use pass_manager::*;
 pub use stablehlo::{DotDimensionNumbers, FuncView, StableHloOp, verify_stablehlo_shapes};
 pub use tensor_store::{
     TensorBacking, TensorEntry, TensorStore, format_dense_f32_literal, format_dense_i8_literal,
     parse_dense_f32_literal,
 };
+pub use verify_ir::*;
 pub use viz::*;
 
 use anyhow::{Result, anyhow};

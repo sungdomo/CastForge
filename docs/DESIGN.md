@@ -89,12 +89,14 @@ CastForge is built around three foundational design principles:
 ## 3. Source Module Topology (`src/`)
 
 - **`src/ir`**: Core arena-backed SSA data structures (`Module`, `Operation`, `Value`, `Block`,
-  `Region`), `Type`/`DType`/`Dim`, `TensorStore` (`tensor_store.rs`), strongly-typed `StableHloOp`
-  dialect views (`stablehlo.rs`), MLIR parser/printer (`parser.rs`, `mlir.rs`), ONNX/GGUF
-  importers/exporters (`import.rs`), Mermaid/DOT/JSON/HTML/Diff graph visualizers (`viz.rs`), and
+  `Region`), `Type`/`DType`/`Dim`, `Pass`/`PassManager`/`PassRegistry`/`PipelineConfig`
+  (`pass_manager.rs`), unified IR verifier/hasher/profiler (`verify_ir/`), `TensorStore`
+  (`tensor_store.rs`), strongly-typed `StableHloOp` dialect views (`stablehlo.rs`), MLIR
+  parser/printer (`parser.rs`, `mlir.rs`), ONNX/GGUF importers/exporters (`import.rs`),
+  Mermaid/DOT/JSON/HTML/Diff graph visualizers (`viz.rs`), and
   `Payload`/`Translator`/`TranslatorChain`.
-- **`src/passes`**: `Pass` trait, `PassManager`, `PassRegistry`, declarative TOML/JSON
-  `PipelineConfig`, and **21 built-in Graph IR transformation passes and presets**.
+- **`src/passes`**: `PassRegistry::with_builtin_passes()` (`src/passes/registry/`) and **21 built-in
+  Graph IR transformation passes and presets**.
 - **`src/codegen`**: Liveness analysis, static arena memory planner (`MemoryPlan`), Roofline cost
   model, reference interpreter (`evaluate_module`), `LoopModule` + **`OptimizeLoopIrPass`**,
   `CodegenBackend` + `BackendRegistry` (7 built-in targets + 7 CPU SIMD ISAs), autotuner, and
@@ -190,7 +192,7 @@ target-independent `LoopModule` consisting of `LoopKernel`s and recursive `LoopS
 
 ## 7. Verification, Bisection & Roofline Cost Modeling
 
-- **Shape & Dominance Verification (`src/passes/verify_ir/`, `src/ir/stablehlo.rs`):** Every pass
+- **Shape & Dominance Verification (`src/ir/verify_ir/`, `src/ir/stablehlo.rs`):** Every pass
   in `PassManager` can automatically invoke `module.verify()` + `verify_stablehlo_shapes(&module)`
   after execution.
 - **Reference Interpreter (`src/codegen/eval.rs`):** Evaluates all StableHLO operations and all

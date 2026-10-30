@@ -3,21 +3,6 @@
 mod lowering;
 
 use super::*;
-use anyhow::{Result, anyhow};
-use indexmap::IndexMap;
-
-pub type PassFactory = Box<dyn Fn(&PassOptions) -> Result<Box<dyn Pass>> + Send + Sync>;
-
-pub struct PassDescriptor {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub factory: PassFactory,
-}
-
-/// Registry holding all available passes for dynamic lookup by CLI, command name, or config file.
-pub struct PassRegistry {
-    passes: IndexMap<&'static str, PassDescriptor>,
-}
 
 impl Default for PassRegistry {
     fn default() -> Self {
@@ -26,12 +11,6 @@ impl Default for PassRegistry {
 }
 
 impl PassRegistry {
-    pub fn new() -> Self {
-        Self {
-            passes: IndexMap::new(),
-        }
-    }
-
     /// Create a registry pre-populated with all 21 built-in CastForge passes (`18` passes + `3`
     /// presets `O1`/`O2`/`O3`).
     pub fn with_builtin_passes() -> Self {
@@ -521,30 +500,5 @@ impl PassRegistry {
         );
         lowering::register_lowering_passes(&mut reg);
         reg
-    }
-
-    pub fn register<F>(&mut self, name: &'static str, description: &'static str, factory: F)
-    where
-        F: Fn(&PassOptions) -> Result<Box<dyn Pass>> + Send + Sync + 'static,
-    {
-        self.passes.insert(
-            name,
-            PassDescriptor {
-                name,
-                description,
-                factory: Box::new(factory),
-            },
-        );
-    }
-
-    pub fn create_pass(&self, name: &str, opts: &PassOptions) -> Result<Box<dyn Pass>> {
-        let desc = self.passes.get(name).ok_or_else(|| {
-            anyhow!("Unknown pass `{name}`. Run `castforge list-passes` to see available passes.")
-        })?;
-        (desc.factory)(opts)
-    }
-
-    pub fn list(&self) -> impl Iterator<Item = (&'static str, &'static str)> + '_ {
-        self.passes.values().map(|d| (d.name, d.description))
     }
 }

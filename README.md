@@ -18,17 +18,19 @@ support.
 ## Project Directory Structure (`src/`)
 
 - [`src/ir`](src/ir): Arena-allocated MLIR-compatible Dual-Plane IR (`Module`, `Operation`, `Value`,
-  `Block`, `Region`, `Type`, `Attribute`, `Location`), `TensorStore` weight plane & `.safetensors`
-  zero-copy I/O (`tensor_store.rs`), strongly-typed `StableHloOp` and `FuncView` dialect views
-  (`stablehlo.rs`), zero-C++ MLIR parser (`parser.rs`) & printer (`mlir.rs`), symmetric **GGUF
-  v2/v3**, **ONNX-JSON**, and **SafeTensors** model importers & exporters (`import.rs`), and
-  computation graph visualization exporters (**Mermaid**, **Graphviz DOT**, **JSON**, **IR Diff**,
-  and **Interactive HTML Pass Timeline Debugger** in `viz.rs`).
-- [`src/passes`](src/passes): Unified `Pass`, `PassRegistry` (`src/passes/registry/`), and
-  `PassManager` with **21 canonical single-traversal A-to-B IR translator modules & presets** (`18
-  passes + 3 presets`), organized into modular pass packages (`src/passes/<pass>/`) and concise
-  pass modules under `src/passes/`, supporting static Rust construction, CLI pipeline strings
-  (`-p`), Unix pipes (`stdin -> stdout`), declarative TOML config files (`--config`), and
+  `Block`, `Region`, `Type`, `Attribute`, `Location`), core pass & pipeline infrastructure (`Pass`,
+  `PassManager`, `PassRegistry`, `PipelineConfig` in `pass_manager.rs`), unified IR verification,
+  structural hashing, equivalence, sanitization & Roofline profiling (`verify_ir/`), `TensorStore`
+  weight plane & `.safetensors` zero-copy I/O (`tensor_store.rs`), strongly-typed `StableHloOp` and
+  `FuncView` dialect views (`stablehlo.rs`), zero-C++ MLIR parser (`parser.rs`) & printer
+  (`mlir.rs`), symmetric **GGUF v2/v3**, **ONNX-JSON**, and **SafeTensors** model importers &
+  exporters (`import.rs`), and computation graph visualization exporters (**Mermaid**, **Graphviz
+  DOT**, **JSON**, **IR Diff**, and **Interactive HTML Pass Timeline Debugger** in `viz.rs`).
+- [`src/passes`](src/passes): Built-in `PassRegistry::with_builtin_passes()`
+  (`src/passes/registry/`) and **21 canonical single-traversal A-to-B IR translator modules &
+  presets** (`18 passes + 3 presets`), organized into modular pass packages (`src/passes/<pass>/`)
+  and concise pass modules under `src/passes/`, supporting static Rust construction, CLI pipeline
+  strings (`-p`), Unix pipes (`stdin -> stdout`), declarative TOML config files (`--config`), and
   step-by-step tracing.
 - [`src/codegen`](src/codegen): Liveness analyzer (`LivenessAnalysis`), greedy interval-coloring
   arena buffer planner (`MemoryPlan`), progressive `LoopModule` IR with unified
