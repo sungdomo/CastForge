@@ -298,10 +298,15 @@ impl MlirParser {
                 .strip_prefix("dense<")
                 .and_then(|s| s.strip_suffix('>'))
             {
-                let res_key = lhs_names
+                let base_key = lhs_names
                     .first()
                     .cloned()
                     .unwrap_or_else(|| format!("const_{}", module.tensor_store.len()));
+                let res_key = if module.tensor_store.get(&base_key).is_some() {
+                    format!("{}_{}", base_key, module.tensor_store.len())
+                } else {
+                    base_key
+                };
                 let num_elems = tensor_ty.num_elements().unwrap_or(1) as usize;
                 if let Some(f32_vals) = crate::ir::parse_dense_f32_literal(inner, num_elems) {
                     module.tensor_store.insert(crate::ir::TensorEntry::from_f32(
@@ -379,6 +384,43 @@ impl MlirParser {
                     "broadcast_dimensions"
                 };
                 attrs.insert(attr_key.to_string(), Attribute::DenseIntArray(nums));
+            } else if let Some(dim_rest) = item.strip_prefix("dim") {
+                let dim_rest = dim_rest.trim().trim_start_matches('=').trim();
+                if let Ok(d) = dim_rest.parse::<i64>() {
+                    attrs.insert("iota_dimension".to_string(), Attribute::Int(d));
+                }
+            } else if let Some(cd_rest) = item.strip_prefix("contracting_dims") {
+                let cd_rest = cd_rest.trim().trim_start_matches('=').trim();
+                if let Some((l_str, r_str)) = cd_rest.split_once('x') {
+                    let l_dims = parse_int_list(l_str);
+                    let r_dims = parse_int_list(r_str);
+                    if l_dims != [1] || r_dims != [0] {
+                        attrs.insert(
+                            "lhs_contracting_dimensions".to_string(),
+                            Attribute::DenseIntArray(l_dims),
+                        );
+                        attrs.insert(
+                            "rhs_contracting_dimensions".to_string(),
+                            Attribute::DenseIntArray(r_dims),
+                        );
+                    }
+                }
+            } else if let Some(bd_rest) = item.strip_prefix("batching_dims") {
+                let bd_rest = bd_rest.trim().trim_start_matches('=').trim();
+                if let Some((l_str, r_str)) = bd_rest.split_once('x') {
+                    let l_dims = parse_int_list(l_str);
+                    let r_dims = parse_int_list(r_str);
+                    if !l_dims.is_empty() || !r_dims.is_empty() {
+                        attrs.insert(
+                            "lhs_batching_dimensions".to_string(),
+                            Attribute::DenseIntArray(l_dims),
+                        );
+                        attrs.insert(
+                            "rhs_batching_dimensions".to_string(),
+                            Attribute::DenseIntArray(r_dims),
+                        );
+                    }
+                }
             } else if let Some(ssa) = item.strip_prefix('%') {
                 let val_id =
                     *self
@@ -440,6 +482,7 @@ impl MlirParser {
         line_no: usize,
     ) -> Result<BlockId, ParseError> {
         self.value_map.clear();
+        let (line, fn_loc) = extract_trailing_loc(line.trim().trim_end_matches('{').trim());
         let after_kw = line.trim_start_matches("func.func").trim();
         let is_private = after_kw.starts_with("private ");
         let at_idx = line.find('@').ok_or_else(|| ParseError::Syntax {
@@ -523,7 +566,7 @@ impl MlirParser {
             attrs,
             vec![fn_region],
             true,
-            Location::Unknown,
+            fn_loc,
         );
 
         Ok(fn_block)
@@ -574,7 +617,13 @@ impl MlirParser {
         let ty_part = after_parens[colon_idx + 1..].trim();
 
         let mut attrs = IndexMap::new();
-        if let Some(applies_rest) = spec_part.strip_prefix("applies") {
+        let spec_no_attrs = if let Some(brace_idx) = spec_part.find('{') {
+            parse_attr_dict(&spec_part[brace_idx..], &mut attrs);
+            spec_part[..brace_idx].trim()
+        } else {
+            spec_part
+        };
+        if let Some(applies_rest) = spec_no_attrs.strip_prefix("applies") {
             let applies_rest = applies_rest.trim();
             if let Some((reducer, dims_part)) = applies_rest.split_once("across") {
                 attrs.insert(
@@ -714,6 +763,16 @@ pub(crate) fn extract_trailing_loc(line: &str) -> (&str, Location) {
         let loc_part = line[idx + 5..].trim().trim_end_matches(')');
         let loc = if loc_part == "unknown" {
             Location::Unknown
+        } else if let Some(after_quote) = loc_part.strip_prefix('"')
+            && let Some((file, rest)) = after_quote.split_once("\":")
+            && let Some((l_str, c_str)) = rest.split_once(':')
+            && let (Ok(l), Ok(c)) = (l_str.parse::<u32>(), c_str.parse::<u32>())
+        {
+            Location::FileLineCol {
+                file: file.to_string(),
+                line: l,
+                col: c,
+            }
         } else {
             Location::Named(loc_part.trim_matches('"').to_string())
         };
@@ -854,9 +913,44 @@ pub(crate) fn parse_attribute_value(val_str: &str) -> Attribute {
             .filter_map(|x| x.trim().parse::<i64>().ok())
             .collect();
         Attribute::DenseIntArray(nums)
+    } else if let Some(arr_inner) = val_str
+        .strip_prefix("array<f64:")
+        .and_then(|s| s.strip_suffix('>'))
+    {
+        let nums = arr_inner
+            .split(',')
+            .filter_map(|x| x.trim().parse::<f64>().ok())
+            .collect();
+        Attribute::DenseF64Array(nums)
+    } else if val_str.starts_with('{') && val_str.ends_with('}') {
+        let mut dict = IndexMap::new();
+        parse_attr_dict(val_str, &mut dict);
+        Attribute::Dictionary(dict)
     } else if val_str.starts_with('[') && val_str.ends_with(']') {
-        let nums = parse_int_list(val_str);
-        Attribute::DenseIntArray(nums)
+        let inner = val_str[1..val_str.len() - 1].trim();
+        if inner.is_empty() {
+            return Attribute::DenseIntArray(Vec::new());
+        }
+        let items = split_top_level(inner, ',');
+        let mut int_vals = Vec::with_capacity(items.len());
+        let mut all_ints = true;
+        for tok in &items {
+            if let Ok(n) = tok.trim().parse::<i64>() {
+                int_vals.push(n);
+            } else {
+                all_ints = false;
+                break;
+            }
+        }
+        if all_ints {
+            Attribute::DenseIntArray(int_vals)
+        } else {
+            let parsed_items = items
+                .into_iter()
+                .map(|t| parse_attribute_value(t.trim()))
+                .collect();
+            Attribute::Array(parsed_items)
+        }
     } else if let Some(rest) = val_str.strip_prefix("dense_resource<") {
         if let Some((key_part, ty_part)) = rest.split_once('>') {
             let ty_str = ty_part.trim().trim_start_matches(':').trim();
@@ -932,6 +1026,17 @@ pub fn parse_type(s: &str, line_no: usize) -> Result<Type, ParseError> {
             results.push(parse_type(after_arrow, line_no)?);
         }
         return Ok(Type::Function { inputs, results });
+    }
+
+    if let Some(inner) = s.strip_prefix("tuple<").and_then(|x| x.strip_suffix('>')) {
+        let mut elems = Vec::new();
+        for item in split_top_level(inner, ',') {
+            let trimmed = item.trim();
+            if !trimmed.is_empty() {
+                elems.push(parse_type(trimmed, line_no)?);
+            }
+        }
+        return Ok(Type::Tuple(elems));
     }
 
     if let Some(inner) = s.strip_prefix("tensor<").and_then(|x| x.strip_suffix('>')) {
@@ -1023,5 +1128,35 @@ pub(crate) fn parse_dtype(s: &str) -> DType {
         "f64" => DType::F64,
         "index" => DType::Index,
         _ => DType::F32,
+    }
+}
+
+/// Parse an MLIR text string into a CastForge `Module`.
+pub fn parse_mlir(input: &str) -> Result<Module, ParseError> {
+    let mut parser = MlirParser::new();
+    parser.parse_module(input)
+}
+
+/// A-to-B Translator (`Text(MLIR) -> Ir(Module)`).
+#[derive(Default)]
+pub struct MlirParseTranslator;
+
+impl crate::ir::Translator for MlirParseTranslator {
+    fn name(&self) -> &str {
+        "parse-mlir"
+    }
+
+    fn input_kind(&self) -> &'static str {
+        "text"
+    }
+
+    fn output_kind(&self) -> &'static str {
+        "ir"
+    }
+
+    fn translate(&mut self, input: crate::ir::Payload) -> anyhow::Result<crate::ir::Payload> {
+        let src = input.into_text()?;
+        let module = parse_mlir(&src)?;
+        Ok(crate::ir::Payload::from_ir(module))
     }
 }

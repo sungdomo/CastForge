@@ -1,5 +1,5 @@
 use castforge::codegen::{CodegenTarget, generate_code, verify_module_numerics};
-use castforge::mlir::{parse_mlir, print_mlir};
+use castforge::ir::{parse_mlir, print_mlir};
 use castforge::passes::{PassManager, PassRegistry, analyze_roofline};
 
 const SINK_TRANSPOSE_MLIR: &str = r#"

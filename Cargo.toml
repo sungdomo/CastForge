@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sungdomo/CastForge"
-description = "Pure-Rust AI Model IR Transformation, Optimization, Visualization, and Code Generation Suite"
+description = "Pure-Rust AI Model IR Transformation, Optimization, Visualization, and Codegen"
 
 [lib]
 name = "castforge"

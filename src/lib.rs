@@ -6,4 +6,4 @@ pub mod codegen;
 pub mod ir;
 pub mod passes;
 
-pub use ir::{mlir, stablehlo, viz};
+pub use ir::{formats, parser, printer, stablehlo, verify, viz};

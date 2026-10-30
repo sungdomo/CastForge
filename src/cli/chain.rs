@@ -5,10 +5,10 @@ use crate::codegen::{
     HardwareRoofline, MemoryPlanTranslator, OptimizeLoopIrPass, OptimizeLoopIrTranslator,
     RooflineReportTranslator, SharedLibTranslator, SimdIsa, TargetConfig, TensorToLoopTranslator,
 };
-use crate::ir::{HfConfigImportTranslator, Payload, Translator, TranslatorChain};
-use crate::mlir::{
-    GgufExportTranslator, GgufImportTranslator, MlirParseTranslator, MlirPrintTranslator,
-    OnnxExportTranslator, OnnxImportTranslator, PrintOptions, SafetensorsExportTranslator,
+use crate::ir::{
+    GgufExportTranslator, GgufImportTranslator, HfConfigImportTranslator, MlirParseTranslator,
+    MlirPrintTranslator, OnnxExportTranslator, OnnxImportTranslator, Payload, PrintOptions,
+    SafetensorsExportTranslator, Translator, TranslatorChain,
 };
 use crate::passes::{PassRegistry, parse_pass_spec_item, split_pipeline_spec};
 use crate::viz::{IrDiffTranslator, SnapshotIrTranslator, VizFormat, VizTranslator};
@@ -571,7 +571,7 @@ mod tests {
         .unwrap();
         assert!(matches!(cli_passes.command, Commands::ListPasses { .. }));
 
-        let mod_ir = crate::mlir::parse_mlir(
+        let mod_ir = crate::ir::parse_mlir(
             r#"
             module @demo {
               func.func @main(%x: tensor<2x2xf32>) -> tensor<2x2xf32> {

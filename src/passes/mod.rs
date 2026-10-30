@@ -24,7 +24,7 @@ pub mod shard_distributed;
 pub mod simplify_algebraic;
 pub mod specialize_shapes;
 
-pub use crate::ir::{pass_manager::*, verify_ir::*};
+pub use crate::ir::{pass_manager::*, verify::*};
 pub use canonicalize::*;
 pub use cse::*;
 pub use dce::*;

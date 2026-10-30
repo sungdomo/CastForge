@@ -296,7 +296,7 @@ impl PassManager {
     /// Execute the configured pipeline on `module` and return execution logs per pass.
     pub fn run(&mut self, module: &mut Module) -> Result<Vec<PassResult>> {
         let mut history = Vec::new();
-        for _iter in 0..self.max_iterations {
+        for _iter in 0..self.max_iterations.max(1) {
             let mut any_changed = false;
             for pass in &mut self.passes {
                 let res = pass.run(module)?;
@@ -325,7 +325,7 @@ impl PassManager {
         });
 
         let mut step_idx = 1usize;
-        for _iter in 0..self.max_iterations {
+        for _iter in 0..self.max_iterations.max(1) {
             let mut any_changed = false;
             for pass in &mut self.passes {
                 let res = pass.run(module)?;
@@ -372,10 +372,16 @@ pub fn split_pipeline_spec(spec: &str) -> Vec<&str> {
 /// Parses a single `name(k1=v1,k2=v2)` stage specification into `(name, options)`.
 pub fn parse_pass_spec_item(item: &str) -> Result<(String, PassOptions)> {
     let mut opts = PassOptions::new();
+    let item = item.trim();
     if let Some(open) = item.find('(') {
         let close = item
             .rfind(')')
             .ok_or_else(|| anyhow!("Unclosed `(` in pass specification `{item}`"))?;
+        if !item[close + 1..].trim().is_empty() {
+            return Err(anyhow!(
+                "Unexpected trailing characters after `)` in pass specification `{item}`"
+            ));
+        }
         let name = item[..open].trim().to_string();
         let inner = &item[open + 1..close];
         for kv in inner.split(',') {
@@ -386,11 +392,12 @@ pub fn parse_pass_spec_item(item: &str) -> Result<(String, PassOptions)> {
             let (k, v) = kv
                 .split_once('=')
                 .ok_or_else(|| anyhow!("Expected `key=value` option in `{item}`"))?;
-            opts.insert(k.trim().to_string(), v.trim().to_string());
+            let clean_val = v.trim().trim_matches('"').trim_matches('\'').to_string();
+            opts.insert(k.trim().to_string(), clean_val);
         }
         Ok((name, opts))
     } else {
-        Ok((item.trim().to_string(), opts))
+        Ok((item.to_string(), opts))
     }
 }
 
@@ -564,5 +571,6 @@ fn is_known_pass_option_alias(key: &str) -> bool {
             | "format"
             | "name"
             | "count"
+            | "min_elements"
     )
 }

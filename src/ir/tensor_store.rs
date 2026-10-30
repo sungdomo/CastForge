@@ -89,7 +89,7 @@ pub fn f32_to_f16_bits(val: f32) -> u16 {
     if new_exp >= 31 {
         sign | 0x7c00
     } else if new_exp <= 0 {
-        0
+        sign
     } else {
         sign | ((new_exp as u16) << 10) | ((mant >> 13) as u16)
     }
@@ -130,6 +130,25 @@ pub fn parse_dense_f32_literal(raw_literal: &str, expected_len: usize) -> Option
     Some(vals)
 }
 
+fn format_nd_slice<T, F>(values: &[T], dims: &[usize], fmt_elem: &F) -> String
+where
+    F: Fn(&T) -> String,
+{
+    if dims.len() <= 1 {
+        let elems: Vec<String> = values.iter().map(fmt_elem).collect();
+        return format!("[{}]", elems.join(", "));
+    }
+    let outer = dims[0];
+    let inner_stride: usize = dims[1..].iter().product();
+    let mut parts = Vec::with_capacity(outer);
+    for i in 0..outer {
+        let start = i * inner_stride;
+        let end = start + inner_stride;
+        parts.push(format_nd_slice(&values[start..end], &dims[1..], fmt_elem));
+    }
+    format!("[{}]", parts.join(", "))
+}
+
 /// Format a slice of `f32` or `i8` values as an MLIR `dense<...>` literal matching `shape`.
 pub fn format_dense_f32_literal(values: &[f32], shape: &[Dim]) -> String {
     if values.is_empty() {
@@ -147,16 +166,11 @@ pub fn format_dense_f32_literal(values: &[f32], shape: &[Dim]) -> String {
             _ => None,
         })
         .collect();
-    if static_dims.len() == 2 && static_dims[0] * static_dims[1] == values.len() {
-        let rows = static_dims[0];
-        let cols = static_dims[1];
-        let mut row_strs = Vec::with_capacity(rows);
-        for r in 0..rows {
-            let slice = &values[r * cols..(r + 1) * cols];
-            let elems: Vec<String> = slice.iter().map(|v| format!("{v:?}")).collect();
-            row_strs.push(format!("[{}]", elems.join(", ")));
-        }
-        format!("[{}]", row_strs.join(", "))
+    if static_dims.len() >= 2
+        && static_dims.len() == shape.len()
+        && static_dims.iter().product::<usize>() == values.len()
+    {
+        format_nd_slice(values, &static_dims, &|v| format!("{v:?}"))
     } else {
         let elems: Vec<String> = values.iter().map(|v| format!("{v:?}")).collect();
         format!("[{}]", elems.join(", "))
@@ -178,16 +192,11 @@ pub fn format_dense_i8_literal(values: &[i8], shape: &[Dim]) -> String {
             _ => None,
         })
         .collect();
-    if static_dims.len() == 2 && static_dims[0] * static_dims[1] == values.len() {
-        let rows = static_dims[0];
-        let cols = static_dims[1];
-        let mut row_strs = Vec::with_capacity(rows);
-        for r in 0..rows {
-            let slice = &values[r * cols..(r + 1) * cols];
-            let elems: Vec<String> = slice.iter().map(|v| v.to_string()).collect();
-            row_strs.push(format!("[{}]", elems.join(", ")));
-        }
-        format!("[{}]", row_strs.join(", "))
+    if static_dims.len() >= 2
+        && static_dims.len() == shape.len()
+        && static_dims.iter().product::<usize>() == values.len()
+    {
+        format_nd_slice(values, &static_dims, &|v| v.to_string())
     } else {
         let elems: Vec<String> = values.iter().map(|v| v.to_string()).collect();
         format!("[{}]", elems.join(", "))
@@ -315,6 +324,12 @@ impl TensorStore {
                     })
                     .collect(),
             )
+        } else if bytes.len() == expected_len {
+            if matches!(dtype, DType::U8) {
+                Some(bytes.iter().map(|&b| b as f32).collect())
+            } else {
+                Some(bytes.iter().map(|&b| (b as i8) as f32).collect())
+            }
         } else {
             None
         }
@@ -427,7 +442,41 @@ impl TensorStore {
                         },
                     );
                 }
-                _ => {}
+                TensorBacking::ExternalFile {
+                    path,
+                    offset,
+                    length,
+                } => {
+                    let file_bytes = std::fs::read(path)?;
+                    let s = *offset as usize;
+                    let e = s.saturating_add(*length as usize);
+                    let slice = file_bytes.get(s..e).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!("ExternalFile slice out of bounds for {name}"),
+                        )
+                    })?;
+                    data_buf.extend_from_slice(slice);
+                    let dtype_str = match entry.ty.dtype {
+                        DType::F16 => "F16",
+                        DType::BF16 => "BF16",
+                        DType::I8 => "I8",
+                        DType::U8 => "U8",
+                        _ => "F32",
+                    };
+                    let end = data_buf.len();
+                    headers.insert(
+                        name.clone(),
+                        SafeTensorEntryHeader {
+                            dtype: dtype_str.to_string(),
+                            shape,
+                            data_offsets: [start, end],
+                            scale: None,
+                            zero_point: None,
+                        },
+                    );
+                }
+                TensorBacking::Symbolic => {}
             }
         }
 

@@ -6,9 +6,8 @@ use crate::codegen::{
 };
 use crate::ir::{
     Attribute, BlockId, Module, TensorStore, import_gguf_file, import_hf_model_dir,
-    import_onnx_file,
+    import_onnx_file, parse_mlir,
 };
-use crate::mlir::parse_mlir;
 use crate::passes::{PassManager, PassRegistry};
 use anyhow::{Context, Result};
 use indexmap::IndexMap;

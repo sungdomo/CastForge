@@ -809,14 +809,121 @@ pub fn verify_stablehlo_shapes(module: &Module, op_id: OpId) -> Result<(), Strin
                 return Ok(());
             };
             for &bdim in &broadcast_dimensions {
-                if (bdim as usize) >= out_ty.rank() {
+                if bdim < 0 || (bdim as usize) >= out_ty.rank() {
                     return Err(format!(
                         "stablehlo.broadcast_in_dim axis {bdim} out of bounds for rank {}",
                         out_ty.rank()
                     ));
                 }
             }
-            let _ = in_ty;
+            if broadcast_dimensions.len() == in_ty.rank() {
+                for (in_axis, &bdim) in broadcast_dimensions.iter().enumerate() {
+                    if let (Some(Dim::Static(in_d)), Some(Dim::Static(out_d))) =
+                        (in_ty.shape.get(in_axis), out_ty.shape.get(bdim as usize))
+                        && *in_d != 1
+                        && in_d != out_d
+                    {
+                        return Err(format!(
+                            "stablehlo.broadcast_in_dim dim mismatch at axis {in_axis} -> {bdim}: \
+                             {in_d} vs {out_d}"
+                        ));
+                    }
+                }
+            }
+        }
+        StableHloOp::Iota {
+            iota_dimension,
+            result,
+        } => {
+            if let Some(out_ty) = module.values[result].ty.as_tensor()
+                && out_ty.rank() > 0
+                && (iota_dimension < 0 || (iota_dimension as usize) >= out_ty.rank())
+            {
+                return Err(format!(
+                    "stablehlo.iota dim {iota_dimension} out of bounds for rank {}",
+                    out_ty.rank()
+                ));
+            }
+        }
+        StableHloOp::Reduce {
+            inputs, dimensions, ..
+        } => {
+            if let Some(&inp) = inputs.first()
+                && let Some(in_ty) = module.values[inp].ty.as_tensor()
+            {
+                for &dim in &dimensions {
+                    if dim < 0 || (dim as usize) >= in_ty.rank() {
+                        return Err(format!(
+                            "stablehlo.reduce dimension {dim} out of bounds for rank {}",
+                            in_ty.rank()
+                        ));
+                    }
+                }
+            }
+        }
+        StableHloOp::Exp { operand, result }
+        | StableHloOp::Tanh { operand, result }
+        | StableHloOp::Rsqrt { operand, result }
+        | StableHloOp::Sqrt { operand, result }
+        | StableHloOp::Log { operand, result }
+        | StableHloOp::Sine { operand, result }
+        | StableHloOp::Cosine { operand, result }
+        | StableHloOp::Abs { operand, result }
+        | StableHloOp::Negate { operand, result }
+        | StableHloOp::Logistic { operand, result } => {
+            if let (Some(in_ty), Some(out_ty)) = (
+                module.values[operand].ty.as_tensor(),
+                module.values[result].ty.as_tensor(),
+            ) {
+                if in_ty.rank() != out_ty.rank() {
+                    return Err(format!(
+                        "{} rank mismatch: {} vs {}",
+                        op.name,
+                        in_ty.rank(),
+                        out_ty.rank()
+                    ));
+                }
+                for (i, (a, b)) in in_ty.shape.iter().zip(out_ty.shape.iter()).enumerate() {
+                    if let (Dim::Static(da), Dim::Static(db)) = (a, b)
+                        && da != db
+                    {
+                        return Err(format!(
+                            "{} dim mismatch at axis {i}: {da} vs {db}",
+                            op.name
+                        ));
+                    }
+                }
+            }
+        }
+        StableHloOp::Add { lhs, rhs, result }
+        | StableHloOp::Subtract { lhs, rhs, result }
+        | StableHloOp::Multiply { lhs, rhs, result }
+        | StableHloOp::Divide { lhs, rhs, result }
+        | StableHloOp::Maximum { lhs, rhs, result }
+        | StableHloOp::Minimum { lhs, rhs, result }
+        | StableHloOp::Power { lhs, rhs, result }
+        | StableHloOp::Compare {
+            lhs, rhs, result, ..
+        } => {
+            if let (Some(l_ty), Some(r_ty), Some(out_ty)) = (
+                module.values[lhs].ty.as_tensor(),
+                module.values[rhs].ty.as_tensor(),
+                module.values[result].ty.as_tensor(),
+            ) && l_ty.rank() == r_ty.rank()
+                && l_ty.rank() == out_ty.rank()
+            {
+                for i in 0..out_ty.rank() {
+                    if let (Dim::Static(dl), Dim::Static(dr), Dim::Static(do_)) =
+                        (&l_ty.shape[i], &r_ty.shape[i], &out_ty.shape[i])
+                        && ((*dl != *do_ && *dl != 1) || (*dr != *do_ && *dr != 1))
+                    {
+                        return Err(format!(
+                            "{} incompatible dims at axis {i}: lhs={dl}, rhs={dr}, out={do_}",
+                            op.name
+                        ));
+                    }
+                }
+            }
         }
         _ => {}
     }

@@ -1,14 +1,6 @@
-//! Pure-Rust MLIR printer and MLIR/ONNX/GGUF A-to-B translators (`castforge::ir::mlir`).
+//! Pure-Rust MLIR printer and `MlirPrintTranslator` (`castforge::ir::printer`).
 
-pub use crate::ir::import::{
-    GgmlType, GgufExportTranslator, OnnxExportTranslator, OnnxJsonInitializer, OnnxJsonModel,
-    OnnxJsonNode, OnnxJsonValueInfo, SafetensorsExportTranslator, collect_module_tensors,
-    export_gguf_bytes, export_gguf_file, export_onnx_file, export_onnx_json, import_gguf_bytes,
-    import_gguf_file, import_onnx_file, import_onnx_json,
-};
-pub use crate::ir::parser::{MlirParser, ParseError, parse_type};
-
-use crate::ir::{Attribute, BlockId, Module, OpId, Type, ValueId};
+use crate::ir::{Attribute, Module, OpId, Type, ValueId};
 use std::collections::HashMap;
 use std::fmt::{self, Write};
 
@@ -163,48 +155,42 @@ impl<'a> MlirPrinter<'a> {
                 .unwrap_or_default();
             write!(
                 out,
-                "stablehlo.transpose {}, dims = [{}] : ({}) -> {}",
+                "stablehlo.transpose {}, dims = [{}]",
                 operand_names.join(", "),
-                dims,
-                in_ty,
-                out_ty
+                dims
             )?;
+            self.print_extra_attrs(out, &op.attributes, &["permutation"])?;
+            write!(out, " : ({in_ty}) -> {out_ty}")?;
         } else if op.is_op("stablehlo", "reshape") && op.results.len() == 1 {
             let in_ty = &operand_types[0];
             let out_ty = &result_types[0];
-            write!(
-                out,
-                "stablehlo.reshape {} : ({}) -> {}",
-                operand_names.join(", "),
-                in_ty,
-                out_ty
-            )?;
+            write!(out, "stablehlo.reshape {}", operand_names.join(", "))?;
+            self.print_extra_attrs(out, &op.attributes, &[])?;
+            write!(out, " : ({in_ty}) -> {out_ty}")?;
         } else if op.is_op("stablehlo", "convert") && op.results.len() == 1 {
             let in_ty = &operand_types[0];
             let out_ty = &result_types[0];
-            write!(
-                out,
-                "stablehlo.convert {} : ({}) -> {}",
-                operand_names.join(", "),
-                in_ty,
-                out_ty
-            )?;
+            write!(out, "stablehlo.convert {}", operand_names.join(", "))?;
+            self.print_extra_attrs(out, &op.attributes, &[])?;
+            write!(out, " : ({in_ty}) -> {out_ty}")?;
         } else if op.is_op("stablehlo", "uniform_dequantize") && op.results.len() == 1 {
             let in_ty = &operand_types[0];
             let out_ty = &result_types[0];
             write!(
                 out,
-                "stablehlo.uniform_dequantize {} : ({}) -> {}",
-                operand_names.join(", "),
-                in_ty,
-                out_ty
+                "stablehlo.uniform_dequantize {}",
+                operand_names.join(", ")
             )?;
+            self.print_extra_attrs(out, &op.attributes, &[])?;
+            write!(out, " : ({in_ty}) -> {out_ty}")?;
         } else if op.is_op("stablehlo", "iota") && op.results.len() == 1 {
             let dim = match op.attributes.get("iota_dimension") {
                 Some(Attribute::Int(d)) => *d,
                 _ => 0,
             };
-            write!(out, "stablehlo.iota dim = {} : {}", dim, result_types[0])?;
+            write!(out, "stablehlo.iota dim = {dim}")?;
+            self.print_extra_attrs(out, &op.attributes, &["iota_dimension"])?;
+            write!(out, " : {}", result_types[0])?;
         } else if op.is_op("stablehlo", "reduce")
             && op.operands.len() == 2
             && op.results.len() == 1
@@ -234,8 +220,10 @@ impl<'a> MlirPrinter<'a> {
             write!(
                 out,
                 "stablehlo.reduce({lhs} init: {init}) applies {reducer} \
-                 across dimensions = [{dims}] : ({in0}, {in1}) -> {res0}"
+                 across dimensions = [{dims}]"
             )?;
+            self.print_extra_attrs(out, &op.attributes, &["reducer", "dimensions"])?;
+            write!(out, " : ({in0}, {in1}) -> {res0}")?;
         } else if op.is_op("stablehlo", "broadcast_in_dim") && op.results.len() == 1 {
             let in_ty = &operand_types[0];
             let out_ty = &result_types[0];
@@ -252,12 +240,12 @@ impl<'a> MlirPrinter<'a> {
                 .unwrap_or_default();
             write!(
                 out,
-                "stablehlo.broadcast_in_dim {}, dims = [{}] : ({}) -> {}",
+                "stablehlo.broadcast_in_dim {}, dims = [{}]",
                 operand_names.join(", "),
-                dims,
-                in_ty,
-                out_ty
+                dims
             )?;
+            self.print_extra_attrs(out, &op.attributes, &["broadcast_dimensions"])?;
+            write!(out, " : ({in_ty}) -> {out_ty}")?;
         } else if op.name.dialect == "stablehlo"
             && op.results.len() == 1
             && !operand_types.is_empty()
@@ -288,8 +276,26 @@ impl<'a> MlirPrinter<'a> {
             write!(out, " : {fn_ty}")?;
         }
 
+        let op_regions = op.regions.clone();
+        let op_loc = op.location.clone();
+        if !op_regions.is_empty() {
+            writeln!(out, " {{")?;
+            for reg_id in op_regions {
+                if let Some(reg) = self.module.regions.get(reg_id) {
+                    let blocks = reg.blocks.clone();
+                    for blk_id in blocks {
+                        let ops = self.module.blocks[blk_id].ops.clone();
+                        for child_op in ops {
+                            self.print_op(out, child_op, indent + 1)?;
+                        }
+                    }
+                }
+            }
+            write!(out, "{pad}}}")?;
+        }
+
         if self.opts.print_locations {
-            write!(out, " {}", op.location)?;
+            write!(out, " {op_loc}")?;
         }
         writeln!(out)?;
         Ok(())
@@ -304,8 +310,12 @@ impl<'a> MlirPrinter<'a> {
             .and_then(|a| a.as_str())
             .unwrap_or("main");
 
-        let fn_reg = op.regions[0];
-        let entry_block: BlockId = self.module.regions[fn_reg].blocks[0];
+        let Some(&fn_reg) = op.regions.first() else {
+            return Ok(());
+        };
+        let Some(&entry_block) = self.module.regions[fn_reg].blocks.first() else {
+            return Ok(());
+        };
         let args = &self.module.blocks[entry_block].arguments;
 
         let mut arg_strs = Vec::with_capacity(args.len());
@@ -332,9 +342,15 @@ impl<'a> MlirPrinter<'a> {
             _ => "",
         };
 
+        let loc_str = if self.opts.print_locations {
+            format!(" {}", op.location)
+        } else {
+            String::new()
+        };
+
         writeln!(
             out,
-            "{pad}func.func {vis_str}@{sym_name}({}){ret_str} {{",
+            "{pad}func.func {vis_str}@{sym_name}({}){ret_str}{loc_str} {{",
             arg_strs.join(", ")
         )?;
 
@@ -345,6 +361,29 @@ impl<'a> MlirPrinter<'a> {
 
         writeln!(out, "{pad}}}")?;
         Ok(())
+    }
+
+    fn print_extra_attrs(
+        &self,
+        out: &mut String,
+        attrs: &indexmap::IndexMap<String, Attribute>,
+        skip_keys: &[&str],
+    ) -> fmt::Result {
+        let extra: Vec<(&String, &Attribute)> = attrs
+            .iter()
+            .filter(|(k, _)| !skip_keys.contains(&k.as_str()))
+            .collect();
+        if extra.is_empty() {
+            return Ok(());
+        }
+        write!(out, " {{")?;
+        for (i, (k, v)) in extra.iter().enumerate() {
+            if i > 0 {
+                write!(out, ", ")?;
+            }
+            write!(out, "{k} = {v}")?;
+        }
+        write!(out, "}}")
     }
 
     fn print_attr_dict(
@@ -363,12 +402,6 @@ impl<'a> MlirPrinter<'a> {
     }
 }
 
-/// Parse an MLIR text string into a CastForge `Module`.
-pub fn parse_mlir(input: &str) -> Result<Module, ParseError> {
-    let mut parser = MlirParser::new();
-    parser.parse_module(input)
-}
-
 /// Format a CastForge `Module` into MLIR text with default pretty syntax.
 pub fn print_mlir(module: &Module) -> String {
     let mut printer = MlirPrinter::new(module, PrintOptions::default());
@@ -379,30 +412,6 @@ pub fn print_mlir(module: &Module) -> String {
 pub fn print_mlir_with_options(module: &Module, opts: PrintOptions) -> String {
     let mut printer = MlirPrinter::new(module, opts);
     printer.print_module().unwrap_or_default()
-}
-
-/// A-to-B Translator (`Text(MLIR) -> Ir(Module)`).
-#[derive(Default)]
-pub struct MlirParseTranslator;
-
-impl crate::ir::Translator for MlirParseTranslator {
-    fn name(&self) -> &str {
-        "parse-mlir"
-    }
-
-    fn input_kind(&self) -> &'static str {
-        "text"
-    }
-
-    fn output_kind(&self) -> &'static str {
-        "ir"
-    }
-
-    fn translate(&mut self, input: crate::ir::Payload) -> anyhow::Result<crate::ir::Payload> {
-        let src = input.into_text()?;
-        let module = parse_mlir(&src)?;
-        Ok(crate::ir::Payload::from_ir(module))
-    }
 }
 
 /// A-to-B Translator (`Ir(Module) -> Text(MLIR)`).
@@ -430,53 +439,5 @@ impl crate::ir::Translator for MlirPrintTranslator {
             &module,
             self.options,
         )))
-    }
-}
-
-/// A-to-B Translator (`Text(ONNX-JSON) -> Ir(Module)`).
-#[derive(Default)]
-pub struct OnnxImportTranslator;
-
-impl crate::ir::Translator for OnnxImportTranslator {
-    fn name(&self) -> &str {
-        "import-onnx"
-    }
-
-    fn input_kind(&self) -> &'static str {
-        "text"
-    }
-
-    fn output_kind(&self) -> &'static str {
-        "ir"
-    }
-
-    fn translate(&mut self, input: crate::ir::Payload) -> anyhow::Result<crate::ir::Payload> {
-        let src = input.into_text()?;
-        let module = import_onnx_json(&src)?;
-        Ok(crate::ir::Payload::from_ir(module))
-    }
-}
-
-/// A-to-B Translator (`Bytes(GGUF) -> Ir(Module)`).
-#[derive(Default)]
-pub struct GgufImportTranslator;
-
-impl crate::ir::Translator for GgufImportTranslator {
-    fn name(&self) -> &str {
-        "import-gguf"
-    }
-
-    fn input_kind(&self) -> &'static str {
-        "bytes"
-    }
-
-    fn output_kind(&self) -> &'static str {
-        "ir"
-    }
-
-    fn translate(&mut self, input: crate::ir::Payload) -> anyhow::Result<crate::ir::Payload> {
-        let bytes = input.into_bytes()?;
-        let module = import_gguf_bytes(&bytes)?;
-        Ok(crate::ir::Payload::from_ir(module))
     }
 }

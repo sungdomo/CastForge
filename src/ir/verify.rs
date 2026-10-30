@@ -22,6 +22,7 @@ impl Pass for VerifyShapesPass {
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        module.verify()?;
         for (op_id, _) in &module.ops {
             if let Err(msg) = verify_stablehlo_shapes(module, op_id) {
                 return Err(anyhow!(msg));
@@ -200,9 +201,38 @@ pub fn compute_structural_hash(module: &Module) -> u64 {
 
     for (name, entry) in module.tensor_store.iter() {
         mix(name.as_bytes());
-        if let Some(vals) = entry.as_f32_slice() {
-            for &v in vals {
-                mix(&v.to_bits().to_le_bytes());
+        mix(entry.ty.to_string().as_bytes());
+        match &entry.backing {
+            crate::ir::TensorBacking::F32Data(vals) => {
+                for &v in vals {
+                    mix(&v.to_bits().to_le_bytes());
+                }
+            }
+            crate::ir::TensorBacking::QuantizedI8 {
+                data,
+                scale,
+                zero_point,
+            } => {
+                mix(&scale.to_bits().to_le_bytes());
+                mix(&zero_point.to_le_bytes());
+                for &q in data {
+                    mix(&[q as u8]);
+                }
+            }
+            crate::ir::TensorBacking::InMemory(bytes) => {
+                mix(bytes);
+            }
+            crate::ir::TensorBacking::ExternalFile {
+                path,
+                offset,
+                length,
+            } => {
+                mix(path.to_string_lossy().as_bytes());
+                mix(&offset.to_le_bytes());
+                mix(&length.to_le_bytes());
+            }
+            crate::ir::TensorBacking::Symbolic => {
+                mix(b"symbolic");
             }
         }
     }
@@ -297,6 +327,15 @@ impl Pass for VerifyEquivPass {
                         blk_args.len()
                     );
                 }
+                for (i, (expected_ty, &arg_id)) in inputs.iter().zip(blk_args.iter()).enumerate() {
+                    let actual_ty = &module.values[arg_id].ty;
+                    if expected_ty != actual_ty {
+                        bail!(
+                            "Function input {i} type mismatch: signature has {expected_ty} vs \
+                             block arg {actual_ty}"
+                        );
+                    }
+                }
                 if let Some(&ret_id) = module.blocks[blk_id]
                     .ops
                     .iter()
@@ -309,6 +348,17 @@ impl Pass for VerifyEquivPass {
                             results.len(),
                             ret_opnds.len()
                         );
+                    }
+                    for (i, (expected_ty, &ret_val)) in
+                        results.iter().zip(ret_opnds.iter()).enumerate()
+                    {
+                        let actual_ty = &module.values[ret_val].ty;
+                        if expected_ty != actual_ty {
+                            bail!(
+                                "Function result {i} type mismatch: signature has {expected_ty} \
+                                 vs return operand {actual_ty}"
+                            );
+                        }
                     }
                 }
             }
@@ -422,8 +472,12 @@ impl Pass for SanitizeNumericsPass {
         let eps = self.eps.abs().max(1e-12);
 
         for fn_op_id in module.functions() {
-            let reg_id = module.ops[fn_op_id].regions[0];
-            let block_id = module.regions[reg_id].blocks[0];
+            let Some(&reg_id) = module.ops[fn_op_id].regions.first() else {
+                continue;
+            };
+            let Some(&block_id) = module.regions[reg_id].blocks.first() else {
+                continue;
+            };
             let ops = module.blocks[block_id].ops.clone();
 
             for op_id in ops {
@@ -589,21 +643,43 @@ fn op_flops_and_bytes(module: &Module, op: &Operation) -> (i64, i64) {
     if op.is_op("stablehlo", "dot_general") && op.operands.len() >= 2 {
         let lhs_ty = module.values[op.operands[0]].ty.as_tensor();
         let rhs_ty = module.values[op.operands[1]].ty.as_tensor();
-        if let (Some(l), Some(r)) = (lhs_ty, rhs_ty)
-            && let (Some(Dim::Static(m)), Some(Dim::Static(k)), Some(Dim::Static(n))) =
+        if let (Some(l), Some(r)) = (lhs_ty, rhs_ty) {
+            if let (Some(Dim::Static(m)), Some(Dim::Static(k)), Some(Dim::Static(n))) =
                 (l.shape.first(), l.shape.get(1), r.shape.get(1))
-        {
-            return (2 * m * k * n, bytes);
+                && l.shape.len() == 2
+                && r.shape.len() == 2
+            {
+                return (2 * m * k * n, bytes);
+            }
+            if let Some(Dim::Static(k)) = l.shape.last() {
+                return (2 * out_elems * k, bytes);
+            }
         }
     }
 
-    if op.is_op("stablehlo", "composite") {
-        let name = op
-            .attributes
+    if op.is_op("stablehlo", "convolution") && op.operands.len() >= 2 {
+        if let Some(rhs_ty) = module.values[op.operands[1]].ty.as_tensor() {
+            let k_elems = rhs_ty.num_elements().unwrap_or(1).max(1);
+            return (2 * out_elems * k_elems, bytes);
+        }
+    }
+
+    let comp_name = if op.is_op("stablehlo", "composite") {
+        op.attributes
             .get("name")
             .and_then(|a| a.as_str())
-            .unwrap_or("");
-        if name == "castforge.fused_matmul_epilogue" && op.operands.len() >= 2 {
+            .unwrap_or("")
+    } else if op.name.dialect == "castforge" {
+        op.name.name.as_str()
+    } else {
+        ""
+    };
+
+    if !comp_name.is_empty() {
+        let short = comp_name.strip_prefix("castforge.").unwrap_or(comp_name);
+        if matches!(short, "fused_matmul_epilogue" | "fused_dequant_matmul")
+            && op.operands.len() >= 2
+        {
             let lhs_ty = module.values[op.operands[0]].ty.as_tensor();
             let rhs_ty = module.values[op.operands[1]].ty.as_tensor();
             if let (Some(l), Some(r)) = (lhs_ty, rhs_ty)
@@ -612,8 +688,29 @@ fn op_flops_and_bytes(module: &Module, op: &Operation) -> (i64, i64) {
             {
                 return (2 * m * k * n + 2 * m * n, bytes);
             }
-        } else if name == "castforge.fused_softmax" || name == "castforge.fused_rmsnorm" {
+        } else if matches!(
+            short,
+            "fused_softmax"
+                | "fused_log_softmax"
+                | "fused_rmsnorm"
+                | "fused_layernorm"
+                | "fused_residual_rmsnorm"
+        ) {
             return (out_elems * 5, bytes);
+        } else if matches!(short, "fma" | "fused_add_max") {
+            return (out_elems * 2, bytes);
+        } else if matches!(short, "fused_attention" | "flash_attention" | "attention") {
+            let seq = op
+                .results
+                .first()
+                .and_then(|&v| module.values[v].ty.as_tensor())
+                .and_then(|t| match t.shape.first() {
+                    Some(Dim::Static(s)) => Some(*s),
+                    _ => None,
+                })
+                .unwrap_or(1)
+                .max(1);
+            return (4 * seq * out_elems, bytes);
         }
     }
 
@@ -701,8 +798,12 @@ impl Pass for InstrumentProfilingPass {
         let mut created = 0usize;
 
         for fn_id in module.functions() {
-            let reg_id = module.ops[fn_id].regions[0];
-            let block_id = module.regions[reg_id].blocks[0];
+            let Some(&reg_id) = module.ops[fn_id].regions.first() else {
+                continue;
+            };
+            let Some(&block_id) = module.regions[reg_id].blocks.first() else {
+                continue;
+            };
             let ops = module.blocks[block_id].ops.clone();
 
             for op_id in ops {

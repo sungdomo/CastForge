@@ -3,7 +3,7 @@ use castforge::codegen::{
     analyze_module_cost_with_roofline, build_memory_plan, evaluate_module, generate_code,
     generate_code_with_config, verify_module_numerics,
 };
-use castforge::mlir::{parse_mlir, print_mlir};
+use castforge::ir::{parse_mlir, print_mlir};
 use castforge::passes::{PassManager, PassRegistry};
 
 #[test]
@@ -571,7 +571,7 @@ module @conv_model {
 #[test]
 fn test_frontend_importers_autodiff_and_native_jit() {
     use castforge::codegen::{autotune_module_jit, jit_execute_and_benchmark};
-    use castforge::mlir::{export_gguf_bytes, import_gguf_bytes, import_onnx_json};
+    use castforge::ir::{export_gguf_bytes, import_gguf_bytes, import_onnx_json};
 
     // 1. Test ONNX-JSON Frontend Importer + GGUF v3 Binary Round-Trip
     let onnx_json = r#"{
@@ -971,8 +971,7 @@ module @parallel_branches {
 #[test]
 fn test_modular_a_to_b_translator_chain_and_loop_ir_passes() {
     use castforge::codegen::CodegenTranslator;
-    use castforge::ir::{Payload, TranslatorChain};
-    use castforge::mlir::MlirParseTranslator;
+    use castforge::ir::{MlirParseTranslator, Payload, TranslatorChain};
     use castforge::passes::{
         PassTranslator, PermuteLoopsPass, TileLoopsPass, UnrollLoopsPass, VectorizeLoopsPass,
     };
@@ -1056,10 +1055,9 @@ fn test_symmetric_model_exports_loop_ir_gpu_backends_autotune_and_diff_translato
         OptimizeLoopIrTranslator, RooflineReportTranslator, SharedLibTranslator,
         TensorToLoopTranslator,
     };
-    use castforge::ir::{Payload, TranslatorChain};
-    use castforge::mlir::{
+    use castforge::ir::{
         GgufExportTranslator, GgufImportTranslator, MlirParseTranslator, OnnxExportTranslator,
-        OnnxImportTranslator, SafetensorsExportTranslator,
+        OnnxImportTranslator, Payload, SafetensorsExportTranslator, TranslatorChain,
     };
     use castforge::passes::PassRegistry;
     use castforge::viz::{IrDiffTranslator, SnapshotIrTranslator};

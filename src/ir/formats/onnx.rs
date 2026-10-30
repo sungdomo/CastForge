@@ -144,13 +144,26 @@ pub fn import_onnx_json(json_str: &str) -> Result<Module> {
                     .cloned()
                     .unwrap_or_else(|| vec![1, 1]);
                 let in1_ty = format!("tensor<{}xf32>", fmt_shape(&in1_sh));
+                let trans_a = node
+                    .attrs
+                    .get("transA")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let trans_b = node
+                    .attrs
+                    .get("transB")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let lhs_c = if trans_a != 0 { 0 } else { 1 };
+                let rhs_c = if trans_b != 0 { 1 } else { 0 };
                 if node.op_type == "Gemm" && node.inputs.len() >= 3 {
                     let mm_tmp = format!("{out_name}_mm");
                     let bias = sanitize_name(&node.inputs[2]);
                     writeln!(
                         mlir,
                         "    %{mm_tmp} = stablehlo.dot_general %{in0}, %{in1}, \
-                         contracting_dims = [1] x [0] : ({in0_ty}, {in1_ty}) -> {out_ty}"
+                         contracting_dims = [{lhs_c}] x [{rhs_c}] \
+                         : ({in0_ty}, {in1_ty}) -> {out_ty}"
                     )?;
                     writeln!(
                         mlir,
@@ -160,7 +173,8 @@ pub fn import_onnx_json(json_str: &str) -> Result<Module> {
                     writeln!(
                         mlir,
                         "    %{out_name} = stablehlo.dot_general %{in0}, %{in1}, \
-                         contracting_dims = [1] x [0] : ({in0_ty}, {in1_ty}) -> {out_ty}"
+                         contracting_dims = [{lhs_c}] x [{rhs_c}] \
+                         : ({in0_ty}, {in1_ty}) -> {out_ty}"
                     )?;
                 }
             }
@@ -349,11 +363,37 @@ pub fn import_onnx_json(json_str: &str) -> Result<Module> {
                     .cloned()
                     .unwrap_or_else(|| vec![1, 1, 1, 1]);
                 let in1_ty = format!("tensor<{}xf32>", fmt_shape(&in1_sh));
+                let strides: Vec<String> = node
+                    .attrs
+                    .get("strides")
+                    .or_else(|| node.attrs.get("window_strides"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_i64())
+                            .map(|d| d.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_else(|| vec!["1".to_string(), "1".to_string()]);
+                let pads: Vec<String> = node
+                    .attrs
+                    .get("pads")
+                    .or_else(|| node.attrs.get("padding"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_i64())
+                            .map(|d| d.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_else(|| vec!["0".to_string(), "0".to_string()]);
                 writeln!(
                     mlir,
                     "    %{out_name} = stablehlo.convolution %{in0}, %{in1} \
-                     {{window_strides = [1, 1], padding = [0, 0]}} \
-                     : ({in0_ty}, {in1_ty}) -> {out_ty}"
+                     {{window_strides = [{}], padding = [{}]}} \
+                     : ({in0_ty}, {in1_ty}) -> {out_ty}",
+                    strides.join(", "),
+                    pads.join(", ")
                 )?;
             }
             "Softmax" => {
@@ -458,10 +498,11 @@ fn build_onnx_model(module: &Module) -> OnnxJsonModel {
         for &arg_id in &block.arguments {
             let v_name = name_of(arg_id);
             let shape = value_shape(module, arg_id);
+            let dtype = value_dtype(module, arg_id);
             inputs.push(OnnxJsonValueInfo {
                 name: v_name,
                 shape,
-                dtype: "f32".to_string(),
+                dtype,
             });
         }
 
@@ -471,10 +512,11 @@ fn build_onnx_model(module: &Module) -> OnnxJsonModel {
                 for &ret_val in &op.operands {
                     let v_name = name_of(ret_val);
                     let shape = value_shape(module, ret_val);
+                    let dtype = value_dtype(module, ret_val);
                     outputs.push(OnnxJsonValueInfo {
                         name: v_name,
                         shape,
-                        dtype: "f32".to_string(),
+                        dtype,
                     });
                 }
                 continue;
@@ -570,6 +612,14 @@ fn value_shape(module: &Module, vid: crate::ir::ValueId) -> Vec<i64> {
         .unwrap_or_else(|| vec![1])
 }
 
+fn value_dtype(module: &Module, vid: crate::ir::ValueId) -> String {
+    module.values[vid]
+        .ty
+        .as_tensor()
+        .map(|t| t.dtype.to_string())
+        .unwrap_or_else(|| "f32".to_string())
+}
+
 fn map_stablehlo_to_onnx_op(hlo_name: &str) -> String {
     match hlo_name {
         "dot_general" => "MatMul".to_string(),
@@ -602,6 +652,30 @@ fn map_stablehlo_to_onnx_op(hlo_name: &str) -> String {
         "reshape" => "Reshape".to_string(),
         "convolution" => "Conv".to_string(),
         other => other.to_string(),
+    }
+}
+
+/// A-to-B Model Import Translator (`Text(ONNX-JSON) -> Ir(Module)`).
+#[derive(Default)]
+pub struct OnnxImportTranslator;
+
+impl crate::ir::Translator for OnnxImportTranslator {
+    fn name(&self) -> &str {
+        "import-onnx"
+    }
+
+    fn input_kind(&self) -> &'static str {
+        "text"
+    }
+
+    fn output_kind(&self) -> &'static str {
+        "ir"
+    }
+
+    fn translate(&mut self, input: crate::ir::Payload) -> Result<crate::ir::Payload> {
+        let src = input.into_text()?;
+        let module = import_onnx_json(&src)?;
+        Ok(crate::ir::Payload::from_ir(module))
     }
 }
 

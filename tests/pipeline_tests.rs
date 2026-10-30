@@ -1,4 +1,4 @@
-use castforge::mlir::{PrintOptions, parse_mlir, print_mlir, print_mlir_with_options};
+use castforge::ir::{PrintOptions, parse_mlir, print_mlir, print_mlir_with_options};
 use castforge::passes::{PassManager, PassRegistry};
 
 const SAMPLE_MLIR: &str = r#"

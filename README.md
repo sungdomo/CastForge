@@ -21,12 +21,12 @@ support.
 - [`src/ir`](src/ir): Arena-allocated MLIR-compatible Dual-Plane IR (`Module`, `Operation`, `Value`,
   `Block`, `Region`, `Type`, `Attribute`, `Location`), core pass & pipeline infrastructure (`Pass`,
   `PassManager`, `PassRegistry`, `PipelineConfig` in `pass_manager.rs`), unified IR verification,
-  structural hashing, equivalence, sanitization & Roofline profiling (`verify_ir.rs`), `TensorStore`
+  structural hashing, equivalence, sanitization & Roofline profiling (`verify.rs`), `TensorStore`
   weight plane & `.safetensors` (`F32`/`F16`/`BF16`/`I8`) + `ExternalFile` zero-copy I/O
   (`tensor_store.rs`), strongly-typed `StableHloOp` and `FuncView` dialect views (`stablehlo.rs`),
-  zero-C++ MLIR parser (`parser.rs`) & printer (`mlir.rs`), symmetric **GGUF v2/v3** (`F32`/`F16`/
-  `BF16`/`Q8_0`/`Q4_0`), **ONNX-JSON**, **HuggingFace `config.json`**, and **SafeTensors** model
-  importers & exporters (`src/ir/import/`), and computation graph visualization exporters
+  zero-C++ MLIR parser (`parser.rs`) & printer (`printer.rs`), symmetric **GGUF v2/v3** (`F32`/
+  `F16`/`BF16`/`Q8_0`/`Q4_0`), **ONNX-JSON**, **HuggingFace `config.json`**, and **SafeTensors**
+  model importers & exporters (`src/ir/formats/`), and computation graph visualization exporters
   (**Mermaid**, **Graphviz DOT**, **JSON**, **IR Diff**, and **Interactive HTML Pass Timeline
   Debugger** in `viz.rs`).
 - [`src/passes`](src/passes): Built-in `PassRegistry::with_builtin_passes()`

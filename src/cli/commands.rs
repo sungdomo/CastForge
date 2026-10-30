@@ -14,12 +14,9 @@ use crate::codegen::{
     generate_synthetic_inputs, jit_execute_and_benchmark, lower_to_loop_ir,
 };
 use crate::ir::{
-    Module, OpId, PassResult, Payload, collect_module_tensors, export_gguf_file, export_onnx_file,
-    import_hf_model_dir, verify_stablehlo_shapes,
-};
-use crate::mlir::{
-    PrintOptions, import_gguf_file, import_onnx_file, parse_mlir, print_mlir,
-    print_mlir_with_options,
+    Module, OpId, PassResult, Payload, PrintOptions, collect_module_tensors, export_gguf_file,
+    export_onnx_file, import_gguf_file, import_hf_model_dir, import_onnx_file, parse_mlir,
+    print_mlir, print_mlir_with_options, verify_stablehlo_shapes,
 };
 use crate::passes::{ComposeFunctionsPass, Pass, PassManager, PassRegistry, link_modules};
 use crate::viz::{

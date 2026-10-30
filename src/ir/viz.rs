@@ -134,8 +134,12 @@ pub fn build_graph_json(module: &Module) -> GraphJson {
 
     for func_op_id in module.functions() {
         let func_op = &module.ops[func_op_id];
-        let region_id = func_op.regions[0];
-        let block_id = module.regions[region_id].blocks[0];
+        let Some(&region_id) = func_op.regions.first() else {
+            continue;
+        };
+        let Some(&block_id) = module.regions[region_id].blocks.first() else {
+            continue;
+        };
         let block = &module.blocks[block_id];
 
         for &arg_id in &block.arguments {
@@ -220,8 +224,14 @@ pub fn render_mermaid(module: &Module) -> String {
             .unwrap_or("main");
 
         let _ = writeln!(out, "  subgraph fn_{fn_name}[\"func.func @{fn_name}\"]");
-        let region_id = func_op.regions[0];
-        let block_id = module.regions[region_id].blocks[0];
+        let Some(&region_id) = func_op.regions.first() else {
+            let _ = writeln!(out, "  end");
+            continue;
+        };
+        let Some(&block_id) = module.regions[region_id].blocks.first() else {
+            let _ = writeln!(out, "  end");
+            continue;
+        };
         let block = &module.blocks[block_id];
 
         for &arg_id in &block.arguments {
@@ -284,8 +294,14 @@ pub fn render_dot(module: &Module) -> String {
 
         let _ = writeln!(out, "  subgraph cluster_{fn_name} {{");
         let _ = writeln!(out, "    label=\"func.func @{fn_name}\";");
-        let region_id = func_op.regions[0];
-        let block_id = module.regions[region_id].blocks[0];
+        let Some(&region_id) = func_op.regions.first() else {
+            let _ = writeln!(out, "  }}");
+            continue;
+        };
+        let Some(&block_id) = module.regions[region_id].blocks.first() else {
+            let _ = writeln!(out, "  }}");
+            continue;
+        };
         let block = &module.blocks[block_id];
 
         for &arg_id in &block.arguments {
@@ -340,37 +356,43 @@ pub fn diff_modules(before: &Module, after: &Module) -> String {
     diff_mlir_strings(&before_txt, &after_txt)
 }
 
-/// Computes a unified diff between two MLIR text strings.
+/// Computes a unified diff between two MLIR text strings using Longest Common Subsequence (LCS).
 pub fn diff_mlir_strings(before_txt: &str, after_txt: &str) -> String {
-    let before_lines: Vec<&str> = before_txt.lines().collect();
-    let after_lines: Vec<&str> = after_txt.lines().collect();
+    let a: Vec<&str> = before_txt.lines().collect();
+    let b: Vec<&str> = after_txt.lines().collect();
+    let n = a.len();
+    let m = b.len();
+    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            if a[i] == b[j] {
+                dp[i][j] = dp[i + 1][j + 1] + 1;
+            } else {
+                dp[i][j] = dp[i + 1][j].max(dp[i][j + 1]);
+            }
+        }
+    }
+
     let mut out = String::new();
     let _ = writeln!(out, "--- a/module.mlir");
     let _ = writeln!(out, "+++ b/module.mlir");
-
-    let max_len = before_lines.len().max(after_lines.len());
+    let mut i = 0;
+    let mut j = 0;
     let mut removed = 0usize;
     let mut added = 0usize;
-    for i in 0..max_len {
-        match (before_lines.get(i), after_lines.get(i)) {
-            (Some(a), Some(b)) if a == b => {
-                let _ = writeln!(out, "  {a}");
-            }
-            (Some(a), Some(b)) => {
-                let _ = writeln!(out, "- {a}");
-                let _ = writeln!(out, "+ {b}");
-                removed += 1;
-                added += 1;
-            }
-            (Some(a), None) => {
-                let _ = writeln!(out, "- {a}");
-                removed += 1;
-            }
-            (None, Some(b)) => {
-                let _ = writeln!(out, "+ {b}");
-                added += 1;
-            }
-            (None, None) => {}
+    while i < n || j < m {
+        if i < n && j < m && a[i] == b[j] {
+            let _ = writeln!(out, "  {}", a[i]);
+            i += 1;
+            j += 1;
+        } else if i < n && (j == m || dp[i + 1][j] >= dp[i][j + 1]) {
+            let _ = writeln!(out, "- {}", a[i]);
+            removed += 1;
+            i += 1;
+        } else {
+            let _ = writeln!(out, "+ {}", b[j]);
+            added += 1;
+            j += 1;
         }
     }
     let _ = writeln!(out, "// Summary: -{removed} removed / +{added} added lines");

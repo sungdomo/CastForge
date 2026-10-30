@@ -2,8 +2,8 @@
 
 use super::{collect_module_tensors, fmt_shape, sanitize_name};
 use crate::ir::{
-    DType, Dim, Module, TensorBacking, TensorEntry, TensorStore, TensorType, f32_to_bf16_bits,
-    f32_to_f16_bits, format_dense_f32_literal, parse_mlir,
+    DType, Dim, Module, TensorBacking, TensorEntry, TensorStore, TensorType, bf16_bits_to_f32,
+    f16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits, format_dense_f32_literal, parse_mlir,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use std::fmt::Write as _;
@@ -305,6 +305,30 @@ pub fn export_gguf_file(module: &Module, path: impl AsRef<Path>) -> Result<()> {
         .with_context(|| format!("Failed to write GGUF file {}", path.as_ref().display()))
 }
 
+/// A-to-B Model Import Translator (`Bytes(GGUF) -> Ir(Module)`).
+#[derive(Default)]
+pub struct GgufImportTranslator;
+
+impl crate::ir::Translator for GgufImportTranslator {
+    fn name(&self) -> &str {
+        "import-gguf"
+    }
+
+    fn input_kind(&self) -> &'static str {
+        "bytes"
+    }
+
+    fn output_kind(&self) -> &'static str {
+        "ir"
+    }
+
+    fn translate(&mut self, input: crate::ir::Payload) -> Result<crate::ir::Payload> {
+        let bytes = input.into_bytes()?;
+        let module = import_gguf_bytes(&bytes)?;
+        Ok(crate::ir::Payload::from_ir(module))
+    }
+}
+
 /// A-to-B Model Export Translator (`Ir(Module) -> Bytes(GGUF v3)`).
 #[derive(Default)]
 pub struct GgufExportTranslator;
@@ -364,10 +388,16 @@ fn write_gguf_string(out: &mut Vec<u8>, s: &str) {
 fn skip_or_read_gguf_val(bytes: &[u8], cursor: &mut usize, val_ty: u32) -> Result<Option<String>> {
     match val_ty {
         0 | 1 | 7 => {
+            if *cursor + 1 > bytes.len() {
+                bail!("Unexpected EOF reading 1-byte GGUF metadata value");
+            }
             *cursor += 1;
             Ok(None)
         }
         2 | 3 => {
+            if *cursor + 2 > bytes.len() {
+                bail!("Unexpected EOF reading 2-byte GGUF metadata value");
+            }
             *cursor += 2;
             Ok(None)
         }
@@ -420,7 +450,7 @@ fn decode_ggml_tensor(
                 .as_chunks::<2>()
                 .0
                 .iter()
-                .map(|&c| f16_to_f32(u16::from_le_bytes(c)))
+                .map(|&c| f16_bits_to_f32(u16::from_le_bytes(c)))
                 .collect())
         }
         GgmlType::BF16 => {
@@ -432,7 +462,7 @@ fn decode_ggml_tensor(
                 .as_chunks::<2>()
                 .0
                 .iter()
-                .map(|&c| f32::from_bits((u16::from_le_bytes(c) as u32) << 16))
+                .map(|&c| bf16_bits_to_f32(u16::from_le_bytes(c)))
                 .collect())
         }
         GgmlType::Q4_0 => {
@@ -443,7 +473,7 @@ fn decode_ggml_tensor(
                 .ok_or_else(|| anyhow!("GGUF Q4_0 tensor data out of bounds"))?;
             let mut out = Vec::with_capacity(num_elems);
             for blk in raw.as_chunks::<18>().0 {
-                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                let d = f16_bits_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
                 for &b in &blk[2..18] {
                     if out.len() < num_elems {
                         let lo = (b & 0x0f) as i32 - 8;
@@ -465,7 +495,7 @@ fn decode_ggml_tensor(
                 .ok_or_else(|| anyhow!("GGUF Q8_0 tensor data out of bounds"))?;
             let mut out = Vec::with_capacity(num_elems);
             for blk in raw.as_chunks::<34>().0 {
-                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                let d = f16_bits_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
                 for &q in &blk[2..34] {
                     if out.len() < num_elems {
                         out.push((q as i8 as f32) * d);
@@ -476,29 +506,4 @@ fn decode_ggml_tensor(
             Ok(out)
         }
     }
-}
-
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 1) as u32;
-    let exp = ((bits >> 10) & 0x1f) as u32;
-    let mant = (bits & 0x03ff) as u32;
-    let f32_bits = if exp == 0 {
-        if mant == 0 {
-            sign << 31
-        } else {
-            let mut m = mant;
-            let mut e = 127 - 14;
-            while (m & 0x0400) == 0 {
-                m <<= 1;
-                e -= 1;
-            }
-            m &= 0x03ff;
-            (sign << 31) | (e << 23) | (m << 13)
-        }
-    } else if exp == 0x1f {
-        (sign << 31) | 0x7f80_0000 | (mant << 13)
-    } else {
-        (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13)
-    };
-    f32::from_bits(f32_bits)
 }

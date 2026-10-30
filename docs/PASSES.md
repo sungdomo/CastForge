@@ -2,7 +2,7 @@
 
 CastForge provides **115 built-in modular A-to-B IR passes & presets** (`38 top-level/composite
 passes & presets + 77 single-optimization leaf passes`) across `src/passes/` and
-`src/ir/verify_ir.rs` (plus the unified **`OptimizeLoopIrPass`** (`optimize-loop-ir`) in
+`src/ir/verify.rs` (plus the unified **`OptimizeLoopIrPass`** (`optimize-loop-ir`) in
 `src/codegen/`).
 
 - **Leaf passes** perform a single optimization (or tightly related single-traversal family) in a
@@ -257,13 +257,13 @@ passes & presets + 77 single-optimization leaf passes`) across `src/passes/` and
    backward dependency cone slicer (`target=%v,stop_at=%in`).
 5. **`reduce-ir` (`ReduceIrPass` — `normalize_ir/inliner.rs`):** Single-traversal delta-debugging
    IR reducer (`max_ops=N` or `keep_op=...`).
-6. **`verify-ir` (`VerifyIrPass` — `src/ir/verify_ir.rs`):** Read-only IR verifier,
+6. **`verify-ir` (`VerifyIrPass` — `src/ir/verify.rs`):** Read-only IR verifier,
    structural FNV-1a hasher, numerical equivalence checker, pass bisector, and Roofline profiler
    (`shapes=true,equiv=true,tol=1e-4,hash=true,bisect=N,profile=true,ridge=10.0`).
-7. **`sanitize-numerics` (`SanitizeNumericsPass` — `src/ir/verify_ir.rs`):** Single-traversal
+7. **`sanitize-numerics` (`SanitizeNumericsPass` — `src/ir/verify.rs`):** Single-traversal
    numerical sanitizer inserting `castforge.nan_guard` finite clamps and division-by-zero guards
    (`clamp_max=65504.0,eps=1e-6`).
-8. **`instrument-profiling` (`InstrumentProfilingPass` — `src/ir/verify_ir.rs`):**
+8. **`instrument-profiling` (`InstrumentProfilingPass` — `src/ir/verify.rs`):**
    Single-traversal profiling instrumenter wrapping target ops in `castforge.profile_region`
    (`filter=gemm|all`).
 

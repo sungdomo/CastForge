@@ -6,34 +6,33 @@
 //! parser/printer, ONNX/GGUF importers/exporters, and the composable [`Translator`] /
 //! [`TranslatorChain`] A-to-B pipeline abstraction.
 
-pub mod import;
-pub mod mlir;
+pub mod formats;
 pub mod parser;
 pub mod pass_manager;
+pub mod printer;
 pub mod stablehlo;
 pub mod tensor_store;
-pub mod verify_ir;
+pub mod verify;
 pub mod viz;
 
-pub use import::{
-    GgmlType, GgufExportTranslator, HfConfigImportTranslator, HfModelConfig, OnnxExportTranslator,
-    OnnxJsonInitializer, OnnxJsonModel, OnnxJsonNode, OnnxJsonValueInfo,
-    SafetensorsExportTranslator, collect_module_tensors, export_gguf_bytes, export_gguf_file,
-    export_onnx_file, export_onnx_json, import_gguf_bytes, import_gguf_file, import_hf_config_json,
-    import_hf_model_dir, import_onnx_file, import_onnx_json,
+pub use formats::{
+    GgmlType, GgufExportTranslator, GgufImportTranslator, HfConfigImportTranslator, HfModelConfig,
+    OnnxExportTranslator, OnnxImportTranslator, OnnxJsonInitializer, OnnxJsonModel, OnnxJsonNode,
+    OnnxJsonValueInfo, SafetensorsExportTranslator, collect_module_tensors, export_gguf_bytes,
+    export_gguf_file, export_onnx_file, export_onnx_json, import_gguf_bytes, import_gguf_file,
+    import_hf_config_json, import_hf_model_dir, import_onnx_file, import_onnx_json,
 };
-pub use mlir::{
-    GgufImportTranslator, MlirParseTranslator, MlirPrintTranslator, MlirPrinter,
-    OnnxImportTranslator, PrintOptions, parse_mlir, print_mlir, print_mlir_with_options,
-};
-pub use parser::{MlirParser, ParseError, parse_type};
+pub use parser::{MlirParseTranslator, MlirParser, ParseError, parse_mlir, parse_type};
 pub use pass_manager::*;
+pub use printer::{
+    MlirPrintTranslator, MlirPrinter, PrintOptions, print_mlir, print_mlir_with_options,
+};
 pub use stablehlo::{DotDimensionNumbers, FuncView, StableHloOp, verify_stablehlo_shapes};
 pub use tensor_store::{
     TensorBacking, TensorEntry, TensorStore, bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits,
     f32_to_f16_bits, format_dense_f32_literal, format_dense_i8_literal, parse_dense_f32_literal,
 };
-pub use verify_ir::*;
+pub use verify::*;
 pub use viz::*;
 
 use anyhow::{Result, anyhow};
@@ -297,16 +296,34 @@ impl Attribute {
         }
     }
 
-    /// If this attribute is a scalar/splat `DenseElements` constant (e.g., `dense<0.0>`),
-    /// parses and returns its scalar `f64` value.
+    /// If this attribute is a scalar/splat `DenseElements` constant (e.g., `dense<0.0>` or a
+    /// bracketed literal where all elements are identical), parses and returns its scalar `f64`
+    /// value.
     pub fn as_splat_f64(&self) -> Option<f64> {
         match self {
             Attribute::DenseElements { raw_literal, .. } => {
                 let s = raw_literal.trim();
-                if s.starts_with('[') {
-                    return None;
+                if !s.starts_with('[') {
+                    return s.parse::<f64>().ok();
                 }
-                s.parse::<f64>().ok()
+                let cleaned: String = s
+                    .chars()
+                    .map(|c| if c == '[' || c == ']' { ' ' } else { c })
+                    .collect();
+                let mut first: Option<f64> = None;
+                for tok in cleaned.split(',') {
+                    let tok = tok.trim();
+                    if tok.is_empty() {
+                        continue;
+                    }
+                    let val = tok.parse::<f64>().ok()?;
+                    match first {
+                        None => first = Some(val),
+                        Some(f) if (val - f).abs() <= f64::EPSILON => {}
+                        Some(_) => return None,
+                    }
+                }
+                first
             }
             Attribute::Float(f) => Some(*f),
             Attribute::Int(i) => Some(*i as f64),
@@ -500,8 +517,18 @@ impl TranslatorChain {
     /// Executes all concatenated [`Translator`] modules sequentially on `initial`.
     pub fn execute(&mut self, initial: Payload) -> Result<Payload> {
         let mut current = initial;
-        for stage in &mut self.stages {
-            current = stage.translate(current)?;
+        for (idx, stage) in self.stages.iter_mut().enumerate() {
+            if current.kind() != stage.input_kind() {
+                return Err(anyhow!(
+                    "TranslatorChain stage {idx} (`{}`) expected `{}` input, found `{}`",
+                    stage.name(),
+                    stage.input_kind(),
+                    current.kind()
+                ));
+            }
+            current = stage.translate(current).map_err(|e| {
+                anyhow!("TranslatorChain stage {idx} (`{}`) failed: {e}", stage.name())
+            })?;
         }
         Ok(current)
     }
@@ -509,11 +536,20 @@ impl TranslatorChain {
 
 #[derive(Debug, Error)]
 pub enum VerifyError {
+    #[error("Module root_region does not exist in regions arena")]
+    InvalidRootRegion,
+
     #[error("Operation `{op_name}` references missing operand ValueId")]
     DanglingOperand { op_name: String },
 
     #[error("Operation `{op_name}` references missing result ValueId")]
     DanglingResult { op_name: String },
+
+    #[error("Operation `{op_name}` references missing RegionId")]
+    DanglingRegion { op_name: String },
+
+    #[error("Block references missing argument ValueId")]
+    DanglingBlockArgument,
 
     #[error("Region references missing BlockId")]
     DanglingBlock,
@@ -636,6 +672,20 @@ impl Operation {
                 )
             }
             ("stablehlo", _) => true,
+            ("castforge", name) => !matches!(
+                name,
+                "kv_cache_update"
+                    | "all_reduce"
+                    | "all_gather"
+                    | "reduce_scatter"
+                    | "all_to_all"
+                    | "send"
+                    | "recv"
+                    | "stream_wait"
+                    | "offload_to_host"
+                    | "offload_to_device"
+                    | "profile_region"
+            ),
             _ => false,
         }
     }
@@ -658,7 +708,7 @@ pub struct Region {
 }
 
 /// Top-level CastForge Dual-Plane IR Module (SSA Compute Graph + Weight TensorStore).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Module {
     pub name: Option<String>,
     pub ops: SlotMap<OpId, Operation>,
@@ -669,11 +719,22 @@ pub struct Module {
     pub tensor_store: TensorStore,
 }
 
+impl Default for Module {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
 impl Module {
     pub fn new(name: Option<String>) -> Self {
         let mut module = Self {
             name,
-            ..Default::default()
+            ops: SlotMap::with_key(),
+            values: SlotMap::with_key(),
+            blocks: SlotMap::with_key(),
+            regions: SlotMap::with_key(),
+            root_region: RegionId::default(),
+            tensor_store: TensorStore::default(),
         };
         let entry_block = module.create_block(None);
         let root_region = module.create_region(vec![entry_block]);
@@ -811,12 +872,36 @@ impl Module {
         self.blocks[block].ops.clone()
     }
 
-    /// Removes `op_id` from `block` and deletes it from the arena.
+    /// Removes `op_id` from `block` and deletes it (and any nested regions) from the arena.
     pub fn remove_op(&mut self, block: BlockId, op_id: OpId) {
-        self.blocks[block].ops.retain(|&id| id != op_id);
+        if let Some(blk) = self.blocks.get_mut(block) {
+            blk.ops.retain(|&id| id != op_id);
+        }
+        self.remove_op_unlinked(op_id);
+    }
+
+    fn remove_op_unlinked(&mut self, op_id: OpId) {
         if let Some(op) = self.ops.remove(op_id) {
             for res in op.results {
                 self.values.remove(res);
+            }
+            for reg_id in op.regions {
+                self.remove_region(reg_id);
+            }
+        }
+    }
+
+    fn remove_region(&mut self, region_id: RegionId) {
+        if let Some(region) = self.regions.remove(region_id) {
+            for blk_id in region.blocks {
+                if let Some(blk) = self.blocks.remove(blk_id) {
+                    for arg in blk.arguments {
+                        self.values.remove(arg);
+                    }
+                    for op_id in blk.ops {
+                        self.remove_op_unlinked(op_id);
+                    }
+                }
             }
         }
     }
@@ -837,13 +922,25 @@ impl Module {
             .collect()
     }
 
-    /// Verifies structural integrity of the IR (all SSA ValueIds, OpIds, and BlockIds resolve).
+    /// Verifies structural integrity of the IR (all SSA ValueIds, OpIds, BlockIds, and RegionIds
+    /// resolve).
     pub fn verify(&self) -> Result<(), VerifyError> {
+        let Some(root_reg) = self.regions.get(self.root_region) else {
+            return Err(VerifyError::InvalidRootRegion);
+        };
+        if root_reg.blocks.is_empty() {
+            return Err(VerifyError::DanglingBlock);
+        }
         for (_, region) in &self.regions {
             for &block_id in &region.blocks {
                 let Some(block) = self.blocks.get(block_id) else {
                     return Err(VerifyError::DanglingBlock);
                 };
+                for &arg_id in &block.arguments {
+                    if !self.values.contains_key(arg_id) {
+                        return Err(VerifyError::DanglingBlockArgument);
+                    }
+                }
                 for &op_id in &block.ops {
                     let Some(op) = self.ops.get(op_id) else {
                         continue;
@@ -862,9 +959,168 @@ impl Module {
                             });
                         }
                     }
+                    for &reg_id in &op.regions {
+                        if !self.regions.contains_key(reg_id) {
+                            return Err(VerifyError::DanglingRegion {
+                                op_name: op.name.full_name(),
+                            });
+                        }
+                    }
                 }
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ir_fixes_and_roundtrips() {
+        // 1. Purity of castforge compute ops vs collective/stateful ops
+        let mut m = Module::new(Some("test".to_string()));
+        let blk = m.body_block();
+        let fma_id = m.add_operation(
+            blk,
+            OpName::new("castforge", "fma"),
+            SmallVec::new(),
+            Vec::new(),
+            IndexMap::new(),
+            Vec::new(),
+            false,
+            Location::Unknown,
+        );
+        let ar_id = m.add_operation(
+            blk,
+            OpName::new("castforge", "all_reduce"),
+            SmallVec::new(),
+            Vec::new(),
+            IndexMap::new(),
+            Vec::new(),
+            false,
+            Location::Unknown,
+        );
+        assert!(m.ops[fma_id].is_pure());
+        assert!(!m.ops[ar_id].is_pure());
+
+        // 2. Recursive region cleanup on remove_op
+        let sub_blk = m.create_block(None);
+        let _arg = m.add_block_argument(sub_blk, Some("a".to_string()), Type::Scalar(DType::F32));
+        let sub_reg = m.create_region(vec![sub_blk]);
+        let reg_op = m.add_operation(
+            blk,
+            OpName::new("stablehlo", "while"),
+            SmallVec::new(),
+            Vec::new(),
+            IndexMap::new(),
+            vec![sub_reg],
+            false,
+            Location::Unknown,
+        );
+        assert!(m.regions.contains_key(sub_reg));
+        assert!(m.blocks.contains_key(sub_blk));
+        m.remove_op(blk, reg_op);
+        assert!(!m.regions.contains_key(sub_reg));
+        assert!(!m.blocks.contains_key(sub_blk));
+        assert!(m.verify().is_ok());
+
+        // 3. 3D nested literal formatting
+        let dims_3d = vec![Dim::Static(2), Dim::Static(1), Dim::Static(2)];
+        let lit = format_dense_f32_literal(&[1.0, 2.0, 3.0, 4.0], &dims_3d);
+        assert_eq!(lit, "[[[1.0, 2.0]], [[3.0, 4.0]]]");
+
+        // 4. Tuple type parsing and FileLineCol location parsing
+        let ty = parse_type("tuple<tensor<2xf32>, i32>", 1).expect("tuple parses");
+        assert_eq!(ty.to_string(), "tuple<tensor<2xf32>, i32>");
+
+        let mlir_src = concat!(
+            "module @m {\n",
+            "  func.func @f1(%x: tensor<2xf32>) -> tensor<2xf32> loc(\"m.py\":10:2) {\n",
+            "    %c = stablehlo.constant dense<[1.0, 2.0]> : tensor<2xf32> loc(\"m.py\":11:4)\n",
+            "    %y = stablehlo.add %x, %c : tensor<2xf32>\n",
+            "    return %y : tensor<2xf32>\n",
+            "  }\n",
+            "  func.func @f2(%x: tensor<2xf32>) -> tensor<2xf32> {\n",
+            "    %c = stablehlo.constant dense<[3.0, 4.0]> : tensor<2xf32>\n",
+            "    %y = stablehlo.add %x, %c : tensor<2xf32>\n",
+            "    return %y : tensor<2xf32>\n",
+            "  }\n",
+            "}\n"
+        );
+        let parsed = parse_mlir(mlir_src).expect("valid mlir");
+        assert_eq!(parsed.tensor_store.len(), 2);
+        let fns = parsed.functions();
+        assert_eq!(
+            parsed.ops[fns[0]].location,
+            Location::FileLineCol {
+                file: "m.py".to_string(),
+                line: 10,
+                col: 2,
+            }
+        );
+
+        // 5. LCS diff check
+        let diff = diff_mlir_strings("a\nb\nc\n", "a\nx\nb\nc\n");
+        assert!(diff.contains("+ x"));
+        assert!(diff.contains("// Summary: -0 removed / +1 added lines"));
+
+        // 6. Module::default() is valid and does not panic on body_block()
+        let def_mod = Module::default();
+        let _ = def_mod.body_block();
+        assert!(def_mod.verify().is_ok());
+
+        // 7. Bracketed uniform splat detection
+        let splat_attr = Attribute::DenseElements {
+            ty: TensorType::new(vec![Dim::Static(2), Dim::Static(2)], DType::F32),
+            raw_literal: "[[1.0, 1.0], [1.0, 1.0]]".to_string(),
+        };
+        assert!(splat_attr.is_splat_one());
+        assert!(!splat_attr.is_splat_zero());
+
+        // 8. Non-default contracting_dims / batching_dims & iota dim round-trip
+        let dg_mlir = concat!(
+            "module @dg {\n",
+            "  func.func @main(%a: tensor<2x3x4xf32>, %b: tensor<2x3x5xf32>)",
+            " -> tensor<2x4x5xf32> {\n",
+            "    %idx = stablehlo.iota dim = 1 : tensor<2x4xi32>\n",
+            "    %out = stablehlo.dot_general %a, %b, batching_dims = [0] x [0],",
+            " contracting_dims = [1] x [1]",
+            " : (tensor<2x3x4xf32>, tensor<2x3x5xf32>) -> tensor<2x4x5xf32>\n",
+            "    return %out : tensor<2x4x5xf32>\n",
+            "  }\n",
+            "}\n"
+        );
+        let dg_mod = parse_mlir(dg_mlir).expect("dg_mlir parses");
+        let dg_fn = dg_mod.functions()[0];
+        let dg_blk = dg_mod.regions[dg_mod.ops[dg_fn].regions[0]].blocks[0];
+        let iota_op = &dg_mod.ops[dg_mod.blocks[dg_blk].ops[0]];
+        assert_eq!(iota_op.attributes.get("iota_dimension"), Some(&Attribute::Int(1)));
+        let dot_op = &dg_mod.ops[dg_mod.blocks[dg_blk].ops[1]];
+        assert_eq!(
+            dot_op.attributes.get("lhs_batching_dimensions"),
+            Some(&Attribute::DenseIntArray(vec![0]))
+        );
+        assert_eq!(
+            dot_op.attributes.get("rhs_contracting_dimensions"),
+            Some(&Attribute::DenseIntArray(vec![1]))
+        );
+        assert!(verify_stablehlo_shapes(&dg_mod, dot_op.id).is_ok());
+
+        // 9. Attribute parsing for array<f64: ...>, nested dict, and non-int array
+        let attr_f64 = parser::parse_attribute_value("array<f64: 1.5, 2.5>");
+        assert_eq!(attr_f64, Attribute::DenseF64Array(vec![1.5, 2.5]));
+        let attr_str_arr = parser::parse_attribute_value("[\"x\", \"y\"]");
+        assert_eq!(
+            attr_str_arr,
+            Attribute::Array(vec![
+                Attribute::String("x".to_string()),
+                Attribute::String("y".to_string()),
+            ])
+        );
+
+        // 10. f32_to_f16_bits preserves negative zero sign on underflow
+        assert_eq!(f32_to_f16_bits(-1e-10), 0x8000);
     }
 }
