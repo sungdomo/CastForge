@@ -43,7 +43,7 @@ impl Pass for SimplifyAlgebraicPass {
     }
 
     fn child_passes(&self) -> &'static [&'static str] {
-        &["fold-constants"]
+        &["fold-constants", "fuse-fma"]
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
@@ -152,6 +152,31 @@ impl Pass for FoldConstantsPass {
             include_conditional: true,
             egraph: false,
             fuse_fma: false,
+        }
+        .run(module)?
+        .with_name(self.name()))
+    }
+}
+
+/// E-Graph Distributive Factoring & Fused Multiply-Add Extraction Pass (`fuse-fma`).
+#[derive(Debug, Clone, Default)]
+pub struct FuseFmaPass;
+
+impl Pass for FuseFmaPass {
+    fn name(&self) -> &'static str {
+        "fuse-fma"
+    }
+
+    fn description(&self) -> &'static str {
+        "Applies e-graph distributive factoring (a*b + a*c -> a*(b+c)) and extracts castforge.fma"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        Ok(SimplifyAlgebraicPass {
+            fold_constants: false,
+            include_conditional: false,
+            egraph: true,
+            fuse_fma: true,
         }
         .run(module)?
         .with_name(self.name()))

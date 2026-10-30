@@ -1,7 +1,7 @@
-# CastForge — Complete Reference of All 103 Hierarchical Graph IR Passes (+ LoopIR Pass)
+# CastForge — Complete Reference of All 115 Hierarchical Graph IR Passes (+ LoopIR Pass)
 
-CastForge provides **103 built-in modular A-to-B IR passes & presets** (`38 top-level/composite
-passes & presets + 65 single-optimization leaf passes`) across `src/passes/` and
+CastForge provides **115 built-in modular A-to-B IR passes & presets** (`38 top-level/composite
+passes & presets + 77 single-optimization leaf passes`) across `src/passes/` and
 `src/ir/verify_ir.rs` (plus the unified **`OptimizeLoopIrPass`** (`optimize-loop-ir`) in
 `src/codegen/`).
 
@@ -21,17 +21,17 @@ passes & presets + 65 single-optimization leaf passes`) across `src/passes/` and
 
 | Category | Top | Leaf | Section |
 | :--- | :---: | :---: | :--- |
-| **1. General MLIR & Algebraic Passes (+ `O1`/`O2`/`O3`)** | 7 | +2 | Section 1 |
-| **2. Views, Shape Specialization & Layout** | 2 | +2 | Section 2 |
-| **3. Weight Surgery, Pruning & Quantization** | 5 | +13 | Section 3 |
+| **1. General MLIR & Algebraic Passes (+ `O1`/`O2`/`O3`)** | 7 | +5 | Section 1 |
+| **2. Views, Shape Specialization & Layout** | 2 | +4 | Section 2 |
+| **3. Weight Surgery, Pruning & Quantization** | 5 | +18 | Section 3 |
 | **4. Transformer, GEMM & Operator Fusions** | 7 | +21 | Section 4 |
 | **5. Memory Planning, Remat & Offload** | 3 | +2 | Section 5 |
-| **6. Distributed Parallelism, Streams & Autodiff** | 3 | +4 | Section 6 |
+| **6. Distributed Parallelism, Streams & Autodiff** | 3 | +6 | Section 6 |
 | **7. Polyhedral Loop Scheduling & Tensor Cores** | 3 | +6 | Section 7 |
 | **8. IR Surgery, Verification & Tooling** | 8 | +15 | Section 8 |
 | **9. Polyhedral / Imperative LoopIR** | +1 | — | Section 9 |
 
-*(Total: **103 registered Graph IR passes/presets** in `PassRegistry` + **`OptimizeLoopIrPass`**.)*
+*(Total: **115 registered Graph IR passes/presets** in `PassRegistry` + **`OptimizeLoopIrPass`**.)*
 
 ---
 

@@ -76,7 +76,10 @@ impl Pass for QuantizePass {
             "quantize-weights",
             "quantize-groupwise",
             "quantize-fp8",
+            "quantize-fp4",
             "calibrate-quantize",
+            "smooth-quantize",
+            "insert-qat-ste",
             "lower-mixed-precision",
         ]
     }
@@ -125,16 +128,23 @@ impl Pass for QuantizePass {
                 block_size: self.block_size,
             }
             .run(module)?,
-            "fp4" | "mxfp4" | "nvfp4" | "e2m1" => run_fp4_quantize(module, &s, self.block_size)?,
+            "fp4" | "mxfp4" | "nvfp4" | "e2m1" => QuantizeFp4Pass {
+                scheme: s,
+                block_size: self.block_size,
+            }
+            .run(module)?,
             "w8a8" | "calibrate" | "static" => CalibrateQuantizePass {
                 bits: self.bits,
                 num_samples: self.samples,
             }
             .run(module)?,
-            "smoothquant" | "smooth" => {
-                run_smoothquant(module, self.bits, self.alpha, self.samples)?
+            "smoothquant" | "smooth" => SmoothQuantizePass {
+                bits: self.bits,
+                alpha: self.alpha,
+                num_samples: self.samples,
             }
-            "qat" | "qat_ste" | "ste" => run_qat_ste(module, self.bits)?,
+            .run(module)?,
+            "qat" | "qat_ste" | "ste" => InsertQatStePass { bits: self.bits }.run(module)?,
             _ => QuantizeWeightsPass {
                 bits: self.bits,
                 min_elements: self.min_elements,
@@ -143,6 +153,40 @@ impl Pass for QuantizePass {
         };
         steps.push(main_step);
         Ok(PassResult::aggregate(self.name(), &steps))
+    }
+}
+
+/// SmoothQuant Activation-to-Weight Outlier Migration Pass (`smooth-quantize`).
+pub struct SmoothQuantizePass {
+    pub bits: u8,
+    pub alpha: f32,
+    pub num_samples: usize,
+}
+
+impl Default for SmoothQuantizePass {
+    fn default() -> Self {
+        Self {
+            bits: 8,
+            alpha: 0.5,
+            num_samples: 4,
+        }
+    }
+}
+
+impl Pass for SmoothQuantizePass {
+    fn name(&self) -> &'static str {
+        "smooth-quantize"
+    }
+
+    fn description(&self) -> &'static str {
+        "Migrates activation outlier difficulty into weights via SmoothQuant alpha scaling"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        Ok(
+            run_smoothquant(module, self.bits, self.alpha, self.num_samples)?
+                .with_name(self.name()),
+        )
     }
 }
 

@@ -22,9 +22,38 @@ pub(super) fn register_leaf_passes(reg: &mut PassRegistry) {
         },
     );
     reg.register(
+        "hoist-loop-invariants",
+        "Hoists loop- and region-invariant pure operations out of nested regions (LICM)",
+        |_opts| Ok(Box::new(HoistLoopInvariantsPass)),
+    );
+    reg.register(
+        "hoist-constants",
+        "Hoists stablehlo.constant operations to block entry and deduplicates identical constants",
+        |_opts| Ok(Box::new(HoistConstantsPass)),
+    );
+    reg.register(
         "fold-constants",
         "Evaluates pure operations on constant inputs at compile time (including SCCP)",
         |_opts| Ok(Box::new(FoldConstantsPass)),
+    );
+    reg.register(
+        "fuse-fma",
+        "Applies e-graph distributive factoring (a*b + a*c -> a*(b+c)) and extracts castforge.fma",
+        |_opts| Ok(Box::new(FuseFmaPass)),
+    );
+    reg.register(
+        "convert-layout",
+        "Converts spatial/matrix layouts (nhwc/nchw/col_major) and propagates layout across ops",
+        |opts| {
+            let layout = opts
+                .get("layout")
+                .cloned()
+                .unwrap_or_else(|| "nhwc".to_string());
+            let propagate = opts
+                .get("propagate")
+                .is_some_and(|v| v == "true" || v == "1");
+            Ok(Box::new(ConvertLayoutPass { layout, propagate }))
+        },
     );
     reg.register(
         "resize-batch",
@@ -47,6 +76,18 @@ pub(super) fn register_leaf_passes(reg: &mut PassRegistry) {
                 .cloned()
                 .unwrap_or_else(|| "1;4;8".to_string());
             Ok(Box::new(BucketShapesPass { buckets }))
+        },
+    );
+    reg.register(
+        "prune-tokens",
+        "Applies ToMe/FastV dynamic sequence token pruning and bipartite token merging",
+        |opts| {
+            let ratio = opts
+                .get("ratio")
+                .or_else(|| opts.get("token_prune_ratio"))
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(0.5);
+            Ok(Box::new(PruneTokensPass { ratio }))
         },
     );
     reg.register(
@@ -115,6 +156,22 @@ pub(super) fn register_leaf_passes(reg: &mut PassRegistry) {
         },
     );
     reg.register(
+        "quantize-fp4",
+        "Quantizes weights to Blackwell NVFP4 / OCP MXFP4 E2M1 4-bit float microscaling blocks",
+        |opts| {
+            let scheme = opts
+                .get("scheme")
+                .or_else(|| opts.get("format"))
+                .cloned()
+                .unwrap_or_else(|| "nvfp4".to_string());
+            let block_size = opts
+                .get("block_size")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(16);
+            Ok(Box::new(QuantizeFp4Pass { scheme, block_size }))
+        },
+    );
+    reg.register(
         "calibrate-quantize",
         "Profile-guided static W8A8/W4A8 calibration and quantization",
         |opts| {
@@ -128,6 +185,41 @@ pub(super) fn register_leaf_passes(reg: &mut PassRegistry) {
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(4);
             Ok(Box::new(CalibrateQuantizePass { bits, num_samples }))
+        },
+    );
+    reg.register(
+        "smooth-quantize",
+        "Migrates activation outlier difficulty into weights via SmoothQuant alpha scaling",
+        |opts| {
+            let bits = opts
+                .get("bits")
+                .and_then(|s| s.parse::<u8>().ok())
+                .unwrap_or(8);
+            let alpha = opts
+                .get("alpha")
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(0.5);
+            let num_samples = opts
+                .get("samples")
+                .or_else(|| opts.get("num_samples"))
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(4);
+            Ok(Box::new(SmoothQuantizePass {
+                bits,
+                alpha,
+                num_samples,
+            }))
+        },
+    );
+    reg.register(
+        "insert-qat-ste",
+        "Applies fake-quantization with Straight-Through Estimator (QAT-STE) for training",
+        |opts| {
+            let bits = opts
+                .get("bits")
+                .and_then(|s| s.parse::<u8>().ok())
+                .unwrap_or(8);
+            Ok(Box::new(InsertQatStePass { bits }))
         },
     );
     reg.register(
@@ -167,6 +259,17 @@ pub(super) fn register_leaf_passes(reg: &mut PassRegistry) {
                 .and_then(|s| s.parse::<f32>().ok())
                 .unwrap_or(1.0);
             Ok(Box::new(BakeLoraPass { alpha }))
+        },
+    );
+    reg.register(
+        "bake-dora",
+        "Bakes DoRA adapters via column-wise directional normalization and magnitude rescaling",
+        |opts| {
+            let alpha = opts
+                .get("alpha")
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(1.0);
+            Ok(Box::new(BakeDoraPass { alpha }))
         },
     );
     reg.register(
@@ -214,6 +317,17 @@ pub(super) fn register_leaf_passes(reg: &mut PassRegistry) {
         "prune-2to4",
         "Prunes 2D weight matrices to NVIDIA 2:4 semi-structured sparsity (2 non-zeros per 4)",
         |_opts| Ok(Box::new(Prune2To4Pass)),
+    );
+    reg.register(
+        "prune-activations",
+        "Applies TEAL/CATS dynamic top-k magnitude activation sparsity to GEMM inputs",
+        |opts| {
+            let sparsity = opts
+                .get("sparsity")
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(0.5);
+            Ok(Box::new(PruneActivationsPass { sparsity }))
+        },
     );
     reg.register(
         "fuse-map-reduce",
@@ -485,6 +599,30 @@ pub(super) fn register_leaf_passes(reg: &mut PassRegistry) {
                 microbatches,
                 schedule,
             }))
+        },
+    );
+    reg.register(
+        "shard-fsdp",
+        "Shards GEMM weights with ZeRO-3/FSDP all_gather prefetch and reduce_scatter grad sync",
+        |opts| {
+            let num_devices = opts
+                .get("devices")
+                .or_else(|| opts.get("num_devices"))
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(2);
+            Ok(Box::new(ShardFsdpPass { num_devices }))
+        },
+    );
+    reg.register(
+        "shard-experts",
+        "Shards MoE/MLP experts across devices with all_to_all token dispatch and combine",
+        |opts| {
+            let num_devices = opts
+                .get("devices")
+                .or_else(|| opts.get("num_devices"))
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(2);
+            Ok(Box::new(ShardExpertsPass { num_devices }))
         },
     );
     reg.register(

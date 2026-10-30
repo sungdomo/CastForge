@@ -141,7 +141,7 @@ impl Pass for PruneWeightsPass {
     }
 
     fn child_passes(&self) -> &'static [&'static str] {
-        &["prune-structured", "prune-2to4"]
+        &["prune-structured", "prune-2to4", "prune-activations"]
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
@@ -149,7 +149,10 @@ impl Pass for PruneWeightsPass {
         let res = if m == "2to4" {
             Prune2To4Pass.run(module)?
         } else if matches!(m.as_str(), "activation_sparse" | "activation" | "teal") {
-            run_activation_sparsity(module, self.sparsity)?
+            PruneActivationsPass {
+                sparsity: self.sparsity,
+            }
+            .run(module)?
         } else {
             PruneStructuredPass {
                 sparsity: self.sparsity,
@@ -157,6 +160,31 @@ impl Pass for PruneWeightsPass {
             .run(module)?
         };
         Ok(res.with_name(self.name()))
+    }
+}
+
+/// Dynamic Top-K Activation Sparsity Pass (`prune-activations`).
+pub struct PruneActivationsPass {
+    pub sparsity: f32,
+}
+
+impl Default for PruneActivationsPass {
+    fn default() -> Self {
+        Self { sparsity: 0.5 }
+    }
+}
+
+impl Pass for PruneActivationsPass {
+    fn name(&self) -> &'static str {
+        "prune-activations"
+    }
+
+    fn description(&self) -> &'static str {
+        "Applies TEAL/CATS dynamic top-k magnitude activation sparsity to GEMM inputs"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        Ok(run_activation_sparsity(module, self.sparsity)?.with_name(self.name()))
     }
 }
 

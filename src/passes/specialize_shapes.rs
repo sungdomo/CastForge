@@ -43,17 +43,11 @@ impl Pass for SpecializeShapesPass {
     }
 
     fn child_passes(&self) -> &'static [&'static str] {
-        &["resize-batch", "bucket-shapes"]
+        &["resize-batch", "bucket-shapes", "prune-tokens"]
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let modified = specialize_and_resize_single_traversal(
-            module,
-            self,
-            true,
-            None,
-            self.token_prune_ratio,
-        );
+        let modified = specialize_and_resize_single_traversal(module, self, true, None, None);
         let mut steps = vec![PassResult {
             pass_name: self.name().to_string(),
             changed: modified > 0,
@@ -61,6 +55,9 @@ impl Pass for SpecializeShapesPass {
             ops_modified: modified,
             ops_created: 0,
         }];
+        if let Some(ratio) = self.token_prune_ratio {
+            steps.push(PruneTokensPass { ratio }.run(module)?);
+        }
         if let Some(batch) = self.batch {
             steps.push(ResizeBatchPass { batch }.run(module)?);
         }
@@ -73,6 +70,40 @@ impl Pass for SpecializeShapesPass {
             );
         }
         Ok(PassResult::aggregate(self.name(), &steps))
+    }
+}
+
+/// ToMe / FastV Dynamic Sequence Token Pruning Pass (`prune-tokens`).
+pub struct PruneTokensPass {
+    pub ratio: f32,
+}
+
+impl Default for PruneTokensPass {
+    fn default() -> Self {
+        Self { ratio: 0.5 }
+    }
+}
+
+impl Pass for PruneTokensPass {
+    fn name(&self) -> &'static str {
+        "prune-tokens"
+    }
+
+    fn description(&self) -> &'static str {
+        "Applies ToMe/FastV dynamic sequence token pruning and bipartite token merging"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let dummy = SpecializeShapesPass::default();
+        let modified =
+            specialize_and_resize_single_traversal(module, &dummy, false, None, Some(self.ratio));
+        Ok(PassResult {
+            pass_name: self.name().to_string(),
+            changed: modified > 0,
+            ops_removed: 0,
+            ops_modified: modified,
+            ops_created: 0,
+        })
     }
 }
 

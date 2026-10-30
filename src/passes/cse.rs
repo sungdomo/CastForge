@@ -30,6 +30,10 @@ impl Pass for CsePass {
         "Unified CSE, cross-region Dominator GVN, LICM, and constant hoisting/deduplication"
     }
 
+    fn child_passes(&self) -> &'static [&'static str] {
+        &["hoist-loop-invariants", "hoist-constants"]
+    }
+
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let mut removed = 0usize;
         let mut modified = 0usize;
@@ -283,4 +287,52 @@ fn gvn_signature(
         "{}|operands:{:?}|attrs:{:?}|ty:{}",
         op.name, ops_vec, attrs, res_ty
     )
+}
+
+/// Loop/Region-Invariant Code Motion Pass (`hoist-loop-invariants`).
+#[derive(Debug, Clone, Default)]
+pub struct HoistLoopInvariantsPass;
+
+impl Pass for HoistLoopInvariantsPass {
+    fn name(&self) -> &'static str {
+        "hoist-loop-invariants"
+    }
+
+    fn description(&self) -> &'static str {
+        "Hoists loop- and region-invariant pure operations out of nested regions (LICM)"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        Ok(CsePass {
+            gvn: false,
+            hoist_constants: false,
+            licm: true,
+        }
+        .run(module)?
+        .with_name(self.name()))
+    }
+}
+
+/// Entry-Block Constant Hoisting & Deduplication Pass (`hoist-constants`).
+#[derive(Debug, Clone, Default)]
+pub struct HoistConstantsPass;
+
+impl Pass for HoistConstantsPass {
+    fn name(&self) -> &'static str {
+        "hoist-constants"
+    }
+
+    fn description(&self) -> &'static str {
+        "Hoists stablehlo.constant operations to block entry and deduplicates identical constants"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        Ok(CsePass {
+            gvn: false,
+            hoist_constants: true,
+            licm: false,
+        }
+        .run(module)?
+        .with_name(self.name()))
+    }
 }

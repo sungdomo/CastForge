@@ -11,9 +11,9 @@ support.
   CastForge's Dual-Plane IR (`Module` + `TensorStore`), modular A-to-B `Translator` architecture,
   static arena memory planning, polyhedral `LoopModule` IR, multi-architecture SIMD profiles, and
   pluggable `CodegenBackend` registry.
-- [**Complete Reference of All 103 Hierarchical Passes (`docs/PASSES.md`)**](docs/PASSES.md):
+- [**Complete Reference of All 115 Hierarchical Passes (`docs/PASSES.md`)**](docs/PASSES.md):
   Detailed explanation, CLI options, and IR transformation rules for CastForge's two-tier pass
-  hierarchy (`38 top-level/composite passes & presets + 65 single-optimization leaf passes`) and
+  hierarchy (`38 top-level/composite passes & presets + 77 single-optimization leaf passes`) and
   unified `OptimizeLoopIrPass` (`optimize-loop-ir`).
 
 ## Project Directory Structure (`src/`)
@@ -28,8 +28,8 @@ support.
   exporters (`import.rs`), and computation graph visualization exporters (**Mermaid**, **Graphviz
   DOT**, **JSON**, **IR Diff**, and **Interactive HTML Pass Timeline Debugger** in `viz.rs`).
 - [`src/passes`](src/passes): Built-in `PassRegistry::with_builtin_passes()`
-  (`src/passes/registry/`) and **103 built-in hierarchical A-to-B IR translator passes & presets**
-  (`38 top-level/composite passes & presets + 65 single-optimization leaf passes`), organized into
+  (`src/passes/registry/`) and **115 built-in hierarchical A-to-B IR translator passes & presets**
+  (`38 top-level/composite passes & presets + 77 single-optimization leaf passes`), organized into
   modular pass packages (`src/passes/<pass>/`) and concise pass modules under `src/passes/`,
   supporting static Rust construction, CLI pipeline strings (`-p`), Unix pipes (`stdin -> stdout`),
   declarative TOML config files (`--config`), and step-by-step tracing.
@@ -47,11 +47,11 @@ support.
 - [`tests/`](tests): End-to-end integration test suites (`ai_opt_tests.rs`, `codegen_tests.rs`,
   `pipeline_tests.rs`).
 
-## Built-in Hierarchical A-to-B Translator Passes & Presets (38 Top-Level + 65 Leaf Passes)
+## Built-in Hierarchical A-to-B Translator Passes & Presets (38 Top-Level + 77 Leaf Passes)
 
 Every higher-level composite pass (`Pass::is_composite() == true`) orchestrates a sequence of
 distinct single-optimization leaf passes (`Pass::child_passes()`), and both composite and leaf
-passes are registered in `PassRegistry` (103 total entries).
+passes are registered in `PassRegistry` (115 total entries).
 
 | Pass Name | Category | Description |
 | :--- | :--- | :--- |
@@ -116,7 +116,7 @@ passes are registered in `PassRegistry` (103 total entries).
 ## Quick Start
 
 ```bash
-# 1. List all 103 registered A-to-B translator passes (38 composite/top-level + 65 leaf passes)
+# 1. List all 115 registered A-to-B translator passes (38 composite/top-level + 77 leaf passes)
 cargo run --bin castforge -- list-passes
 
 # 2. Concatenate simple A-to-B translators via standard Unix pipes (stdin -> stdout)

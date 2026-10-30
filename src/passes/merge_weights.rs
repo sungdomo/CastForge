@@ -40,14 +40,14 @@ impl Pass for MergeWeightsPass {
     }
 
     fn child_passes(&self) -> &'static [&'static str] {
-        &["bake-lora", "merge-task-vectors"]
+        &["bake-lora", "bake-dora", "merge-task-vectors"]
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let m = self.method.to_ascii_lowercase();
         let res = match m.as_str() {
             "lora" | "bake_lora" => BakeLoraPass { alpha: self.alpha }.run(module)?,
-            "dora" | "bake_dora" => run_bake_dora(module, self.alpha)?,
+            "dora" | "bake_dora" => BakeDoraPass { alpha: self.alpha }.run(module)?,
             "task_arithmetic" | "task" | "dare" => MergeTaskVectorsPass {
                 lambda: self.lambda,
                 drop_rate: self.drop_rate,
@@ -684,6 +684,31 @@ pub fn merge_f32_tensors(a: &[f32], b: &[f32], method: MergeMethod, t: f32) -> V
                 }
             })
             .collect(),
+    }
+}
+
+/// Weight-Decomposed Low-Rank Adaptation (DoRA) Baking Pass (`bake-dora`).
+pub struct BakeDoraPass {
+    pub alpha: f32,
+}
+
+impl Default for BakeDoraPass {
+    fn default() -> Self {
+        Self { alpha: 1.0 }
+    }
+}
+
+impl Pass for BakeDoraPass {
+    fn name(&self) -> &'static str {
+        "bake-dora"
+    }
+
+    fn description(&self) -> &'static str {
+        "Bakes DoRA adapters via column-wise directional normalization and magnitude rescaling"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        Ok(run_bake_dora(module, self.alpha)?.with_name(self.name()))
     }
 }
 

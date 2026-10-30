@@ -30,6 +30,10 @@ impl Pass for FoldViewsPass {
         "Unified folding of transpose, reshape, broadcast, slice/concat, convert, and layout views"
     }
 
+    fn child_passes(&self) -> &'static [&'static str] {
+        &["convert-layout"]
+    }
+
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         if self.layout.is_some() || self.propagate {
             let tgt_layout = self
@@ -38,8 +42,13 @@ impl Pass for FoldViewsPass {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .unwrap_or("nhwc")
-                .to_ascii_lowercase();
-            return run_convert_layout(module, &tgt_layout, self.propagate, self.name());
+                .to_string();
+            return Ok(ConvertLayoutPass {
+                layout: tgt_layout,
+                propagate: self.propagate,
+            }
+            .run(module)?
+            .with_name(self.name()));
         }
 
         let (created, modified, removed) = fold_all_views_single_pass(module)?;
@@ -50,6 +59,38 @@ impl Pass for FoldViewsPass {
             ops_modified: modified,
             ops_created: created,
         })
+    }
+}
+
+/// Spatial & Matrix Layout Conversion Pass (`convert-layout`).
+#[derive(Debug, Clone)]
+pub struct ConvertLayoutPass {
+    pub layout: String,
+    pub propagate: bool,
+}
+
+impl Default for ConvertLayoutPass {
+    fn default() -> Self {
+        Self {
+            layout: "nhwc".to_string(),
+            propagate: false,
+        }
+    }
+}
+
+impl Pass for ConvertLayoutPass {
+    fn name(&self) -> &'static str {
+        "convert-layout"
+    }
+
+    fn description(&self) -> &'static str {
+        "Converts spatial/matrix layouts (nhwc/nchw/col_major) and propagates layout across ops"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        let tgt = self.layout.trim().to_ascii_lowercase();
+        let tgt_layout = if tgt.is_empty() { "nhwc" } else { tgt.as_str() };
+        run_convert_layout(module, tgt_layout, self.propagate, self.name())
     }
 }
 

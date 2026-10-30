@@ -368,6 +368,35 @@ fn snap_e2m1(val: f32) -> f32 {
     sign * best
 }
 
+/// Blackwell NVFP4 / OCP MXFP4 4-Bit Float Microscaling Quantization Pass (`quantize-fp4`).
+pub struct QuantizeFp4Pass {
+    pub scheme: String,
+    pub block_size: usize,
+}
+
+impl Default for QuantizeFp4Pass {
+    fn default() -> Self {
+        Self {
+            scheme: "nvfp4".to_string(),
+            block_size: 16,
+        }
+    }
+}
+
+impl Pass for QuantizeFp4Pass {
+    fn name(&self) -> &'static str {
+        "quantize-fp4"
+    }
+
+    fn description(&self) -> &'static str {
+        "Quantizes weights to Blackwell NVFP4 / OCP MXFP4 E2M1 4-bit float microscaling blocks"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        Ok(run_fp4_quantize(module, &self.scheme, self.block_size)?.with_name(self.name()))
+    }
+}
+
 pub(super) fn run_fp4_quantize(
     module: &mut Module,
     scheme: &str,
@@ -636,6 +665,31 @@ pub fn quantize_symmetric_f32(
     };
 
     (q_data, scale, 0, q_dtype)
+}
+
+/// QAT Straight-Through Estimator Fake-Quantization Pass (`insert-qat-ste`).
+pub struct InsertQatStePass {
+    pub bits: u8,
+}
+
+impl Default for InsertQatStePass {
+    fn default() -> Self {
+        Self { bits: 8 }
+    }
+}
+
+impl Pass for InsertQatStePass {
+    fn name(&self) -> &'static str {
+        "insert-qat-ste"
+    }
+
+    fn description(&self) -> &'static str {
+        "Applies fake-quantization with Straight-Through Estimator (QAT-STE) for training"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        Ok(run_qat_ste(module, self.bits)?.with_name(self.name()))
+    }
 }
 
 pub(super) fn run_qat_ste(module: &mut Module, bits: u8) -> Result<PassResult> {

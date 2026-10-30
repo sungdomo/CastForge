@@ -63,6 +63,8 @@ impl Pass for ShardDistributedPass {
             "shard-spmd",
             "shard-ring-attention",
             "shard-pipeline-parallel",
+            "shard-fsdp",
+            "shard-experts",
             "coalesce-all-reduce",
             "schedule-streams",
             "autodiff",
@@ -115,10 +117,20 @@ impl Pass for ShardDistributedPass {
             );
         }
         if m == "fsdp" || m == "zero3" || m == "zero" {
-            steps.push(run_fsdp_sharding(module, self.devices)?);
+            steps.push(
+                ShardFsdpPass {
+                    num_devices: self.devices,
+                }
+                .run(module)?,
+            );
         }
         if m == "ep" || m == "expert" || m == "moe" {
-            steps.push(run_expert_parallelism(module, self.devices)?);
+            steps.push(
+                ShardExpertsPass {
+                    num_devices: self.devices,
+                }
+                .run(module)?,
+            );
         }
         if m == "streams" || m == "stream" || m == "async" {
             steps.push(
@@ -709,6 +721,31 @@ fn insert_stream_wait_before(
     res_val
 }
 
+/// ZeRO-3 / FSDP Parameter Sharding Pass (`shard-fsdp`).
+pub struct ShardFsdpPass {
+    pub num_devices: usize,
+}
+
+impl Default for ShardFsdpPass {
+    fn default() -> Self {
+        Self { num_devices: 2 }
+    }
+}
+
+impl Pass for ShardFsdpPass {
+    fn name(&self) -> &'static str {
+        "shard-fsdp"
+    }
+
+    fn description(&self) -> &'static str {
+        "Shards GEMM weights with ZeRO-3/FSDP all_gather prefetch and reduce_scatter grad sync"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        Ok(run_fsdp_sharding(module, self.num_devices)?.with_name(self.name()))
+    }
+}
+
 fn run_fsdp_sharding(module: &mut Module, num_devices: usize) -> Result<PassResult> {
     let devices = num_devices.max(2) as i64;
     let mut modified = 0usize;
@@ -755,6 +792,31 @@ fn run_fsdp_sharding(module: &mut Module, num_devices: usize) -> Result<PassResu
         ops_modified: modified,
         ops_created: 0,
     })
+}
+
+/// Mixture-of-Experts Expert Parallelism Pass (`shard-experts`).
+pub struct ShardExpertsPass {
+    pub num_devices: usize,
+}
+
+impl Default for ShardExpertsPass {
+    fn default() -> Self {
+        Self { num_devices: 2 }
+    }
+}
+
+impl Pass for ShardExpertsPass {
+    fn name(&self) -> &'static str {
+        "shard-experts"
+    }
+
+    fn description(&self) -> &'static str {
+        "Shards MoE/MLP experts across devices with all_to_all token dispatch and combine"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        Ok(run_expert_parallelism(module, self.num_devices)?.with_name(self.name()))
+    }
 }
 
 fn run_expert_parallelism(module: &mut Module, num_devices: usize) -> Result<PassResult> {

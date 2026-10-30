@@ -1542,7 +1542,7 @@ module @advanced_ir_tools {
 #[test]
 fn test_pad_for_tiling_split_gemm_unroll_calls_hoist_all_reduce_instrument_and_strip() {
     let registry = PassRegistry::with_builtin_passes();
-    assert_eq!(registry.list().count(), 103);
+    assert_eq!(registry.list().count(), 115);
     for (name, _) in registry.list() {
         let pass = registry
             .create_pass(name, &Default::default())
