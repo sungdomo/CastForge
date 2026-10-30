@@ -5,9 +5,9 @@ use crate::ir::{Attribute, BlockId, Module, OpId, ValueDef, ValueId};
 use crate::passes::{
     DeadCodeEliminationPass, FoldConstantsPass, FoldViewsPass, FoldWeightsPass,
     FuseActivationsPass, FuseElementwisePass, FuseGemmPass, FuseNormPass, FuseSoftmaxPass,
-    InlinerPass, LicmPass, OptimizeMemoryPass, Pass, PassResult, ShardDistributedPass,
-    UnifiedCsePass, UnifiedFuseAttentionPass, UnifiedMergeWeightsPass,
-    UnifiedSimplifyAlgebraicPass, UnifiedSpecializeShapesPass,
+    InlinerPass, OptimizeMemoryPass, Pass, PassResult, ShardDistributedPass, UnifiedCsePass,
+    UnifiedFuseAttentionPass, UnifiedMergeWeightsPass, UnifiedSimplifyAlgebraicPass,
+    UnifiedSpecializeShapesPass,
 };
 use anyhow::Result;
 use indexmap::IndexMap;
@@ -371,7 +371,6 @@ impl Pass for OptO1Pass {
                 include_conditional: true,
             }
             .run(module)?,
-            LicmPass.run(module)?,
             UnifiedCsePass::default().run(module)?,
             FoldViewsPass::default().run(module)?,
             CanonicalizePass::default().run(module)?,

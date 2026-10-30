@@ -1764,7 +1764,7 @@ module @sota_cse_dce {
     assert!(!use_counts.is_empty());
 
     let mut pm = PassManager::new()
-        .add_pass(castforge::passes::CommonSubexpressionEliminationPass)
+        .add_pass(castforge::passes::UnifiedCsePass::default())
         .add_pass(castforge::passes::DeadCodeEliminationPass::default());
     let results = pm.run(&mut module).expect("run cse + dce");
     assert_eq!(
