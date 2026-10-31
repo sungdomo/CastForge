@@ -5,12 +5,12 @@ use crate::codegen::{
     HardwareRoofline, MemoryPlanTranslator, OptimizeLoopIrPass, OptimizeLoopIrTranslator,
     RooflineReportTranslator, SharedLibTranslator, SimdIsa, TargetConfig, TensorToLoopTranslator,
 };
+use crate::ir::viz::{IrDiffTranslator, SnapshotIrTranslator, VizFormat, VizTranslator};
 use crate::ir::{
     GgufExportTranslator, GgufImportTranslator, HfConfigImportTranslator, MlirParseTranslator,
     MlirPrintTranslator, OnnxExportTranslator, OnnxImportTranslator, Payload, PrintOptions,
     SafetensorsExportTranslator, SafetensorsImportTranslator, Translator, TranslatorChain,
 };
-use crate::ir::viz::{IrDiffTranslator, SnapshotIrTranslator, VizFormat, VizTranslator};
 use crate::passes::{PassRegistry, parse_pass_spec_item, split_pipeline_spec};
 use anyhow::{Context, Result};
 use indexmap::IndexMap;

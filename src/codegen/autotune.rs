@@ -149,7 +149,10 @@ pub fn autotune_module(module: &Module, roofline: &HardwareRoofline) -> Autotune
                         for &sk in &split_ks {
                             // Split-K is mutually exclusive with register/cache tiling & unrolling
                             if sk > 1
-                                && (mr > 0 || l1 > 0 || l2 > 0 || uf > 1
+                                && (mr > 0
+                                    || l1 > 0
+                                    || l2 > 0
+                                    || uf > 1
                                     || order != GemmLoopOrder::Mnk)
                             {
                                 continue;
@@ -342,7 +345,11 @@ fn dominant_gemm_dims(module: &Module) -> (usize, usize, usize) {
             let out_d = static_shape(module, op.results[0]);
             if lhs_d.len() >= 2 && out_d.len() >= 2 {
                 let n = *out_d.last().unwrap_or(&1);
-                let m = out_d[..out_d.len() - 1].iter().copied().product::<usize>().max(1);
+                let m = out_d[..out_d.len() - 1]
+                    .iter()
+                    .copied()
+                    .product::<usize>()
+                    .max(1);
                 let k = *lhs_d.last().unwrap_or(&1);
                 let vol = m * n * k;
                 if (is_gemm && !found_gemm) || vol > best_vol {

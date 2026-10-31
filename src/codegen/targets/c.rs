@@ -992,7 +992,10 @@ fn emit_c_hlo_op(
                 )?;
                 writeln!(out, "        float sum = 0.0f;")?;
                 writeln!(out, "        for (int c = 0; c < {cols}; ++c) {{")?;
-                writeln!(out, "            float e = expf({x}[r * {cols} + c] - max_v);")?;
+                writeln!(
+                    out,
+                    "            float e = expf({x}[r * {cols} + c] - max_v);"
+                )?;
                 writeln!(out, "            {res_name}[r * {cols} + c] = e;")?;
                 writeln!(out, "            sum += e;")?;
                 writeln!(out, "        }}")?;
@@ -1515,10 +1518,7 @@ fn emit_c_hlo_op(
             let max_start = x_len.saturating_sub(res_len);
             if let Some(&s_id) = start_indices.first() {
                 let s0 = value_ident(module, s_id, names, counter);
-                writeln!(
-                    out,
-                    "    int start_off_{res_name} = (int)roundf({s0}[0]);"
-                )?;
+                writeln!(out, "    int start_off_{res_name} = (int)roundf({s0}[0]);")?;
                 writeln!(
                     out,
                     "    if (start_off_{res_name} < 0) start_off_{res_name} = 0;"
@@ -1581,10 +1581,7 @@ fn emit_c_hlo_op(
             )?;
             if let Some(&s_id) = start_indices.first() {
                 let s0 = value_ident(module, s_id, names, counter);
-                writeln!(
-                    out,
-                    "    int upd_off_{res_name} = (int)roundf({s0}[0]);"
-                )?;
+                writeln!(out, "    int upd_off_{res_name} = (int)roundf({s0}[0]);")?;
                 writeln!(
                     out,
                     "    if (upd_off_{res_name} < 0) upd_off_{res_name} = 0;"
@@ -1682,15 +1679,15 @@ fn emit_c_hlo_op(
                 writeln!(out, "            for (int ox = 0; ox < {ow}; ++ox) {{")?;
                 writeln!(out, "                for (int co = 0; co < {oc}; ++co) {{")?;
                 writeln!(out, "                    float acc = 0.0f;")?;
-                writeln!(out, "                    for (int ky = 0; ky < {kh}; ++ky) {{")?;
+                writeln!(
+                    out,
+                    "                    for (int ky = 0; ky < {kh}; ++ky) {{"
+                )?;
                 writeln!(
                     out,
                     "                        int iy = oy * {sh} + ky - ({ph});"
                 )?;
-                writeln!(
-                    out,
-                    "                        if (iy >= 0 && iy < {ih}) {{"
-                )?;
+                writeln!(out, "                        if (iy >= 0 && iy < {ih}) {{")?;
                 writeln!(
                     out,
                     "                            for (int kx = 0; kx < {kw}; ++kx) {{"

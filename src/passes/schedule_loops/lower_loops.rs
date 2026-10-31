@@ -411,9 +411,15 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                     .and_then(|a| a.as_str())
                     .unwrap_or("stablehlo.add");
                 let (init_expr, accum_expr) = if reducer.contains("max") {
-                    ("-3.402823e38f".to_string(), format!("fmaxf({dst}[row], {src_idx})"))
+                    (
+                        "-3.402823e38f".to_string(),
+                        format!("fmaxf({dst}[row], {src_idx})"),
+                    )
                 } else if reducer.contains("min") {
-                    ("3.402823e38f".to_string(), format!("fminf({dst}[row], {src_idx})"))
+                    (
+                        "3.402823e38f".to_string(),
+                        format!("fminf({dst}[row], {src_idx})"),
+                    )
                 } else if reducer.contains("mul") {
                     ("1.0f".to_string(), format!("{dst}[row] * {src_idx}"))
                 } else {

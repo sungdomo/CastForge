@@ -481,7 +481,10 @@ fn emit_wgsl_func(
                     let f = wgsl_idx(module, on_false, res_len, &f_n, "i");
                     writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
                     writeln!(out, "    for (var i = 0u; i < {res_len}u; i = i + 1u) {{")?;
-                    writeln!(out, "        {res_name}[i] = select({f}, {t}, ({p}) != 0.0);")?;
+                    writeln!(
+                        out,
+                        "        {res_name}[i] = select({f}, {t}, ({p}) != 0.0);"
+                    )?;
                     writeln!(out, "    }}")?;
                 }
                 StableHloOp::Iota { iota_dimension, .. } => {
@@ -523,10 +526,7 @@ fn emit_wgsl_func(
                              u32(clamp(i32(round({s0}[0u])), 0i, {max_start}i));"
                         )?;
                         writeln!(out, "    for (var i = 0u; i < {u_len}u; i = i + 1u) {{")?;
-                        writeln!(
-                            out,
-                            "        {res_name}[upd_off_{res_name} + i] = {u}[i];"
-                        )?;
+                        writeln!(out, "        {res_name}[upd_off_{res_name} + i] = {u}[i];")?;
                         writeln!(out, "    }}")?;
                     } else {
                         writeln!(out, "    for (var i = 0u; i < {u_len}u; i = i + 1u) {{")?;
@@ -834,10 +834,7 @@ fn emit_wgsl_composite(
                  (1.0 + tanh(0.7978846 * (gate + 0.044715 * gate * gate * gate)));"
             )?;
         } else {
-            writeln!(
-                out,
-                "            let g_act = gate / (1.0 + exp(-gate));"
-            )?;
+            writeln!(out, "            let g_act = gate / (1.0 + exp(-gate));")?;
         }
         writeln!(out, "            {res_name}[m * {n}u + n] = g_act * up;")?;
         writeln!(out, "        }}")?;
@@ -1057,7 +1054,10 @@ fn emit_wgsl_composite(
         writeln!(out, "        var o_acc: array<f32, {d_v}>;")?;
         writeln!(out, "        var m_prev: f32 = -1e30;")?;
         writeln!(out, "        var l_prev: f32 = 0.0;")?;
-        writeln!(out, "        for (var c = 0u; c < {seq_kv}u; c = c + 1u) {{")?;
+        writeln!(
+            out,
+            "        for (var c = 0u; c < {seq_kv}u; c = c + 1u) {{"
+        )?;
         writeln!(out, "            var acc: f32 = 0.0;")?;
         writeln!(
             out,
@@ -1073,7 +1073,10 @@ fn emit_wgsl_composite(
         writeln!(out, "            let alpha = exp(m_prev - m_new);")?;
         writeln!(out, "            let beta = exp(s - m_new);")?;
         writeln!(out, "            l_prev = l_prev * alpha + beta;")?;
-        writeln!(out, "            for (var d = 0u; d < {d_v}u; d = d + 1u) {{")?;
+        writeln!(
+            out,
+            "            for (var d = 0u; d < {d_v}u; d = d + 1u) {{"
+        )?;
         writeln!(
             out,
             "                o_acc[d] = o_acc[d] * alpha + beta * {v}[c * {d_v}u + d];"
@@ -1118,7 +1121,10 @@ fn emit_wgsl_composite(
             out,
             "                let w_val = f32(i32({w_q}[{b_idx}]) - {zp}i) * {scale:.6};"
         )?;
-        writeln!(out, "                acc = acc + {a}[m * {k}u + k] * w_val;")?;
+        writeln!(
+            out,
+            "                acc = acc + {a}[m * {k}u + k] * w_val;"
+        )?;
         writeln!(out, "            }}")?;
         if let Some(&bias_id) = inputs.get(2) {
             let bias = value_ident(module, bias_id, names, counter);
@@ -1201,7 +1207,10 @@ fn emit_wgsl_composite(
         writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
         writeln!(out, "    for (var r = 0u; r < {res_len}u; r = r + 1u) {{")?;
         writeln!(out, "        var acc: f32 = {init_v}[0u];")?;
-        writeln!(out, "        for (var c = 0u; c < {red_ext}u; c = c + 1u) {{")?;
+        writeln!(
+            out,
+            "        for (var c = 0u; c < {red_ext}u; c = c + 1u) {{"
+        )?;
         writeln!(out, "            acc = acc + {mapped};")?;
         writeln!(out, "        }}")?;
         writeln!(out, "        {res_name}[r] = acc;")?;

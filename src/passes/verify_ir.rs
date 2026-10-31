@@ -537,8 +537,7 @@ impl Pass for SanitizeNumericsPass {
                     .iter()
                     .position(|&id| id == op_id)
                 {
-                    let downstream: Vec<_> =
-                        module.blocks[block_id].ops[pos + 1..].to_vec();
+                    let downstream: Vec<_> = module.blocks[block_id].ops[pos + 1..].to_vec();
                     for other_id in downstream {
                         if let Some(other_op) = module.ops.get_mut(other_id) {
                             for opnd in &mut other_op.operands {
@@ -865,8 +864,7 @@ impl Pass for InstrumentProfilingPass {
                     .iter()
                     .position(|&id| id == op_id)
                 {
-                    let downstream: Vec<_> =
-                        module.blocks[block_id].ops[pos + 1..].to_vec();
+                    let downstream: Vec<_> = module.blocks[block_id].ops[pos + 1..].to_vec();
                     for other_id in downstream {
                         if let Some(other_op) = module.ops.get_mut(other_id) {
                             for opnd in &mut other_op.operands {

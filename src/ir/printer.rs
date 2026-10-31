@@ -368,12 +368,7 @@ impl<'a> MlirPrinter<'a> {
         let extra_fn_attrs: Vec<(&String, &Attribute)> = op
             .attributes
             .iter()
-            .filter(|(k, _)| {
-                !matches!(
-                    k.as_str(),
-                    "sym_name" | "function_type" | "sym_visibility"
-                )
-            })
+            .filter(|(k, _)| !matches!(k.as_str(), "sym_name" | "function_type" | "sym_visibility"))
             .collect();
         let mut fn_attrs_str = String::new();
         if !extra_fn_attrs.is_empty() {

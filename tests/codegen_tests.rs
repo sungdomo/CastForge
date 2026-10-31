@@ -2414,7 +2414,10 @@ fn test_iterative_cli_ir_codegen_audit_fixes() {
     let blk_id = while_mod.regions[while_mod.ops[fn_id].regions[0]].blocks[0];
     let intervals = castforge::codegen::compute_block_liveness(&while_mod, blk_id);
     // %step is defined at step 1 and used inside the nested regions of %w at step 2
-    let step_iv = intervals.iter().find(|iv| iv.first_def == 1).expect("step iv");
+    let step_iv = intervals
+        .iter()
+        .find(|iv| iv.first_def == 1)
+        .expect("step iv");
     assert_eq!(step_iv.last_use, 2);
     let viz_json =
         castforge::ir::viz::render_module(&while_mod, castforge::ir::viz::VizFormat::Json);

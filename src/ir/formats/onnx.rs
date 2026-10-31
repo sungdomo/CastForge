@@ -502,7 +502,10 @@ pub fn import_onnx_json(json_str: &str) -> Result<Module> {
                     sanitize_name(p_in)
                 } else {
                     let pv = format!("pad_val_{idx}");
-                    writeln!(mlir, "    %{pv} = stablehlo.constant dense<0.0> : tensor<f32>")?;
+                    writeln!(
+                        mlir,
+                        "    %{pv} = stablehlo.constant dense<0.0> : tensor<f32>"
+                    )?;
                     pv
                 };
                 let fmt_arr = |key: &str, rank: usize| -> String {

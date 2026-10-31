@@ -36,8 +36,8 @@ pub use crate::codegen::targets::{
     emit_c_module, emit_c_module_with_config, emit_cuda_from_loop_ir, emit_cuda_module_with_config,
     emit_hip_from_loop_ir, emit_hip_module_with_config, emit_msl_from_loop_ir,
     emit_msl_module_with_config, emit_opencl_from_loop_ir, emit_opencl_module_with_config,
-    emit_rust_from_loop_ir, emit_rust_module, emit_rust_module_with_config,
-    emit_wgsl_from_loop_ir, emit_wgsl_module, emit_wgsl_module_with_config,
+    emit_rust_from_loop_ir, emit_rust_module, emit_rust_module_with_config, emit_wgsl_from_loop_ir,
+    emit_wgsl_module, emit_wgsl_module_with_config,
 };
 pub use crate::ir::loops::{LoopKernel, LoopModule, LoopStmt};
 use crate::ir::{Dim, Module, TensorType, ValueId};
