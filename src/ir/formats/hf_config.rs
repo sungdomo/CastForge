@@ -256,7 +256,12 @@ pub fn import_hf_model_dir(dir: impl AsRef<Path>) -> Result<Module> {
     };
     let cfg_str = fs::read_to_string(&cfg_path)
         .with_context(|| format!("Failed to read HuggingFace config {}", cfg_path.display()))?;
-    let st_path = dir.join("model.safetensors");
+    let parent_dir = if dir.is_file() {
+        dir.parent().unwrap_or(dir)
+    } else {
+        dir
+    };
+    let st_path = parent_dir.join("model.safetensors");
     let weights = if st_path.is_file() {
         let mut store = TensorStore::default();
         store.load_safetensors_file(&st_path)?;

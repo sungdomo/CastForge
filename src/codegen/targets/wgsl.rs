@@ -1,6 +1,9 @@
 //! WebGPU WGSL Compute Shader Code Generator (`CodegenTarget::Wgsl`).
 
-use crate::codegen::{TargetConfig, build_memory_plan, tensor_len, tensor_shape_dims, value_ident};
+use crate::codegen::{
+    LoopModule, LoopStmt, TargetConfig, build_memory_plan, matmul_dims_ex, tensor_len,
+    tensor_shape_dims, value_ident,
+};
 use crate::ir::{Attribute, DType, Module, OpId, Operation, ValueId};
 use crate::stablehlo::StableHloOp;
 use anyhow::Result;
@@ -265,9 +268,84 @@ fn emit_wgsl_func(
                     )?;
                     writeln!(out, "    }}")?;
                 }
+                StableHloOp::Transpose {
+                    operand,
+                    permutation,
+                    ..
+                } => {
+                    let x = value_ident(module, operand, &mut names, &mut counter);
+                    let in_dims = module.values[operand]
+                        .ty
+                        .as_tensor()
+                        .map(tensor_shape_dims)
+                        .unwrap_or_default();
+                    if in_dims.len() == 2 && permutation.as_slice() == [1, 0] {
+                        let (rows, cols) = (in_dims[0], in_dims[1]);
+                        writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+                        writeln!(out, "    for (var r = 0u; r < {rows}u; r = r + 1u) {{")?;
+                        writeln!(out, "        for (var c = 0u; c < {cols}u; c = c + 1u) {{")?;
+                        writeln!(
+                            out,
+                            "            {res_name}[c * {rows}u + r] = {x}[r * {cols}u + c];"
+                        )?;
+                        writeln!(out, "        }}")?;
+                        writeln!(out, "    }}")?;
+                    } else {
+                        let x_len = tensor_len(module, operand).max(1);
+                        writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+                        writeln!(out, "    for (var i = 0u; i < {res_len}u; i = i + 1u) {{")?;
+                        writeln!(out, "        {res_name}[i] = {x}[i % {x_len}u];")?;
+                        writeln!(out, "    }}")?;
+                    }
+                }
+                StableHloOp::Slice {
+                    operand,
+                    start_indices,
+                    strides,
+                    ..
+                } => {
+                    let x = value_ident(module, operand, &mut names, &mut counter);
+                    let in_dims = module.values[operand]
+                        .ty
+                        .as_tensor()
+                        .map(tensor_shape_dims)
+                        .unwrap_or_else(|| vec![tensor_len(module, operand).max(1)]);
+                    let out_dims = module.values[res_val]
+                        .ty
+                        .as_tensor()
+                        .map(tensor_shape_dims)
+                        .unwrap_or_else(|| vec![res_len]);
+                    if in_dims.len() == 2 && out_dims.len() == 2 {
+                        let s0 = (*start_indices.first().unwrap_or(&0)).max(0) as usize;
+                        let s1 = (*start_indices.get(1).unwrap_or(&0)).max(0) as usize;
+                        let st0 = (*strides.first().unwrap_or(&1)).max(1) as usize;
+                        let st1 = (*strides.get(1).unwrap_or(&1)).max(1) as usize;
+                        let in_c = in_dims[1].max(1);
+                        let (out_r, out_c) = (out_dims[0], out_dims[1]);
+                        writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+                        writeln!(out, "    for (var r = 0u; r < {out_r}u; r = r + 1u) {{")?;
+                        writeln!(out, "        for (var c = 0u; c < {out_c}u; c = c + 1u) {{")?;
+                        writeln!(
+                            out,
+                            "            {res_name}[r * {out_c}u + c] = \
+                             {x}[({s0}u + r * {st0}u) * {in_c}u + ({s1}u + c * {st1}u)];"
+                        )?;
+                        writeln!(out, "        }}")?;
+                        writeln!(out, "    }}")?;
+                    } else {
+                        let x_len = tensor_len(module, operand).max(1);
+                        let s0 = (*start_indices.first().unwrap_or(&0)).max(0) as usize;
+                        let st0 = (*strides.first().unwrap_or(&1)).max(1) as usize;
+                        writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+                        writeln!(out, "    for (var i = 0u; i < {res_len}u; i = i + 1u) {{")?;
+                        writeln!(
+                            out,
+                            "        {res_name}[i] = {x}[({s0}u + i * {st0}u) % {x_len}u];"
+                        )?;
+                        writeln!(out, "    }}")?;
+                    }
+                }
                 StableHloOp::BroadcastInDim { operand, .. }
-                | StableHloOp::Transpose { operand, .. }
-                | StableHloOp::Slice { operand, .. }
                 | StableHloOp::DynamicSlice { operand, .. }
                 | StableHloOp::Pad { operand, .. } => {
                     let x = value_ident(module, operand, &mut names, &mut counter);
@@ -277,26 +355,55 @@ fn emit_wgsl_func(
                     writeln!(out, "        {res_name}[i] = {x}[i % {x_len}u];")?;
                     writeln!(out, "    }}")?;
                 }
-                StableHloOp::Concatenate { inputs, .. } => {
+                StableHloOp::Concatenate {
+                    inputs, dimension, ..
+                } => {
+                    let out_dims = module.values[res_val]
+                        .ty
+                        .as_tensor()
+                        .map(tensor_shape_dims)
+                        .unwrap_or_else(|| vec![res_len]);
+                    let dim = (dimension.max(0) as usize).min(out_dims.len().saturating_sub(1));
+                    let outer: usize = out_dims.iter().take(dim).product::<usize>().max(1);
+                    let out_cat_stride: usize = out_dims.iter().skip(dim).product::<usize>().max(1);
+                    let inner: usize = out_dims.iter().skip(dim + 1).product::<usize>().max(1);
                     writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
-                    let mut offset = 0usize;
+                    let mut cat_offset = 0usize;
                     for &inp in &inputs {
                         let a = value_ident(module, inp, &mut names, &mut counter);
-                        let a_len = tensor_len(module, inp);
-                        writeln!(out, "    for (var i = 0u; i < {a_len}u; i = i + 1u) {{")?;
-                        writeln!(out, "        {res_name}[{offset}u + i] = {a}[i];")?;
+                        let in_dims = module.values[inp]
+                            .ty
+                            .as_tensor()
+                            .map(tensor_shape_dims)
+                            .unwrap_or_else(|| vec![tensor_len(module, inp).max(1)]);
+                        let in_cat = (*in_dims.get(dim).unwrap_or(&1)).max(1);
+                        let chunk = in_cat * inner;
+                        writeln!(out, "    for (var o = 0u; o < {outer}u; o = o + 1u) {{")?;
+                        writeln!(out, "        for (var c = 0u; c < {chunk}u; c = c + 1u) {{")?;
+                        writeln!(
+                            out,
+                            "            {res_name}[o * {out_cat_stride}u + {cat_offset}u + c] = \
+                             {a}[o * {chunk}u + c];"
+                        )?;
+                        writeln!(out, "        }}")?;
                         writeln!(out, "    }}")?;
-                        offset += a_len;
+                        cat_offset += chunk;
                     }
                 }
                 StableHloOp::Reduce {
                     inputs,
                     init_values,
+                    dimensions,
                     reducer_op,
                     ..
                 } if !inputs.is_empty() => {
                     let operand = inputs[0];
                     let x = value_ident(module, operand, &mut names, &mut counter);
+                    let in_dims = module.values[operand]
+                        .ty
+                        .as_tensor()
+                        .map(tensor_shape_dims)
+                        .unwrap_or_default();
                     let init_expr = init_values
                         .first()
                         .map(|&v| {
@@ -306,13 +413,17 @@ fn emit_wgsl_func(
                         .unwrap_or_else(|| "0.0".to_string());
                     let x_len = tensor_len(module, operand);
                     let red_ext = (x_len / res_len.max(1)).max(1);
-                    let elem = format!("{x}[r * {red_ext}u + c]");
+                    let elem = if in_dims.len() == 2 && dimensions.as_slice() == [0] {
+                        format!("{x}[c * {res_len}u + r]")
+                    } else {
+                        format!("{x}[r * {red_ext}u + c]")
+                    };
                     let red_op = reducer_op.as_deref().unwrap_or("add");
-                    let step_expr = if red_op.contains("maximum") {
+                    let step_expr = if red_op.contains("max") {
                         format!("max(acc, {elem})")
-                    } else if red_op.contains("minimum") {
+                    } else if red_op.contains("min") {
                         format!("min(acc, {elem})")
-                    } else if red_op.contains("multiply") {
+                    } else if red_op.contains("mul") {
                         format!("acc * {elem}")
                     } else {
                         format!("acc + {elem}")
@@ -327,6 +438,117 @@ fn emit_wgsl_func(
                     writeln!(out, "            acc = {step_expr};")?;
                     writeln!(out, "        }}")?;
                     writeln!(out, "        {res_name}[r] = acc;")?;
+                    writeln!(out, "    }}")?;
+                }
+                StableHloOp::Compare {
+                    lhs,
+                    rhs,
+                    direction,
+                    ..
+                } => {
+                    let a_n = value_ident(module, lhs, &mut names, &mut counter);
+                    let b_n = value_ident(module, rhs, &mut names, &mut counter);
+                    let a = wgsl_idx(module, lhs, res_len, &a_n, "i");
+                    let b = wgsl_idx(module, rhs, res_len, &b_n, "i");
+                    let cmp_op = match direction.as_str() {
+                        "EQ" => "==",
+                        "NE" => "!=",
+                        "LT" => "<",
+                        "LE" => "<=",
+                        "GT" => ">",
+                        "GE" => ">=",
+                        _ => "==",
+                    };
+                    writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+                    writeln!(out, "    for (var i = 0u; i < {res_len}u; i = i + 1u) {{")?;
+                    writeln!(
+                        out,
+                        "        {res_name}[i] = select(0.0, 1.0, ({a}) {cmp_op} ({b}));"
+                    )?;
+                    writeln!(out, "    }}")?;
+                }
+                StableHloOp::Select {
+                    pred,
+                    on_true,
+                    on_false,
+                    ..
+                } => {
+                    let p_n = value_ident(module, pred, &mut names, &mut counter);
+                    let t_n = value_ident(module, on_true, &mut names, &mut counter);
+                    let f_n = value_ident(module, on_false, &mut names, &mut counter);
+                    let p = wgsl_idx(module, pred, res_len, &p_n, "i");
+                    let t = wgsl_idx(module, on_true, res_len, &t_n, "i");
+                    let f = wgsl_idx(module, on_false, res_len, &f_n, "i");
+                    writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+                    writeln!(out, "    for (var i = 0u; i < {res_len}u; i = i + 1u) {{")?;
+                    writeln!(out, "        {res_name}[i] = select({f}, {t}, ({p}) != 0.0);")?;
+                    writeln!(out, "    }}")?;
+                }
+                StableHloOp::Iota { iota_dimension, .. } => {
+                    let dims = module.values[res_val]
+                        .ty
+                        .as_tensor()
+                        .map(tensor_shape_dims)
+                        .unwrap_or_else(|| vec![res_len]);
+                    let d = (iota_dimension.max(0) as usize).min(dims.len().saturating_sub(1));
+                    let dim_size = (*dims.get(d).unwrap_or(&res_len)).max(1);
+                    let inner: usize = dims.iter().skip(d + 1).product::<usize>().max(1);
+                    writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+                    writeln!(out, "    for (var i = 0u; i < {res_len}u; i = i + 1u) {{")?;
+                    writeln!(
+                        out,
+                        "        {res_name}[i] = f32((i / {inner}u) % {dim_size}u);"
+                    )?;
+                    writeln!(out, "    }}")?;
+                }
+                StableHloOp::DynamicUpdateSlice {
+                    operand,
+                    update,
+                    start_indices,
+                    ..
+                } => {
+                    let x = value_ident(module, operand, &mut names, &mut counter);
+                    let u = value_ident(module, update, &mut names, &mut counter);
+                    let u_len = tensor_len(module, update).min(res_len);
+                    let max_start = res_len.saturating_sub(u_len);
+                    writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+                    writeln!(out, "    for (var i = 0u; i < {res_len}u; i = i + 1u) {{")?;
+                    writeln!(out, "        {res_name}[i] = {x}[i];")?;
+                    writeln!(out, "    }}")?;
+                    if let Some(&s_id) = start_indices.first() {
+                        let s0 = value_ident(module, s_id, &mut names, &mut counter);
+                        writeln!(
+                            out,
+                            "    let upd_off_{res_name} = \
+                             u32(clamp(i32(round({s0}[0u])), 0i, {max_start}i));"
+                        )?;
+                        writeln!(out, "    for (var i = 0u; i < {u_len}u; i = i + 1u) {{")?;
+                        writeln!(
+                            out,
+                            "        {res_name}[upd_off_{res_name} + i] = {u}[i];"
+                        )?;
+                        writeln!(out, "    }}")?;
+                    } else {
+                        writeln!(out, "    for (var i = 0u; i < {u_len}u; i = i + 1u) {{")?;
+                        writeln!(out, "        {res_name}[i] = {u}[i];")?;
+                        writeln!(out, "    }}")?;
+                    }
+                }
+                StableHloOp::Convolution { lhs, rhs, .. } => {
+                    let a = value_ident(module, lhs, &mut names, &mut counter);
+                    let b = value_ident(module, rhs, &mut names, &mut counter);
+                    let a_len = tensor_len(module, lhs).max(1);
+                    let b_len = tensor_len(module, rhs).max(1);
+                    writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+                    writeln!(out, "    for (var i = 0u; i < {res_len}u; i = i + 1u) {{")?;
+                    writeln!(out, "        var acc: f32 = 0.0;")?;
+                    writeln!(out, "        for (var k = 0u; k < {b_len}u; k = k + 1u) {{")?;
+                    writeln!(
+                        out,
+                        "            if (i + k < {a_len}u) {{ acc = acc + {a}[i + k] * {b}[k]; }}"
+                    )?;
+                    writeln!(out, "        }}")?;
+                    writeln!(out, "        {res_name}[i] = acc;")?;
                     writeln!(out, "    }}")?;
                 }
                 StableHloOp::Gather {
@@ -384,23 +606,7 @@ fn emit_wgsl_func(
                     let packed = dims.rhs_contracting_dimensions == [1];
                     let a = value_ident(module, lhs, &mut names, &mut counter);
                     let b = value_ident(module, rhs, &mut names, &mut counter);
-                    let lhs_dims = module.values[lhs]
-                        .ty
-                        .as_tensor()
-                        .map(tensor_shape_dims)
-                        .unwrap_or_else(|| vec![1, 1]);
-                    let rhs_dims = module.values[rhs]
-                        .ty
-                        .as_tensor()
-                        .map(tensor_shape_dims)
-                        .unwrap_or_else(|| vec![1, 1]);
-                    let m = *lhs_dims.first().unwrap_or(&1);
-                    let k = *lhs_dims.get(1).unwrap_or(&1);
-                    let n = if packed {
-                        *rhs_dims.first().unwrap_or(&1)
-                    } else {
-                        *rhs_dims.get(1).unwrap_or(&1)
-                    };
+                    let (m, k, n) = matmul_dims_ex(module, lhs, rhs, packed);
                     let b_idx = if packed {
                         format!("n * {k}u + k")
                     } else {
@@ -522,23 +728,7 @@ fn emit_wgsl_composite(
         let b = value_ident(module, inputs[1], names, counter);
         let bias = value_ident(module, inputs[2], names, counter);
         let bias_expr = wgsl_idx(module, inputs[2], res_len, &bias, "flat");
-        let lhs_dims = module.values[inputs[0]]
-            .ty
-            .as_tensor()
-            .map(tensor_shape_dims)
-            .unwrap_or_else(|| vec![1, 1]);
-        let rhs_dims = module.values[inputs[1]]
-            .ty
-            .as_tensor()
-            .map(tensor_shape_dims)
-            .unwrap_or_else(|| vec![1, 1]);
-        let m = *lhs_dims.first().unwrap_or(&1);
-        let k = *lhs_dims.get(1).unwrap_or(&1);
-        let n = if packed {
-            *rhs_dims.first().unwrap_or(&1)
-        } else {
-            *rhs_dims.get(1).unwrap_or(&1)
-        };
+        let (m, k, n) = matmul_dims_ex(module, inputs[0], inputs[1], packed);
         let b_idx = if packed {
             format!("n * {k}u + k")
         } else {
@@ -593,9 +783,7 @@ fn emit_wgsl_composite(
         }
         writeln!(out, "        }}")?;
         writeln!(out, "    }}")?;
-    } else if matches!(name, "castforge.fused_swiglu" | "castforge.fused_gated_mlp")
-        && inputs.len() >= 2
-    {
+    } else if name == "castforge.fused_swiglu" && inputs.len() >= 2 {
         let g = value_ident(module, inputs[0], names, counter);
         let u = value_ident(module, inputs[1], names, counter);
         writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
@@ -605,13 +793,56 @@ fn emit_wgsl_composite(
             "        {res_name}[i] = ({g}[i] / (1.0 + exp(-{g}[i]))) * {u}[i];"
         )?;
         writeln!(out, "    }}")?;
-    } else if matches!(
-        name,
-        "castforge.fused_rmsnorm"
-            | "castforge.fused_layernorm"
-            | "castforge.fused_residual_rmsnorm"
-    ) && !inputs.is_empty()
-    {
+    } else if name == "castforge.fused_gated_mlp" && inputs.len() >= 2 {
+        let packed = op
+            .attributes
+            .get("packed_rhs")
+            .is_some_and(|a| matches!(a, Attribute::Bool(true)));
+        let act = op
+            .attributes
+            .get("activation")
+            .and_then(|a| a.as_str())
+            .unwrap_or("swiglu");
+        let (m, k, wide_n) = matmul_dims_ex(module, inputs[0], inputs[1], packed);
+        let n = (wide_n / 2).max(1);
+        let a = value_ident(module, inputs[0], names, counter);
+        let w = value_ident(module, inputs[1], names, counter);
+        let wg_idx = if packed {
+            format!("n * {k}u + k")
+        } else {
+            format!("k * {wide_n}u + n")
+        };
+        let wu_idx = if packed {
+            format!("(n + {n}u) * {k}u + k")
+        } else {
+            format!("k * {wide_n}u + n + {n}u")
+        };
+        writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+        writeln!(out, "    for (var m = 0u; m < {m}u; m = m + 1u) {{")?;
+        writeln!(out, "        for (var n = 0u; n < {n}u; n = n + 1u) {{")?;
+        writeln!(out, "            var gate: f32 = 0.0;")?;
+        writeln!(out, "            var up: f32 = 0.0;")?;
+        writeln!(out, "            for (var k = 0u; k < {k}u; k = k + 1u) {{")?;
+        writeln!(out, "                let xv = {a}[m * {k}u + k];")?;
+        writeln!(out, "                gate = gate + xv * {w}[{wg_idx}];")?;
+        writeln!(out, "                up = up + xv * {w}[{wu_idx}];")?;
+        writeln!(out, "            }}")?;
+        if act == "geglu" {
+            writeln!(
+                out,
+                "            let g_act = 0.5 * gate * \
+                 (1.0 + tanh(0.7978846 * (gate + 0.044715 * gate * gate * gate)));"
+            )?;
+        } else {
+            writeln!(
+                out,
+                "            let g_act = gate / (1.0 + exp(-gate));"
+            )?;
+        }
+        writeln!(out, "            {res_name}[m * {n}u + n] = g_act * up;")?;
+        writeln!(out, "        }}")?;
+        writeln!(out, "    }}")?;
+    } else if name == "castforge.fused_rmsnorm" && !inputs.is_empty() {
         let x = value_ident(module, inputs[0], names, counter);
         let dims = module.values[res_val]
             .ty
@@ -620,6 +851,10 @@ fn emit_wgsl_composite(
             .unwrap_or_else(|| vec![1, res_len]);
         let cols = (*dims.last().unwrap_or(&res_len)).max(1);
         let rows = (res_len / cols).max(1);
+        let eps = match op.attributes.get("eps") {
+            Some(Attribute::Float(f)) => *f as f32,
+            _ => 1e-5_f32,
+        };
         writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
         writeln!(out, "    for (var r = 0u; r < {rows}u; r = r + 1u) {{")?;
         writeln!(out, "        var sq: f32 = 0.0;")?;
@@ -629,12 +864,10 @@ fn emit_wgsl_composite(
         writeln!(out, "        }}")?;
         writeln!(
             out,
-            "        let inv_rms = inverseSqrt(sq / f32({cols}u) + 1e-5);"
+            "        let inv_rms = inverseSqrt(sq / f32({cols}u) + {eps:.6});"
         )?;
         writeln!(out, "        for (var c = 0u; c < {cols}u; c = c + 1u) {{")?;
-        if let Some(&w_id) = inputs.last()
-            && inputs.len() >= 2
-        {
+        if let Some(&w_id) = inputs.get(1) {
             let w = value_ident(module, w_id, names, counter);
             let w_len = tensor_len(module, w_id).max(1);
             writeln!(
@@ -648,6 +881,96 @@ fn emit_wgsl_composite(
                 "            {res_name}[r * {cols}u + c] = {x}[r * {cols}u + c] * inv_rms;"
             )?;
         }
+        writeln!(out, "        }}")?;
+        writeln!(out, "    }}")?;
+    } else if name == "castforge.fused_residual_rmsnorm" && inputs.len() >= 2 {
+        let x = value_ident(module, inputs[0], names, counter);
+        let res_in = value_ident(module, inputs[1], names, counter);
+        let dims = module.values[res_val]
+            .ty
+            .as_tensor()
+            .map(tensor_shape_dims)
+            .unwrap_or_else(|| vec![1, res_len]);
+        let cols = (*dims.last().unwrap_or(&res_len)).max(1);
+        let rows = (res_len / cols).max(1);
+        let eps = match op.attributes.get("eps") {
+            Some(Attribute::Float(f)) => *f as f32,
+            _ => 1e-5_f32,
+        };
+        writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+        writeln!(out, "    for (var r = 0u; r < {rows}u; r = r + 1u) {{")?;
+        writeln!(out, "        var sq: f32 = 0.0;")?;
+        writeln!(out, "        for (var c = 0u; c < {cols}u; c = c + 1u) {{")?;
+        writeln!(
+            out,
+            "            let h = {x}[r * {cols}u + c] + {res_in}[r * {cols}u + c];"
+        )?;
+        writeln!(out, "            sq = sq + h * h;")?;
+        writeln!(out, "        }}")?;
+        writeln!(
+            out,
+            "        let inv_rms = inverseSqrt(sq / f32({cols}u) + {eps:.6});"
+        )?;
+        writeln!(out, "        for (var c = 0u; c < {cols}u; c = c + 1u) {{")?;
+        if let Some(&w_id) = inputs.get(2) {
+            let w = value_ident(module, w_id, names, counter);
+            let w_len = tensor_len(module, w_id).max(1);
+            writeln!(
+                out,
+                "            {res_name}[r * {cols}u + c] = \
+                 ({x}[r * {cols}u + c] + {res_in}[r * {cols}u + c]) * inv_rms * {w}[c % {w_len}u];"
+            )?;
+        } else {
+            writeln!(
+                out,
+                "            {res_name}[r * {cols}u + c] = \
+                 ({x}[r * {cols}u + c] + {res_in}[r * {cols}u + c]) * inv_rms;"
+            )?;
+        }
+        writeln!(out, "        }}")?;
+        writeln!(out, "    }}")?;
+    } else if name == "castforge.fused_layernorm" && !inputs.is_empty() {
+        let x = value_ident(module, inputs[0], names, counter);
+        let dims = module.values[res_val]
+            .ty
+            .as_tensor()
+            .map(tensor_shape_dims)
+            .unwrap_or_else(|| vec![1, res_len]);
+        let cols = (*dims.last().unwrap_or(&res_len)).max(1);
+        let rows = (res_len / cols).max(1);
+        let eps = match op.attributes.get("eps") {
+            Some(Attribute::Float(f)) => *f as f32,
+            _ => 1e-5_f32,
+        };
+        writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+        writeln!(out, "    for (var r = 0u; r < {rows}u; r = r + 1u) {{")?;
+        writeln!(out, "        var sum: f32 = 0.0;")?;
+        writeln!(out, "        for (var c = 0u; c < {cols}u; c = c + 1u) {{")?;
+        writeln!(out, "            sum = sum + {x}[r * {cols}u + c];")?;
+        writeln!(out, "        }}")?;
+        writeln!(out, "        let mean = sum / f32({cols}u);")?;
+        writeln!(out, "        var var_s: f32 = 0.0;")?;
+        writeln!(out, "        for (var c = 0u; c < {cols}u; c = c + 1u) {{")?;
+        writeln!(out, "            let d = {x}[r * {cols}u + c] - mean;")?;
+        writeln!(out, "            var_s = var_s + d * d;")?;
+        writeln!(out, "        }}")?;
+        writeln!(
+            out,
+            "        let inv = inverseSqrt(var_s / f32({cols}u) + {eps:.6});"
+        )?;
+        let mut expr = format!("({x}[r * {cols}u + c] - mean) * inv");
+        if let Some(&g_id) = inputs.get(1) {
+            let g = value_ident(module, g_id, names, counter);
+            let g_len = tensor_len(module, g_id).max(1);
+            expr = format!("{expr} * {g}[c % {g_len}u]");
+        }
+        if let Some(&b_id) = inputs.get(2) {
+            let b = value_ident(module, b_id, names, counter);
+            let b_len = tensor_len(module, b_id).max(1);
+            expr = format!("{expr} + {b}[c % {b_len}u]");
+        }
+        writeln!(out, "        for (var c = 0u; c < {cols}u; c = c + 1u) {{")?;
+        writeln!(out, "            {res_name}[r * {cols}u + c] = {expr};")?;
         writeln!(out, "        }}")?;
         writeln!(out, "    }}")?;
     } else if matches!(
@@ -702,33 +1025,276 @@ fn emit_wgsl_composite(
         let q = value_ident(module, inputs[0], names, counter);
         let k = value_ident(module, inputs[1], names, counter);
         let v = value_ident(module, inputs[2], names, counter);
-        let dims = module.values[res_val]
+        let q_dims = module.values[inputs[0]]
             .ty
             .as_tensor()
             .map(tensor_shape_dims)
             .unwrap_or_else(|| vec![1, res_len]);
-        let d_head = (*dims.last().unwrap_or(&1)).max(1);
-        let seq = (res_len / d_head).max(1);
-        let scale = 1.0f32 / (d_head as f32).sqrt();
+        let v_dims = module.values[inputs[2]]
+            .ty
+            .as_tensor()
+            .map(tensor_shape_dims)
+            .unwrap_or_else(|| vec![1, res_len]);
+        let seq_q = (*q_dims.first().unwrap_or(&1)).max(1);
+        let d_k = (*q_dims.get(1).unwrap_or(&1)).max(1);
+        let seq_kv = (*v_dims.first().unwrap_or(&1)).max(1);
+        let d_v = (*v_dims.get(1).unwrap_or(&1)).max(1);
+        let scale = match op.attributes.get("scale") {
+            Some(Attribute::Float(f)) => *f as f32,
+            _ => 1.0_f32,
+        };
+        let k_transposed = op
+            .attributes
+            .get("k_transposed")
+            .is_some_and(|a| matches!(a, Attribute::Bool(true)));
+        let k_idx = if k_transposed {
+            format!("c * {d_k}u + kd")
+        } else {
+            format!("kd * {seq_kv}u + c")
+        };
         writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
-        writeln!(out, "    for (var qi = 0u; qi < {seq}u; qi = qi + 1u) {{")?;
-        writeln!(
-            out,
-            "        for (var d = 0u; d < {d_head}u; d = d + 1u) {{"
-        )?;
+        writeln!(out, "    for (var r = 0u; r < {seq_q}u; r = r + 1u) {{")?;
+        writeln!(out, "        var o_acc: array<f32, {d_v}>;")?;
+        writeln!(out, "        var m_prev: f32 = -1e30;")?;
+        writeln!(out, "        var l_prev: f32 = 0.0;")?;
+        writeln!(out, "        for (var c = 0u; c < {seq_kv}u; c = c + 1u) {{")?;
         writeln!(out, "            var acc: f32 = 0.0;")?;
         writeln!(
             out,
-            "            for (var kj = 0u; kj < {seq}u; kj = kj + 1u) {{"
+            "            for (var kd = 0u; kd < {d_k}u; kd = kd + 1u) {{"
         )?;
         writeln!(
             out,
-            "                acc = acc + ({q}[qi * {d_head}u + d] * \
-             {k}[kj * {d_head}u + d] * {scale:.6}) * {v}[kj * {d_head}u + d];"
+            "                acc = acc + {q}[r * {d_k}u + kd] * {k}[{k_idx}];"
         )?;
         writeln!(out, "            }}")?;
-        writeln!(out, "            {res_name}[qi * {d_head}u + d] = acc;")?;
+        writeln!(out, "            let s = acc * {scale:.6};")?;
+        writeln!(out, "            let m_new = max(m_prev, s);")?;
+        writeln!(out, "            let alpha = exp(m_prev - m_new);")?;
+        writeln!(out, "            let beta = exp(s - m_new);")?;
+        writeln!(out, "            l_prev = l_prev * alpha + beta;")?;
+        writeln!(out, "            for (var d = 0u; d < {d_v}u; d = d + 1u) {{")?;
+        writeln!(
+            out,
+            "                o_acc[d] = o_acc[d] * alpha + beta * {v}[c * {d_v}u + d];"
+        )?;
+        writeln!(out, "            }}")?;
+        writeln!(out, "            m_prev = m_new;")?;
         writeln!(out, "        }}")?;
+        writeln!(out, "        for (var d = 0u; d < {d_v}u; d = d + 1u) {{")?;
+        writeln!(
+            out,
+            "            {res_name}[r * {d_v}u + d] = o_acc[d] / l_prev;"
+        )?;
+        writeln!(out, "        }}")?;
+        writeln!(out, "    }}")?;
+    } else if name == "castforge.fused_qmatmul" && inputs.len() >= 2 {
+        let packed = op
+            .attributes
+            .get("packed_rhs")
+            .is_some_and(|a| matches!(a, Attribute::Bool(true)));
+        let scale = match op.attributes.get("scale") {
+            Some(Attribute::Float(f)) => *f as f32,
+            _ => 1.0_f32,
+        };
+        let zp = match op.attributes.get("zero_point") {
+            Some(Attribute::Int(z)) => *z as i32,
+            _ => 0,
+        };
+        let (m, k, n) = matmul_dims_ex(module, inputs[0], inputs[1], packed);
+        let a = value_ident(module, inputs[0], names, counter);
+        let w_q = value_ident(module, inputs[1], names, counter);
+        let b_idx = if packed {
+            format!("n * {k}u + k")
+        } else {
+            format!("k * {n}u + n")
+        };
+        writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+        writeln!(out, "    for (var m = 0u; m < {m}u; m = m + 1u) {{")?;
+        writeln!(out, "        for (var n = 0u; n < {n}u; n = n + 1u) {{")?;
+        writeln!(out, "            var acc: f32 = 0.0;")?;
+        writeln!(out, "            for (var k = 0u; k < {k}u; k = k + 1u) {{")?;
+        writeln!(
+            out,
+            "                let w_val = f32(i32({w_q}[{b_idx}]) - {zp}i) * {scale:.6};"
+        )?;
+        writeln!(out, "                acc = acc + {a}[m * {k}u + k] * w_val;")?;
+        writeln!(out, "            }}")?;
+        if let Some(&bias_id) = inputs.get(2) {
+            let bias = value_ident(module, bias_id, names, counter);
+            let bias_len = tensor_len(module, bias_id).max(1);
+            let bias_idx = if bias_len <= n {
+                format!("n % {bias_len}u")
+            } else {
+                format!("m * {n}u + n")
+            };
+            writeln!(
+                out,
+                "            {res_name}[m * {n}u + n] = acc + {bias}[{bias_idx}];"
+            )?;
+        } else {
+            writeln!(out, "            {res_name}[m * {n}u + n] = acc;")?;
+        }
+        writeln!(out, "        }}")?;
+        writeln!(out, "    }}")?;
+    } else if name == "castforge.fused_moe" && inputs.len() >= 4 {
+        let packed = op
+            .attributes
+            .get("packed_rhs")
+            .is_some_and(|a| matches!(a, Attribute::Bool(true)));
+        let (m, k, n) = matmul_dims_ex(module, inputs[0], inputs[1], packed);
+        let a = value_ident(module, inputs[0], names, counter);
+        let w1 = value_ident(module, inputs[1], names, counter);
+        let w2 = value_ident(module, inputs[2], names, counter);
+        let g = value_ident(module, inputs[3], names, counter);
+        let g_len = tensor_len(module, inputs[3]).max(1);
+        let b_idx = if packed {
+            format!("n * {k}u + k")
+        } else {
+            format!("k * {n}u + n")
+        };
+        writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+        writeln!(out, "    for (var m = 0u; m < {m}u; m = m + 1u) {{")?;
+        writeln!(out, "        for (var n = 0u; n < {n}u; n = n + 1u) {{")?;
+        writeln!(out, "            var acc1: f32 = 0.0;")?;
+        writeln!(out, "            var acc2: f32 = 0.0;")?;
+        writeln!(out, "            for (var k = 0u; k < {k}u; k = k + 1u) {{")?;
+        writeln!(out, "                let xv = {a}[m * {k}u + k];")?;
+        writeln!(out, "                acc1 = acc1 + xv * {w1}[{b_idx}];")?;
+        writeln!(out, "                acc2 = acc2 + xv * {w2}[{b_idx}];")?;
+        writeln!(out, "            }}")?;
+        writeln!(out, "            let flat = m * {n}u + n;")?;
+        writeln!(out, "            let gv = {g}[flat % {g_len}u];")?;
+        if let Some(&g1_id) = inputs.get(4) {
+            let g1 = value_ident(module, g1_id, names, counter);
+            let g1_len = tensor_len(module, g1_id).max(1);
+            writeln!(
+                out,
+                "            {res_name}[flat] = acc1 * gv + acc2 * {g1}[flat % {g1_len}u];"
+            )?;
+        } else {
+            writeln!(
+                out,
+                "            {res_name}[flat] = acc1 * gv + acc2 * (1.0 - gv);"
+            )?;
+        }
+        writeln!(out, "        }}")?;
+        writeln!(out, "    }}")?;
+    } else if name == "castforge.fused_map_reduce" && inputs.len() >= 2 {
+        let x = value_ident(module, inputs[0], names, counter);
+        let init_v = value_ident(module, inputs[1], names, counter);
+        let x_len = tensor_len(module, inputs[0]);
+        let red_ext = (x_len / res_len.max(1)).max(1);
+        let map_op = op
+            .attributes
+            .get("map_op")
+            .and_then(|a| a.as_str())
+            .unwrap_or("exponential");
+        let elem = format!("{x}[r * {red_ext}u + c]");
+        let mapped = match map_op {
+            "exponential" => format!("exp({elem})"),
+            "abs" => format!("abs({elem})"),
+            "tanh" => format!("tanh({elem})"),
+            "square" => format!("({elem} * {elem})"),
+            _ => elem,
+        };
+        writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+        writeln!(out, "    for (var r = 0u; r < {res_len}u; r = r + 1u) {{")?;
+        writeln!(out, "        var acc: f32 = {init_v}[0u];")?;
+        writeln!(out, "        for (var c = 0u; c < {red_ext}u; c = c + 1u) {{")?;
+        writeln!(out, "            acc = acc + {mapped};")?;
+        writeln!(out, "        }}")?;
+        writeln!(out, "        {res_name}[r] = acc;")?;
+        writeln!(out, "    }}")?;
+    } else if name == "castforge.fused_loop_chain" && !inputs.is_empty() {
+        let steps_str = op
+            .attributes
+            .get("steps")
+            .and_then(|a| a.as_str())
+            .unwrap_or("");
+        let ext_exprs: Vec<String> = inputs
+            .iter()
+            .map(|&v| {
+                let n = value_ident(module, v, names, counter);
+                wgsl_idx(module, v, res_len, &n, "i")
+            })
+            .collect();
+        let specs: Vec<&str> = steps_str.split(';').filter(|s| !s.is_empty()).collect();
+        writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+        writeln!(out, "    for (var i = 0u; i < {res_len}u; i = i + 1u) {{")?;
+        for (idx, spec) in specs.iter().enumerate() {
+            let Some((op_name, rest)) = spec.split_once('(') else {
+                continue;
+            };
+            let args: Vec<String> = rest
+                .trim_end_matches(')')
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|tok| {
+                    if tok.starts_with('s') {
+                        tok.to_string()
+                    } else {
+                        tok.parse::<usize>()
+                            .ok()
+                            .and_then(|k| ext_exprs.get(k).cloned())
+                            .unwrap_or_else(|| "0.0".to_string())
+                    }
+                })
+                .collect();
+            let a0 = args.first().map(String::as_str).unwrap_or("0.0");
+            let a1 = args.get(1).map(String::as_str).unwrap_or("0.0");
+            let expr = match op_name.trim() {
+                "add" => format!("({a0}) + ({a1})"),
+                "subtract" => format!("({a0}) - ({a1})"),
+                "multiply" => format!("({a0}) * ({a1})"),
+                "divide" => format!("({a0}) / ({a1})"),
+                "maximum" => format!("max({a0}, {a1})"),
+                "minimum" => format!("min({a0}, {a1})"),
+                "exponential" => format!("exp({a0})"),
+                "tanh" => format!("tanh({a0})"),
+                "rsqrt" => format!("inverseSqrt({a0})"),
+                _ => a0.to_string(),
+            };
+            writeln!(out, "        let s{idx}: f32 = {expr};")?;
+        }
+        let last_idx = specs.len().saturating_sub(1);
+        writeln!(out, "        {res_name}[i] = s{last_idx};")?;
+        writeln!(out, "    }}")?;
+    } else if name == "castforge.static_quantize" && !inputs.is_empty() {
+        let x = value_ident(module, inputs[0], names, counter);
+        let scale = match op.attributes.get("scale") {
+            Some(Attribute::Float(f)) => (*f as f32).max(1e-8),
+            _ => 1.0 / 127.0,
+        };
+        let zp = match op.attributes.get("zero_point") {
+            Some(Attribute::Int(z)) => *z as f32,
+            _ => 0.0,
+        };
+        let qmin = match op.attributes.get("qmin") {
+            Some(Attribute::Int(v)) => *v as f32,
+            _ => -128.0,
+        };
+        let qmax = match op.attributes.get("qmax") {
+            Some(Attribute::Int(v)) => *v as f32,
+            _ => 127.0,
+        };
+        writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+        writeln!(out, "    for (var i = 0u; i < {res_len}u; i = i + 1u) {{")?;
+        writeln!(
+            out,
+            "        let q = clamp(round({x}[i] / {scale:.8} + {zp:.1}), {qmin:.1}, {qmax:.1});"
+        )?;
+        writeln!(out, "        {res_name}[i] = (q - {zp:.1}) * {scale:.8};")?;
+        writeln!(out, "    }}")?;
+    } else if name == "castforge.nan_guard" && !inputs.is_empty() {
+        let x = value_ident(module, inputs[0], names, counter);
+        writeln!(out, "    var {res_name}: array<f32, {res_len}>;")?;
+        writeln!(out, "    for (var i = 0u; i < {res_len}u; i = i + 1u) {{")?;
+        writeln!(out, "        let v = {x}[i];")?;
+        writeln!(
+            out,
+            "        {res_name}[i] = select(0.0, clamp(v, -65504.0, 65504.0), v == v);"
+        )?;
         writeln!(out, "    }}")?;
     } else if name == "castforge.fused_rope" && inputs.len() >= 3 {
         let x = value_ident(module, inputs[0], names, counter);
@@ -788,6 +1354,99 @@ fn emit_wgsl_composite(
         writeln!(out, "    for (var i = 0u; i < {res_len}u; i = i + 1u) {{")?;
         writeln!(out, "        {res_name}[i] = {a}[i];")?;
         writeln!(out, "    }}")?;
+    }
+    Ok(())
+}
+
+/// Emits WebGPU WGSL compute shader code from a lowered [`LoopModule`].
+pub fn emit_wgsl_from_loop_ir(loop_mod: &LoopModule) -> Result<String> {
+    emit_wgsl_from_loop_ir_with_workgroup(loop_mod, 64)
+}
+
+/// Emits WebGPU WGSL compute shader code from a lowered [`LoopModule`] with a configurable
+/// `@workgroup_size`.
+pub fn emit_wgsl_from_loop_ir_with_workgroup(
+    loop_mod: &LoopModule,
+    wg_size: u32,
+) -> Result<String> {
+    let wg_size = wg_size.max(1);
+    let mut out = String::new();
+    writeln!(
+        out,
+        "// Auto-generated by CastForge Loop-IR Codegen (Target: WebGPU WGSL)"
+    )?;
+    for kernel in &loop_mod.kernels {
+        for (b_idx, (name, _)) in kernel.params.iter().enumerate() {
+            writeln!(
+                out,
+                "@group(0) @binding({b_idx}) var<storage, read> {name}: array<f32>;"
+            )?;
+        }
+        let out_binding = kernel.params.len();
+        let (out_name, _) = &kernel.output;
+        writeln!(
+            out,
+            "@group(0) @binding({out_binding}) var<storage, read_write> {out_name}: array<f32>;\n"
+        )?;
+        writeln!(out, "@compute @workgroup_size({wg_size})")?;
+        writeln!(
+            out,
+            "fn {}_wgsl(@builtin(global_invocation_id) gid: vec3<u32>) {{",
+            kernel.name
+        )?;
+        for stmt in &kernel.body {
+            emit_wgsl_loop_stmt(stmt, out_name, 1, true, &mut out)?;
+        }
+        writeln!(out, "}}")?;
+    }
+    Ok(out)
+}
+
+fn emit_wgsl_loop_stmt(
+    stmt: &LoopStmt,
+    ret_name: &str,
+    indent: usize,
+    map_outer_to_gid: bool,
+    out: &mut String,
+) -> Result<()> {
+    let pad = "    ".repeat(indent);
+    match stmt {
+        LoopStmt::Comment(c) => writeln!(out, "{pad}// {c}")?,
+        LoopStmt::Alloc { name, len } if name != ret_name => {
+            writeln!(out, "{pad}var {name}: array<f32, {len}>;")?;
+        }
+        LoopStmt::Alloc { .. } => {}
+        LoopStmt::For {
+            var,
+            lower,
+            upper,
+            step,
+            body,
+            ..
+        } => {
+            let st = (*step).max(1);
+            if map_outer_to_gid && *lower == 0 && st == 1 {
+                writeln!(out, "{pad}if (gid.x < {upper}u) {{")?;
+                writeln!(out, "{pad}    let {var}: u32 = gid.x;")?;
+                for inner in body {
+                    emit_wgsl_loop_stmt(inner, ret_name, indent + 1, false, out)?;
+                }
+                writeln!(out, "{pad}}}")?;
+            } else {
+                writeln!(
+                    out,
+                    "{pad}for (var {var}: u32 = {lower}u; {var} < {upper}u; \
+                     {var} = {var} + {st}u) {{"
+                )?;
+                for inner in body {
+                    emit_wgsl_loop_stmt(inner, ret_name, indent + 1, false, out)?;
+                }
+                writeln!(out, "{pad}}}")?;
+            }
+        }
+        LoopStmt::Assign { dst, index, expr } => {
+            writeln!(out, "{pad}{dst}[{index}] = {expr};")?;
+        }
     }
     Ok(())
 }

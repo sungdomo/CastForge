@@ -1,7 +1,7 @@
 //! Pure-Rust MLIR printer and `MlirPrintTranslator` (`castforge::ir::printer`).
 
 use crate::ir::{Attribute, Module, OpId, Type, ValueId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -16,6 +16,7 @@ pub struct MlirPrinter<'a> {
     module: &'a Module,
     opts: PrintOptions,
     value_names: HashMap<ValueId, String>,
+    used_names: HashSet<String>,
     next_anon_id: usize,
 }
 
@@ -25,6 +26,7 @@ impl<'a> MlirPrinter<'a> {
             module,
             opts,
             value_names: HashMap::new(),
+            used_names: HashSet::new(),
             next_anon_id: 0,
         }
     }
@@ -50,12 +52,29 @@ impl<'a> MlirPrinter<'a> {
         }
         let val = &self.module.values[val_id];
         let name = if let Some(ssa) = &val.ssa_name {
-            format!("%{ssa}")
+            let base = format!("%{ssa}");
+            if !self.used_names.contains(&base) {
+                base
+            } else {
+                let mut suffix = 1usize;
+                loop {
+                    let candidate = format!("%{ssa}_{suffix}");
+                    if !self.used_names.contains(&candidate) {
+                        break candidate;
+                    }
+                    suffix += 1;
+                }
+            }
         } else {
-            let n = format!("%{}", self.next_anon_id);
-            self.next_anon_id += 1;
-            n
+            loop {
+                let n = format!("%{}", self.next_anon_id);
+                self.next_anon_id += 1;
+                if !self.used_names.contains(&n) {
+                    break n;
+                }
+            }
         };
+        self.used_names.insert(name.clone());
         self.value_names.insert(val_id, name.clone());
         name
     }
@@ -302,6 +321,10 @@ impl<'a> MlirPrinter<'a> {
     }
 
     fn print_func_op(&mut self, out: &mut String, op_id: OpId, indent: usize) -> fmt::Result {
+        self.value_names.clear();
+        self.used_names.clear();
+        self.next_anon_id = 0;
+
         let pad = "  ".repeat(indent);
         let op = &self.module.ops[op_id];
         let sym_name = op
@@ -342,6 +365,28 @@ impl<'a> MlirPrinter<'a> {
             _ => "",
         };
 
+        let extra_fn_attrs: Vec<(&String, &Attribute)> = op
+            .attributes
+            .iter()
+            .filter(|(k, _)| {
+                !matches!(
+                    k.as_str(),
+                    "sym_name" | "function_type" | "sym_visibility"
+                )
+            })
+            .collect();
+        let mut fn_attrs_str = String::new();
+        if !extra_fn_attrs.is_empty() {
+            fn_attrs_str.push_str(" attributes {");
+            for (i, (k, v)) in extra_fn_attrs.iter().enumerate() {
+                if i > 0 {
+                    fn_attrs_str.push_str(", ");
+                }
+                let _ = write!(fn_attrs_str, "{k} = {v}");
+            }
+            fn_attrs_str.push('}');
+        }
+
         let loc_str = if self.opts.print_locations {
             format!(" {}", op.location)
         } else {
@@ -350,7 +395,7 @@ impl<'a> MlirPrinter<'a> {
 
         writeln!(
             out,
-            "{pad}func.func {vis_str}@{sym_name}({}){ret_str}{loc_str} {{",
+            "{pad}func.func {vis_str}@{sym_name}({}){ret_str}{fn_attrs_str}{loc_str} {{",
             arg_strs.join(", ")
         )?;
 

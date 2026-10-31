@@ -177,7 +177,11 @@ pub fn compute_structural_hash(module: &Module) -> u64 {
 
         for &child_id in &block.ops {
             let child = &module.ops[child_id];
-            mix(child.name.to_string().as_bytes());
+            if !child.name.dialect.is_empty() {
+                mix(child.name.dialect.as_bytes());
+                mix(b".");
+            }
+            mix(child.name.name.as_bytes());
             for &opnd in &child.operands {
                 let slot = val_slots.get(&opnd).copied().unwrap_or(u32::MAX);
                 mix(&slot.to_le_bytes());
@@ -528,22 +532,22 @@ impl Pass for SanitizeNumericsPass {
                 module.blocks[block_id].ops.pop();
                 let guard_res: ValueId = module.ops[guard_op_id].results[0];
 
-                for (other_id, other_op) in module.ops.iter_mut() {
-                    if other_id == op_id || other_id == guard_op_id {
-                        continue;
-                    }
-                    for opnd in &mut other_op.operands {
-                        if *opnd == orig_res {
-                            *opnd = guard_res;
-                        }
-                    }
-                }
-
                 if let Some(pos) = module.blocks[block_id]
                     .ops
                     .iter()
                     .position(|&id| id == op_id)
                 {
+                    let downstream: Vec<_> =
+                        module.blocks[block_id].ops[pos + 1..].to_vec();
+                    for other_id in downstream {
+                        if let Some(other_op) = module.ops.get_mut(other_id) {
+                            for opnd in &mut other_op.operands {
+                                if *opnd == orig_res {
+                                    *opnd = guard_res;
+                                }
+                            }
+                        }
+                    }
                     module.blocks[block_id].ops.insert(pos + 1, guard_op_id);
                 }
                 created += 1;
@@ -657,11 +661,12 @@ fn op_flops_and_bytes(module: &Module, op: &Operation) -> (i64, i64) {
         }
     }
 
-    if op.is_op("stablehlo", "convolution") && op.operands.len() >= 2 {
-        if let Some(rhs_ty) = module.values[op.operands[1]].ty.as_tensor() {
-            let k_elems = rhs_ty.num_elements().unwrap_or(1).max(1);
-            return (2 * out_elems * k_elems, bytes);
-        }
+    if op.is_op("stablehlo", "convolution")
+        && op.operands.len() >= 2
+        && let Some(rhs_ty) = module.values[op.operands[1]].ty.as_tensor()
+    {
+        let k_elems = rhs_ty.num_elements().unwrap_or(1).max(1);
+        return (2 * out_elems * k_elems, bytes);
     }
 
     let comp_name = if op.is_op("stablehlo", "composite") {
@@ -855,22 +860,22 @@ impl Pass for InstrumentProfilingPass {
                 module.blocks[block_id].ops.pop();
                 let prof_res = module.ops[prof_op_id].results[0];
 
-                for (other_id, other_op) in module.ops.iter_mut() {
-                    if other_id == op_id || other_id == prof_op_id {
-                        continue;
-                    }
-                    for opnd in &mut other_op.operands {
-                        if *opnd == orig_res {
-                            *opnd = prof_res;
-                        }
-                    }
-                }
-
                 if let Some(pos) = module.blocks[block_id]
                     .ops
                     .iter()
                     .position(|&id| id == op_id)
                 {
+                    let downstream: Vec<_> =
+                        module.blocks[block_id].ops[pos + 1..].to_vec();
+                    for other_id in downstream {
+                        if let Some(other_op) = module.ops.get_mut(other_id) {
+                            for opnd in &mut other_op.operands {
+                                if *opnd == orig_res {
+                                    *opnd = prof_res;
+                                }
+                            }
+                        }
+                    }
                     module.blocks[block_id].ops.insert(pos + 1, prof_op_id);
                 }
                 created += 1;

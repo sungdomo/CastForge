@@ -294,6 +294,9 @@ fn evaluate_region(
         let res_len = tensor_len(module, res_val);
 
         if op.is_op("stablehlo", "constant") {
+            if env.contains_key(&res_val) {
+                continue;
+            }
             let t_ty = module.values[res_val]
                 .ty
                 .as_tensor()
@@ -786,58 +789,60 @@ fn eval_stablehlo_op(
                 .as_tensor()
                 .map(tensor_shape_dims)
                 .unwrap_or_else(|| vec![res_len]);
-            if out_dims.len() == 2 && dimension == 1 {
-                let rows = out_dims[0];
-                let in_vecs: Vec<(Vec<f32>, usize)> = inputs
-                    .iter()
-                    .map(|&inp| {
-                        let v = get_v(inp);
-                        let c = module.values[inp]
-                            .ty
-                            .as_tensor()
-                            .and_then(|t| tensor_shape_dims(t).get(1).copied())
-                            .unwrap_or(1);
-                        (v, c)
-                    })
-                    .collect();
-                let mut out_v = Vec::with_capacity(res_len);
-                for r in 0..rows {
-                    for (v, cols) in &in_vecs {
-                        let start = r * cols;
-                        out_v.extend_from_slice(&v[start..start + cols]);
+            let dim = (dimension.max(0) as usize).min(out_dims.len().saturating_sub(1));
+            let outer: usize = out_dims.iter().take(dim).product::<usize>().max(1);
+            let out_cat_stride: usize = out_dims.iter().skip(dim).product::<usize>().max(1);
+            let inner: usize = out_dims.iter().skip(dim + 1).product::<usize>().max(1);
+            let mut out_v = vec![0.0_f32; res_len];
+            let mut cat_offset = 0usize;
+            for &inp in &inputs {
+                let v = get_v(inp);
+                let in_dims = module.values[inp]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_else(|| vec![v.len().max(1)]);
+                let in_cat = (*in_dims.get(dim).unwrap_or(&1)).max(1);
+                let chunk = in_cat * inner;
+                for o in 0..outer {
+                    for c in 0..chunk {
+                        let dst_idx = o * out_cat_stride + cat_offset + c;
+                        if let Some(slot) = out_v.get_mut(dst_idx) {
+                            *slot = *v.get(o * chunk + c).unwrap_or(&0.0);
+                        }
                     }
                 }
-                out_v
-            } else {
-                let mut out_v = Vec::with_capacity(res_len);
-                for inp in inputs {
-                    out_v.extend(get_v(inp));
-                }
-                out_v.truncate(res_len);
-                out_v
+                cat_offset += chunk;
             }
+            out_v
         }
         StableHloOp::Compare {
             lhs,
             rhs,
             direction,
             ..
-        } => get_v(lhs)
-            .iter()
-            .zip(get_v(rhs).iter())
-            .map(|(a, b)| {
-                let cond = match direction.as_str() {
-                    "EQ" => (a - b).abs() < 1e-7,
-                    "NE" => (a - b).abs() >= 1e-7,
-                    "LT" => a < b,
-                    "LE" => a <= b,
-                    "GT" => a > b,
-                    "GE" => a >= b,
-                    _ => false,
-                };
-                if cond { 1.0 } else { 0.0 }
-            })
-            .collect(),
+        } => {
+            let lv = get_v(lhs);
+            let rv = get_v(rhs);
+            let l_len = lv.len().max(1);
+            let r_len = rv.len().max(1);
+            (0..res_len)
+                .map(|i| {
+                    let a = lv.get(i % l_len).copied().unwrap_or(0.0);
+                    let b = rv.get(i % r_len).copied().unwrap_or(0.0);
+                    let cond = match direction.as_str() {
+                        "EQ" => (a - b).abs() < 1e-7,
+                        "NE" => (a - b).abs() >= 1e-7,
+                        "LT" => a < b,
+                        "LE" => a <= b,
+                        "GT" => a > b,
+                        "GE" => a >= b,
+                        _ => false,
+                    };
+                    if cond { 1.0 } else { 0.0 }
+                })
+                .collect()
+        }
         StableHloOp::Select {
             pred,
             on_true,
@@ -847,36 +852,53 @@ fn eval_stablehlo_op(
             let p = get_v(pred);
             let t = get_v(on_true);
             let f = get_v(on_false);
+            let p_len = p.len().max(1);
+            let t_len = t.len().max(1);
+            let f_len = f.len().max(1);
             (0..res_len)
                 .map(|i| {
-                    let pv = p.get(i).or_else(|| p.first()).copied().unwrap_or(0.0);
-                    if pv != 0.0 { t[i] } else { f[i] }
+                    let pv = p.get(i % p_len).copied().unwrap_or(0.0);
+                    let tv = t.get(i % t_len).copied().unwrap_or(0.0);
+                    let fv = f.get(i % f_len).copied().unwrap_or(0.0);
+                    if pv != 0.0 { tv } else { fv }
                 })
                 .collect()
         }
         StableHloOp::Reduce {
             inputs,
             init_values,
+            dimensions,
             reducer_op,
             ..
         } => {
             let inp = get_v(inputs[0]);
+            let in_dims = module.values[inputs[0]]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![inp.len().max(1)]);
             let init = init_values
                 .first()
                 .and_then(|&v| get_v(v).first().copied())
                 .unwrap_or(0.0);
             let inner = (inp.len() / res_len.max(1)).max(1);
+            let reduce_dim0 = in_dims.len() == 2 && dimensions.as_slice() == [0];
             let red_op = reducer_op.as_deref().unwrap_or("add");
             (0..res_len)
                 .map(|o| {
                     let mut acc = init;
                     for k in 0..inner {
-                        let v = inp[o * inner + k];
-                        if red_op.contains("maximum") {
+                        let idx = if reduce_dim0 {
+                            k * res_len + o
+                        } else {
+                            o * inner + k
+                        };
+                        let v = *inp.get(idx).unwrap_or(&0.0);
+                        if red_op.contains("maximum") || red_op.contains("max") {
                             acc = acc.max(v);
-                        } else if red_op.contains("minimum") {
+                        } else if red_op.contains("minimum") || red_op.contains("min") {
                             acc = acc.min(v);
-                        } else if red_op.contains("multiply") {
+                        } else if red_op.contains("multiply") || red_op.contains("mul") {
                             acc *= v;
                         } else {
                             acc += v;
@@ -1318,13 +1340,12 @@ fn eval_stablehlo_op(
                 .as_tensor()
                 .map(tensor_shape_dims)
                 .unwrap_or_else(|| vec![res_len]);
-            if dims.len() == 2 && iota_dimension == 0 {
-                let cols = dims[1].max(1);
-                (0..res_len).map(|i| (i / cols) as f32).collect()
-            } else {
-                let cols = *dims.last().unwrap_or(&res_len).max(&1);
-                (0..res_len).map(|i| (i % cols) as f32).collect()
-            }
+            let d = (iota_dimension.max(0) as usize).min(dims.len().saturating_sub(1));
+            let dim_size = (*dims.get(d).unwrap_or(&res_len)).max(1);
+            let inner: usize = dims.iter().skip(d + 1).product::<usize>().max(1);
+            (0..res_len)
+                .map(|i| ((i / inner) % dim_size) as f32)
+                .collect()
         }
         StableHloOp::CustomCall { inputs, .. } => inputs
             .first()
@@ -1614,7 +1635,7 @@ fn eval_fused_loop_chain(
                         tok.parse::<usize>()
                             .ok()
                             .and_then(|k| ext.get(k))
-                            .and_then(|v| v.get(i).copied())
+                            .and_then(|v| v.get(i % v.len().max(1)).copied())
                             .unwrap_or(0.0)
                     }
                 })

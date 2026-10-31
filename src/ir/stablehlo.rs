@@ -149,6 +149,10 @@ pub enum StableHloOp {
         operand: ValueId,
         result: ValueId,
     },
+    UniformDequantize {
+        operand: ValueId,
+        result: ValueId,
+    },
     Reshape {
         operand: ValueId,
         result: ValueId,
@@ -404,6 +408,10 @@ impl StableHloOp {
                 results: op.results.to_vec(),
             }),
             "convert" => Some(StableHloOp::Convert {
+                operand: *op.operands.first()?,
+                result: first_res?,
+            }),
+            "uniform_dequantize" => Some(StableHloOp::UniformDequantize {
                 operand: *op.operands.first()?,
                 result: first_res?,
             }),
@@ -846,7 +854,10 @@ pub fn verify_stablehlo_shapes(module: &Module, op_id: OpId) -> Result<(), Strin
             }
         }
         StableHloOp::Reduce {
-            inputs, dimensions, ..
+            inputs,
+            dimensions,
+            results,
+            ..
         } => {
             if let Some(&inp) = inputs.first()
                 && let Some(in_ty) = module.values[inp].ty.as_tensor()
@@ -856,6 +867,123 @@ pub fn verify_stablehlo_shapes(module: &Module, op_id: OpId) -> Result<(), Strin
                         return Err(format!(
                             "stablehlo.reduce dimension {dim} out of bounds for rank {}",
                             in_ty.rank()
+                        ));
+                    }
+                }
+                if let Some(&res) = results.first()
+                    && let Some(out_ty) = module.values[res].ty.as_tensor()
+                {
+                    let expected_rank = in_ty.rank().saturating_sub(dimensions.len());
+                    if out_ty.rank() != expected_rank && out_ty.rank() != in_ty.rank() {
+                        return Err(format!(
+                            "stablehlo.reduce output rank {} incompatible with input rank {} \
+                             and reduced dims {:?}",
+                            out_ty.rank(),
+                            in_ty.rank(),
+                            dimensions
+                        ));
+                    }
+                }
+            }
+        }
+        StableHloOp::Select {
+            pred,
+            on_true,
+            on_false,
+            result,
+        } => {
+            if let (Some(t_ty), Some(f_ty), Some(out_ty)) = (
+                module.values[on_true].ty.as_tensor(),
+                module.values[on_false].ty.as_tensor(),
+                module.values[result].ty.as_tensor(),
+            ) {
+                if t_ty.rank() != out_ty.rank() || f_ty.rank() != out_ty.rank() {
+                    return Err(format!(
+                        "stablehlo.select rank mismatch: on_true={}, on_false={}, out={}",
+                        t_ty.rank(),
+                        f_ty.rank(),
+                        out_ty.rank()
+                    ));
+                }
+                for i in 0..out_ty.rank() {
+                    if let (Dim::Static(dt), Dim::Static(df), Dim::Static(do_)) =
+                        (&t_ty.shape[i], &f_ty.shape[i], &out_ty.shape[i])
+                        && ((*dt != *do_ && *dt != 1) || (*df != *do_ && *df != 1))
+                    {
+                        return Err(format!(
+                            "stablehlo.select dim mismatch at axis {i}: \
+                             on_true={dt}, on_false={df}, out={do_}"
+                        ));
+                    }
+                }
+                if let Some(p_ty) = module.values[pred].ty.as_tensor()
+                    && p_ty.rank() != 0
+                    && p_ty.rank() != out_ty.rank()
+                {
+                    return Err(format!(
+                        "stablehlo.select pred rank {} must be 0 or match output rank {}",
+                        p_ty.rank(),
+                        out_ty.rank()
+                    ));
+                }
+            }
+        }
+        StableHloOp::Pad {
+            operand,
+            edge_padding_low,
+            edge_padding_high,
+            interior_padding,
+            result,
+            ..
+        } => {
+            if let (Some(in_ty), Some(out_ty)) = (
+                module.values[operand].ty.as_tensor(),
+                module.values[result].ty.as_tensor(),
+            ) && in_ty.rank() == out_ty.rank()
+                && edge_padding_low.len() == in_ty.rank()
+                && edge_padding_high.len() == in_ty.rank()
+            {
+                for i in 0..in_ty.rank() {
+                    if let (Dim::Static(in_d), Dim::Static(out_d)) =
+                        (&in_ty.shape[i], &out_ty.shape[i])
+                    {
+                        let low = edge_padding_low[i];
+                        let high = edge_padding_high[i];
+                        let interior = interior_padding.get(i).copied().unwrap_or(0);
+                        let expected = *in_d + low + high + (*in_d - 1).max(0) * interior;
+                        if *out_d != expected {
+                            return Err(format!(
+                                "stablehlo.pad axis {i} expected dim {expected}, got {out_d}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        StableHloOp::DynamicSlice {
+            operand,
+            slice_sizes,
+            result,
+            ..
+        } => {
+            if let (Some(in_ty), Some(out_ty)) = (
+                module.values[operand].ty.as_tensor(),
+                module.values[result].ty.as_tensor(),
+            ) && !slice_sizes.is_empty()
+            {
+                if slice_sizes.len() != in_ty.rank() || slice_sizes.len() != out_ty.rank() {
+                    return Err(format!(
+                        "stablehlo.dynamic_slice slice_sizes len {} != rank {}",
+                        slice_sizes.len(),
+                        in_ty.rank()
+                    ));
+                }
+                for (i, &sz) in slice_sizes.iter().enumerate() {
+                    if let Dim::Static(out_d) = out_ty.shape[i]
+                        && out_d != sz
+                    {
+                        return Err(format!(
+                            "stablehlo.dynamic_slice axis {i} slice_size {sz} != out dim {out_d}"
                         ));
                     }
                 }
@@ -870,7 +998,8 @@ pub fn verify_stablehlo_shapes(module: &Module, op_id: OpId) -> Result<(), Strin
         | StableHloOp::Cosine { operand, result }
         | StableHloOp::Abs { operand, result }
         | StableHloOp::Negate { operand, result }
-        | StableHloOp::Logistic { operand, result } => {
+        | StableHloOp::Logistic { operand, result }
+        | StableHloOp::UniformDequantize { operand, result } => {
             if let (Some(in_ty), Some(out_ty)) = (
                 module.values[operand].ty.as_tensor(),
                 module.values[result].ty.as_tensor(),

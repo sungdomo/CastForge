@@ -8,10 +8,10 @@ use crate::codegen::{
 use crate::ir::{
     GgufExportTranslator, GgufImportTranslator, HfConfigImportTranslator, MlirParseTranslator,
     MlirPrintTranslator, OnnxExportTranslator, OnnxImportTranslator, Payload, PrintOptions,
-    SafetensorsExportTranslator, Translator, TranslatorChain,
+    SafetensorsExportTranslator, SafetensorsImportTranslator, Translator, TranslatorChain,
 };
+use crate::ir::viz::{IrDiffTranslator, SnapshotIrTranslator, VizFormat, VizTranslator};
 use crate::passes::{PassRegistry, parse_pass_spec_item, split_pipeline_spec};
-use crate::viz::{IrDiffTranslator, SnapshotIrTranslator, VizFormat, VizTranslator};
 use anyhow::{Context, Result};
 use indexmap::IndexMap;
 use std::path::PathBuf;
@@ -149,7 +149,12 @@ pub fn build_translator_chain_with_weights(
     let (first_name, _) = parse_pass_spec_item(items[0])?;
     let starts_with_frontend = matches!(
         first_name.as_str(),
-        "parse-mlir" | "parse" | "import-onnx" | "import-gguf" | "import-hf-config"
+        "parse-mlir"
+            | "parse"
+            | "import-onnx"
+            | "import-gguf"
+            | "import-safetensors"
+            | "import-hf-config"
     );
     let mut first_in = "text";
     if !starts_with_frontend {
@@ -204,6 +209,18 @@ pub fn build_translator_chain_with_weights(
                     first_in = "bytes";
                 }
                 chain.push(Box::new(GgufImportTranslator));
+                if idx == 0
+                    && let Some(w_path) = weights.clone()
+                {
+                    chain.push(Box::new(LoadWeightsTranslator { path: w_path }));
+                }
+                last_out = "ir";
+            }
+            "import-safetensors" => {
+                if idx == 0 {
+                    first_in = "bytes";
+                }
+                chain.push(Box::new(SafetensorsImportTranslator));
                 if idx == 0
                     && let Some(w_path) = weights.clone()
                 {
@@ -612,6 +629,6 @@ mod tests {
         let tcat = crate::cli::target_catalog();
         assert_eq!(tcat.target.len(), 10);
         assert_eq!(tcat.arch_profile.len(), 11);
-        assert_eq!(tcat.translator.len(), 20);
+        assert_eq!(tcat.translator.len(), 21);
     }
 }

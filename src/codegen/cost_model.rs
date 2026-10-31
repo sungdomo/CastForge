@@ -375,29 +375,22 @@ fn profile_single_op(module: &Module, op_id: OpId, roofline: &HardwareRoofline) 
                 .first()
                 .map(|&v| static_dims(module, v))
                 .unwrap_or_default();
-            let out_dims = op
-                .results
-                .first()
-                .map(|&v| static_dims(module, v))
-                .unwrap_or_default();
-            let m = out_dims.first().copied().unwrap_or(1);
-            let n = out_dims.get(1).copied().unwrap_or(1);
             let k = lhs_dims.last().copied().unwrap_or(1);
-            let mut gemm_flops = 2 * m * n * k;
+            let mut gemm_flops = 2 * out_elems * k;
             if short == "fused_matmul_bias" {
-                gemm_flops += m * n;
+                gemm_flops += out_elems;
             } else if short == "fused_matmul_epilogue" || short == "fused_qmatmul" {
                 if op.operands.len() >= 3 {
-                    gemm_flops += m * n;
+                    gemm_flops += out_elems;
                 }
                 let epilogue = match op.attributes.get("epilogue") {
                     Some(Attribute::String(s)) => s.as_str(),
                     _ => "bias",
                 };
                 gemm_flops += match epilogue {
-                    "bias_relu" | "bias_scale" => m * n,
-                    "bias_tanh" | "bias_silu" => 4 * m * n,
-                    "bias_gelu" => 8 * m * n,
+                    "bias_relu" | "bias_scale" => out_elems,
+                    "bias_tanh" | "bias_silu" => 4 * out_elems,
+                    "bias_gelu" => 8 * out_elems,
                     _ => 0,
                 };
             }
@@ -409,15 +402,8 @@ fn profile_single_op(module: &Module, op_id: OpId, roofline: &HardwareRoofline) 
                 .first()
                 .map(|&v| static_dims(module, v))
                 .unwrap_or_default();
-            let out_dims = op
-                .results
-                .first()
-                .map(|&v| static_dims(module, v))
-                .unwrap_or_default();
-            let m = out_dims.first().copied().unwrap_or(1);
-            let n = out_dims.get(1).copied().unwrap_or(1);
             let k = lhs_dims.last().copied().unwrap_or(1);
-            4 * m * n * k + 5 * m * n
+            4 * out_elems * k + 5 * out_elems
         }
         "lora_linear" => {
             let x_dims = op
@@ -494,7 +480,9 @@ fn profile_single_op(module: &Module, op_id: OpId, roofline: &HardwareRoofline) 
                 .unwrap_or(out_elems)
         }
         "add" | "subtract" | "multiply" | "divide" | "maximum" | "minimum" | "power" | "negate"
-        | "abs" | "relu" | "clamp" | "dequantize_int8" | "uniform_dequantize" => out_elems,
+        | "abs" | "relu" | "clamp" | "compare" | "select" | "nan_guard" | "dequantize_int8"
+        | "uniform_dequantize" => out_elems,
+        "static_quantize" => 3 * out_elems,
         "reduce" | "reduce_sum" | "reduce_max" => op
             .operands
             .first()
@@ -938,8 +926,8 @@ impl TargetConfig {
     /// [`TargetConfig`] (used for emitting top-level SIMD headers or module banners).
     pub fn with_module_attributes(&self, module: &crate::ir::Module) -> Self {
         let mut cfg = *self;
-        for (_, op) in &module.ops {
-            cfg = cfg.with_op_attributes(op);
+        for op_id in module.live_ops() {
+            cfg = cfg.with_op_attributes(&module.ops[op_id]);
         }
         cfg
     }

@@ -464,6 +464,7 @@ pub(crate) fn fold_all_views_single_pass(module: &mut Module) -> Result<(usize, 
     Ok((created, modified, removed))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_sink_transpose_through_elementwise(
     module: &mut Module,
     block_id: BlockId,
@@ -541,6 +542,7 @@ fn try_sink_transpose_through_elementwise(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_folded_transpose_before(
     module: &mut Module,
     block_id: BlockId,

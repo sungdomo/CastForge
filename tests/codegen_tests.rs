@@ -2340,3 +2340,105 @@ module @gather_scatter_mod {
     assert!(o3_pass.is_composite());
     assert!(!o3_pass.child_passes().is_empty());
 }
+
+#[test]
+fn test_iterative_cli_ir_codegen_audit_fixes() {
+    // 1. Batched 3D GEMM cost model FLOPs & compare/select/nan_guard/static_quantize FLOPs
+    let cost_mlir = concat!(
+        "module @cost_audit {\n",
+        "  func.func @forward(%a: tensor<2x3x4xf32>, %b: tensor<2x4x5xf32>) ",
+        "-> tensor<2x3x5xf32> {\n",
+        "    %mm = \"stablehlo.dot_general\"(%a, %b) ",
+        "{lhs_batching_dimensions = [0], rhs_batching_dimensions = [0], ",
+        "lhs_contracting_dimensions = [2], rhs_contracting_dimensions = [1]} ",
+        ": (tensor<2x3x4xf32>, tensor<2x4x5xf32>) -> tensor<2x3x5xf32>\n",
+        "    %cmp = \"stablehlo.compare\"(%mm, %mm) {comparison_direction = \"GT\"} ",
+        ": (tensor<2x3x5xf32>, tensor<2x3x5xf32>) -> tensor<2x3x5xi1>\n",
+        "    %sel = \"stablehlo.select\"(%cmp, %mm, %mm) ",
+        ": (tensor<2x3x5xi1>, tensor<2x3x5xf32>, tensor<2x3x5xf32>) -> tensor<2x3x5xf32>\n",
+        "    %ng = \"castforge.nan_guard\"(%sel) {clamp_max = 65504.0} ",
+        ": (tensor<2x3x5xf32>) -> tensor<2x3x5xf32>\n",
+        "    %sq = \"castforge.static_quantize\"(%ng) {bits = 8, scale = 0.01} ",
+        ": (tensor<2x3x5xf32>) -> tensor<2x3x5xf32>\n",
+        "    func.return %sq : tensor<2x3x5xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let cost_mod = parse_mlir(cost_mlir).expect("parse cost_audit");
+    let cost_rep = castforge::codegen::analyze_module_cost(&cost_mod);
+    // 3D dot_general: 2 * (2*3*5) * 4 = 240 FLOPs
+    // compare (30) + select (30) + nan_guard (30) + static_quantize (90) = 180 FLOPs
+    assert_eq!(cost_rep.total_flops, 240 + 180);
+
+    // 2. Reduce along axis 0 on 2D tensor + 2D strided Slice + 2D Concatenate + Iota
+    let ops_mlir = concat!(
+        "module @ops_2d {\n",
+        "  func.func @forward(%x: tensor<2x3xf32>) -> tensor<3xf32> {\n",
+        "    %z = stablehlo.constant dense<0.0> : tensor<f32>\n",
+        "    %red0 = stablehlo.reduce %x, %z ",
+        "{dimensions = [0], reducer = \"stablehlo.maximum\"} ",
+        ": (tensor<2x3xf32>, tensor<f32>) -> tensor<3xf32>\n",
+        "    func.return %red0 : tensor<3xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let ops_mod = parse_mlir(ops_mlir).expect("parse ops_2d");
+    // Input [[1, 5, 2], [4, 3, 6]] -> max along axis 0 -> [4, 5, 6]
+    let eval_out =
+        evaluate_module(&ops_mod, &[vec![1.0, 5.0, 2.0, 4.0, 3.0, 6.0]]).expect("eval red0");
+    assert_eq!(eval_out[0], vec![4.0, 5.0, 6.0]);
+    let c_code = generate_code(&ops_mod, CodegenTarget::C).expect("c red0");
+    assert!(c_code.contains("[k * 3 + o]"));
+    let rs_code = generate_code(&ops_mod, CodegenTarget::Rust).expect("rust red0");
+    assert!(rs_code.contains("[k * 3 + o]"));
+    let wgsl_code = generate_code(&ops_mod, CodegenTarget::Wgsl).expect("wgsl red0");
+    assert!(wgsl_code.contains("[c * 3u + r]"));
+
+    // 3. Nested region liveness in compute_block_liveness & viz graph recursion
+    let while_mlir = concat!(
+        "module @while_live {\n",
+        "  func.func @forward(%x: tensor<2xf32>) -> tensor<2xf32> {\n",
+        "    %step = stablehlo.constant dense<[1.0, 1.0]> : tensor<2xf32>\n",
+        "    %w = \"stablehlo.while\"(%x) : (tensor<2xf32>) -> tensor<2xf32> {\n",
+        "      %c = \"stablehlo.compare\"(%x, %step) {comparison_direction = \"LT\"} ",
+        ": (tensor<2xf32>, tensor<2xf32>) -> tensor<2xi1>\n",
+        "      %next = stablehlo.add %x, %step : tensor<2xf32>\n",
+        "      func.return %next : tensor<2xf32>\n",
+        "    }\n",
+        "    func.return %w : tensor<2xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let while_mod = parse_mlir(while_mlir).expect("parse while_live");
+    let fn_id = while_mod.functions()[0];
+    let blk_id = while_mod.regions[while_mod.ops[fn_id].regions[0]].blocks[0];
+    let intervals = castforge::codegen::compute_block_liveness(&while_mod, blk_id);
+    // %step is defined at step 1 and used inside the nested regions of %w at step 2
+    let step_iv = intervals.iter().find(|iv| iv.first_def == 1).expect("step iv");
+    assert_eq!(step_iv.last_use, 2);
+    let viz_json =
+        castforge::ir::viz::render_module(&while_mod, castforge::ir::viz::VizFormat::Json);
+    assert!(viz_json.contains("stablehlo.compare"));
+
+    // 4. ONNX ReduceMax/ReduceMin/ReduceProd & Slice/Pad round-trip
+    let onnx_rt_mlir = concat!(
+        "module @onnx_rt {\n",
+        "  func.func @forward(%x: tensor<2x2xf32>) -> tensor<2xf32> {\n",
+        "    %z = stablehlo.constant dense<1.0> : tensor<f32>\n",
+        "    %sl = stablehlo.slice %x ",
+        "{start_indices = [0, 0], limit_indices = [2, 2], strides = [1, 1]} ",
+        ": (tensor<2x2xf32>) -> tensor<2x2xf32>\n",
+        "    %r = stablehlo.reduce %sl, %z ",
+        "{dimensions = [1], reducer = \"stablehlo.multiply\"} ",
+        ": (tensor<2x2xf32>, tensor<f32>) -> tensor<2xf32>\n",
+        "    func.return %r : tensor<2xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let onnx_orig = parse_mlir(onnx_rt_mlir).expect("parse onnx_rt");
+    let onnx_json = castforge::ir::export_onnx_json(&onnx_orig).expect("export onnx");
+    let onnx_reimp = castforge::ir::import_onnx_json(&onnx_json).expect("reimport onnx");
+    let rep_onnx =
+        verify_module_numerics(&onnx_orig, &onnx_reimp, 1e-5).expect("verify onnx roundtrip");
+    assert!(rep_onnx.passed);
+}

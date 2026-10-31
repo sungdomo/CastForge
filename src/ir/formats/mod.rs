@@ -29,7 +29,8 @@ pub fn collect_module_tensors(module: &Module) -> TensorStore {
     }
     let mut store = TensorStore::new();
     let mut idx = 0usize;
-    for (_, op) in module.ops.iter() {
+    for op_id in module.live_ops() {
+        let op = &module.ops[op_id];
         if !op.is_op("stablehlo", "constant") {
             continue;
         }
@@ -111,6 +112,120 @@ impl crate::ir::Translator for SafetensorsExportTranslator {
         let store = collect_module_tensors(&module);
         let bytes = store.to_safetensors_bytes()?;
         Ok(crate::ir::Payload::Bytes(bytes))
+    }
+}
+
+/// Imports a `.safetensors` binary buffer into a CastForge [`Module`] with a populated
+/// [`TensorStore`] and `dense_resource<...>` constants.
+pub fn import_safetensors_bytes(bytes: &[u8]) -> Result<Module> {
+    use crate::ir::{Attribute, Location, OpName, Type};
+    use indexmap::IndexMap;
+    use smallvec::SmallVec;
+
+    let store = TensorStore::from_safetensors_bytes(bytes)?;
+    let mut module = Module::new(Some("safetensors_model".to_string()));
+
+    let fn_blk = module.create_block(None);
+    let fn_reg = module.create_region(vec![fn_blk]);
+
+    let mut return_vals = SmallVec::new();
+    let mut return_tys = Vec::new();
+
+    for (idx, (name, entry)) in store.iter().enumerate() {
+        let mut attrs = IndexMap::new();
+        attrs.insert(
+            "value".to_string(),
+            Attribute::TensorRef {
+                key: name.clone(),
+                ty: entry.ty.clone(),
+            },
+        );
+        let ssa_name = sanitize_name(name);
+        let ssa = if ssa_name.is_empty() {
+            format!("w{idx}")
+        } else {
+            ssa_name
+        };
+        let res_ty = Type::Tensor(entry.ty.clone());
+        let op_id = module.add_operation(
+            fn_blk,
+            OpName::new("stablehlo", "constant"),
+            SmallVec::new(),
+            vec![(Some(ssa), res_ty.clone())],
+            attrs,
+            Vec::new(),
+            true,
+            Location::Unknown,
+        );
+        return_vals.push(module.ops[op_id].results[0]);
+        return_tys.push(res_ty);
+    }
+
+    module.add_operation(
+        fn_blk,
+        OpName::new("func", "return"),
+        return_vals,
+        Vec::new(),
+        IndexMap::new(),
+        Vec::new(),
+        true,
+        Location::Unknown,
+    );
+
+    let mut fn_attrs = IndexMap::new();
+    fn_attrs.insert(
+        "sym_name".to_string(),
+        Attribute::String("weights".to_string()),
+    );
+    fn_attrs.insert(
+        "function_type".to_string(),
+        Attribute::Type(Type::Function {
+            inputs: Vec::new(),
+            results: return_tys,
+        }),
+    );
+    let root_blk = module.body_block();
+    module.add_operation(
+        root_blk,
+        OpName::new("func", "func"),
+        SmallVec::new(),
+        Vec::new(),
+        fn_attrs,
+        vec![fn_reg],
+        true,
+        Location::Unknown,
+    );
+    module.tensor_store = store;
+    Ok(module)
+}
+
+/// Imports a `.safetensors` file from disk into a CastForge [`Module`].
+pub fn import_safetensors_file(path: impl AsRef<std::path::Path>) -> Result<Module> {
+    let bytes = std::fs::read(path.as_ref())?;
+    import_safetensors_bytes(&bytes)
+}
+
+/// A-to-B Weight Import Translator (`Bytes(SafeTensors) -> Ir(Module)`).
+#[derive(Default)]
+pub struct SafetensorsImportTranslator;
+
+impl crate::ir::Translator for SafetensorsImportTranslator {
+    fn name(&self) -> &str {
+        "import-safetensors"
+    }
+
+    fn input_kind(&self) -> &'static str {
+        "bytes"
+    }
+
+    fn output_kind(&self) -> &'static str {
+        "ir"
+    }
+
+    fn translate(&mut self, input: crate::ir::Payload) -> Result<crate::ir::Payload> {
+        let bytes = input.into_bytes()?;
+        let module = import_safetensors_bytes(&bytes)?;
+        Ok(crate::ir::Payload::from_ir(module))
     }
 }
 

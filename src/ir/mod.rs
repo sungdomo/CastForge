@@ -13,16 +13,18 @@ pub mod parser;
 pub mod printer;
 pub mod stablehlo;
 pub mod tensor_store;
-pub mod verify;
 pub mod viz;
 
 pub use crate::passes::manager::*;
+pub use crate::passes::verify_ir::*;
 pub use formats::{
     GgmlType, GgufExportTranslator, GgufImportTranslator, HfConfigImportTranslator, HfModelConfig,
     OnnxExportTranslator, OnnxImportTranslator, OnnxJsonInitializer, OnnxJsonModel, OnnxJsonNode,
-    OnnxJsonValueInfo, SafetensorsExportTranslator, collect_module_tensors, export_gguf_bytes,
-    export_gguf_file, export_onnx_file, export_onnx_json, import_gguf_bytes, import_gguf_file,
-    import_hf_config_json, import_hf_model_dir, import_onnx_file, import_onnx_json,
+    OnnxJsonValueInfo, SafetensorsExportTranslator, SafetensorsImportTranslator,
+    collect_module_tensors, export_gguf_bytes, export_gguf_file, export_onnx_file,
+    export_onnx_json, import_gguf_bytes, import_gguf_file, import_hf_config_json,
+    import_hf_model_dir, import_onnx_file, import_onnx_json, import_safetensors_bytes,
+    import_safetensors_file,
 };
 pub use loops::{LoopKernel, LoopModule, LoopStmt};
 pub use mlir::*;
@@ -35,7 +37,6 @@ pub use tensor_store::{
     TensorBacking, TensorEntry, TensorStore, bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits,
     f32_to_f16_bits, format_dense_f32_literal, format_dense_i8_literal, parse_dense_f32_literal,
 };
-pub use verify::*;
 pub use viz::*;
 
 use anyhow::{Result, anyhow};
@@ -331,5 +332,88 @@ mod tests {
 
         // 10. f32_to_f16_bits preserves negative zero sign on underflow
         assert_eq!(f32_to_f16_bits(-1e-10), 0x8000);
+
+        // 11. Module::verify detects DanglingOp and InvalidValueDef
+        let mut bad_mod = Module::new(None);
+        let bad_blk = bad_mod.body_block();
+        let dummy_op = bad_mod.add_operation(
+            bad_blk,
+            OpName::new("stablehlo", "constant"),
+            SmallVec::new(),
+            vec![(Some("v".to_string()), Type::Scalar(DType::F32))],
+            IndexMap::new(),
+            Vec::new(),
+            true,
+            Location::Unknown,
+        );
+        bad_mod.ops.remove(dummy_op);
+        assert!(matches!(bad_mod.verify(), Err(VerifyError::DanglingOp)));
+
+        // 12. Quote-aware comment stripping, func attributes, and nested region parsing
+        let nested_src = concat!(
+            "module @nested {\n",
+            "  func.func @main(%x: tensor<2xf32>) -> tensor<2xf32>",
+            " attributes {tag = \"http://a//b\"} {\n",
+            "    %w = stablehlo.while %x : (tensor<2xf32>) -> tensor<2xf32> {\n",
+            "      %y = stablehlo.add %x, %x : tensor<2xf32>\n",
+            "    }\n",
+            "    %z = stablehlo.add %w, %x : tensor<2xf32>\n",
+            "    return %z : tensor<2xf32>\n",
+            "  }\n",
+            "}\n"
+        );
+        let nested_mod = parse_mlir(nested_src).expect("nested_src parses");
+        let fn_id = nested_mod.functions()[0];
+        assert_eq!(
+            nested_mod.ops[fn_id].attributes.get("tag"),
+            Some(&Attribute::String("http://a//b".to_string()))
+        );
+        let printed_nested = print_mlir(&nested_mod);
+        assert!(printed_nested.contains("attributes {tag = \"http://a//b\"}"));
+        let reparsed_nested = parse_mlir(&printed_nested).expect("reparses");
+        assert!(reparsed_nested.verify().is_ok());
+
+        // 13. Printer SSA name collision disambiguation
+        let mut col_mod = parse_mlir(
+            "module {\n  func.func @f(%x: tensor<2xf32>) -> tensor<2xf32> {\n    \
+             %a = stablehlo.add %x, %x : tensor<2xf32>\n    \
+             %b = stablehlo.multiply %a, %x : tensor<2xf32>\n    \
+             return %b : tensor<2xf32>\n  }\n}\n",
+        )
+        .expect("parses");
+        for (_, v) in col_mod.values.iter_mut() {
+            if v.ssa_name.as_deref() == Some("b") {
+                v.ssa_name = Some("a".to_string());
+            }
+        }
+        let col_printed = print_mlir(&col_mod);
+        assert!(col_printed.contains("%a_1 ="));
+        assert!(parse_mlir(&col_printed).is_ok());
+
+        // 14. Shape verification for Select, Pad, DynamicSlice, Reduce, UniformDequantize
+        let shape_mlir = concat!(
+            "module {\n",
+            "  func.func @s(%p: tensor<2xi1>, %x: tensor<2xf32>) -> tensor<3xf32> {\n",
+            "    %s = stablehlo.select %p, %x, %x",
+            " : (tensor<2xi1>, tensor<2xf32>, tensor<2xf32>) -> tensor<3xf32>\n",
+            "    return %s : tensor<3xf32>\n",
+            "  }\n",
+            "}\n"
+        );
+        let shape_mod = parse_mlir(shape_mlir).expect("parses");
+        let s_fn = shape_mod.functions()[0];
+        let s_blk = shape_mod.regions[shape_mod.ops[s_fn].regions[0]].blocks[0];
+        let s_op = shape_mod.blocks[s_blk].ops[0];
+        assert!(verify_stablehlo_shapes(&shape_mod, s_op).is_err());
+
+        // 15. SafeTensors import/export translator round-trip
+        let st_bytes = SafetensorsExportTranslator
+            .translate(Payload::from_ir(parsed))
+            .expect("export st")
+            .into_bytes()
+            .expect("bytes");
+        let st_mod = import_safetensors_bytes(&st_bytes).expect("import st");
+        assert_eq!(st_mod.tensor_store.len(), 2);
+        assert!(st_mod.verify().is_ok());
     }
 }

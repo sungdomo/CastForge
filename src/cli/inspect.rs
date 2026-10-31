@@ -1,10 +1,10 @@
 //! Model, IR, weight (`TensorStore`), and hardware target inspection (`castforge inspect` &
 //! `castforge list-targets`).
 
-use crate::codegen::{HardwareRoofline, TargetConfig, analyze_module_cost, build_memory_plan};
+use crate::codegen::{HardwareRoofline, analyze_module_cost, build_memory_plan};
 use crate::ir::{
     Attribute, BlockId, Module, TensorStore, import_gguf_file, import_hf_model_dir,
-    import_onnx_file, parse_mlir,
+    import_onnx_file, import_safetensors_file, parse_mlir,
 };
 use crate::passes::{PassManager, PassRegistry};
 use anyhow::{Context, Result};
@@ -408,6 +408,8 @@ fn load_any_module(input: Option<&PathBuf>) -> Result<Module> {
         let lower = path.to_string_lossy().to_ascii_lowercase();
         if lower.ends_with(".gguf") {
             return import_gguf_file(path);
+        } else if lower.ends_with(".safetensors") {
+            return import_safetensors_file(path);
         } else if path.is_dir() || lower.ends_with("config.json") {
             return import_hf_model_dir(path);
         } else if lower.ends_with(".onnx") || lower.ends_with(".onnx.json") {
@@ -454,7 +456,6 @@ pub fn run_list_targets(filter: Option<&str>, json: bool, output: Option<&PathBu
         })
         .map(|spec| {
             let rf = HardwareRoofline::for_arch(&spec.arch);
-            let _ = TargetConfig::for_arch(&spec.arch);
             ArchProfileInfo {
                 arch: spec.arch.clone(),
                 aliases: spec.aliases.clone(),

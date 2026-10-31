@@ -133,8 +133,27 @@ pub fn autotune_module(module: &Module, roofline: &HardwareRoofline) -> Autotune
                     continue;
                 }
                 for &(mr, nr) in &reg_tiles {
+                    // Register tiling is mutually exclusive with cache tiling and non-MNK orders
+                    if mr > 0 && (l1 > 0 || l2 > 0 || order != GemmLoopOrder::Mnk) {
+                        continue;
+                    }
+                    // Cache tiling uses its own tiled MNK schedule
+                    if l1 > 0 && order != GemmLoopOrder::Mnk {
+                        continue;
+                    }
                     for &uf in &unrolls {
+                        // K-unrolling only applies to non-tiled, non-register-tiled MNK
+                        if uf > 1 && (mr > 0 || l1 > 0 || order != GemmLoopOrder::Mnk) {
+                            continue;
+                        }
                         for &sk in &split_ks {
+                            // Split-K is mutually exclusive with register/cache tiling & unrolling
+                            if sk > 1
+                                && (mr > 0 || l1 > 0 || l2 > 0 || uf > 1
+                                    || order != GemmLoopOrder::Mnk)
+                            {
+                                continue;
+                            }
                             for &vec_en in &[false, true] {
                                 for &par_en in &[false, true] {
                                     let pf = if l1 >= 16 || mr >= 2 { 4 } else { 0 };
@@ -301,16 +320,33 @@ fn score_candidate(
 fn dominant_gemm_dims(module: &Module) -> (usize, usize, usize) {
     let mut best = (4usize, 4usize, 4usize);
     let mut best_vol = 0usize;
-    for op in module.ops.values() {
+    let mut found_gemm = false;
+    for op_id in module.live_ops() {
+        let op = &module.ops[op_id];
         if op.operands.len() >= 2 && !op.results.is_empty() {
+            let is_gemm = matches!(
+                op.name.name.as_str(),
+                "dot_general"
+                    | "fused_matmul_bias"
+                    | "fused_matmul_epilogue"
+                    | "fused_qmatmul"
+                    | "fused_gated_mlp"
+                    | "fused_moe"
+                    | "scaled_dot_product_attention"
+                    | "fused_attention"
+            );
+            if found_gemm && !is_gemm {
+                continue;
+            }
             let lhs_d = static_shape(module, op.operands[0]);
             let out_d = static_shape(module, op.results[0]);
             if lhs_d.len() >= 2 && out_d.len() >= 2 {
-                let m = out_d[0];
-                let n = out_d[1];
+                let n = *out_d.last().unwrap_or(&1);
+                let m = out_d[..out_d.len() - 1].iter().copied().product::<usize>().max(1);
                 let k = *lhs_d.last().unwrap_or(&1);
                 let vol = m * n * k;
-                if vol > best_vol {
+                if (is_gemm && !found_gemm) || vol > best_vol {
+                    found_gemm = found_gemm || is_gemm;
                     best_vol = vol;
                     best = (m, n, k);
                 }
@@ -340,7 +376,9 @@ fn static_shape(module: &Module, val_id: crate::ir::ValueId) -> Vec<usize> {
 /// `simd_vectorize`, etc.) directly onto all compute operations in `module`.
 pub fn apply_schedule_to_module(module: &mut Module, config: &TargetConfig) {
     use crate::ir::Attribute;
-    for (_, op) in module.ops.iter_mut() {
+    let live = module.live_ops();
+    for op_id in live {
+        let op = &mut module.ops[op_id];
         if op.is_op("builtin", "module")
             || op.is_op("func", "func")
             || op.is_op("func", "return")
@@ -530,6 +568,13 @@ pub fn jit_execute_and_benchmark(
     let pid = std::process::id();
     let tmp_dir = std::env::temp_dir().join(format!("castforge_jit_{pid}_{seq}"));
     fs::create_dir_all(&tmp_dir)?;
+    struct TempDirGuard(std::path::PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _tmp_guard = TempDirGuard(tmp_dir.clone());
     let bin_path = tmp_dir.join("kernel_bench");
 
     match target {
@@ -597,7 +642,6 @@ pub fn jit_execute_and_benchmark(
                 .context("Failed to invoke `rustc` for JIT compilation")?;
             if !status.status.success() {
                 let stderr = String::from_utf8_lossy(&status.stderr);
-                let _ = fs::remove_dir_all(&tmp_dir);
                 bail!("rustc JIT compilation failed: {stderr}");
             }
         }
@@ -668,7 +712,6 @@ pub fn jit_execute_and_benchmark(
                 .context("Failed to invoke `cc` for C99 JIT compilation")?;
             if !status.status.success() {
                 let stderr = String::from_utf8_lossy(&status.stderr);
-                let _ = fs::remove_dir_all(&tmp_dir);
                 bail!("cc JIT compilation failed: {stderr}");
             }
         }
@@ -677,7 +720,6 @@ pub fn jit_execute_and_benchmark(
         | CodegenTarget::Msl
         | CodegenTarget::Hip
         | CodegenTarget::OpenCl => {
-            let _ = fs::remove_dir_all(&tmp_dir);
             bail!("Native CPU JIT execution supports Rust and C99 targets");
         }
     }
@@ -685,7 +727,6 @@ pub fn jit_execute_and_benchmark(
     let run_out = Command::new(&bin_path)
         .output()
         .context("Failed to execute compiled JIT binary")?;
-    let _ = fs::remove_dir_all(&tmp_dir);
     if !run_out.status.success() {
         bail!("Compiled JIT binary exited with non-zero status");
     }
@@ -755,7 +796,7 @@ pub fn autotune_module_jit(
             let measured_ns = bench.min_latency_ns.max(0.1);
             cand.estimated_latency_ns = measured_ns;
             cand.effective_gflops = flops / measured_ns;
-            cand.speedup_over_baseline = (base_ns / measured_ns).max(1.0);
+            cand.speedup_over_baseline = base_ns / measured_ns;
         }
     }
 

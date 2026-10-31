@@ -110,9 +110,9 @@ pub(crate) fn fuse_elementwise_and_activations_single_traversal(
                 continue;
             }
 
-            if do_swiglu && try_fuse_swiglu_at_op(module, op_id) {
-                created += 1;
-            } else if do_gelu && try_fuse_gelu_or_geglu_at_op(module, op_id) {
+            if (do_swiglu && try_fuse_swiglu_at_op(module, op_id))
+                || (do_gelu && try_fuse_gelu_or_geglu_at_op(module, op_id))
+            {
                 created += 1;
             }
 

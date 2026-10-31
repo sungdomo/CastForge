@@ -284,17 +284,27 @@ impl TensorStore {
                         offset,
                         length,
                     } => {
-                        let file_bytes = std::fs::read(path).ok()?;
-                        let start = *offset as usize;
-                        let end = start.saturating_add(*length as usize);
-                        let slice = file_bytes.get(start..end)?;
-                        Self::decode_raw_bytes_to_f32(slice, &entry.ty.dtype, expected_len)
+                        let slice = Self::read_external_slice(path, *offset, *length).ok()?;
+                        Self::decode_raw_bytes_to_f32(&slice, &entry.ty.dtype, expected_len)
                     }
                     _ => None,
                 }
             }
             _ => None,
         }
+    }
+
+    fn read_external_slice(
+        path: &std::path::Path,
+        offset: u64,
+        length: u64,
+    ) -> std::io::Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; length as usize];
+        file.read_exact(&mut buf)?;
+        Ok(buf)
     }
 
     fn decode_raw_bytes_to_f32(
@@ -451,16 +461,8 @@ impl TensorStore {
                     offset,
                     length,
                 } => {
-                    let file_bytes = std::fs::read(path)?;
-                    let s = *offset as usize;
-                    let e = s.saturating_add(*length as usize);
-                    let slice = file_bytes.get(s..e).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            format!("ExternalFile slice out of bounds for {name}"),
-                        )
-                    })?;
-                    data_buf.extend_from_slice(slice);
+                    let slice = Self::read_external_slice(path, *offset, *length)?;
+                    data_buf.extend_from_slice(&slice);
                     let dtype_str = match entry.ty.dtype {
                         DType::F16 => "F16",
                         DType::BF16 => "BF16",
@@ -496,6 +498,13 @@ impl TensorStore {
         out.extend_from_slice(&header_json);
         out.extend_from_slice(&data_buf);
         Ok(out)
+    }
+
+    /// Construct a `TensorStore` from a `.safetensors` byte slice.
+    pub fn from_safetensors_bytes(bytes: &[u8]) -> Result<Self, std::io::Error> {
+        let mut store = Self::new();
+        store.load_safetensors_bytes(bytes)?;
+        Ok(store)
     }
 
     /// Load tensors from a `.safetensors` byte slice into this `TensorStore`.

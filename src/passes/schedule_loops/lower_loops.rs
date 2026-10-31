@@ -179,6 +179,21 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                 } else {
                     format!("{rhs}[p * {n} + j]")
                 };
+                let init_assign = LoopStmt::Assign {
+                    dst: dst.clone(),
+                    index: format!("i * {n} + j"),
+                    expr: "0.0f".to_string(),
+                };
+                let init_j_loop = LoopStmt::For {
+                    var: "j".to_string(),
+                    lower: 0,
+                    upper: n,
+                    step: 1,
+                    parallel: false,
+                    vectorized: cfg.vectorize,
+                    unroll: cfg.unroll_factor,
+                    body: vec![init_assign],
+                };
                 let fma = LoopStmt::Assign {
                     dst: dst.clone(),
                     index: format!("i * {n} + j"),
@@ -204,7 +219,7 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                     unroll: 1,
                     body: vec![j_loop],
                 };
-                let mut i_body = vec![p_loop];
+                let mut i_body = vec![init_j_loop, p_loop];
                 if op_name == "fused_matmul_epilogue" && op.operands.len() >= 3 {
                     let bias = value_ident(module, op.operands[2], &mut names, &mut counter);
                     let act = op
@@ -319,6 +334,20 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                 body.push(LoopStmt::Comment(format!(
                     "Fused scaled dot-product attention ({op_name}) seq={seq} d_head={d_head}"
                 )));
+                let init_d = LoopStmt::For {
+                    var: "d".to_string(),
+                    lower: 0,
+                    upper: d_head,
+                    step: 1,
+                    parallel: false,
+                    vectorized: cfg.vectorize,
+                    unroll: cfg.unroll_factor,
+                    body: vec![LoopStmt::Assign {
+                        dst: dst.clone(),
+                        index: format!("qi * {d_head} + d"),
+                        expr: "0.0f".to_string(),
+                    }],
+                };
                 let d_loop = LoopStmt::For {
                     var: "d".to_string(),
                     lower: 0,
@@ -354,12 +383,47 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                     parallel: cfg.parallel,
                     vectorized: false,
                     unroll: 1,
-                    body: vec![kj_loop],
+                    body: vec![init_d, kj_loop],
                 });
             } else if dialect == "stablehlo" && op_name == "reduce" && !op.operands.is_empty() {
                 let src = value_ident(module, op.operands[0], &mut names, &mut counter);
+                let src_dims = module.values[op.operands[0]]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_default();
+                let reduce_dim0 = src_dims.len() == 2
+                    && op
+                        .attributes
+                        .get("dimensions")
+                        .and_then(|a| a.as_int_slice())
+                        .is_some_and(|v| v == [0]);
                 let src_len = tensor_len(module, op.operands[0]);
                 let red_extent = (src_len / len.max(1)).max(1);
+                let src_idx = if reduce_dim0 {
+                    format!("{src}[r * {len} + row]")
+                } else {
+                    format!("{src}[row * {red_extent} + r]")
+                };
+                let reducer = op
+                    .attributes
+                    .get("reducer")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("stablehlo.add");
+                let (init_expr, accum_expr) = if reducer.contains("max") {
+                    ("-3.402823e38f".to_string(), format!("fmaxf({dst}[row], {src_idx})"))
+                } else if reducer.contains("min") {
+                    ("3.402823e38f".to_string(), format!("fminf({dst}[row], {src_idx})"))
+                } else if reducer.contains("mul") {
+                    ("1.0f".to_string(), format!("{dst}[row] * {src_idx}"))
+                } else {
+                    ("0.0f".to_string(), format!("{dst}[row] + {src_idx}"))
+                };
+                let init_assign = LoopStmt::Assign {
+                    dst: dst.clone(),
+                    index: "row".to_string(),
+                    expr: init_expr,
+                };
                 let r_loop = LoopStmt::For {
                     var: "r".to_string(),
                     lower: 0,
@@ -371,7 +435,7 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                     body: vec![LoopStmt::Assign {
                         dst: dst.clone(),
                         index: "row".to_string(),
-                        expr: format!("{dst}[row] + {src}[row * {red_extent} + r]"),
+                        expr: accum_expr,
                     }],
                 };
                 body.push(LoopStmt::For {
@@ -382,7 +446,7 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                     parallel: cfg.parallel,
                     vectorized: false,
                     unroll: 1,
-                    body: vec![r_loop],
+                    body: vec![init_assign, r_loop],
                 });
             } else if dialect == "stablehlo" && op_name == "gather" && op.operands.len() >= 2 {
                 let tbl = value_ident(module, op.operands[0], &mut names, &mut counter);
@@ -728,8 +792,10 @@ fn optimize_loop_stmt(
         ..
     } = stmt
     {
-        if interchange && var == "i" && body.len() == 1 {
-            if let LoopStmt::For {
+        if interchange
+            && var == "i"
+            && body.len() == 1
+            && let LoopStmt::For {
                 var: v_mid,
                 lower: l_mid,
                 upper: u_mid,
@@ -737,23 +803,22 @@ fn optimize_loop_stmt(
                 body: mid_body,
                 ..
             } = &mut body[0]
-                && v_mid == "j"
-                && mid_body.len() == 1
-                && let LoopStmt::For {
-                    var: v_in,
-                    lower: l_in,
-                    upper: u_in,
-                    step: s_in,
-                    ..
-                } = &mut mid_body[0]
-                && v_in == "p"
-            {
-                std::mem::swap(v_mid, v_in);
-                std::mem::swap(l_mid, l_in);
-                std::mem::swap(u_mid, u_in);
-                std::mem::swap(s_mid, s_in);
-                count += 1;
-            }
+            && v_mid == "j"
+            && mid_body.len() == 1
+            && let LoopStmt::For {
+                var: v_in,
+                lower: l_in,
+                upper: u_in,
+                step: s_in,
+                ..
+            } = &mut mid_body[0]
+            && v_in == "p"
+        {
+            std::mem::swap(v_mid, v_in);
+            std::mem::swap(l_mid, l_in);
+            std::mem::swap(u_mid, u_in);
+            std::mem::swap(s_mid, s_in);
+            count += 1;
         }
         let has_nested_for = body.iter().any(|s| matches!(s, LoopStmt::For { .. }));
         if is_outer && parallel && !*p {

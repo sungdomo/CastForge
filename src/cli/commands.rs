@@ -13,15 +13,16 @@ use crate::codegen::{
     emit_c_header, evaluate_function, evaluate_module, generate_code_with_config,
     generate_synthetic_inputs, jit_execute_and_benchmark, lower_to_loop_ir,
 };
-use crate::ir::{
-    Module, OpId, PassResult, Payload, PrintOptions, collect_module_tensors, export_gguf_file,
-    export_onnx_file, import_gguf_file, import_hf_model_dir, import_onnx_file, parse_mlir,
-    print_mlir, print_mlir_with_options, verify_stablehlo_shapes,
-};
-use crate::passes::{ComposeFunctionsPass, Pass, PassManager, PassRegistry, link_modules};
-use crate::viz::{
+use crate::ir::viz::{
     TimelineFrame, VizFormat, build_graph_json, diff_modules, render_module, render_timeline_html,
 };
+use crate::ir::{
+    Module, OpId, PassResult, Payload, PrintOptions, collect_module_tensors, export_gguf_file,
+    export_onnx_file, import_gguf_file, import_hf_model_dir, import_onnx_file,
+    import_safetensors_file, parse_mlir, print_mlir, print_mlir_with_options,
+    verify_stablehlo_shapes,
+};
+use crate::passes::{ComposeFunctionsPass, Pass, PassManager, PassRegistry, link_modules};
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::fs;
@@ -160,9 +161,10 @@ pub fn run() -> Result<()> {
                 let registry = PassRegistry::with_builtin_passes();
                 let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
                 if bisect {
-                    run_pipeline_with_bisect(
+                    run_pipeline_with_bisect_func(
                         &mut pm,
                         &mut module,
+                        func.as_deref(),
                         &inputs,
                         &baseline,
                         tolerance,
@@ -285,15 +287,13 @@ pub fn run() -> Result<()> {
                 render_module(&module, fmt)
             };
 
-            if let Some(out_path) = output {
-                fs::write(&out_path, rendered)?;
+            write_text_output(output.as_ref(), &rendered)?;
+            if let Some(out_path) = &output {
                 eprintln!(
                     "[castforge:viz] Wrote {} visualization to {}",
                     format,
                     out_path.display()
                 );
-            } else {
-                println!("{rendered}");
             }
         }
 
@@ -639,6 +639,7 @@ pub fn run() -> Result<()> {
             let mod_b = if let Some(sec_path) = second {
                 let src_b = read_input_text(Some(&sec_path))?;
                 let mut parsed_b = parse_mlir(&src_b)?;
+                load_optional_weights(&mut parsed_b, weights.as_ref(), false)?;
                 if let Some(spec) = passes {
                     let registry = PassRegistry::with_builtin_passes();
                     let mut pm = PassManager::from_pipeline_str(&registry, &spec)?;
@@ -686,6 +687,8 @@ pub fn run() -> Result<()> {
                     let s = input.to_string_lossy().to_ascii_lowercase();
                     if s.ends_with(".gguf") {
                         "gguf".to_string()
+                    } else if s.ends_with(".safetensors") {
+                        "safetensors".to_string()
                     } else if input.is_dir() || s.ends_with("config.json") {
                         "hf".to_string()
                     } else {
@@ -695,10 +698,14 @@ pub fn run() -> Result<()> {
             };
             let mut module = match fmt.trim().to_ascii_lowercase().as_str() {
                 "gguf" => import_gguf_file(&input)?,
+                "safetensors" | "st" => import_safetensors_file(&input)?,
                 "hf" | "huggingface" | "config.json" => import_hf_model_dir(&input)?,
                 "onnx" | "onnx.json" | "json" => import_onnx_file(&input)?,
                 other => {
-                    anyhow::bail!("Unknown import format `{other}` (expected: gguf, onnx, or hf)")
+                    anyhow::bail!(
+                        "Unknown import format `{other}` \
+                         (expected: gguf, safetensors, onnx, or hf)"
+                    )
                 }
             };
             if let Some(spec) = passes {
@@ -972,6 +979,50 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+fn run_pipeline_with_bisect_func(
+    pm: &mut PassManager,
+    module: &mut Module,
+    func_name: Option<&str>,
+    inputs: &[Vec<f32>],
+    out_before: &[Vec<f32>],
+    tolerance: f32,
+    show_stats: bool,
+) -> Result<()> {
+    let trace_steps = pm.run_with_trace(module)?;
+    let mut first_failing: Option<(usize, String, f32)> = None;
+    for step in &trace_steps {
+        if let Some(r) = &step.result
+            && show_stats
+        {
+            eprintln!(
+                "[castforge:pass] {:<18} | changed: {:<5} | \
+                 removed: {:<3} | modified: {:<3} | created: {:<3}",
+                r.pass_name, r.changed, r.ops_removed, r.ops_modified, r.ops_created
+            );
+        }
+        if step.step_index == 0 {
+            continue;
+        }
+        let step_fn_id = resolve_target_func(&step.module, func_name)?;
+        let out_step = evaluate_function(&step.module, step_fn_id, inputs)?;
+        let rep = compare_output_tensors(out_before, &out_step, tolerance)?;
+        eprintln!(
+            "[castforge:bisect] step #{:<2} {:<22} | passed: {:<5} | max_abs_diff: {:.6e}",
+            step.step_index, step.label, rep.passed, rep.max_abs_diff
+        );
+        if !rep.passed && first_failing.is_none() {
+            first_failing = Some((step.step_index, step.label.clone(), rep.max_abs_diff));
+        }
+    }
+    if let Some((idx, name, diff)) = first_failing {
+        anyhow::bail!(
+            "Pass bisection identified numerical failure at step #{idx} (`{name}`): \
+             max_abs_diff {diff:.6e} > tol {tolerance:.2e}"
+        );
+    }
+    Ok(())
+}
+
 /// Executes a pass invoked directly as a top-level subcommand
 /// (`castforge <pass-spec> [key=val ...] [input] [-o <output>] [-w <weights>]`).
 fn run_direct_pass(registry: &PassRegistry, args: &[String]) -> Result<()> {
@@ -1041,6 +1092,12 @@ fn run_direct_pass(registry: &PassRegistry, args: &[String]) -> Result<()> {
             }
             "--bisect" => {
                 bisect = true;
+            }
+            "--stats=false" => {
+                quiet = true;
+            }
+            "--stats" | "--stats=true" => {
+                quiet = false;
             }
             kv if !kv.starts_with('-')
                 && kv.contains('=')
@@ -1205,38 +1262,7 @@ fn run_pipeline_with_bisect(
     tolerance: f32,
     show_stats: bool,
 ) -> Result<()> {
-    let trace_steps = pm.run_with_trace(module)?;
-    let mut first_failing: Option<(usize, String, f32)> = None;
-    for step in &trace_steps {
-        if let Some(r) = &step.result
-            && show_stats
-        {
-            eprintln!(
-                "[castforge:pass] {:<18} | changed: {:<5} | \
-                 removed: {:<3} | modified: {:<3} | created: {:<3}",
-                r.pass_name, r.changed, r.ops_removed, r.ops_modified, r.ops_created
-            );
-        }
-        if step.step_index == 0 {
-            continue;
-        }
-        let out_step = evaluate_module(&step.module, inputs)?;
-        let rep = compare_output_tensors(out_before, &out_step, tolerance)?;
-        eprintln!(
-            "[castforge:bisect] step #{:<2} {:<22} | passed: {:<5} | max_abs_diff: {:.6e}",
-            step.step_index, step.label, rep.passed, rep.max_abs_diff
-        );
-        if !rep.passed && first_failing.is_none() {
-            first_failing = Some((step.step_index, step.label.clone(), rep.max_abs_diff));
-        }
-    }
-    if let Some((idx, name, diff)) = first_failing {
-        anyhow::bail!(
-            "Pass bisection identified numerical failure at step #{idx} (`{name}`): \
-             max_abs_diff {diff:.6e} > tol {tolerance:.2e}"
-        );
-    }
-    Ok(())
+    run_pipeline_with_bisect_func(pm, module, None, inputs, out_before, tolerance, show_stats)
 }
 
 fn build_roofline(
@@ -1286,7 +1312,7 @@ fn write_text_output(output: Option<&PathBuf>, content: &str) -> Result<()> {
 }
 
 fn verify_all_stablehlo_shapes(module: &Module) -> Result<()> {
-    for op_id in module.ops.keys() {
+    for op_id in module.live_ops() {
         verify_stablehlo_shapes(module, op_id).map_err(|e| anyhow::anyhow!(e))?;
     }
     Ok(())

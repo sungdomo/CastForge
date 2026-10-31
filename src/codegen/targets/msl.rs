@@ -59,9 +59,10 @@ fn emit_msl_stmt(out: &mut String, stmt: &LoopStmt, ret_name: &str) -> Result<()
             body,
             ..
         } => {
-            if *step > 1 {
-                writeln!(out, "    if ({lower}u + gid * {step}u < {upper}u) {{")?;
-                writeln!(out, "        uint {var} = {lower}u + gid * {step}u;")?;
+            let st = (*step).max(1);
+            if st > 1 || *lower > 0 {
+                writeln!(out, "    if ({lower}u + gid * {st}u < {upper}u) {{")?;
+                writeln!(out, "        uint {var} = {lower}u + gid * {st}u;")?;
             } else {
                 writeln!(out, "    if (gid < {upper}u) {{")?;
                 writeln!(out, "        uint {var} = gid;")?;

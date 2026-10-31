@@ -1,8 +1,9 @@
 //! Standalone Rust (`no_std`-compatible) source code generator (`CodegenTarget::Rust`).
 
 use crate::codegen::{
-    GemmLoopOrder, MemoryPlan, SimdIsa, TargetConfig, build_memory_plan, sanitize_ident,
-    tensor_len, tensor_shape_dims, value_ident,
+    GemmLoopOrder, LoopModule, LoopStmt, MemoryPlan, SimdIsa, TargetConfig,
+    build_function_memory_plan, build_memory_plan, matmul_dims_ex, sanitize_ident, tensor_len,
+    tensor_shape_dims, value_ident,
 };
 use crate::ir::{Attribute, DType, Module, OpId, ValueId};
 use crate::stablehlo::StableHloOp;
@@ -93,7 +94,7 @@ pub fn emit_rust_module_with_config(module: &Module, base_cfg: &TargetConfig) ->
     }
 
     for fn_op_id in module.functions() {
-        emit_rust_func(module, fn_op_id, &plan, config, &mut out)?;
+        emit_rust_func(module, fn_op_id, config, &mut out)?;
     }
 
     Ok(out)
@@ -142,10 +143,11 @@ fn r_bcast_idx(
 fn emit_rust_func(
     module: &Module,
     fn_op_id: OpId,
-    plan: &MemoryPlan,
     config: &TargetConfig,
     out: &mut String,
 ) -> Result<()> {
+    let plan = build_function_memory_plan(module, fn_op_id);
+    let plan = &plan;
     let fn_op = &module.ops[fn_op_id];
     let fn_name = sanitize_ident(
         fn_op
@@ -610,20 +612,24 @@ fn emit_rust_hlo_op(
         StableHloOp::Reduce {
             inputs,
             init_values,
+            dimensions,
             reducer_op,
             ..
         } => {
+            let in_dims = module.values[inputs[0]]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_default();
             let in_len = tensor_len(module, inputs[0]);
             let inner = (in_len / res_len.max(1)).max(1);
             let init0 = r_idx(module, plan, init_values[0], "0", names, counter);
-            let src = r_idx(
-                module,
-                plan,
-                inputs[0],
-                &format!("o * {inner} + k"),
-                names,
-                counter,
-            );
+            let src_idx = if in_dims.len() == 2 && dimensions.as_slice() == [0] {
+                format!("k * {res_len} + o")
+            } else {
+                format!("o * {inner} + k")
+            };
+            let src = r_idx(module, plan, inputs[0], &src_idx, names, counter);
             let dst = r_idx(module, plan, res_val, "o", names, counter);
             let red_op = reducer_op.as_deref().unwrap_or("add");
             let red_stmt = if red_op.contains("max") {
@@ -1046,6 +1052,14 @@ fn emit_rust_hlo_op(
                     .unwrap_or_else(|| vec![1, res_len]);
                 let cols = *dims.last().unwrap_or(&res_len).max(&1);
                 let rows = (res_len / cols).max(1);
+                let src0 = r_idx(
+                    module,
+                    plan,
+                    inputs[0],
+                    &format!("r * {cols}"),
+                    names,
+                    counter,
+                );
                 let src = r_idx(
                     module,
                     plan,
@@ -1063,9 +1077,14 @@ fn emit_rust_hlo_op(
                     counter,
                 );
                 writeln!(out, "    for r in 0..{rows} {{")?;
+                writeln!(out, "        let mut max_v = {src0};")?;
+                writeln!(
+                    out,
+                    "        for c in 1..{cols} {{ max_v = max_v.max({src}); }}"
+                )?;
                 writeln!(out, "        let mut sum = 0.0_f32;")?;
                 writeln!(out, "        for c in 0..{cols} {{")?;
-                writeln!(out, "            let e = ({src}).exp();")?;
+                writeln!(out, "            let e = ({src} - max_v).exp();")?;
                 writeln!(out, "            {dst} = e;")?;
                 writeln!(out, "            sum += e;")?;
                 writeln!(out, "        }}")?;
@@ -1280,6 +1299,14 @@ fn emit_rust_hlo_op(
                     .unwrap_or_else(|| vec![1, res_len]);
                 let cols = *dims.last().unwrap_or(&res_len).max(&1);
                 let rows = (res_len / cols).max(1);
+                let src0 = r_idx(
+                    module,
+                    plan,
+                    inputs[0],
+                    &format!("r * {cols}"),
+                    names,
+                    counter,
+                );
                 let src = r_idx(
                     module,
                     plan,
@@ -1297,15 +1324,20 @@ fn emit_rust_hlo_op(
                     counter,
                 );
                 writeln!(out, "    for r in 0..{rows} {{")?;
+                writeln!(out, "        let mut max_v = {src0};")?;
+                writeln!(
+                    out,
+                    "        for c in 1..{cols} {{ max_v = max_v.max({src}); }}"
+                )?;
                 writeln!(out, "        let mut sum = 0.0_f32;")?;
                 writeln!(
                     out,
-                    "        for c in 0..{cols} {{ sum += ({src}).exp(); }}"
+                    "        for c in 0..{cols} {{ sum += ({src} - max_v).exp(); }}"
                 )?;
                 writeln!(out, "        let lse = sum.ln();")?;
                 writeln!(
                     out,
-                    "        for c in 0..{cols} {{ {dst} = ({src}) - lse; }}"
+                    "        for c in 0..{cols} {{ {dst} = ({src} - max_v) - lse; }}"
                 )?;
                 writeln!(out, "    }}")?;
             } else if name == "castforge.im2col" && !inputs.is_empty() {
@@ -2010,7 +2042,7 @@ fn emit_rust_fused_loop_chain(
 ) -> Result<()> {
     let ext_exprs: Vec<String> = inputs
         .iter()
-        .map(|&v| r_idx(module, plan, v, "i", names, counter))
+        .map(|&v| r_bcast_idx(module, plan, v, "i", res_len, names, counter))
         .collect();
     let dst = r_idx(module, plan, res_val, "i", names, counter);
     let specs: Vec<&str> = steps_str.split(';').filter(|s| !s.is_empty()).collect();
@@ -2323,28 +2355,88 @@ fn emit_rust_gated_mlp(
     Ok(())
 }
 
-fn matmul_dims_ex(
-    module: &Module,
-    lhs: ValueId,
-    rhs: ValueId,
-    packed: bool,
-) -> (usize, usize, usize) {
-    let lhs_dims = module.values[lhs]
-        .ty
-        .as_tensor()
-        .map(tensor_shape_dims)
-        .unwrap_or_else(|| vec![1, 1]);
-    let rhs_dims = module.values[rhs]
-        .ty
-        .as_tensor()
-        .map(tensor_shape_dims)
-        .unwrap_or_else(|| vec![1, 1]);
-    let m = *lhs_dims.first().unwrap_or(&1);
-    let k = *lhs_dims.get(1).unwrap_or(&1);
-    let n = if packed {
-        *rhs_dims.first().unwrap_or(&1)
-    } else {
-        *rhs_dims.get(1).unwrap_or(&1)
-    };
-    (m, k, n)
+/// Emits standalone Rust source code from a lowered [`LoopModule`].
+pub fn emit_rust_from_loop_ir(loop_mod: &LoopModule) -> Result<String> {
+    let mut out = String::new();
+    writeln!(
+        out,
+        "// Auto-generated by CastForge Loop-IR Codegen (Target: Rust)"
+    )?;
+    writeln!(
+        out,
+        "#![allow(clippy::excessive_precision, unused_variables, clippy::identity_op, dead_code)]\n"
+    )?;
+    for kernel in &loop_mod.kernels {
+        let params: Vec<String> = kernel
+            .params
+            .iter()
+            .map(|(n, len)| format!("{n}: &[f32; {len}]"))
+            .collect();
+        let (out_name, out_len) = (&kernel.output.0, kernel.output.1);
+        writeln!(
+            out,
+            "pub fn {}({}) -> [f32; {out_len}] {{",
+            kernel.name,
+            params.join(", ")
+        )?;
+        writeln!(out, "    let mut {out_name} = [0.0_f32; {out_len}];")?;
+        for stmt in &kernel.body {
+            emit_rust_loop_stmt(stmt, &kernel.output.0, 1, &mut out)?;
+        }
+        writeln!(out, "    {out_name}")?;
+        writeln!(out, "}}\n")?;
+    }
+    Ok(out)
+}
+
+fn emit_rust_loop_stmt(
+    stmt: &LoopStmt,
+    ret_name: &str,
+    indent: usize,
+    out: &mut String,
+) -> Result<()> {
+    let pad = "    ".repeat(indent);
+    match stmt {
+        LoopStmt::Comment(c) => writeln!(out, "{pad}// {c}")?,
+        LoopStmt::Alloc { name, len } if name != ret_name => {
+            writeln!(out, "{pad}let mut {name} = [0.0_f32; {len}];")?;
+        }
+        LoopStmt::Alloc { .. } => {}
+        LoopStmt::For {
+            var,
+            lower,
+            upper,
+            step,
+            parallel,
+            vectorized,
+            unroll,
+            body,
+        } => {
+            if *parallel {
+                writeln!(out, "{pad}// [parallel]")?;
+            }
+            if *vectorized {
+                writeln!(out, "{pad}// [vectorize]")?;
+            }
+            if *unroll > 1 {
+                writeln!(out, "{pad}// [unroll({unroll})]")?;
+            }
+            if *step <= 1 {
+                writeln!(out, "{pad}for {var} in {lower}..{upper} {{")?;
+            } else {
+                writeln!(
+                    out,
+                    "{pad}for {var} in ({lower}..{upper}).step_by({step}) {{"
+                )?;
+            }
+            for inner in body {
+                emit_rust_loop_stmt(inner, ret_name, indent + 1, out)?;
+            }
+            writeln!(out, "{pad}}}")?;
+        }
+        LoopStmt::Assign { dst, index, expr } => {
+            writeln!(out, "{pad}{dst}[{index}] = {expr};")?;
+        }
+    }
+    Ok(())
 }

@@ -198,6 +198,11 @@ signature = "bytes -> ir"
 description = "Import GGUF v2/v3 binary model into StableHLO Module + TensorStore"
 
 [[translator]]
+stage = "import-safetensors"
+signature = "bytes -> ir"
+description = "Import SafeTensors binary weights into StableHLO Module + TensorStore"
+
+[[translator]]
 stage = "import-hf-config"
 signature = "text -> ir"
 description = "Synthesize Transformer architecture from HuggingFace config.json"

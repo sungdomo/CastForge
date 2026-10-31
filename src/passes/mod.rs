@@ -24,8 +24,8 @@ pub mod schedule_loops;
 pub mod shard_distributed;
 pub mod simplify_algebraic;
 pub mod specialize_shapes;
+pub mod verify_ir;
 
-pub use crate::ir::verify::*;
 pub use canonicalize::*;
 pub use cse::*;
 pub use dce::*;
@@ -44,3 +44,4 @@ pub use schedule_loops::*;
 pub use shard_distributed::*;
 pub use simplify_algebraic::*;
 pub use specialize_shapes::*;
+pub use verify_ir::*;

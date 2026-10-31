@@ -388,6 +388,12 @@ pub enum VerifyError {
 
     #[error("Region references missing BlockId")]
     DanglingBlock,
+
+    #[error("Block references missing OpId")]
+    DanglingOp,
+
+    #[error("SSA Value definition metadata does not match owning Operation or Block")]
+    InvalidValueDef,
 }
 
 new_key_type! {
@@ -757,6 +763,32 @@ impl Module {
             .collect()
     }
 
+    /// Returns all live operations reachable from `self.root_region` in program order.
+    pub fn live_ops(&self) -> Vec<OpId> {
+        let mut out = Vec::new();
+        self.collect_region_live_ops(self.root_region, &mut out);
+        out
+    }
+
+    fn collect_region_live_ops(&self, region_id: RegionId, out: &mut Vec<OpId>) {
+        let Some(region) = self.regions.get(region_id) else {
+            return;
+        };
+        for &blk_id in &region.blocks {
+            let Some(blk) = self.blocks.get(blk_id) else {
+                continue;
+            };
+            for &op_id in &blk.ops {
+                if let Some(op) = self.ops.get(op_id) {
+                    out.push(op_id);
+                    for &child_reg in &op.regions {
+                        self.collect_region_live_ops(child_reg, out);
+                    }
+                }
+            }
+        }
+    }
+
     /// Verifies structural integrity of the IR (all SSA ValueIds, OpIds, BlockIds, and RegionIds
     /// resolve).
     pub fn verify(&self) -> Result<(), VerifyError> {
@@ -771,14 +803,22 @@ impl Module {
                 let Some(block) = self.blocks.get(block_id) else {
                     return Err(VerifyError::DanglingBlock);
                 };
-                for &arg_id in &block.arguments {
-                    if !self.values.contains_key(arg_id) {
+                for (idx, &arg_id) in block.arguments.iter().enumerate() {
+                    let Some(val) = self.values.get(arg_id) else {
                         return Err(VerifyError::DanglingBlockArgument);
+                    };
+                    if val.def
+                        != (ValueDef::BlockArgument {
+                            block: block_id,
+                            index: idx as u32,
+                        })
+                    {
+                        return Err(VerifyError::InvalidValueDef);
                     }
                 }
                 for &op_id in &block.ops {
                     let Some(op) = self.ops.get(op_id) else {
-                        continue;
+                        return Err(VerifyError::DanglingOp);
                     };
                     for &operand in &op.operands {
                         if !self.values.contains_key(operand) {
@@ -787,11 +827,19 @@ impl Module {
                             });
                         }
                     }
-                    for &result in &op.results {
-                        if !self.values.contains_key(result) {
+                    for (idx, &result) in op.results.iter().enumerate() {
+                        let Some(val) = self.values.get(result) else {
                             return Err(VerifyError::DanglingResult {
                                 op_name: op.name.full_name(),
                             });
+                        };
+                        if val.def
+                            != (ValueDef::OpResult {
+                                op: op_id,
+                                index: idx as u32,
+                            })
+                        {
+                            return Err(VerifyError::InvalidValueDef);
                         }
                     }
                     for &reg_id in &op.regions {

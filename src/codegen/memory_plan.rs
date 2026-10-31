@@ -1,7 +1,7 @@
 //! Static liveness analysis ([`LiveInterval`]) and interval-coloring arena buffer planner
 //! ([`MemoryPlan`], [`build_memory_plan`]).
 
-use crate::ir::{Attribute, BlockId, Module, ValueDef, ValueId};
+use crate::ir::{Attribute, BlockId, Module, OpId, ValueDef, ValueId};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -76,6 +76,9 @@ pub fn compute_block_liveness(module: &Module, block_id: BlockId) -> Vec<LiveInt
                 }
             }
         }
+        for &child_reg in &op.regions {
+            extend_region_liveness(module, child_reg, step, &mut intervals);
+        }
     }
 
     order
@@ -84,17 +87,53 @@ pub fn compute_block_liveness(module: &Module, block_id: BlockId) -> Vec<LiveInt
         .collect()
 }
 
+fn extend_region_liveness(
+    module: &Module,
+    region_id: crate::ir::RegionId,
+    step: usize,
+    intervals: &mut HashMap<ValueId, LiveInterval>,
+) {
+    let Some(region) = module.regions.get(region_id) else {
+        return;
+    };
+    for &blk_id in &region.blocks {
+        let Some(blk) = module.blocks.get(blk_id) else {
+            continue;
+        };
+        for &op_id in &blk.ops {
+            let Some(op) = module.ops.get(op_id) else {
+                continue;
+            };
+            for &operand_id in &op.operands {
+                if let Some(iv) = intervals.get_mut(&operand_id) {
+                    iv.last_use = iv.last_use.max(step);
+                }
+            }
+            for &child_reg in &op.regions {
+                extend_region_liveness(module, child_reg, step, intervals);
+            }
+        }
+    }
+}
+
 /// Computes live intervals across all function entry blocks in `module`.
+/// Step numbers are offset across functions so distinct functions do not collide.
 pub fn compute_module_liveness(module: &Module) -> HashMap<ValueId, LiveInterval> {
     let mut all = HashMap::new();
+    let mut step_offset = 0usize;
     for fn_op_id in module.functions() {
         let fn_op = &module.ops[fn_op_id];
         if let Some(&reg_id) = fn_op.regions.first()
             && let Some(&blk_id) = module.regions[reg_id].blocks.first()
         {
-            for iv in compute_block_liveness(module, blk_id) {
+            let mut max_step = step_offset;
+            for mut iv in compute_block_liveness(module, blk_id) {
+                iv.first_def += step_offset;
+                iv.last_use += step_offset;
+                max_step = max_step.max(iv.last_use);
                 all.insert(iv.value, iv);
             }
+            step_offset = max_step + 2;
         }
     }
     // Fallback for standalone modules without a `func.func` wrapper
@@ -224,6 +263,28 @@ impl ArenaSlot {
 /// Computes a liveness-guided static memory and arena buffer reuse plan for `module`.
 pub fn build_memory_plan(module: &Module) -> MemoryPlan {
     let liveness = compute_module_liveness(module);
+    build_memory_plan_from_liveness(module, &liveness)
+}
+
+/// Computes a liveness-guided static memory and arena buffer reuse plan scoped to a
+/// single `func.func` operation (`fn_op_id`).
+pub fn build_function_memory_plan(module: &Module, fn_op_id: OpId) -> MemoryPlan {
+    let mut liveness = HashMap::new();
+    let fn_op = &module.ops[fn_op_id];
+    if let Some(&reg_id) = fn_op.regions.first()
+        && let Some(&blk_id) = module.regions[reg_id].blocks.first()
+    {
+        for iv in compute_block_liveness(module, blk_id) {
+            liveness.insert(iv.value, iv);
+        }
+    }
+    build_memory_plan_from_liveness(module, &liveness)
+}
+
+fn build_memory_plan_from_liveness(
+    module: &Module,
+    liveness: &HashMap<ValueId, LiveInterval>,
+) -> MemoryPlan {
     let mut plan = MemoryPlan::default();
     let mut slots: Vec<ArenaSlot> = Vec::new();
 

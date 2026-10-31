@@ -132,18 +132,18 @@ pub fn build_graph_json(module: &Module) -> GraphJson {
     let mut arg_node_ids: HashMap<ValueId, String> = HashMap::new();
     let mut counter = 0usize;
 
-    for func_op_id in module.functions() {
-        let func_op = &module.ops[func_op_id];
-        let Some(&region_id) = func_op.regions.first() else {
-            continue;
-        };
-        let Some(&block_id) = module.regions[region_id].blocks.first() else {
-            continue;
-        };
+    fn recurse_block(
+        module: &Module,
+        block_id: crate::ir::BlockId,
+        nodes: &mut Vec<GraphNodeJson>,
+        edges: &mut Vec<GraphEdgeJson>,
+        op_node_ids: &mut HashMap<OpId, String>,
+        arg_node_ids: &mut HashMap<ValueId, String>,
+        counter: &mut usize,
+    ) {
         let block = &module.blocks[block_id];
-
         for &arg_id in &block.arguments {
-            counter += 1;
+            *counter += 1;
             let nid = format!("n{counter}");
             let val = &module.values[arg_id];
             let ssa = val.ssa_name.as_deref().unwrap_or("arg");
@@ -159,7 +159,7 @@ pub fn build_graph_json(module: &Module) -> GraphJson {
         }
 
         for &op_id in &block.ops {
-            counter += 1;
+            *counter += 1;
             let nid = format!("n{counter}");
             let op = &module.ops[op_id];
             let full_name = op.name.to_string();
@@ -197,6 +197,40 @@ pub fn build_graph_json(module: &Module) -> GraphJson {
                     });
                 }
             }
+
+            for &sub_reg in &op.regions {
+                if let Some(reg) = module.regions.get(sub_reg) {
+                    for &sub_blk in &reg.blocks {
+                        recurse_block(
+                            module,
+                            sub_blk,
+                            nodes,
+                            edges,
+                            op_node_ids,
+                            arg_node_ids,
+                            counter,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    for func_op_id in module.functions() {
+        let func_op = &module.ops[func_op_id];
+        let Some(&region_id) = func_op.regions.first() else {
+            continue;
+        };
+        for &block_id in &module.regions[region_id].blocks {
+            recurse_block(
+                module,
+                block_id,
+                &mut nodes,
+                &mut edges,
+                &mut op_node_ids,
+                &mut arg_node_ids,
+                &mut counter,
+            );
         }
     }
 

@@ -416,12 +416,12 @@ pub enum Commands {
         output: Option<PathBuf>,
     },
 
-    /// Import an external model (GGUF v2/v3, ONNX JSON, or HuggingFace config.json) into IR
+    /// Import an external model (GGUF, SafeTensors, ONNX JSON, or HF config.json) into IR
     Import {
-        /// Input model path (.gguf, .onnx.json, config.json, or HF model directory)
+        /// Input model path (.gguf, .safetensors, .onnx.json, config.json, or HF model dir)
         input: PathBuf,
 
-        /// Frontend format: gguf, onnx, or hf (auto-detected from path by default)
+        /// Frontend format: gguf, safetensors, onnx, or hf (auto-detected by default)
         #[arg(short = 'f', long = "format")]
         format: Option<String>,
 

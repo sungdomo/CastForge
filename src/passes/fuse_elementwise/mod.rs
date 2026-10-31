@@ -3,11 +3,11 @@
 //!
 //! Organized into cohesive submodules:
 //! - [`mod.rs`](self): `FuseElementwisePass`, `FuseMapReducePass`, `FuseAddMaxPass`
-//! - [`loops`]: `FuseLoopsPass`, `SplitLoopsPass`, `FuseMegakernelPass`
-//! - [`decompose`]: `DecomposeCompositesPass`
-//! - [`decompose_helpers`]: Primitive StableHLO expansion builders for composite decomposition
-//! - [`activations`]: `FuseActivationsPass`, `FuseSwiGluPass`, `FuseGeluPass`, `FuseGatedMlpPass`,
-//!   `FuseMoePass`
+//! - [`loops`][]: `FuseLoopsPass`, `SplitLoopsPass`, `FuseMegakernelPass`
+//! - [`decompose`][]: `DecomposeCompositesPass`
+//! - [`decompose_helpers`][]: Primitive StableHLO expansion builders for composite decomposition
+//! - [`activations`][]: `FuseActivationsPass`, `FuseSwiGluPass`, `FuseGeluPass`,
+//!   `FuseGatedMlpPass`, `FuseMoePass`
 
 pub mod activations;
 pub mod decompose;

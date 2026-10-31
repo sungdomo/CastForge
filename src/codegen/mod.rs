@@ -28,15 +28,16 @@ pub use crate::codegen::eval::{
     verify_module_numerics,
 };
 pub use crate::codegen::memory_plan::{
-    BufferAllocation, LiveInterval, MemoryPlan, build_memory_plan, compute_block_liveness,
-    compute_module_liveness,
+    BufferAllocation, LiveInterval, MemoryPlan, build_function_memory_plan, build_memory_plan,
+    compute_block_liveness, compute_module_liveness,
 };
 pub use crate::codegen::targets::{
-    CHeaderTranslator, SharedLibTranslator, compile_shared_lib, emit_c_header, emit_c_module,
-    emit_c_module_with_config, emit_cuda_from_loop_ir, emit_cuda_module_with_config,
+    CHeaderTranslator, SharedLibTranslator, compile_shared_lib, emit_c_from_loop_ir, emit_c_header,
+    emit_c_module, emit_c_module_with_config, emit_cuda_from_loop_ir, emit_cuda_module_with_config,
     emit_hip_from_loop_ir, emit_hip_module_with_config, emit_msl_from_loop_ir,
     emit_msl_module_with_config, emit_opencl_from_loop_ir, emit_opencl_module_with_config,
-    emit_rust_module, emit_rust_module_with_config, emit_wgsl_module, emit_wgsl_module_with_config,
+    emit_rust_from_loop_ir, emit_rust_module, emit_rust_module_with_config,
+    emit_wgsl_from_loop_ir, emit_wgsl_module, emit_wgsl_module_with_config,
 };
 pub use crate::ir::loops::{LoopKernel, LoopModule, LoopStmt};
 use crate::ir::{Dim, Module, TensorType, ValueId};
@@ -262,6 +263,32 @@ pub(crate) fn tensor_shape_dims(t: &TensorType) -> Vec<usize> {
         .collect()
 }
 
+pub(crate) fn matmul_dims_ex(
+    module: &Module,
+    lhs: ValueId,
+    rhs: ValueId,
+    packed: bool,
+) -> (usize, usize, usize) {
+    let lhs_dims = module.values[lhs]
+        .ty
+        .as_tensor()
+        .map(tensor_shape_dims)
+        .unwrap_or_else(|| vec![1, 1]);
+    let rhs_dims = module.values[rhs]
+        .ty
+        .as_tensor()
+        .map(tensor_shape_dims)
+        .unwrap_or_else(|| vec![1, 1]);
+    let m = *lhs_dims.first().unwrap_or(&1);
+    let k = *lhs_dims.get(1).unwrap_or(&1);
+    let n = if packed {
+        *rhs_dims.first().unwrap_or(&1)
+    } else {
+        *rhs_dims.get(1).unwrap_or(&1)
+    };
+    (m, k, n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,12 +375,40 @@ mod tests {
         let lsm_mod = parse_mlir(lsm_src).unwrap();
         let wgsl_lsm = emit_wgsl_module(&lsm_mod).unwrap();
         assert!(wgsl_lsm.contains("let lse: f32 = max_v + log(sum_exp);"));
-        let mut reg_cfg = TargetConfig::default();
-        reg_cfg.reg_tile_m = 2;
-        reg_cfg.reg_tile_n = 2;
+        let reg_cfg = TargetConfig::default().with_register_tile(2, 2);
         let rust_tiled = emit_rust_module_with_config(&lsm_mod, &reg_cfg).unwrap();
         assert!(rust_tiled.contains("for n in 2..3"));
         let c_tiled = emit_c_module_with_config(&lsm_mod, &reg_cfg).unwrap();
         assert!(c_tiled.contains("for (int n = 2; n < 3; ++n)"));
+
+        // 5. Loop-IR to Rust and WGSL targets
+        let loop_rust = emit_rust_from_loop_ir(&loop_mod).unwrap();
+        assert!(loop_rust.contains("pub fn forward("));
+        let loop_wgsl = emit_wgsl_from_loop_ir(&loop_mod).unwrap();
+        assert!(loop_wgsl.contains("@compute @workgroup_size(64)"));
+
+        // 6. WGSL composite math (Layernorm, Residual RMSNorm, FlashAttention)
+        let comp_src = concat!(
+            "module @wgsl_comp {\n",
+            "  func.func @forward(%x: tensor<2x4xf32>, %r: tensor<2x4xf32>, %g: tensor<4xf32>, ",
+            "%b: tensor<4xf32>) -> tensor<2x4xf32> {\n",
+            "    %h = stablehlo.composite %x, %r, %g ",
+            "{name = \"castforge.fused_residual_rmsnorm\"} ",
+            ": (tensor<2x4xf32>, tensor<2x4xf32>, tensor<4xf32>) -> tensor<2x4xf32>\n",
+            "    %ln = stablehlo.composite %h, %g, %b ",
+            "{name = \"castforge.fused_layernorm\"} ",
+            ": (tensor<2x4xf32>, tensor<4xf32>, tensor<4xf32>) -> tensor<2x4xf32>\n",
+            "    %att = stablehlo.composite %ln, %ln, %ln ",
+            "{name = \"castforge.fused_attention\", scale = 0.5 : f32, k_transposed = true} ",
+            ": (tensor<2x4xf32>, tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>\n",
+            "    func.return %att : tensor<2x4xf32>\n",
+            "  }\n",
+            "}\n",
+        );
+        let comp_mod = parse_mlir(comp_src).unwrap();
+        let wgsl_comp = emit_wgsl_module(&comp_mod).unwrap();
+        assert!(wgsl_comp.contains("+ input_1[r * 4u + c]"));
+        assert!(wgsl_comp.contains("let mean = sum / f32(4u);"));
+        assert!(wgsl_comp.contains("o_acc[d] / l_prev"));
     }
 }

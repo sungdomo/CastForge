@@ -172,6 +172,25 @@ pub fn import_gguf_bytes(bytes: &[u8]) -> Result<Module> {
                      : tensor<{cur_rows}x{cur_cols}xf32>"
                 )?;
                 cur_ssa = out_ssa;
+            } else if info.shape.len() == 1 && info.shape[0] == cur_cols {
+                let bc_ssa = format!("%bc{idx}");
+                let out_ssa = format!("%h{idx}");
+                let elem_op = if info.name.contains("norm") {
+                    "multiply"
+                } else {
+                    "add"
+                };
+                writeln!(
+                    body,
+                    "    {bc_ssa} = stablehlo.broadcast_in_dim {w_ssa}, dims = [1] \
+                     : (tensor<{cur_cols}xf32>) -> tensor<{cur_rows}x{cur_cols}xf32>"
+                )?;
+                writeln!(
+                    body,
+                    "    {out_ssa} = stablehlo.{elem_op} {cur_ssa}, {bc_ssa} \
+                     : tensor<{cur_rows}x{cur_cols}xf32>"
+                )?;
+                cur_ssa = out_ssa;
             }
         }
         writeln!(

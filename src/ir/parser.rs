@@ -36,16 +36,12 @@ impl MlirParser {
 
     pub fn parse_module(&mut self, input: &str) -> Result<Module, ParseError> {
         let mut module = Module::new(None);
-        let mut current_block: BlockId = module.body_block();
-        let mut in_func = false;
+        let mut block_stack: Vec<BlockId> = vec![module.body_block()];
 
         let mut logical_lines: Vec<(usize, String)> = Vec::new();
         for (idx, raw_line) in input.lines().enumerate() {
             let line_no = idx + 1;
-            let line = match raw_line.find("//") {
-                Some(pos) => raw_line[..pos].trim(),
-                None => raw_line.trim(),
-            };
+            let line = strip_line_comment(raw_line).trim();
             if line.is_empty() {
                 continue;
             }
@@ -61,7 +57,7 @@ impl MlirParser {
                 || line.starts_with("->")
                 || line.starts_with("applies ")
                 || line.starts_with("across ")
-                || line.starts_with('{')
+                || (line.starts_with('{') && !line.ends_with('{'))
                 || line.starts_with('[');
             if is_continuation && let Some((_prev_ln, prev_text)) = logical_lines.last_mut() {
                 prev_text.push(' ');
@@ -86,20 +82,24 @@ impl MlirParser {
             }
 
             if line == "}" {
-                if in_func {
-                    in_func = false;
-                    current_block = module.body_block();
+                if block_stack.len() > 1 {
+                    block_stack.pop();
                 }
                 continue;
             }
 
             if line.starts_with("func.func ") {
-                current_block = self.parse_func_header(&mut module, line, line_no)?;
-                in_func = true;
+                let fn_blk = self.parse_func_header(&mut module, line, line_no)?;
+                block_stack.push(fn_blk);
                 continue;
             }
 
-            self.parse_operation_line(&mut module, current_block, line, line_no)?;
+            let current_block = *block_stack.last().unwrap_or(&module.body_block());
+            if let Some(sub_blk) =
+                self.parse_operation_line(&mut module, current_block, line, line_no)?
+            {
+                block_stack.push(sub_blk);
+            }
         }
 
         Ok(module)
@@ -111,9 +111,15 @@ impl MlirParser {
         block: BlockId,
         line: &str,
         line_no: usize,
-    ) -> Result<(), ParseError> {
+    ) -> Result<Option<BlockId>, ParseError> {
+        let opens_region = line.trim_end().ends_with('{');
+        let line_no_brace = if opens_region {
+            line.trim_end().trim_end_matches('{').trim_end()
+        } else {
+            line
+        };
         // Strip optional trailing `loc(...)`
-        let (line, location) = extract_trailing_loc(line);
+        let (line, location) = extract_trailing_loc(line_no_brace);
 
         // Split LHS results if `=` is present before any quotes/braces
         let (lhs_names, rhs) = if let Some(eq_idx) = find_top_level_eq(line) {
@@ -129,7 +135,12 @@ impl MlirParser {
 
         // 1. Check if Generic MLIR form: `"dialect.op"(...)`
         if rhs.starts_with('"') {
-            return self.parse_generic_op(module, block, lhs_names, rhs, location, line_no);
+            self.parse_generic_op(module, block, lhs_names, rhs, location, line_no)?;
+            return Ok(Self::attach_nested_region_if_opened(
+                module,
+                block,
+                opens_region,
+            ));
         }
 
         // 2. Check `return` / `func.return`
@@ -166,7 +177,7 @@ impl MlirParser {
                 true,
                 location,
             );
-            return Ok(());
+            return Ok(None);
         }
 
         // 3. Custom / Pretty syntax: `<op_name> ...`
@@ -178,7 +189,12 @@ impl MlirParser {
 
         // Special case: `stablehlo.reduce(%in init: %init) applies <op> across dimensions = [...]`
         if op_name.dialect == "stablehlo" && op_name.name == "reduce" && rest.starts_with('(') {
-            return self.parse_reduce_short_op(module, block, lhs_names, rest, location, line_no);
+            self.parse_reduce_short_op(module, block, lhs_names, rest, location, line_no)?;
+            return Ok(Self::attach_nested_region_if_opened(
+                module,
+                block,
+                opens_region,
+            ));
         }
 
         // Special case: `func.call @callee(%a, %b) : (...) -> ...`
@@ -247,7 +263,7 @@ impl MlirParser {
                     self.value_map.insert(name, val_id);
                 }
             }
-            return Ok(());
+            return Ok(None);
         }
 
         // Special case: `stablehlo.constant dense<...> : tensor<...>`
@@ -316,7 +332,7 @@ impl MlirParser {
             if let Some(name) = res_name {
                 self.value_map.insert(name, module.ops[op_id].results[0]);
             }
-            return Ok(());
+            return Ok(None);
         }
 
         // General custom syntax: `<operands> [, dims = [...]] [{attrs}] : <type_or_fn_type>`
@@ -439,7 +455,26 @@ impl MlirParser {
             }
         }
 
-        Ok(())
+        Ok(Self::attach_nested_region_if_opened(
+            module,
+            block,
+            opens_region,
+        ))
+    }
+
+    fn attach_nested_region_if_opened(
+        module: &mut Module,
+        block: BlockId,
+        opens_region: bool,
+    ) -> Option<BlockId> {
+        if !opens_region {
+            return None;
+        }
+        let op_id = *module.blocks[block].ops.last()?;
+        let sub_blk = module.create_block(None);
+        let sub_reg = module.create_region(vec![sub_blk]);
+        module.ops[op_id].regions.push(sub_reg);
+        Some(sub_blk)
     }
 }
 
@@ -495,8 +530,20 @@ impl MlirParser {
             self.value_map.insert(ssa, val_id);
         }
 
+        let mut extra_fn_attrs = IndexMap::new();
+        let after_args_no_attrs = if let Some(attr_kw_idx) = after_args.find("attributes")
+            && let Some(brace_rel) = after_args[attr_kw_idx..].find('{')
+        {
+            let brace_idx = attr_kw_idx + brace_rel;
+            let dict_slice = after_args[brace_idx..].trim().trim_end_matches('{').trim();
+            parse_attr_dict(dict_slice, &mut extra_fn_attrs);
+            after_args[..attr_kw_idx].trim()
+        } else {
+            after_args
+        };
+
         let mut result_types = Vec::new();
-        if let Some(arrow_rest) = after_args.strip_prefix("->") {
+        if let Some(arrow_rest) = after_args_no_attrs.strip_prefix("->") {
             let ret_part = arrow_rest.trim().trim_end_matches('{').trim();
             if ret_part.starts_with('(') && ret_part.ends_with(')') {
                 let inner = &ret_part[1..ret_part.len() - 1];
@@ -525,6 +572,9 @@ impl MlirParser {
                 results: result_types,
             }),
         );
+        for (k, v) in extra_fn_attrs {
+            attrs.insert(k, v);
+        }
 
         let root_block = module.body_block();
         module.add_operation(
@@ -725,6 +775,21 @@ impl MlirParser {
 
         Ok(())
     }
+}
+
+pub(crate) fn strip_line_comment(s: &str) -> &str {
+    let mut in_quotes = false;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' && (i == 0 || bytes[i - 1] != b'\\') {
+            in_quotes = !in_quotes;
+        } else if !in_quotes && i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            return &s[..i];
+        }
+        i += 1;
+    }
+    s
 }
 
 pub(crate) fn extract_trailing_loc(line: &str) -> (&str, Location) {

@@ -289,17 +289,29 @@ pub fn import_onnx_json(json_str: &str) -> Result<Module> {
                      : ({in0_ty}, {out_ty}, {out_ty}) -> {out_ty}"
                 )?;
             }
-            "ReduceSum" | "ReduceMax" => {
+            "ReduceSum" | "ReduceMax" | "ReduceMin" | "ReduceProd" => {
                 let z = format!("red_init_{idx}");
-                let reducer = if node.op_type == "ReduceMax" {
-                    "stablehlo.maximum"
-                } else {
-                    "stablehlo.add"
+                let (reducer, init_lit) = match node.op_type.as_str() {
+                    "ReduceMax" => ("stablehlo.maximum", "-3.402823e38"),
+                    "ReduceMin" => ("stablehlo.minimum", "3.402823e38"),
+                    "ReduceProd" => ("stablehlo.multiply", "1.0"),
+                    _ => ("stablehlo.add", "0.0"),
                 };
-                let axis = node.attrs.get("axis").and_then(|v| v.as_i64()).unwrap_or(1);
+                let axis = node
+                    .attrs
+                    .get("axis")
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| {
+                        node.attrs
+                            .get("dimensions")
+                            .and_then(|v| v.as_array())
+                            .and_then(|arr| arr.first())
+                            .and_then(|x| x.as_i64())
+                    })
+                    .unwrap_or(1);
                 writeln!(
                     mlir,
-                    "    %{z} = stablehlo.constant dense<0.0> : tensor<f32>"
+                    "    %{z} = stablehlo.constant dense<{init_lit}> : tensor<f32>"
                 )?;
                 writeln!(
                     mlir,
@@ -423,6 +435,127 @@ pub fn import_onnx_json(json_str: &str) -> Result<Module> {
                     "    %{out_name} = stablehlo.divide %{ex}, %{bcast} : {out_ty}"
                 )?;
             }
+            "BroadcastInDim" | "broadcast_in_dim" => {
+                let dims_str = node
+                    .attrs
+                    .get("broadcast_dimensions")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_i64())
+                            .map(|d| d.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                writeln!(
+                    mlir,
+                    "    %{out_name} = stablehlo.broadcast_in_dim %{in0}, dims = [{dims_str}] \
+                     : ({in0_ty}) -> {out_ty}"
+                )?;
+            }
+            "Slice" | "slice" => {
+                let starts: Vec<i64> = node
+                    .attrs
+                    .get("start_indices")
+                    .or_else(|| node.attrs.get("starts"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
+                    .unwrap_or_else(|| vec![0; node.output_shape.len().max(1)]);
+                let limits: Vec<i64> = node
+                    .attrs
+                    .get("limit_indices")
+                    .or_else(|| node.attrs.get("ends"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
+                    .unwrap_or_else(|| {
+                        starts
+                            .iter()
+                            .zip(node.output_shape.iter())
+                            .map(|(&s, &d)| s + d)
+                            .collect()
+                    });
+                let strides: Vec<i64> = node
+                    .attrs
+                    .get("strides")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
+                    .unwrap_or_else(|| vec![1; starts.len()]);
+                let fmt_i64 = |v: &[i64]| {
+                    v.iter()
+                        .map(|d| d.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                writeln!(
+                    mlir,
+                    "    %{out_name} = stablehlo.slice %{in0} \
+                     {{start_indices = [{}], limit_indices = [{}], strides = [{}]}} \
+                     : ({in0_ty}) -> {out_ty}",
+                    fmt_i64(&starts),
+                    fmt_i64(&limits),
+                    fmt_i64(&strides)
+                )?;
+            }
+            "Pad" | "pad" => {
+                let pv_name = if let Some(p_in) = node.inputs.get(1) {
+                    sanitize_name(p_in)
+                } else {
+                    let pv = format!("pad_val_{idx}");
+                    writeln!(mlir, "    %{pv} = stablehlo.constant dense<0.0> : tensor<f32>")?;
+                    pv
+                };
+                let fmt_arr = |key: &str, rank: usize| -> String {
+                    node.attrs
+                        .get(key)
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_i64())
+                                .map(|d| d.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_else(|| vec!["0"; rank].join(", "))
+                };
+                let rank = node.output_shape.len().max(1);
+                let low = fmt_arr("edge_padding_low", rank);
+                let high = fmt_arr("edge_padding_high", rank);
+                let inter = fmt_arr("interior_padding", rank);
+                writeln!(
+                    mlir,
+                    "    %{out_name} = stablehlo.pad %{in0}, %{pv_name} \
+                     {{edge_padding_low = [{low}], edge_padding_high = [{high}], \
+                     interior_padding = [{inter}]}} : ({in0_ty}, tensor<f32>) -> {out_ty}"
+                )?;
+            }
+            "ScatterElements" | "scatter" => {
+                let idx_name = sanitize_name(
+                    node.inputs
+                        .get(1)
+                        .ok_or_else(|| anyhow!("ScatterElements indices"))?,
+                );
+                let upd_name = sanitize_name(
+                    node.inputs
+                        .get(2)
+                        .ok_or_else(|| anyhow!("ScatterElements updates"))?,
+                );
+                let idx_sh = shapes
+                    .get(&node.inputs[1])
+                    .cloned()
+                    .unwrap_or_else(|| vec![1]);
+                let upd_sh = shapes
+                    .get(&node.inputs[2])
+                    .cloned()
+                    .unwrap_or_else(|| node.output_shape.clone());
+                let idx_ty = format!("tensor<{}xf32>", fmt_shape(&idx_sh));
+                let upd_ty = format!("tensor<{}xf32>", fmt_shape(&upd_sh));
+                writeln!(
+                    mlir,
+                    "    %{out_name} = stablehlo.scatter %{in0}, %{idx_name}, %{upd_name} \
+                     : ({in0_ty}, {idx_ty}, {upd_ty}) -> {out_ty}"
+                )?;
+            }
             other => bail!("Unsupported ONNX op_type `{other}`"),
         }
         shapes.insert(node.outputs[0].clone(), node.output_shape.clone());
@@ -446,7 +579,7 @@ pub fn import_onnx_json(json_str: &str) -> Result<Module> {
     Ok(module)
 }
 
-/// Exports a CastForge [`Module`] + [`TensorStore`](crate::ir::TensorStore) into an
+/// Exports a CastForge [`Module`] + [`TensorStore`] into an
 /// ONNX-JSON model string.
 pub fn export_onnx_json(module: &Module) -> Result<String> {
     let model = build_onnx_model(module);
@@ -551,6 +684,13 @@ fn build_onnx_model(module: &Module) -> OnnxJsonModel {
                 match op.attributes.get("name") {
                     Some(Attribute::String(s)) => s.clone(),
                     _ => "castforge.composite".to_string(),
+                }
+            } else if op.is_op("stablehlo", "reduce") {
+                match op.attributes.get("reducer").and_then(|a| a.as_str()) {
+                    Some(r) if r.contains("max") => "ReduceMax".to_string(),
+                    Some(r) if r.contains("min") => "ReduceMin".to_string(),
+                    Some(r) if r.contains("mul") => "ReduceProd".to_string(),
+                    _ => "ReduceSum".to_string(),
                 }
             } else if op.name.dialect == "castforge" {
                 op.name.full_name()

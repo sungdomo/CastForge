@@ -6,4 +6,5 @@ pub mod codegen;
 pub mod ir;
 pub mod passes;
 
-pub use ir::{formats, parser, printer, stablehlo, verify, viz};
+pub use ir::{formats, parser, printer, stablehlo, viz};
+pub use passes::verify_ir as verify;

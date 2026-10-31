@@ -2,11 +2,11 @@
 //! (`codegen-header`), and Native Shared Library Compiler (`compile-lib`).
 
 use crate::codegen::{
-    CodegenTarget, GemmLoopOrder, MemoryPlan, SimdIsa, TargetConfig, build_memory_plan,
-    generate_code_with_config, lower_to_loop_ir, sanitize_ident, tensor_len, tensor_shape_dims,
-    value_ident,
+    CodegenTarget, GemmLoopOrder, SimdIsa, TargetConfig, build_function_memory_plan,
+    build_memory_plan, generate_code_with_config, lower_to_loop_ir, matmul_dims_ex, sanitize_ident,
+    tensor_len, tensor_shape_dims, value_ident,
 };
-use crate::ir::{Attribute, DType, Module, OpId, Payload, Translator, ValueId};
+use crate::ir::{Attribute, DType, LoopModule, Module, OpId, Payload, Translator, ValueId};
 use crate::stablehlo::StableHloOp;
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
@@ -144,7 +144,7 @@ pub fn emit_c_module_with_config(module: &Module, base_cfg: &TargetConfig) -> Re
     }
 
     for fn_op_id in funcs {
-        emit_c_func(module, fn_op_id, &plan, config, &mut out)?;
+        emit_c_func(module, fn_op_id, config, &mut out)?;
     }
 
     Ok(out)
@@ -153,10 +153,11 @@ pub fn emit_c_module_with_config(module: &Module, base_cfg: &TargetConfig) -> Re
 fn emit_c_func(
     module: &Module,
     fn_op_id: OpId,
-    plan: &MemoryPlan,
     config: &TargetConfig,
     out: &mut String,
 ) -> Result<()> {
+    let plan = build_function_memory_plan(module, fn_op_id);
+    let plan = &plan;
     let fn_op = &module.ops[fn_op_id];
     let fn_name = sanitize_ident(
         fn_op
@@ -411,12 +412,14 @@ fn emit_c_hlo_op(
             )?;
         }
         StableHloOp::Power { lhs, rhs, .. } => {
-            let a = value_ident(module, lhs, names, counter);
-            let b = value_ident(module, rhs, names, counter);
+            let a_n = value_ident(module, lhs, names, counter);
+            let b_n = value_ident(module, rhs, names, counter);
+            let a = c_idx(module, lhs, res_len, &a_n, "i");
+            let b = c_idx(module, rhs, res_len, &b_n, "i");
             writeln!(
                 out,
                 "    for (int i = 0; i < {res_len}; ++i) \
-                 {res_name}[i] = powf({a}[i], {b}[i]);"
+                 {res_name}[i] = powf({a}, {b});"
             )?;
         }
         StableHloOp::Clamp {
@@ -539,20 +542,30 @@ fn emit_c_hlo_op(
         StableHloOp::Reduce {
             inputs,
             init_values,
+            dimensions,
             reducer_op,
             ..
         } => {
             let inp = value_ident(module, inputs[0], names, counter);
             let init = value_ident(module, init_values[0], names, counter);
+            let in_dims = module.values[inputs[0]]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_default();
             let in_len = tensor_len(module, inputs[0]);
             let inner = (in_len / res_len.max(1)).max(1);
             let red_op = reducer_op.as_deref().unwrap_or("add");
-            let elem = format!("{inp}[o * {inner} + k]");
-            let step_stmt = if red_op.contains("maximum") {
+            let elem = if in_dims.len() == 2 && dimensions.as_slice() == [0] {
+                format!("{inp}[k * {res_len} + o]")
+            } else {
+                format!("{inp}[o * {inner} + k]")
+            };
+            let step_stmt = if red_op.contains("maximum") || red_op.contains("max") {
                 format!("acc = fmaxf(acc, {elem});")
-            } else if red_op.contains("minimum") {
+            } else if red_op.contains("minimum") || red_op.contains("min") {
                 format!("acc = fminf(acc, {elem});")
-            } else if red_op.contains("multiply") {
+            } else if red_op.contains("multiply") || red_op.contains("mul") {
                 format!("acc *= {elem};")
             } else {
                 format!("acc += {elem};")
@@ -971,9 +984,15 @@ fn emit_c_hlo_op(
                 let cols = *dims.last().unwrap_or(&res_len).max(&1);
                 let rows = (res_len / cols).max(1);
                 writeln!(out, "    for (int r = 0; r < {rows}; ++r) {{")?;
+                writeln!(out, "        float max_v = {x}[r * {cols}];")?;
+                writeln!(
+                    out,
+                    "        for (int c = 1; c < {cols}; ++c) \
+                     max_v = fmaxf(max_v, {x}[r * {cols} + c]);"
+                )?;
                 writeln!(out, "        float sum = 0.0f;")?;
                 writeln!(out, "        for (int c = 0; c < {cols}; ++c) {{")?;
-                writeln!(out, "            float e = expf({x}[r * {cols} + c]);")?;
+                writeln!(out, "            float e = expf({x}[r * {cols} + c] - max_v);")?;
                 writeln!(out, "            {res_name}[r * {cols} + c] = e;")?;
                 writeln!(out, "            sum += e;")?;
                 writeln!(out, "        }}")?;
@@ -1160,17 +1179,23 @@ fn emit_c_hlo_op(
                 let cols = *dims.last().unwrap_or(&res_len).max(&1);
                 let rows = (res_len / cols).max(1);
                 writeln!(out, "    for (int r = 0; r < {rows}; ++r) {{")?;
+                writeln!(out, "        float max_v = {x}[r * {cols}];")?;
+                writeln!(
+                    out,
+                    "        for (int c = 1; c < {cols}; ++c) \
+                     max_v = fmaxf(max_v, {x}[r * {cols} + c]);"
+                )?;
                 writeln!(out, "        float sum = 0.0f;")?;
                 writeln!(
                     out,
                     "        for (int c = 0; c < {cols}; ++c) \
-                     sum += expf({x}[r * {cols} + c]);"
+                     sum += expf({x}[r * {cols} + c] - max_v);"
                 )?;
                 writeln!(out, "        float lse = logf(sum);")?;
                 writeln!(
                     out,
                     "        for (int c = 0; c < {cols}; ++c) \
-                     {res_name}[r * {cols} + c] = {x}[r * {cols} + c] - lse;"
+                     {res_name}[r * {cols} + c] = ({x}[r * {cols} + c] - max_v) - lse;"
                 )?;
                 writeln!(out, "    }}")?;
             } else if name == "castforge.im2col" && !inputs.is_empty() {
@@ -1428,21 +1453,14 @@ fn emit_c_hlo_op(
                 .as_tensor()
                 .map(tensor_shape_dims)
                 .unwrap_or_else(|| vec![res_len]);
-            if dims.len() == 2 && iota_dimension == 0 {
-                let cols = dims[1].max(1);
-                writeln!(
-                    out,
-                    "    for (int i = 0; i < {res_len}; ++i) \
-                     {res_name}[i] = (float)(i / {cols});"
-                )?;
-            } else {
-                let cols = (*dims.last().unwrap_or(&res_len)).max(1);
-                writeln!(
-                    out,
-                    "    for (int i = 0; i < {res_len}; ++i) \
-                     {res_name}[i] = (float)(i % {cols});"
-                )?;
-            }
+            let d = (iota_dimension.max(0) as usize).min(dims.len().saturating_sub(1));
+            let dim_size = (*dims.get(d).unwrap_or(&res_len)).max(1);
+            let inner: usize = dims.iter().skip(d + 1).product::<usize>().max(1);
+            writeln!(
+                out,
+                "    for (int i = 0; i < {res_len}; ++i) \
+                 {res_name}[i] = (float)((i / {inner}) % {dim_size});"
+            )?;
         }
         StableHloOp::Slice {
             operand,
@@ -1451,62 +1469,277 @@ fn emit_c_hlo_op(
             ..
         } => {
             let x = value_ident(module, operand, names, counter);
-            let x_len = tensor_len(module, operand).max(1);
-            let s0 = start_indices.first().copied().unwrap_or(0).max(0) as usize;
-            let st0 = (strides.first().copied().unwrap_or(1) as usize).max(1);
-            writeln!(
-                out,
-                "    for (int i = 0; i < {res_len}; ++i) \
-                 {res_name}[i] = {x}[({s0} + i * {st0}) % {x_len}];"
-            )?;
+            let in_dims = module.values[operand]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![tensor_len(module, operand).max(1)]);
+            let out_dims = module.values[op.results[0]]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![res_len]);
+            if in_dims.len() == 2 && out_dims.len() == 2 {
+                let s0 = (*start_indices.first().unwrap_or(&0)).max(0) as usize;
+                let s1 = (*start_indices.get(1).unwrap_or(&0)).max(0) as usize;
+                let st0 = (*strides.first().unwrap_or(&1)).max(1) as usize;
+                let st1 = (*strides.get(1).unwrap_or(&1)).max(1) as usize;
+                let in_c = in_dims[1].max(1);
+                let (out_r, out_c) = (out_dims[0], out_dims[1]);
+                writeln!(out, "    for (int r = 0; r < {out_r}; ++r) {{")?;
+                writeln!(
+                    out,
+                    "        for (int c = 0; c < {out_c}; ++c) \
+                     {res_name}[r * {out_c} + c] = \
+                     {x}[({s0} + r * {st0}) * {in_c} + ({s1} + c * {st1})];"
+                )?;
+                writeln!(out, "    }}")?;
+            } else {
+                let x_len = tensor_len(module, operand).max(1);
+                let s0 = start_indices.first().copied().unwrap_or(0).max(0) as usize;
+                let st0 = (strides.first().copied().unwrap_or(1) as usize).max(1);
+                writeln!(
+                    out,
+                    "    for (int i = 0; i < {res_len}; ++i) \
+                     {res_name}[i] = {x}[({s0} + i * {st0}) % {x_len}];"
+                )?;
+            }
         }
-        StableHloOp::DynamicSlice { operand, .. } | StableHloOp::Pad { operand, .. } => {
+        StableHloOp::DynamicSlice {
+            operand,
+            start_indices,
+            ..
+        } => {
             let x = value_ident(module, operand, names, counter);
             let x_len = tensor_len(module, operand).max(1);
+            let max_start = x_len.saturating_sub(res_len);
+            if let Some(&s_id) = start_indices.first() {
+                let s0 = value_ident(module, s_id, names, counter);
+                writeln!(
+                    out,
+                    "    int start_off_{res_name} = (int)roundf({s0}[0]);"
+                )?;
+                writeln!(
+                    out,
+                    "    if (start_off_{res_name} < 0) start_off_{res_name} = 0;"
+                )?;
+                writeln!(
+                    out,
+                    "    if (start_off_{res_name} > {max_start}) \
+                     start_off_{res_name} = {max_start};"
+                )?;
+                writeln!(
+                    out,
+                    "    for (int i = 0; i < {res_len}; ++i) \
+                     {res_name}[i] = {x}[start_off_{res_name} + i];"
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "    for (int i = 0; i < {res_len}; ++i) \
+                     {res_name}[i] = {x}[i % {x_len}];"
+                )?;
+            }
+        }
+        StableHloOp::Pad {
+            operand,
+            padding_value,
+            edge_padding_low,
+            interior_padding,
+            ..
+        } => {
+            let x = value_ident(module, operand, names, counter);
+            let pv = value_ident(module, padding_value, names, counter);
+            let x_len = tensor_len(module, operand);
+            let low0 = (*edge_padding_low.first().unwrap_or(&0)).max(0) as usize;
+            let ip0 = (*interior_padding.first().unwrap_or(&0)).max(0) as usize;
+            let step = ip0 + 1;
             writeln!(
                 out,
-                "    for (int i = 0; i < {res_len}; ++i) \
-                 {res_name}[i] = {x}[i % {x_len}];"
+                "    for (int i = 0; i < {res_len}; ++i) {res_name}[i] = {pv}[0];"
+            )?;
+            writeln!(
+                out,
+                "    for (int k = 0; k < {x_len}; ++k) \
+                 if ({low0} + k * {step} < {res_len}) \
+                 {res_name}[{low0} + k * {step}] = {x}[k];"
             )?;
         }
         StableHloOp::DynamicUpdateSlice {
-            operand, update, ..
+            operand,
+            update,
+            start_indices,
+            ..
         } => {
             let x = value_ident(module, operand, names, counter);
             let u = value_ident(module, update, names, counter);
             let u_len = tensor_len(module, update).min(res_len);
+            let max_start = res_len.saturating_sub(u_len);
             writeln!(
                 out,
                 "    for (int i = 0; i < {res_len}; ++i) {res_name}[i] = {x}[i];"
             )?;
-            writeln!(
-                out,
-                "    for (int i = 0; i < {u_len}; ++i) {res_name}[i] = {u}[i];"
-            )?;
-        }
-        StableHloOp::Concatenate { inputs, .. } => {
-            let mut offset = 0usize;
-            for &inp in &inputs {
-                let a = value_ident(module, inp, names, counter);
-                let a_len = tensor_len(module, inp);
+            if let Some(&s_id) = start_indices.first() {
+                let s0 = value_ident(module, s_id, names, counter);
                 writeln!(
                     out,
-                    "    for (int i = 0; i < {a_len}; ++i) \
-                     {res_name}[{offset} + i] = {a}[i];"
+                    "    int upd_off_{res_name} = (int)roundf({s0}[0]);"
                 )?;
-                offset += a_len;
+                writeln!(
+                    out,
+                    "    if (upd_off_{res_name} < 0) upd_off_{res_name} = 0;"
+                )?;
+                writeln!(
+                    out,
+                    "    if (upd_off_{res_name} > {max_start}) upd_off_{res_name} = {max_start};"
+                )?;
+                writeln!(
+                    out,
+                    "    for (int i = 0; i < {u_len}; ++i) \
+                     {res_name}[upd_off_{res_name} + i] = {u}[i];"
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "    for (int i = 0; i < {u_len}; ++i) {res_name}[i] = {u}[i];"
+                )?;
             }
         }
-        StableHloOp::Convolution { lhs, rhs, .. } => {
+        StableHloOp::Concatenate {
+            inputs, dimension, ..
+        } => {
+            let out_dims = module.values[op.results[0]]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![res_len]);
+            let dim = (dimension.max(0) as usize).min(out_dims.len().saturating_sub(1));
+            let outer: usize = out_dims.iter().take(dim).product::<usize>().max(1);
+            let out_cat_stride: usize = out_dims.iter().skip(dim).product::<usize>().max(1);
+            let inner: usize = out_dims.iter().skip(dim + 1).product::<usize>().max(1);
+            let mut cat_offset = 0usize;
+            for &inp in &inputs {
+                let a = value_ident(module, inp, names, counter);
+                let in_dims = module.values[inp]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_else(|| vec![tensor_len(module, inp).max(1)]);
+                let in_cat = (*in_dims.get(dim).unwrap_or(&1)).max(1);
+                let chunk = in_cat * inner;
+                writeln!(out, "    for (int o = 0; o < {outer}; ++o) {{")?;
+                writeln!(
+                    out,
+                    "        for (int c = 0; c < {chunk}; ++c) \
+                     {res_name}[o * {out_cat_stride} + {cat_offset} + c] = {a}[o * {chunk} + c];"
+                )?;
+                writeln!(out, "    }}")?;
+                cat_offset += chunk;
+            }
+        }
+        StableHloOp::Convolution {
+            lhs, rhs, result, ..
+        } => {
             let a = value_ident(module, lhs, names, counter);
             let b = value_ident(module, rhs, names, counter);
-            let a_len = tensor_len(module, lhs).max(1);
-            let b_len = tensor_len(module, rhs).max(1);
-            writeln!(
-                out,
-                "    for (int i = 0; i < {res_len}; ++i) \
-                 {res_name}[i] = {a}[i % {a_len}] * {b}[i % {b_len}];"
-            )?;
+            let in_dims = module.values[lhs]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![1]);
+            let w_dims = module.values[rhs]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![1]);
+            let out_dims = module.values[result]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![res_len]);
+            if in_dims.len() == 4 && w_dims.len() == 4 && out_dims.len() == 4 {
+                let (b_sz, ih, iw, ic) = (in_dims[0], in_dims[1], in_dims[2], in_dims[3]);
+                let (kh, kw, _, oc) = (w_dims[0], w_dims[1], w_dims[2], w_dims[3]);
+                let (_, oh, ow, _) = (out_dims[0], out_dims[1], out_dims[2], out_dims[3]);
+                let sh = match op.attributes.get("stride_h") {
+                    Some(Attribute::Int(v)) => (*v).max(1) as usize,
+                    _ => 1,
+                };
+                let sw = match op.attributes.get("stride_w") {
+                    Some(Attribute::Int(v)) => (*v).max(1) as usize,
+                    _ => sh,
+                };
+                let ph = match op.attributes.get("pad_h") {
+                    Some(Attribute::Int(v)) => (*v).max(0) as isize,
+                    _ => 0,
+                };
+                let pw = match op.attributes.get("pad_w") {
+                    Some(Attribute::Int(v)) => (*v).max(0) as isize,
+                    _ => ph,
+                };
+                writeln!(out, "    for (int b = 0; b < {b_sz}; ++b) {{")?;
+                writeln!(out, "        for (int oy = 0; oy < {oh}; ++oy) {{")?;
+                writeln!(out, "            for (int ox = 0; ox < {ow}; ++ox) {{")?;
+                writeln!(out, "                for (int co = 0; co < {oc}; ++co) {{")?;
+                writeln!(out, "                    float acc = 0.0f;")?;
+                writeln!(out, "                    for (int ky = 0; ky < {kh}; ++ky) {{")?;
+                writeln!(
+                    out,
+                    "                        int iy = oy * {sh} + ky - ({ph});"
+                )?;
+                writeln!(
+                    out,
+                    "                        if (iy >= 0 && iy < {ih}) {{"
+                )?;
+                writeln!(
+                    out,
+                    "                            for (int kx = 0; kx < {kw}; ++kx) {{"
+                )?;
+                writeln!(
+                    out,
+                    "                                int ix = ox * {sw} + kx - ({pw});"
+                )?;
+                writeln!(
+                    out,
+                    "                                if (ix >= 0 && ix < {iw}) {{"
+                )?;
+                writeln!(
+                    out,
+                    "                                    for (int ci = 0; ci < {ic}; ++ci) {{"
+                )?;
+                writeln!(
+                    out,
+                    "                                        acc += \
+                     {a}[((b * {ih} + iy) * {iw} + ix) * {ic} + ci] * \
+                     {b}[((ky * {kw} + kx) * {ic} + ci) * {oc} + co];"
+                )?;
+                writeln!(out, "                                    }}")?;
+                writeln!(out, "                                }}")?;
+                writeln!(out, "                            }}")?;
+                writeln!(out, "                        }}")?;
+                writeln!(out, "                    }}")?;
+                writeln!(
+                    out,
+                    "                    {res_name}[((b * {oh} + oy) * {ow} + ox) * {oc} + co] \
+                     = acc;"
+                )?;
+                writeln!(out, "                }}")?;
+                writeln!(out, "            }}")?;
+                writeln!(out, "        }}")?;
+                writeln!(out, "    }}")?;
+            } else {
+                let a_len = tensor_len(module, lhs).max(1);
+                let b_len = tensor_len(module, rhs).max(1);
+                writeln!(out, "    for (int i = 0; i < {res_len}; ++i) {{")?;
+                writeln!(out, "        float acc = 0.0f;")?;
+                writeln!(
+                    out,
+                    "        for (int k = 0; k < {b_len}; ++k) \
+                     if (i + k < {a_len}) acc += {a}[i + k] * {b}[k];"
+                )?;
+                writeln!(out, "        {res_name}[i] = acc;")?;
+                writeln!(out, "    }}")?;
+            }
         }
         _ => {}
     }
@@ -1603,7 +1836,10 @@ fn emit_c_fused_loop_chain(
 ) -> Result<()> {
     let ext_exprs: Vec<String> = inputs
         .iter()
-        .map(|&v| format!("{}[i]", value_ident(module, v, names, counter)))
+        .map(|&v| {
+            let n = value_ident(module, v, names, counter);
+            c_idx(module, v, res_len, &n, "i")
+        })
         .collect();
     let specs: Vec<&str> = steps_str.split(';').filter(|s| !s.is_empty()).collect();
     writeln!(out, "    for (int i = 0; i < {res_len}; ++i) {{")?;
@@ -1694,9 +1930,15 @@ fn emit_c_qmatmul(
     writeln!(out, "            }}")?;
     if let Some(&bias_id) = inputs.get(2) {
         let bias = value_ident(module, bias_id, names, counter);
+        let bias_len = tensor_len(module, bias_id).max(1);
+        let bias_idx = if bias_len <= n {
+            format!("n % {bias_len}")
+        } else {
+            format!("m * {n} + n")
+        };
         writeln!(
             out,
-            "            {res_name}[m * {n} + n] = acc + {bias}[m * {n} + n];"
+            "            {res_name}[m * {n} + n] = acc + {bias}[{bias_idx}];"
         )?;
     } else {
         writeln!(out, "            {res_name}[m * {n} + n] = acc;")?;
@@ -1895,32 +2137,6 @@ fn emit_c_gated_mlp(
     Ok(())
 }
 
-fn matmul_dims_ex(
-    module: &Module,
-    lhs: ValueId,
-    rhs: ValueId,
-    packed: bool,
-) -> (usize, usize, usize) {
-    let lhs_dims = module.values[lhs]
-        .ty
-        .as_tensor()
-        .map(tensor_shape_dims)
-        .unwrap_or_else(|| vec![1, 1]);
-    let rhs_dims = module.values[rhs]
-        .ty
-        .as_tensor()
-        .map(tensor_shape_dims)
-        .unwrap_or_else(|| vec![1, 1]);
-    let m = *lhs_dims.first().unwrap_or(&1);
-    let k = *lhs_dims.get(1).unwrap_or(&1);
-    let n = if packed {
-        *rhs_dims.first().unwrap_or(&1)
-    } else {
-        *rhs_dims.get(1).unwrap_or(&1)
-    };
-    (m, k, n)
-}
-
 /// Generates a C/C++ FFI header (`.h`) matching the C99 symbols emitted by `codegen-c`.
 pub fn emit_c_header(module: &Module) -> Result<String> {
     let loop_mod = lower_to_loop_ir(module, &TargetConfig::default());
@@ -1961,6 +2177,13 @@ pub fn compile_shared_lib(module: &Module, config: &TargetConfig) -> Result<Vec<
     let pid = std::process::id();
     let tmp_dir = std::env::temp_dir().join(format!("castforge_shlib_{pid}_{seq}"));
     fs::create_dir_all(&tmp_dir)?;
+    struct TempDirGuard(std::path::PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _tmp_guard = TempDirGuard(tmp_dir.clone());
     let src_path = tmp_dir.join("kernel.c");
     let lib_path = tmp_dir.join("libcastforge_kernel.so");
     fs::write(&src_path, &c_src)?;
@@ -1976,12 +2199,32 @@ pub fn compile_shared_lib(module: &Module, config: &TargetConfig) -> Result<Vec<
         .status()
         .context("Failed to invoke `cc` for shared library compilation")?;
     if !status.success() {
-        let _ = fs::remove_dir_all(&tmp_dir);
         bail!("`cc -shared` exited with non-zero status: {status}");
     }
     let bytes = fs::read(&lib_path).context("Failed to read compiled shared library")?;
-    let _ = fs::remove_dir_all(&tmp_dir);
     Ok(bytes)
+}
+
+/// Emits portable C99 source code from a lowered [`LoopModule`].
+pub fn emit_c_from_loop_ir(loop_mod: &LoopModule) -> Result<String> {
+    use crate::codegen::backend::emit_c_like_loop_stmt;
+    let mut out = String::new();
+    writeln!(out, "/* Auto-generated by CastForge C99 LoopIR Backend */")?;
+    writeln!(out, "#include <math.h>\n")?;
+    for kernel in &loop_mod.kernels {
+        let mut sig: Vec<String> = kernel
+            .params
+            .iter()
+            .map(|(n, len)| format!("const float {n}[{len}]"))
+            .collect();
+        sig.push(format!("float {}[{}]", kernel.output.0, kernel.output.1));
+        writeln!(out, "void {}({}) {{", kernel.name, sig.join(", "))?;
+        for stmt in &kernel.body {
+            emit_c_like_loop_stmt(&mut out, stmt, &kernel.output.0, "0", 1, false)?;
+        }
+        writeln!(out, "}}\n")?;
+    }
+    Ok(out)
 }
 
 /// C/C++ Header Translator (`Ir(Module) -> Text(C Header)`).

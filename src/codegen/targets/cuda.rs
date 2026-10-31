@@ -69,11 +69,12 @@ fn emit_cuda_stmt(out: &mut String, stmt: &LoopStmt, ret_name: &str) -> Result<(
             if *unroll > 1 {
                 writeln!(out, "    #pragma unroll {unroll}")?;
             }
-            if *step > 1 {
+            let st = (*step).max(1);
+            if st > 1 || *lower > 0 {
                 writeln!(
                     out,
-                    "    for (int {var} = {lower} + tid * {step}; {var} < {upper}; \
-                     {var} += blockDim.x * gridDim.x * {step}) {{"
+                    "    for (int {var} = {lower} + tid * {st}; {var} < {upper}; \
+                     {var} += blockDim.x * gridDim.x * {st}) {{"
                 )?;
             } else {
                 writeln!(
