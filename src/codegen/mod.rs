@@ -12,7 +12,7 @@ pub mod memory_plan;
 pub mod targets;
 
 pub use crate::ir::loops::{LoopKernel, LoopModule, LoopStmt};
-pub use crate::passes::loops::lower_loops::{
+pub use crate::passes::loops::{
     LoopPass, OptimizeLoopIrPass, OptimizeLoopIrTranslator, TensorToLoopTranslator,
     lower_to_loop_ir,
 };
