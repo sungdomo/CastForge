@@ -1,4 +1,5 @@
-//! Submodule `prune` of `fold_weights`.
+//! Weight externalization (`externalize-weights`) and structured/2:4 sparsity pruning
+//! (`prune-2to4`, `prune-weights`).
 
 use crate::ir::{
     Attribute, BlockId, DType, Dim, Module, TensorEntry, TensorType, Type, ValueDef, ValueId,

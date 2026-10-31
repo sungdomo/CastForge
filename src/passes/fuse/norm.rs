@@ -1,9 +1,6 @@
 //! Unified Normalization Fusion (`fuse-norm`): Residual+RMSNorm, RMSNorm, and LayerNorm.
 
-pub mod layernorm_softmax;
-
-pub use layernorm_softmax::*;
-
+use super::layernorm_softmax::*;
 use crate::ir::{Attribute, BlockId, Module, OpName, ValueDef, ValueId};
 use crate::passes::{DeadCodeEliminationPass, FoldConstantsPass, Pass, PassResult};
 use crate::stablehlo::StableHloOp;

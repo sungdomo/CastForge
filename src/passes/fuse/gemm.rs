@@ -1,9 +1,7 @@
 //! Unified Single-Traversal GEMM Fusion (`fuse-gemm`): Horizontal Dot, Quantized Dequant-MatMul,
 //! and MatMul Epilogue Fusion.
 
-pub mod epilogue;
-
-use epilogue::{try_fuse_dequant_at_op, try_fuse_epilogue_at_op};
+use super::epilogue::{try_fuse_dequant_at_op, try_fuse_epilogue_at_op};
 
 use crate::ir::{
     Attribute, BlockId, DType, Dim, Location, Module, OpId, OpName, TensorType, Type, ValueDef,

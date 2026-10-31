@@ -1,10 +1,7 @@
 //! Unified View, Shape, Layout & Type-Cast Folding Pass (`fold-views`), executed in a single
 //! forward block traversal after transpose sinking.
 
-pub mod layout;
-
-pub use layout::ConvertLayoutPass;
-
+use super::ConvertLayoutPass;
 use crate::ir::{
     Attribute, BlockId, DType, Dim, Location, Module, OpId, OpName, Operation, Value, ValueDef,
     ValueId,

@@ -3,10 +3,7 @@
 //! Consolidates `fold-norm-weights` (`mode=norm`), `fold-batchnorm` (`mode=batchnorm`), and
 //! `pack-weights` (`mode=pack`).
 
-pub mod prune;
-
-pub use prune::*;
-
+use super::PruneWeightsPass;
 use crate::ir::{
     Attribute, BlockId, DType, Dim, Module, OpId, TensorType, Type, ValueDef, ValueId,
 };

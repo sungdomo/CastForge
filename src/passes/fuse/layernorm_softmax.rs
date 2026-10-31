@@ -1,6 +1,6 @@
-//! Submodule `layernorm_softmax` of `fuse_norm`.
+//! LayerNorm, Softmax, Log-Softmax, and Cross-Entropy fusion passes.
 
-use super::*;
+use super::norm::*;
 use crate::ir::{Attribute, BlockId, Module, OpName, ValueDef, ValueId};
 use crate::passes::{DeadCodeEliminationPass, FoldConstantsPass, Pass, PassResult};
 use crate::stablehlo::StableHloOp;

@@ -1,25 +1,11 @@
 //! Unified Elementwise, Map-Reduce, Loop-Chain Fusion & Composite Decomposition
 //! (`fuse-elementwise`).
-//!
-//! Organized into cohesive submodules:
-//! - [`mod.rs`](self): `FuseElementwisePass`, `FuseMapReducePass`, `FuseAddMaxPass`
-//! - [`loops`][]: `FuseLoopsPass`, `SplitLoopsPass`, `FuseMegakernelPass`
-//! - [`decompose`][]: `DecomposeCompositesPass`
-//! - [`decompose_helpers`][]: Primitive StableHLO expansion builders for composite decomposition
-//! - [`activations`][]: `FuseActivationsPass`, `FuseSwiGluPass`, `FuseGeluPass`,
-//!   `FuseGatedMlpPass`, `FuseMoePass`
 
-pub mod activations;
-pub mod decompose;
-pub mod decompose_helpers;
-pub mod loops;
-
-pub use activations::*;
-pub use decompose::*;
-pub use loops::*;
-
+use super::activations::*;
+use super::decompose::*;
+use super::loops::*;
 use crate::ir::{Attribute, BlockId, Module, OpId, OpName, ValueDef, ValueId};
-use crate::passes::{DeadCodeEliminationPass, Pass, PassResult};
+use crate::passes::{DeadCodeEliminationPass, Pass, PassResult, SimplifyAlgebraicPass};
 use crate::stablehlo::StableHloOp;
 use anyhow::Result;
 use indexmap::IndexMap;
@@ -318,4 +304,29 @@ pub(crate) fn try_fuse_add_max_at_op(module: &mut Module, block_id: BlockId, op_
 
     module.remove_op(block_id, add_op_id);
     true
+}
+
+/// E-Graph Distributive Factoring & Fused Multiply-Add Extraction Pass (`fuse-fma`).
+#[derive(Debug, Clone, Default)]
+pub struct FuseFmaPass;
+
+impl Pass for FuseFmaPass {
+    fn name(&self) -> &'static str {
+        "fuse-fma"
+    }
+
+    fn description(&self) -> &'static str {
+        "Applies e-graph distributive factoring (a*b + a*c -> a*(b+c)) and extracts castforge.fma"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        Ok(SimplifyAlgebraicPass {
+            fold_constants: false,
+            include_conditional: false,
+            egraph: true,
+            fuse_fma: true,
+        }
+        .run(module)?
+        .with_name(self.name()))
+    }
 }

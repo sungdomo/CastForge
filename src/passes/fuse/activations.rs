@@ -1,10 +1,8 @@
 //! Activation, Gated-MLP, and Mixture-of-Experts (MoE) fusion (`FuseActivationsPass`,
 //! `FuseSwiGluPass`, `FuseGeluPass`, `FuseGatedMlpPass`, `FuseMoePass`).
 
+use super::gemm::{DotCandidate, emit_horizontal_dot_group, try_collect_horizontal_candidate};
 use crate::ir::{Attribute, BlockId, Module, OpId, OpName, ValueDef, ValueId};
-use crate::passes::fuse_gemm::{
-    DotCandidate, emit_horizontal_dot_group, try_collect_horizontal_candidate,
-};
 use crate::passes::{DeadCodeEliminationPass, FoldConstantsPass, Pass, PassResult};
 use crate::stablehlo::StableHloOp;
 use anyhow::Result;

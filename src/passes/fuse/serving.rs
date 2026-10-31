@@ -1,6 +1,6 @@
-//! Submodule `serving` of `fuse_attention`.
+//! Autoregressive KV-cache, PagedAttention, Flash-Decoding, and Tree-Attention passes.
 
-use super::*;
+use super::attention::*;
 use crate::ir::{
     Attribute, BlockId, Location, Module, OpId, OpName, Operation, Value, ValueDef, ValueId,
 };

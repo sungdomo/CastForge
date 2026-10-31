@@ -1,8 +1,8 @@
 //! Quantized Dequant-MatMul and Generalized MatMul Epilogue Fusion patterns.
 
+use super::activations::{match_gelu_op, match_silu_val};
 use crate::ir::{Attribute, BlockId, DType, Module, OpId, OpName, ValueDef, ValueId};
 use crate::passes::FoldConstantsPass;
-use crate::passes::fuse_elementwise::{match_gelu_op, match_silu_val};
 use crate::stablehlo::StableHloOp;
 use indexmap::IndexMap;
 use smallvec::SmallVec;

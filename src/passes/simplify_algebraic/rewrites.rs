@@ -1,10 +1,10 @@
 //! Algebraic identity rewrites, constant reassociation, e-graph distributive factoring,
 //! and FMA extraction.
 
-use super::FoldConstantsPass;
 use crate::ir::{
     Attribute, BlockId, Dim, Location, Module, OpId, OpName, Operation, Value, ValueDef, ValueId,
 };
+use crate::passes::FoldConstantsPass;
 use crate::stablehlo::StableHloOp;
 use indexmap::IndexMap;
 use smallvec::SmallVec;
