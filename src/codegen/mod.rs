@@ -41,7 +41,7 @@ pub use crate::codegen::targets::{
 };
 pub use crate::ir::loops::{LoopKernel, LoopModule, LoopStmt};
 use crate::ir::{Dim, Module, TensorType, ValueId};
-pub use crate::passes::schedule_loops::lower_loops::{
+pub use crate::passes::loops::lower_loops::{
     LoopPass, OptimizeLoopIrPass, OptimizeLoopIrTranslator, TensorToLoopTranslator,
     lower_to_loop_ir,
 };

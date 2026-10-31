@@ -16,7 +16,7 @@ pub mod tensor_store;
 pub mod viz;
 
 pub use crate::passes::manager::*;
-pub use crate::passes::verify_ir::*;
+pub use crate::passes::normalize::verify::*;
 pub use formats::{
     GgmlType, GgufExportTranslator, GgufImportTranslator, HfConfigImportTranslator, HfModelConfig,
     OnnxExportTranslator, OnnxImportTranslator, OnnxJsonInitializer, OnnxJsonModel, OnnxJsonNode,

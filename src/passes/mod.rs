@@ -6,34 +6,24 @@
 //! ergonomics.
 
 pub mod canonicalize;
-pub mod cse;
-pub mod dce;
+pub mod distributed;
 pub mod fold;
 pub mod fuse;
+pub mod loops;
 pub mod manager;
-pub mod merge_weights;
-pub mod normalize_ir;
-pub mod optimize_memory;
+pub mod memory;
+pub mod normalize;
 pub mod quantize;
 pub mod registry;
-pub mod schedule_loops;
-pub mod shard_distributed;
-pub mod simplify_algebraic;
-pub mod specialize_shapes;
-pub mod verify_ir;
+pub mod shapes;
 
 pub use canonicalize::*;
-pub use cse::*;
-pub use dce::*;
+pub use distributed::*;
 pub use fold::*;
 pub use fuse::*;
+pub use loops::*;
 pub use manager::*;
-pub use merge_weights::*;
-pub use normalize_ir::*;
-pub use optimize_memory::*;
+pub use memory::*;
+pub use normalize::*;
 pub use quantize::*;
-pub use schedule_loops::*;
-pub use shard_distributed::*;
-pub use simplify_algebraic::*;
-pub use specialize_shapes::*;
-pub use verify_ir::*;
+pub use shapes::*;

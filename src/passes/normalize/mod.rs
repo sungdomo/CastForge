@@ -3,9 +3,11 @@
 
 pub mod inliner;
 pub mod outline;
+pub mod verify;
 
 pub use inliner::*;
 pub use outline::*;
+pub use verify::*;
 
 use crate::ir::{
     Attribute, DType, Location, Module, OpName, TensorEntry, TensorType, Type, ValueDef, ValueId,

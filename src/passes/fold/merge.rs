@@ -1,9 +1,6 @@
 //! Unified Weight Merging, Task Arithmetic/DARE, and LoRA Baking (`merge-weights`).
 
-pub mod lora;
-
-pub use lora::{BakeDoraPass, BakeLoraPass};
-
+use super::{BakeDoraPass, BakeLoraPass};
 use crate::ir::{
     Attribute, BlockId, Module, OpName, TensorEntry, ValueDef, ValueId, format_dense_f32_literal,
 };

@@ -1,14 +1,20 @@
-//! Composite Canonicalization (`canonicalize`), Topological / Peak-Memory Scheduling,
-//! and Optimization Presets (`O1`, `O2`, `O3`).
+//! Composite Canonicalization (`canonicalize`), CSE/GVN/LICM (`cse`), Dead Code Elimination
+//! (`dce`), Algebraic Simplification (`simplify-algebraic`), Topological / Peak-Memory
+//! Scheduling, and Optimization Presets (`O1`, `O2`, `O3`).
 
+pub mod algebraic;
+pub mod cse;
+pub mod dce;
 pub mod presets;
+pub mod rewrites;
 
+pub use algebraic::SimplifyAlgebraicPass;
+pub use cse::{CsePass, HoistConstantsPass, HoistLoopInvariantsPass};
+pub use dce::DeadCodeEliminationPass;
 pub use presets::{OptO1Pass, OptO2Pass, OptO3Pass};
 
 use crate::ir::{Attribute, BlockId, Module, OpId, ValueDef, ValueId};
-use crate::passes::{
-    CsePass, DeadCodeEliminationPass, FoldViewsPass, Pass, PassResult, SimplifyAlgebraicPass,
-};
+use crate::passes::{FoldViewsPass, Pass, PassResult};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 

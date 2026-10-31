@@ -2,9 +2,7 @@
 //! and E-Graph Factoring/FMA Pass (`simplify-algebraic`), executed in a single forward
 //! dataflow traversal.
 
-pub mod rewrites;
-
-use rewrites::{AlgOutcome, try_egraph_and_fma_op, try_simplify_algebraic_op};
+use super::rewrites::{AlgOutcome, try_egraph_and_fma_op, try_simplify_algebraic_op};
 
 use crate::ir::{BlockId, Module, OpId};
 use crate::passes::fold::{ConstFoldOutcome, try_fold_constant_op};
