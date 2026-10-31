@@ -19,22 +19,19 @@ support.
 ## Project Directory Structure (`src/`)
 
 - [`src/ir`](src/ir): Arena-allocated MLIR-compatible Dual-Plane IR (`Module`, `Operation`, `Value`,
-  `Block`, `Region`, `Type`, `Attribute`, `Location` in `mlir.rs`), core pass & pipeline
-  infrastructure (`Pass`, `PassManager`, `PassRegistry`, `PipelineConfig` in `pass_manager.rs`),
-  unified IR verification, structural hashing, equivalence, sanitization & Roofline profiling
-  (`verify.rs`), `TensorStore` weight plane & `.safetensors` (`F32`/`F16`/`BF16`/`I8`) +
+  `Block`, `Region`, `Type`, `Attribute`, `Location` in `mlir.rs`), imperative `LoopModule` AST
+  (`loops.rs`), `TensorStore` weight plane & `.safetensors` (`F32`/`F16`/`BF16`/`I8`) +
   `ExternalFile` zero-copy I/O (`tensor_store.rs`), strongly-typed `StableHloOp` and `FuncView`
   dialect views (`stablehlo.rs`), zero-C++ MLIR parser (`parser.rs`) & printer (`printer.rs`),
   symmetric **GGUF v2/v3** (`F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`), **ONNX-JSON**, **HuggingFace
   `config.json`**, and **SafeTensors** model importers & exporters (`src/ir/formats/`), and
   computation graph visualization exporters (**Mermaid**, **Graphviz DOT**, **JSON**, **IR Diff**,
   and **Interactive HTML Pass Timeline Debugger** in `viz.rs`).
-- [`src/passes`](src/passes): Built-in `PassRegistry::with_builtin_passes()`
-  (`src/passes/registry/`) and **115 built-in hierarchical A-to-B IR translator passes & presets**
-  (`38 top-level/composite passes & presets + 77 single-optimization leaf passes`), organized into
-  18 modular pass packages (`src/passes/<pass_family>/`), supporting static Rust construction, CLI
-  pipeline strings (`-p`), Unix pipes (`stdin -> stdout`), declarative TOML config files
-  (`--config`), and step-by-step tracing.
+- [`src/passes`](src/passes): Built-in `PassRegistry::with_builtin_passes()`, `PassManager`, and
+  `O1`/`O2`/`O3` presets (`src/passes/registry/`), plus **115 built-in hierarchical A-to-B IR
+  translator passes & presets** (`38 top-level/composite passes & presets + 77 single-optimization
+  leaf passes`) and `OptimizeLoopIrPass`, organized into 9 modular pass packages (`canonicalize`,
+  `shapes`, `weights`, `quantize`, `fuse`, `memory`, `distributed`, `loops`, `normalize`).
 - [`src/codegen`](src/codegen): Liveness analyzer (`LivenessAnalysis`), greedy interval-coloring
   arena buffer planner (`MemoryPlan`), progressive `LoopModule` IR with unified
   `OptimizeLoopIrPass`, pluggable `CodegenBackend` & `BackendRegistry`, multi-architecture SIMD
@@ -47,8 +44,10 @@ support.
   `autotune`, `import`, `export`, `link`, `profile`, `run`, `parse`, `list-passes`, plus direct
   pass subcommands), invoked by [`src/main.rs`](src/main.rs) and exported alongside all modules in
   [`src/lib.rs`](src/lib.rs).
-- [`tests/`](tests): End-to-end integration test suites (`ai_opt_tests.rs`, `codegen_tests.rs`,
-  `pipeline_tests.rs`).
+- [`tests/`](tests) & [`benches/`](benches): 9 test suites (`ai_opt_tests.rs`, `codegen_tests.rs`,
+  `frontend_tests.rs`, `fuzz_invariance_tests.rs`, `loop_ir_tests.rs`, `perf_scaling_tests.rs`,
+  `pipeline_tests.rs`, `regression_roundtrip_tests.rs`, `unit_negative_tests.rs`) and the compiler
+  benchmark suite (`benches/compiler_bench.rs`).
 
 ## Built-in Hierarchical A-to-B Translator Passes & Presets (38 Top-Level + 77 Leaf Passes)
 

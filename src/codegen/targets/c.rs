@@ -930,6 +930,12 @@ fn emit_c_hlo_op(
                     .get("epilogue")
                     .and_then(|attr| attr.as_str())
                     .unwrap_or("bias");
+                let (base_ep, has_res) = if let Some(stripped) = epilogue.strip_suffix("_residual")
+                {
+                    (stripped, true)
+                } else {
+                    (epilogue, false)
+                };
                 writeln!(out, "    for (int m = 0; m < {m}; ++m) {{")?;
                 writeln!(out, "        for (int n = 0; n < {n}; ++n) {{")?;
                 writeln!(out, "            float acc = 0.0f;")?;
@@ -941,36 +947,40 @@ fn emit_c_hlo_op(
                 writeln!(out, "            int idx = m * {n} + n;")?;
                 let bias_expr = c_idx(module, inputs[2], res_len, &bias, "idx");
                 writeln!(out, "            float val = acc + {bias_expr};")?;
-                match epilogue {
-                    "bias_relu" if inputs.len() >= 4 => {
+                match base_ep {
+                    "bias_relu" | "relu" if inputs.len() >= 4 => {
                         let z = value_ident(module, inputs[3], names, counter);
                         let z_expr = c_idx(module, inputs[3], res_len, &z, "idx");
-                        writeln!(out, "            {res_name}[idx] = fmaxf(val, {z_expr});")?;
+                        writeln!(out, "            float act = fmaxf(val, {z_expr});")?;
                     }
-                    "bias_tanh" => {
-                        writeln!(out, "            {res_name}[idx] = tanhf(val);")?;
+                    "bias_tanh" | "tanh" => {
+                        writeln!(out, "            float act = tanhf(val);")?;
                     }
-                    "bias_silu" => {
+                    "bias_silu" | "silu" => {
+                        writeln!(out, "            float act = val / (1.0f + expf(-val));")?;
+                    }
+                    "bias_gelu" | "gelu" => {
                         writeln!(
                             out,
-                            "            {res_name}[idx] = val / (1.0f + expf(-val));"
-                        )?;
-                    }
-                    "bias_gelu" => {
-                        writeln!(
-                            out,
-                            "            {res_name}[idx] = 0.5f * val * \
+                            "            float act = 0.5f * val * \
                              (1.0f + tanhf(0.79788456f * (val + 0.044715f * val * val * val)));"
                         )?;
                     }
                     "bias_scale" if inputs.len() >= 4 => {
                         let s = value_ident(module, inputs[3], names, counter);
                         let s_expr = c_idx(module, inputs[3], res_len, &s, "idx");
-                        writeln!(out, "            {res_name}[idx] = val * {s_expr};")?;
+                        writeln!(out, "            float act = val * {s_expr};")?;
                     }
                     _ => {
-                        writeln!(out, "            {res_name}[idx] = val;")?;
+                        writeln!(out, "            float act = val;")?;
                     }
+                }
+                if has_res && let Some(&res_id) = inputs.last() {
+                    let r = value_ident(module, res_id, names, counter);
+                    let r_expr = c_idx(module, res_id, res_len, &r, "idx");
+                    writeln!(out, "            {res_name}[idx] = act + {r_expr};")?;
+                } else {
+                    writeln!(out, "            {res_name}[idx] = act;")?;
                 }
                 writeln!(out, "        }}")?;
                 writeln!(out, "    }}")?;

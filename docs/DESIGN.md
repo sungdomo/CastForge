@@ -90,15 +90,17 @@ CastForge is built around three foundational design principles:
 ## 3. Source Module Topology (`src/`)
 
 - **`src/ir`**: Core arena-backed SSA data structures (`Module`, `Operation`, `Value`, `Block`,
-  `Region`) and `Type`/`DType`/`Dim`/`Attribute` (`mlir.rs`),
-  `Pass`/`PassManager`/`PassRegistry`/`PipelineConfig` (`pass_manager.rs`), unified IR
-  verifier/hasher/profiler (`verify.rs`), `TensorStore` (`tensor_store.rs`), strongly-typed
-  `StableHloOp` dialect views (`stablehlo.rs`), MLIR parser/printer (`parser.rs`, `printer.rs`),
-  ONNX/GGUF/HF importers/exporters (`src/ir/formats/`), Mermaid/DOT/JSON/HTML/Diff graph
-  visualizers (`viz.rs`), and `Payload`/`Translator`/`TranslatorChain`.
-- **`src/passes`**: `PassRegistry::with_builtin_passes()` (`src/passes/registry/`) and **115
-  built-in hierarchical Graph IR transformation passes and presets** (`38` top-level/composite
-  passes & presets + `77` single-optimization leaf passes) across 18 modular pass subdirectories.
+  `Region`) and `Type`/`DType`/`Dim`/`Attribute` (`mlir.rs`), imperative `LoopModule` AST
+  (`loops.rs`), `TensorStore` (`tensor_store.rs`), strongly-typed `StableHloOp` dialect views
+  (`stablehlo.rs`), MLIR parser/printer (`parser.rs`, `printer.rs`), ONNX/GGUF/HF
+  importers/exporters (`src/ir/formats/`), Mermaid/DOT/JSON/HTML/Diff graph visualizers (`viz.rs`),
+  and `Payload`/`Translator`/`TranslatorChain` (`translator.rs`).
+- **`src/passes`**: `PassRegistry::with_builtin_passes()`, `PassManager`, and `O1`/`O2`/`O3`
+  presets (`src/passes/registry/`), plus **115 built-in hierarchical Graph IR transformation passes
+  and presets** (`38` top-level/composite passes & presets + `77` single-optimization leaf passes)
+  and `OptimizeLoopIrPass` (`src/passes/loops/opt.rs`) across 9 modular pass subdirectories
+  (`canonicalize`, `shapes`, `weights`, `quantize`, `fuse`, `memory`, `distributed`, `loops`,
+  `normalize`).
 - **`src/codegen`**: Liveness analysis, static arena memory planner (`MemoryPlan`), Roofline cost
   model, reference interpreter (`evaluate_module`), `LoopModule` + **`OptimizeLoopIrPass`**,
   `CodegenBackend` + `BackendRegistry` (7 built-in targets + 7 CPU SIMD ISAs), autotuner, and
@@ -129,8 +131,7 @@ CastForge is built around three foundational design principles:
   `src/ir/tensor_store.rs` loads and saves `TensorStore` entries directly to/from HuggingFace
   `.safetensors` files (`F32`, `F16`, `BF16`, `I8`) and resolves lazy `ExternalFile` slices on
   demand.
-- **Weight Surgery Kernels (`src/passes/quantize/`, `src/passes/fold_weights/`,
-  `src/passes/merge_weights/`):**
+- **Weight Surgery Kernels (`src/passes/quantize/`, `src/passes/weights/`):**
   - `quantize_symmetric_f32`: Symmetric per-tensor `i8` (`[-128, 127]`) and `i4` (`[-8, 7]`)
     quantization emitting `!quant.uniform<i8:f32, scale:zp>`.
   - `prune_2d_columns_by_l1`: Structured output-column pruning by L1 norm with zero-dimension
@@ -161,7 +162,7 @@ CastForge is built around three foundational design principles:
 
 ## 6. Polyhedral Loop IR & Pluggable Multi-Arch Codegen
 
-### 6.1 Imperative Loop IR (`loop_ir.rs`)
+### 6.1 Imperative Loop IR (`src/ir/loops.rs`, `src/passes/loops/`)
 Before emitting target code, `lower_module_to_loop_ir` lowers the SSA `Module` into a
 target-independent `LoopModule` consisting of `LoopKernel`s and recursive `LoopStmt` nodes:
 - `LoopStmt::For { var, lower, upper, step, annotations, body }` with `LoopAnnotation` tags
@@ -196,9 +197,9 @@ target-independent `LoopModule` consisting of `LoopKernel`s and recursive `LoopS
 
 ## 7. Verification, Bisection & Roofline Cost Modeling
 
-- **Shape & Dominance Verification (`src/ir/verify.rs`, `src/ir/stablehlo.rs`):** Every pass
-  in `PassManager` can automatically invoke `module.verify()` + `verify_stablehlo_shapes(&module)`
-  after execution.
+- **Shape & Dominance Verification (`src/passes/normalize/verify.rs`, `src/ir/stablehlo.rs`):**
+  Every pass in `PassManager` can automatically invoke `module.verify()` +
+  `verify_stablehlo_shapes(&module)` after execution.
 - **Reference Interpreter (`src/codegen/eval.rs`):** Evaluates all StableHLO operations and all
   `castforge.*` fused composites on deterministic synthetic inputs. `verify_module_numerics`
   verifies numerical equivalence within tolerance (e.g. `1e-4`), and `bisect_module_snapshots`

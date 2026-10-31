@@ -746,40 +746,49 @@ fn emit_wgsl_composite(
         writeln!(out, "            }}")?;
         writeln!(out, "            let flat = m * {n}u + n;")?;
         writeln!(out, "            let val = acc + {bias_expr};")?;
-        match epilogue {
+        let (base_ep, has_res) = if let Some(stripped) = epilogue.strip_suffix("_residual") {
+            (stripped, true)
+        } else {
+            (epilogue, false)
+        };
+        match base_ep {
             "bias_relu" | "relu" => {
                 if let Some(&z_id) = inputs.get(3) {
                     let z_n = value_ident(module, z_id, names, counter);
                     let z = wgsl_idx(module, z_id, res_len, &z_n, "flat");
-                    writeln!(out, "            {res_name}[flat] = max(val, {z});")?;
+                    writeln!(out, "            let act = max(val, {z});")?;
                 } else {
-                    writeln!(out, "            {res_name}[flat] = max(val, 0.0);")?;
+                    writeln!(out, "            let act = max(val, 0.0);")?;
                 }
             }
             "bias_tanh" | "tanh" => {
-                writeln!(out, "            {res_name}[flat] = tanh(val);")?;
+                writeln!(out, "            let act = tanh(val);")?;
             }
             "bias_silu" | "silu" => {
-                writeln!(
-                    out,
-                    "            {res_name}[flat] = val / (1.0 + exp(-val));"
-                )?;
+                writeln!(out, "            let act = val / (1.0 + exp(-val));")?;
             }
             "bias_gelu" | "gelu" => {
                 writeln!(
                     out,
-                    "            {res_name}[flat] = 0.5 * val * \
+                    "            let act = 0.5 * val * \
                      (1.0 + tanh(0.7978846 * (val + 0.044715 * val * val * val)));"
                 )?;
             }
             "bias_scale" if inputs.len() >= 4 => {
                 let s_n = value_ident(module, inputs[3], names, counter);
                 let s = wgsl_idx(module, inputs[3], res_len, &s_n, "flat");
-                writeln!(out, "            {res_name}[flat] = val * {s};")?;
+                writeln!(out, "            let act = val * {s};")?;
             }
             _ => {
-                writeln!(out, "            {res_name}[flat] = val;")?;
+                writeln!(out, "            let act = val;")?;
             }
+        }
+        if has_res && let Some(&res_id) = inputs.last() {
+            let r_n = value_ident(module, res_id, names, counter);
+            let r = wgsl_idx(module, res_id, res_len, &r_n, "flat");
+            writeln!(out, "            {res_name}[flat] = act + {r};")?;
+        } else {
+            writeln!(out, "            {res_name}[flat] = act;")?;
         }
         writeln!(out, "        }}")?;
         writeln!(out, "    }}")?;

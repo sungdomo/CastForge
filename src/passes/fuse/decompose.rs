@@ -7,7 +7,7 @@ use super::decompose_helpers::{
     insert_slice_2d_before, insert_splat_tensor_before, insert_zero_tensor_before,
     reduced_row_type,
 };
-use crate::ir::{Attribute, BlockId, DType, Module, OpName, TensorType, Type};
+use crate::ir::{Attribute, BlockId, DType, Dim, Module, OpName, TensorType, Type};
 use crate::passes::{Pass, PassResult};
 use crate::stablehlo::StableHloOp;
 use anyhow::Result;
@@ -516,6 +516,99 @@ impl Pass for DecomposeCompositesPass {
                             op_mut.attributes.clear();
                             modified += 1;
                         }
+                    }
+                    "castforge.fused_gated_mlp" if inputs.len() == 2 => {
+                        let (x, w_gu) = (inputs[0], inputs[1]);
+                        let is_gelu = op
+                            .attributes
+                            .get("activation")
+                            .and_then(|a| a.as_str())
+                            .is_some_and(|s| {
+                                s.eq_ignore_ascii_case("gelu") || s.eq_ignore_ascii_case("geglu")
+                            });
+                        let packed = op
+                            .attributes
+                            .get("packed_rhs")
+                            .is_some_and(|a| matches!(a, Attribute::Bool(true)));
+                        let (rows, cols) = if let Some(ot) = out_ty.as_tensor()
+                            && ot.shape.len() == 2
+                        {
+                            let r = match ot.shape[0] {
+                                Dim::Static(v) => v,
+                                _ => 1,
+                            };
+                            let c = match ot.shape[1] {
+                                Dim::Static(v) => v,
+                                _ => 1,
+                            };
+                            (r, c)
+                        } else {
+                            (1, 1)
+                        };
+                        let gu_ty = Type::Tensor(TensorType {
+                            shape: vec![Dim::Static(rows), Dim::Static(cols * 2)],
+                            dtype: DType::F32,
+                            encoding: None,
+                        });
+                        let mut dot_attrs = IndexMap::new();
+                        dot_attrs.insert(
+                            "lhs_contracting_dimensions".to_string(),
+                            Attribute::DenseIntArray(vec![1]),
+                        );
+                        dot_attrs.insert(
+                            "rhs_contracting_dimensions".to_string(),
+                            Attribute::DenseIntArray(vec![if packed { 1 } else { 0 }]),
+                        );
+                        let gu_val = insert_op_before(
+                            module,
+                            block_id,
+                            op_id,
+                            OpName::new("stablehlo", "dot_general"),
+                            &[x, w_gu],
+                            dot_attrs,
+                            gu_ty,
+                        );
+                        let gate = insert_slice_2d_before(
+                            module,
+                            block_id,
+                            op_id,
+                            gu_val,
+                            [0, 0],
+                            [rows, cols],
+                            out_ty.clone(),
+                        );
+                        let up = insert_slice_2d_before(
+                            module,
+                            block_id,
+                            op_id,
+                            gu_val,
+                            [0, cols],
+                            [rows, cols * 2],
+                            out_ty.clone(),
+                        );
+                        created += 3;
+                        let act_val = if is_gelu {
+                            created += 8;
+                            insert_gelu_before(module, block_id, op_id, gate, &out_ty)
+                        } else {
+                            let denom =
+                                insert_silu_denom_before(module, block_id, op_id, gate, &out_ty);
+                            created += 6;
+                            insert_op_before(
+                                module,
+                                block_id,
+                                op_id,
+                                OpName::new("stablehlo", "divide"),
+                                &[gate, denom],
+                                IndexMap::new(),
+                                out_ty.clone(),
+                            )
+                        };
+                        let op_mut = &mut module.ops[op_id];
+                        op_mut.name = OpName::new("stablehlo", "multiply");
+                        op_mut.operands = SmallVec::from_slice(&[act_val, up]);
+                        op_mut.attributes.clear();
+                        modified += 1;
                     }
                     "castforge.fused_gated_mlp" if inputs.len() >= 4 => {
                         let (x, w_gate, w_up, w_down) =

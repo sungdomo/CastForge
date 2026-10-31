@@ -67,7 +67,11 @@ impl MlirParser {
             logical_lines.push((line_no, line.to_string()));
         }
 
+        let mut module_brace_open = false;
+        let mut last_line_no = 1usize;
+
         for (line_no, line_buf) in logical_lines {
+            last_line_no = line_no;
             let line = line_buf.as_str();
 
             if let Some(rest) = line.strip_prefix("module") {
@@ -78,12 +82,22 @@ impl MlirParser {
                         .unwrap_or(at_rest.len());
                     module.name = Some(at_rest[..name_end].to_string());
                 }
+                if rest.ends_with('{') {
+                    module_brace_open = true;
+                }
                 continue;
             }
 
             if line == "}" {
                 if block_stack.len() > 1 {
                     block_stack.pop();
+                } else if module_brace_open {
+                    module_brace_open = false;
+                } else {
+                    return Err(ParseError::Syntax {
+                        line: line_no,
+                        message: "Unmatched closing brace `}`".to_string(),
+                    });
                 }
                 continue;
             }
@@ -100,6 +114,13 @@ impl MlirParser {
             {
                 block_stack.push(sub_blk);
             }
+        }
+
+        if block_stack.len() > 1 || module_brace_open {
+            return Err(ParseError::Syntax {
+                line: last_line_no,
+                message: "Unclosed region or module brace `{`".to_string(),
+            });
         }
 
         Ok(module)
@@ -1073,6 +1094,13 @@ pub fn parse_type(s: &str, line_no: usize) -> Result<Type, ParseError> {
         return Ok(Type::Tuple(elems));
     }
 
+    if s.starts_with("tensor<") && !s.ends_with('>') {
+        return Err(ParseError::Syntax {
+            line: line_no,
+            message: format!("Unclosed `tensor<` in type `{s}`"),
+        });
+    }
+
     if let Some(inner) = s.strip_prefix("tensor<").and_then(|x| x.strip_suffix('>')) {
         // Check if element type is `!quant.uniform<...>`
         if let Some(q_idx) = inner.find("!quant.uniform<") {
@@ -1105,8 +1133,11 @@ pub fn parse_type(s: &str, line_no: usize) -> Result<Type, ParseError> {
         let encoding = parts.get(1).map(|e| e.trim().to_string());
 
         let tokens: Vec<&str> = shape_dtype.split('x').collect();
-        let dtype_str = tokens.last().copied().unwrap_or("f32");
-        let dtype = parse_dtype(dtype_str);
+        let dtype_str = tokens.last().copied().unwrap_or("");
+        let dtype = try_parse_dtype(dtype_str).ok_or_else(|| ParseError::Syntax {
+            line: line_no,
+            message: format!("Unknown tensor element type `{dtype_str}` in `{s}`"),
+        })?;
         let mut shape = Vec::with_capacity(tokens.len().saturating_sub(1));
         for &dim_tok in &tokens[..tokens.len().saturating_sub(1)] {
             if dim_tok == "?" {

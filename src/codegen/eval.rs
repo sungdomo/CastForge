@@ -947,22 +947,38 @@ fn eval_stablehlo_op(
                     .get("epilogue")
                     .and_then(|a| a.as_str())
                     .unwrap_or("bias");
+                let (base_ep, has_residual) = if let Some(base) = epilogue.strip_suffix("_residual")
+                {
+                    (base, true)
+                } else {
+                    (epilogue, false)
+                };
                 let z = inputs
                     .get(3)
                     .map(|&v| get_v(v))
                     .unwrap_or_else(|| vec![0.0; res_len]);
+                let res_vec = if has_residual {
+                    inputs.last().map(|&v| get_v(v))
+                } else {
+                    None
+                };
                 let b_len = bias.len().max(1);
                 let z_len = z.len().max(1);
                 (0..res_len)
                     .map(|i| {
                         let val = mm[i] + bias[i % b_len];
-                        match epilogue {
+                        let act = match base_ep {
                             "bias_relu" | "relu" => val.max(z[i % z_len]),
                             "bias_tanh" | "tanh" => val.tanh(),
                             "bias_silu" | "silu" => val / (1.0 + (-val).exp()),
                             "bias_gelu" | "gelu" => eval_gelu_scalar(val),
                             "bias_scale" => val * z[i % z_len],
                             _ => val,
+                        };
+                        if let Some(rv) = &res_vec {
+                            act + rv[i % rv.len().max(1)]
+                        } else {
+                            act
                         }
                     })
                     .collect()

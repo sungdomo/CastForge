@@ -1005,6 +1005,12 @@ fn emit_rust_hlo_op(
                     .get("epilogue")
                     .and_then(|attr| attr.as_str())
                     .unwrap_or("bias");
+                let (base_ep, has_res) = if let Some(stripped) = epilogue.strip_suffix("_residual")
+                {
+                    (stripped, true)
+                } else {
+                    (epilogue, false)
+                };
                 writeln!(out, "    for m in 0..{m} {{")?;
                 writeln!(out, "        for n in 0..{n} {{")?;
                 writeln!(out, "            let mut acc = 0.0_f32;")?;
@@ -1013,22 +1019,22 @@ fn emit_rust_hlo_op(
                 writeln!(out, "            }}")?;
                 writeln!(out, "            let idx = m * {n} + n;")?;
                 writeln!(out, "            let val = acc + {bias};")?;
-                match epilogue {
-                    "bias_relu" if inputs.len() >= 4 => {
+                match base_ep {
+                    "bias_relu" | "relu" if inputs.len() >= 4 => {
                         let z =
                             r_bcast_idx(module, plan, inputs[3], "idx", res_len, names, counter);
-                        writeln!(out, "            {dst} = val.max({z});")?;
+                        writeln!(out, "            let act = val.max({z});")?;
                     }
-                    "bias_tanh" => {
-                        writeln!(out, "            {dst} = val.tanh();")?;
+                    "bias_tanh" | "tanh" => {
+                        writeln!(out, "            let act = val.tanh();")?;
                     }
-                    "bias_silu" => {
-                        writeln!(out, "            {dst} = val / (1.0_f32 + (-val).exp());")?;
+                    "bias_silu" | "silu" => {
+                        writeln!(out, "            let act = val / (1.0_f32 + (-val).exp());")?;
                     }
-                    "bias_gelu" => {
+                    "bias_gelu" | "gelu" => {
                         writeln!(
                             out,
-                            "            {dst} = 0.5_f32 * val * \
+                            "            let act = 0.5_f32 * val * \
                              (1.0_f32 + (0.79788456_f32 * \
                              (val + 0.044715_f32 * val * val * val)).tanh());"
                         )?;
@@ -1036,11 +1042,17 @@ fn emit_rust_hlo_op(
                     "bias_scale" if inputs.len() >= 4 => {
                         let s =
                             r_bcast_idx(module, plan, inputs[3], "idx", res_len, names, counter);
-                        writeln!(out, "            {dst} = val * ({s});")?;
+                        writeln!(out, "            let act = val * ({s});")?;
                     }
                     _ => {
-                        writeln!(out, "            {dst} = val;")?;
+                        writeln!(out, "            let act = val;")?;
                     }
+                }
+                if has_res && let Some(&res_id) = inputs.last() {
+                    let r = r_bcast_idx(module, plan, res_id, "idx", res_len, names, counter);
+                    writeln!(out, "            {dst} = act + ({r});")?;
+                } else {
+                    writeln!(out, "            {dst} = act;")?;
                 }
                 writeln!(out, "        }}")?;
                 writeln!(out, "    }}")?;
