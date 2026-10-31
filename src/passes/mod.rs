@@ -7,23 +7,22 @@
 
 pub mod canonicalize;
 pub mod distributed;
-pub mod fold;
 pub mod fuse;
 pub mod loops;
-pub mod manager;
 pub mod memory;
 pub mod normalize;
 pub mod quantize;
 pub mod registry;
 pub mod shapes;
+pub mod weights;
 
 pub use canonicalize::*;
 pub use distributed::*;
-pub use fold::*;
 pub use fuse::*;
 pub use loops::*;
-pub use manager::*;
 pub use memory::*;
 pub use normalize::*;
 pub use quantize::*;
+pub use registry::*;
 pub use shapes::*;
+pub use weights::*;

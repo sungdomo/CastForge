@@ -1,12 +1,11 @@
 //! Standard compiler optimization level presets (`O1`, `O2`, `O3`).
 
-use super::{CanonicalizePass, TopologicalSortPass};
 use crate::ir::Module;
 use crate::passes::{
-    CsePass, DeadCodeEliminationPass, FoldViewsPass, FoldWeightsPass, FuseActivationsPass,
-    FuseAddMaxPass, FuseAttentionPass, FuseGemmPass, FuseNormPass, FuseSoftmaxPass,
-    InlineCallsPass, MergeWeightsPass, OptimizeMemoryPass, Pass, PassResult, ShardDistributedPass,
-    SimplifyAlgebraicPass, SpecializeShapesPass,
+    CanonicalizePass, CsePass, DeadCodeEliminationPass, FoldViewsPass, FoldWeightsPass,
+    FuseActivationsPass, FuseAddMaxPass, FuseAttentionPass, FuseGemmPass, FuseNormPass,
+    FuseSoftmaxPass, InlineCallsPass, MergeWeightsPass, OptimizeMemoryPass, Pass, PassResult,
+    ShardDistributedPass, SimplifyAlgebraicPass, SpecializeShapesPass, TopologicalSortPass,
 };
 use anyhow::Result;
 use indexmap::IndexMap;

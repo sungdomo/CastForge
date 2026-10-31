@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::ir::DType;
+use crate::passes::*;
 
 pub(super) fn register_leaf_passes(reg: &mut PassRegistry) {
     reg.register(

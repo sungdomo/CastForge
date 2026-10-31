@@ -2,6 +2,7 @@
 //! [`PassRegistry`].
 
 use super::*;
+use crate::passes::*;
 use indexmap::IndexMap;
 
 pub(super) fn register_lowering_passes(reg: &mut PassRegistry) {

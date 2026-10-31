@@ -178,6 +178,9 @@ impl CsePass {
         value_leader: &mut HashMap<ValueId, ValueId>,
         dead_ops: &mut Vec<OpId>,
     ) -> bool {
+        if !(self.gvn || (self.hoist_constants && op.is_op("stablehlo", "constant"))) {
+            return false;
+        }
         if op.is_pure() && op.results.len() == 1 && op.regions.is_empty() {
             let res_val = op.results[0];
             let res_ty = module.values[res_val].ty.clone();

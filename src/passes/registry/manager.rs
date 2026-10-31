@@ -39,7 +39,7 @@ pub struct PassCatalog {
 pub fn pass_catalog() -> &'static PassCatalog {
     static CATALOG: OnceLock<PassCatalog> = OnceLock::new();
     CATALOG.get_or_init(|| {
-        toml::from_str(include_str!("../../config/passes.toml"))
+        toml::from_str(include_str!("../../../config/passes.toml"))
             .expect("config/passes.toml must be valid TOML matching PassCatalog")
     })
 }
