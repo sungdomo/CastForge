@@ -1,40 +1,36 @@
-# CastForge v1.0.0 — System Architecture & Design Document
+# CastForge — System Architecture & Design
 
-**CastForge** is a pure-Rust, zero-LLVM/C++-dependency MLIR + StableHLO AI compiler, weight
-surgery engine, polyhedral loop optimizer, and multi-architecture code generator.
-
----
-
-## 1. Core Architectural Philosophy
-
-CastForge is built around three foundational design principles:
-
-1. **Everything is a Modular A-to-B Translator (`Translator` + `Payload`)**
-   Every compiler component—frontend model importers (`.mlir`, `.safetensors`, `.onnx.json`,
-   `.gguf`, HuggingFace `config.json`), each of the **115 Hierarchical Graph IR passes & presets**
-   (`38` top-level/composite passes & presets + `77` single-optimization leaf passes), the unified
-   **`OptimizeLoopIrPass`** (`optimize-loop-ir`), lowering stages (`ir -> loop-ir`), and backend
-   code emitters (`loop-ir -> code`)—implements the unified `castforge::ir::Translator` trait over
-   a polymorphic `castforge::ir::Payload`. Any stage can be composed into a `TranslatorChain` via
-   CLI (`castforge chain -s "A | B | C"`) or Rust API.
-2. **Dual-Plane Intermediate Representation (SSA Compute Graph + Weight Plane)**
-   Traditional compilers treat multi-gigabyte model weights either as giant AST literals or as
-   opaque external pointers. CastForge decouples them into two synchronized planes inside
-   `castforge::ir::Module`:
-   - **Compute Graph Plane:** Arena-allocated (`slotmap::SlotMap`) SSA operations, values, blocks,
-     and regions (`OpId`, `ValueId`, `BlockId`, `RegionId`).
-   - **Weight Plane (`TensorStore`):** Dedicated storage holding inline `f32`/`i64` tensors,
-     quantized `i8`/`i4` buffers (`TensorBacking::QuantizedI8`), or lazy zero-copy `SafeTensors`
-     (`F32`/`F16`/`BF16`/`I8`) shard references (`TensorBacking::ExternalFile`).
-3. **Two-Tier IR Lowering (`Module` $\to$ `LoopModule` $\to$ Multi-Arch Target Source)**
-   High-level algebraic, fusion, quantization, and graph surgery passes operate on the SSA
-   `Module`. Schedule and loop-nest transformations (`OptimizeLoopIrPass`: fusion, fission,
-   interchange, collapse-parallel, unroll-and-jam, unroll, and vectorize) operate on an explicit
-   polyhedral/imperative `LoopModule` before target-specific code generation.
+**CastForge** is a zero-C++ MLIR and StableHLO compiler, weight surgery engine, polyhedral loop
+optimizer, and multi-target code generator written in pure Rust.
 
 ---
 
-## 2. End-to-End Compiler Pipeline
+## 1. Architectural Principles
+
+1. **Dual-Plane Intermediate Representation (`Module` + `TensorStore`)**
+   CastForge separates symbolic graph topology from bulk model parameters inside
+   [`castforge::ir::Module`](../src/ir/mlir.rs):
+   - **Compute Graph Plane**: Arena-allocated (`slotmap::SlotMap`) SSA operations (`OpId`), values
+     (`ValueId`), basic blocks (`BlockId`), and regions (`RegionId`).
+   - **Weight Plane (`TensorStore`)**: Dedicated storage holding `f32` buffers, quantized `i8`
+     tensors (`TensorBacking::QuantizedI8`), or lazy zero-copy `.safetensors` file slices
+     (`TensorBacking::ExternalFile`).
+
+2. **Two-Tier Compilation (`Module` -> `LoopModule` -> Target Code)**
+   - **Graph Level (`Module`)**: Algebraic simplification, shape specialization, weight surgery,
+     quantization, operator fusion, SPMD sharding, and reverse-mode autodiff run on the SSA graph.
+   - **Loop Level (`LoopModule`)**: Lowered tensor ops become imperative loop nests
+     (`LoopStmt::For`) where polyhedral tiling, loop interchange, unroll-and-jam, fusion/fission,
+     and SIMD vectorization run before target code emission.
+
+3. **Composable Pipeline Stages (`Translator` & `PassManager`)**
+   Every importer, pass, lowering step, visualizer, and code generator implements the unified
+   [`Translator`](../src/ir/translator.rs) interface over `Payload` (`Text`, `Bytes`, `Ir`),
+   allowing stages to be composed in-memory (`TranslatorChain`) or across Unix pipes.
+
+---
+
+## 2. End-to-End Compilation Pipeline
 
 ```text
   +--------------------+   +-------------------+   +-------------------+
@@ -46,165 +42,135 @@ CastForge is built around three foundational design principles:
                                      |
                                      v
                      +-------------------------------+
-                     |    castforge::ir::Module      |
+                     |     castforge::ir::Module     |
                      |  - SSA Compute Graph (SlotMap)|
                      |  - Weight Plane (TensorStore) |
                      +---------------+---------------+
                                      |
                +---------------------+---------------------+
-               |  115 Hierarchical Passes (38 + 77 Leaf)   |
-               |  - Algebraic / Canonicalization / SCCP    |
-               |  - Weight Surgery (Quant/Prune/Merge/LoRA)|
-               |  - LLM & Transformer Operator Fusions     |
-               |  - Distributed SPMD / Autodiff / Memory   |
+               |     9 Optimization Packages (115 Passes)  |
+               |  canonicalize | shapes | weights          |
+               |  quantize     | fuse   | memory           |
+               |  distributed  | loops  | normalize        |
                +---------------------+---------------------+
                                      |
                                      v
                      +-------------------------------+
                      | Static Liveness & Arena Plan  |
                      |  - compute_module_liveness()  |
-                     |  - build_memory_plan() O(N)   |
+                     |  - build_memory_plan()        |
                      +---------------+---------------+
                                      |
                                      v
                      +-------------------------------+
-                     | castforge::codegen::LoopModule|
+                     |   castforge::ir::LoopModule   |
                      |  - OptimizeLoopIrPass         |
-                     |    (interchange, unroll,      |
+                     |    (tile, interchange, unroll,|
                      |     vectorize, jam, fission)  |
                      +---------------+---------------+
                                      |
                                      v
                      +-------------------------------+
-                     |    Pluggable BackendRegistry  |
-                     |  - CPU: Rust, C99 (7 SIMD ISAs|
-                     |    Scalar/AVX2/AVX512/NEON/   |
-                     |    SVE/RVV/WasmSimd128 + JIT) |
-                     |  - GPU: WGSL, CUDA, HIP,      |
-                     |    Metal (MSL), OpenCL        |
+                     |       BackendRegistry         |
+                     |  - CPU: Rust, C99 (7 ISAs)    |
+                     |  - GPU: WGSL, CUDA, Metal,    |
+                     |         ROCm HIP, OpenCL      |
                      +-------------------------------+
 ```
 
 ---
 
-## 3. Source Module Topology (`src/`)
+## 3. Codebase Organization
 
-- **`src/ir`**: Core arena-backed SSA data structures (`Module`, `Operation`, `Value`, `Block`,
-  `Region`) and `Type`/`DType`/`Dim`/`Attribute` (`mlir.rs`), imperative `LoopModule` AST
-  (`loops.rs`), `TensorStore` (`tensor_store.rs`), strongly-typed `StableHloOp` dialect views
-  (`stablehlo.rs`), MLIR parser/printer (`parser.rs`, `printer.rs`), ONNX/GGUF/HF
-  importers/exporters (`src/ir/formats/`), Mermaid/DOT/JSON/HTML/Diff graph visualizers (`viz.rs`),
-  and `Payload`/`Translator`/`TranslatorChain` (`translator.rs`).
-- **`src/passes`**: `PassRegistry::with_builtin_passes()`, `PassManager`, and `O1`/`O2`/`O3`
-  presets (`src/passes/registry/`), plus **115 built-in hierarchical Graph IR transformation passes
-  and presets** (`38` top-level/composite passes & presets + `77` single-optimization leaf passes)
-  and `OptimizeLoopIrPass` (`src/passes/loops/opt.rs`) across 9 modular pass subdirectories
+- **Core IR ([`src/ir/`](../src/ir))**: `Module` arena (`mlir.rs`), `StableHloOp` dialect views
+  (`stablehlo.rs`), MLIR parser/printer (`parser.rs`, `printer.rs`), `TensorStore`
+  (`tensor_store.rs`), `LoopModule` (`loops.rs`), visualizers (`viz.rs`), and
+  ONNX/GGUF/SafeTensors/HF formats (`formats/`).
+- **Passes ([`src/passes/`](../src/passes))**: `PassRegistry`, `PassManager`, structured
+  `PassTelemetry`, `O1`/`O2`/`O3` presets (`registry/`), and 9 domain pass packages
   (`canonicalize`, `shapes`, `weights`, `quantize`, `fuse`, `memory`, `distributed`, `loops`,
   `normalize`).
-- **`src/codegen`**: Liveness analysis, static arena memory planner (`MemoryPlan`), Roofline cost
-  model, reference interpreter (`evaluate_module`), `LoopModule` + **`OptimizeLoopIrPass`**,
-  `CodegenBackend` + `BackendRegistry` (7 built-in targets + 7 CPU SIMD ISAs), autotuner, and
-  native C JIT runner.
-- **`src/cli`**: Unified `castforge` command-line tool exposing `opt`, `run`, `parse`, `viz`,
-  `codegen`, `profile`, `autotune`, `import`, `export`, `chain` (`pipe`), `link`, `list-passes`,
-  and direct pass subcommands.
+- **Codegen ([`src/codegen/`](../src/codegen))**: Liveness & interval-coloring arena planner
+  (`memory_plan.rs`), Roofline cost model (`cost_model.rs`), reference interpreter (`eval.rs`),
+  schedule autotuner (`autotune.rs`), and 7 target backends (`targets/`).
+- **CLI ([`src/cli/`](../src/cli))**: Command-line interface (`opt`, `chain`, `codegen`,
+  `autotune`, `viz`, `profile`, `import`, `export`, `link`, `run`, `list-passes`).
+- **FFI & SDK ([`src/ffi.rs`](../src/ffi.rs))**: Panic-safe `extern "C"` ABI
+  (`include/castforge.h`) and Python `ctypes` wrapper (`bindings/python/castforge.py`).
 
 ---
 
-## 4. Dual-Plane IR Details (`src/ir`)
+## 4. Dual-Plane IR Design (`src/ir/`)
 
-### 4.1 SSA Compute Graph Plane
-- **Arena Storage:** Operations (`OpId`), SSA values (`ValueId`), basic blocks (`BlockId`), and
-  regions (`RegionId`) are stored in dense `slotmap::SlotMap` arenas inside `Module`.
-- **SmallVec Operands & Results:** `Operation::operands` (`SmallVec<[ValueId; 4]>`) and
-  `Operation::results` (`SmallVec<[ValueId; 2]>`) avoid heap allocations for common unary, binary,
-  and ternary operations.
-- **Deterministic Attributes:** `Operation::attributes` uses `IndexMap<String, Attribute>` to
-  preserve insertion order during MLIR round-tripping while supporting canonical key sorting in
-  passes like `cse`, `normalize-ssa`, and `hash-ir`.
-- **$O(N)$ Reference Counting:** `Module::compute_use_counts()` computes operand reference counts
-  across all active blocks in a single $O(N)$ sweep, enabling linear-time Dead Code Elimination.
+### 4.1 SSA Compute Graph (`mlir.rs`)
+- **SlotMap Arenas**: Operations (`OpId`), SSA values (`ValueId`), blocks (`BlockId`), and regions
+  (`RegionId`) live in dense `slotmap::SlotMap` arenas inside `Module`.
+- **Zero-Heap Small Vectors**: `Operation::operands` (`SmallVec<[ValueId; 4]>`) and
+  `Operation::results` (`SmallVec<[ValueId; 2]>`) avoid heap allocation for standard instructions.
+- **Deterministic Attributes**: `Operation::attributes` uses `IndexMap<String, Attribute>` for
+  deterministic MLIR printing and structural hashing (`hash-ir`).
 
-### 4.2 Weight Plane (`TensorStore`) & Weight Surgery (`src/passes/`)
-- **Pure IR Storage (`src/ir`):** Small constants remain inline in MLIR attributes, while large
-  weight matrices use `dense_resource<key>` handles pointing into `Module::tensor_store`.
-  `src/ir/tensor_store.rs` loads and saves `TensorStore` entries directly to/from HuggingFace
-  `.safetensors` files (`F32`, `F16`, `BF16`, `I8`) and resolves lazy `ExternalFile` slices on
-  demand.
-- **Weight Surgery Kernels (`src/passes/quantize/`, `src/passes/weights/`):**
-  - `quantize_symmetric_f32`: Symmetric per-tensor `i8` (`[-128, 127]`) and `i4` (`[-8, 7]`)
-    quantization emitting `!quant.uniform<i8:f32, scale:zp>`.
-  - `prune_2d_columns_by_l1`: Structured output-column pruning by L1 norm with zero-dimension
-    safety guards.
-  - `merge_f32_tensors`: Linear interpolation, Spherical Linear Interpolation (`SLERP`), and
-    `TIES`-Merging (Trim, Elect Sign, Disjoint Merge).
+### 4.2 Weight Plane (`tensor_store.rs`)
+- **Inline vs. External Weights**: Small scalars/constants stay inline as `dense<...>` attributes,
+  while weight matrices use `dense_resource<key>` handles referencing `Module::tensor_store`.
+- **Lazy SafeTensors Indexing**: `TensorStore::load_safetensors_lazy_file` reads only the JSON
+  header from disk and populates `TensorBacking::ExternalFile { path, offset, length }` descriptors
+  so multi-gigabyte checkpoints can be inspected or sliced without eager RAM allocation.
+
+### 4.3 Input Hardening & Safety Quotas
+- **Checked Tensor Arithmetic**: `TensorType::num_elements()` and `TensorType::checked_byte_len()`
+  use checked multiplication (`checked_mul`) and enforce `TensorType::MAX_TENSOR_ELEMENTS`
+  (`1,000,000,000` elements).
+- **Bounded Region Nesting**: `MlirParser` enforces `MAX_REGION_NESTING_DEPTH = 64` to prevent
+  stack overflow on deeply nested regions.
+- **Binary Header Quotas**: SafeTensors headers are capped at 100 MiB and GGUF tensor/metadata
+  counts are capped at `65,536` entries with bounds-checked slice reads.
 
 ---
 
-## 5. Static Liveness & Arena Memory Planning (`src/codegen`)
+## 5. Static Liveness & Arena Memory Planning (`src/codegen/memory_plan.rs`)
 
-1. **Block Liveness Analysis (`src/codegen/memory_plan.rs`):**
-   `compute_block_liveness` assigns each operation in a block a topological step index `1..=N` and
-   computes `LiveInterval { first_def, last_use, is_constant, is_block_arg, is_returned }` for
-   every tensor SSA value.
-2. **In-Place Buffer Donation (`optimize-memory(mode=inplace)`):**
-   Elementwise operations whose input tensor has its final use at that exact instruction
-   (`last_use == step`) and matches the output byte size are annotated with
-   `inplace_operand = <idx>`.
-3. **Greedy Interval Coloring & $O(1)$ Lookup (`src/codegen/memory_plan.rs`):**
-   `build_memory_plan` allocates intermediate tensors into a single contiguous `arena: &mut [f32]`
-   workspace. Non-overlapping live intervals share the same `ArenaSlot` (preferring minimal slot
-   growth), while `inplace_operand` donors reuse the donor's slot at zero additional byte cost.
-   `MemoryPlan::allocation_for(ValueId)` indexes allocations via an internal `HashMap<ValueId,
-   usize>` for $O(1)$ lookup during codegen.
+1. **Block Liveness Analysis**: `compute_block_liveness` assigns each operation a topological index
+   `1..=N` and computes `LiveInterval { first_def, last_use, ... }` for every SSA tensor value.
+2. **In-Place Bufferization (`bufferize-inplace`)**: Elementwise ops whose input tensor has its
+   final use at that instruction (`last_use == step`) and matches the output byte size receive an
+   `inplace_operand` annotation, reusing the input buffer with zero extra memory.
+3. **Greedy Interval Coloring**: `build_memory_plan` packs all intermediate buffers into a single
+   contiguous `arena: &mut [f32]` allocation, reusing slots across non-overlapping live intervals.
 
 ---
 
-## 6. Polyhedral Loop IR & Pluggable Multi-Arch Codegen
+## 6. Loop IR & Multi-Target Code Generation (`src/codegen/`)
 
 ### 6.1 Imperative Loop IR (`src/ir/loops.rs`, `src/passes/loops/`)
-Before emitting target code, `lower_module_to_loop_ir` lowers the SSA `Module` into a
-target-independent `LoopModule` consisting of `LoopKernel`s and recursive `LoopStmt` nodes:
-- `LoopStmt::For { var, lower, upper, step, annotations, body }` with `LoopAnnotation` tags
-  (`Parallel`, `Vectorize(w)`, `SimdIsa(name)`, `Unroll(u)`, `GpuThreadIdx(axis)`).
-- Structured statements (`Assign`, `Accumulate`, `IfZero`, `ExprStmt`, `Comment`) and scalar/index
-  expressions (`LoopExpr::Load`, `Var`, `LitF32`, `Binary`, `Call`).
+`lower_to_loop_ir` converts tensor operations into `LoopKernel`s composed of `LoopStmt` nodes
+(`For`, `Alloc`, `Assign`, `Comment`) annotated with `Parallel`, `Vectorize(width)`, `Unroll(n)`,
+and `SimdIsa`. `OptimizeLoopIrPass` performs loop fusion, fission, interchange, parallel collapse,
+unroll-and-jam, and vectorization directly on `LoopModule`.
 
-### 6.2 Multi-Architecture CPU SIMD & Pluggable GPU Backends (`backend.rs`)
-- **Pluggable `CodegenBackend` Trait & `BackendRegistry`:**
-  Every backend implements `CodegenBackend::emit_from_loop_ir(&LoopModule, &TargetConfig)` (with a
-  default `emit_module(&Module, &TargetConfig)` pipeline that runs `lower_module_to_loop_ir` +
-  `optimize_loop_module`). Users can register custom hardware targets at runtime via
-  `BackendRegistry::register` or wrap them as `Translator` stages via `CustomBackendTranslator`.
-- **7 Built-In Target Backends:**
-  1. `rust`: Dependency-free Rust (`pub fn main(...)`) with shared `arena: &mut [f32]`.
-  2. `c`: Portable C99 (`#pragma omp parallel for`, `#pragma omp simd`) with architecture-specific
-     SIMD intrinsics across **7 Vector ISAs**:
-     - `SimdIsa::Scalar` (1 lane)
-     - `SimdIsa::Avx2` (`<immintrin.h>`, `__m256`, `_mm256_fmadd_ps`, 8 lanes)
-     - `SimdIsa::Avx512` (`<immintrin.h>`, `__m512`, `_mm512_fmadd_ps`, 16 lanes)
-     - `SimdIsa::Neon` (`<arm_neon.h>`, `float32x4_t`, `vfmaq_f32`, 4 lanes)
-     - `SimdIsa::Sve` (`<arm_sve.h>`, `svfloat32_t`, `svmla_f32_m`, scalable lanes)
-     - `SimdIsa::Rvv` (`<riscv_vector.h>`, `vfloat32m1_t`, `__riscv_vfmacc_vv_f32m1`, RVV 1.0)
-     - `SimdIsa::WasmSimd128` (`<wasm_simd128.h>`, `v128_t`, `wasm_f32x4_mul`, 4 lanes)
-  3. `wgsl`: WebGPU compute shaders (`@compute @workgroup_size(...)`).
-  4. `cuda`: NVIDIA CUDA C++ (`.cu`) with WMMA Tensor Core helpers and `__shared__` double buffers.
-  5. `hip`: AMD ROCm HIP C++ (`.hip.cpp`) with `<hip/hip_runtime.h>` and `hipLaunchKernelGGL`.
-  6. `metal`: Apple Silicon Metal Shading Language (`.metal`) with `[[thread_position_in_grid]]`.
-  7. `opencl`: Khronos OpenCL C 1.2+ (`.cl`) with `__kernel`, `__global`, and `get_global_id(0)`.
+### 6.2 Target Backends (`src/codegen/targets/`)
+
+| Target | ID | Output Format & Key Capabilities |
+| :--- | :--- | :--- |
+| **Rust** | `rust` | Standalone Rust (`pub fn main`) with static `arena: &mut [f32]` |
+| **C99** | `c` | Portable C99 with OpenMP + `AVX2`/`AVX-512`/`NEON`/`SVE`/`RVV`/`SIMD128` |
+| **WebGPU** | `wgsl` | `@compute @workgroup_size(...)` WGSL compute shaders |
+| **CUDA** | `cuda` | NVIDIA `.cu` kernels with WMMA Tensor Cores & `__shared__` tiling |
+| **Metal** | `msl` | Apple Silicon `.metal` shaders with `[[thread_position_in_grid]]` |
+| **ROCm HIP** | `hip` | AMD `.hip.cpp` kernels with `<hip/hip_runtime.h>` |
+| **OpenCL** | `opencl` | Khronos OpenCL 1.2+ `.cl` kernels with `__kernel` & `__global` buffers |
 
 ---
 
-## 7. Verification, Bisection & Roofline Cost Modeling
+## 7. Verification, Profiling & Telemetry
 
-- **Shape & Dominance Verification (`src/passes/normalize/verify.rs`, `src/ir/stablehlo.rs`):**
-  Every pass in `PassManager` can automatically invoke `module.verify()` +
-  `verify_stablehlo_shapes(&module)` after execution.
-- **Reference Interpreter (`src/codegen/eval.rs`):** Evaluates all StableHLO operations and all
-  `castforge.*` fused composites on deterministic synthetic inputs. `verify_module_numerics`
-  verifies numerical equivalence within tolerance (e.g. `1e-4`), and `bisect_module_snapshots`
-  pinpoints the exact pass where numerical drift occurs in a single baseline evaluation.
-- **Roofline Performance Estimator (`src/codegen/cost_model.rs`):** Computes per-op and whole-module
-  FLOPs, memory traffic bytes (accounting for weight quantization and arena reuse), operational
-  intensity ($\text{FLOPs}/\text{Byte}$), and ridge-point bottleneck classification (`ComputeBound`
-  vs. `MemoryBound`).
+- **IR & Shape Verifier (`verify-ir`)**: Checks SSA dominance, block ownership, and StableHLO
+  shape/dtype compatibility (`verify_stablehlo_shapes`) after each pass.
+- **Reference Interpreter (`src/codegen/eval.rs`)**: Evaluates all StableHLO ops and `castforge.*`
+  fused composites in memory, powering `--verify-numerics` and automated pass bisection
+  (`bisect_module_snapshots`).
+- **Roofline Cost Model (`src/codegen/cost_model.rs`)**: Computes FLOPs, memory traffic,
+  arithmetic intensity (`FLOPs/Byte`), and ridge-point bottleneck classification (`ComputeBound` vs.
+  `MemoryBound`) across hardware profiles (`h100`, `a100`, `m3-max`, `avx512`, `neon`).
+- **Structured Telemetry (`PassTelemetry`)**: `PassManager::run_with_telemetry` records per-pass
+  execution time (`elapsed_us`), live op counts before/after, and mutation counters as JSON.

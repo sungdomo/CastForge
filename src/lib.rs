@@ -1,5 +1,5 @@
-//! CastForge: Pure-Rust AI Model IR Transformation, Optimization, Visualization, and Code
-//! Generation Suite.
+//! CastForge: Zero-C++ MLIR & StableHLO compiler in pure Rust with 115+ graph optimization,
+//! fusion, quantization, and weight-surgery passes and standalone CPU/GPU codegen.
 
 pub mod cli;
 pub mod codegen;

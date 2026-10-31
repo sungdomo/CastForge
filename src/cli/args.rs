@@ -8,7 +8,7 @@ use std::path::PathBuf;
 #[command(
     name = "castforge",
     version,
-    about = "CastForge: Pure-Rust AI Model IR Transformation, Optimization & Visualization Toolset"
+    about = "Zero-C++ MLIR & StableHLO compiler in pure Rust with standalone CPU/GPU codegen"
 )]
 pub struct Cli {
     #[command(subcommand)]

@@ -5,7 +5,9 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sungdomo/CastForge"
 readme = "README.md"
-description = "Pure-Rust AI Model IR Transformation, Optimization, Visualization, and Codegen"
+description = """
+Zero-C++ MLIR & StableHLO compiler in pure Rust: 115+ graph optimization, fusion, \
+quantization, and weight-surgery passes with standalone CPU/GPU codegen."""
 keywords = ["mlir", "stablehlo", "compiler", "machine-learning", "codegen"]
 categories = ["compilers", "science", "command-line-utilities"]
 
