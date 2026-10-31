@@ -395,6 +395,79 @@ pub(super) fn insert_rmsnorm_core_before(
     (norm_val, 9)
 }
 
+pub(super) fn insert_layernorm_core_before(
+    module: &mut Module,
+    block_id: BlockId,
+    before_op: OpId,
+    x: ValueId,
+    eps: f32,
+    out_ty: &Type,
+) -> (ValueId, usize) {
+    let (red_ty, axis, bcast_dims) = reduced_row_type(out_ty);
+    let cols = out_ty
+        .as_tensor()
+        .and_then(|t| match t.shape.last() {
+            Some(Dim::Static(c)) => Some(*c as f32),
+            _ => None,
+        })
+        .unwrap_or(1.0);
+    let zero_init = insert_scalar_const_before(module, block_id, before_op, 0.0);
+    let mut red_attrs = IndexMap::new();
+    red_attrs.insert(
+        "dimensions".to_string(),
+        Attribute::DenseIntArray(vec![axis]),
+    );
+    red_attrs.insert(
+        "reducer".to_string(),
+        Attribute::String("stablehlo.add".to_string()),
+    );
+    let sum_x = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "reduce"),
+        &[x, zero_init],
+        red_attrs,
+        red_ty.clone(),
+    );
+    let n_const = insert_splat_tensor_before(module, block_id, before_op, &red_ty, cols);
+    let mean_x = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "divide"),
+        &[sum_x, n_const],
+        IndexMap::new(),
+        red_ty,
+    );
+    let mut bcast_attrs = IndexMap::new();
+    bcast_attrs.insert(
+        "broadcast_dimensions".to_string(),
+        Attribute::DenseIntArray(bcast_dims),
+    );
+    let mean_bcast = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "broadcast_in_dim"),
+        &[mean_x],
+        bcast_attrs,
+        out_ty.clone(),
+    );
+    let xc = insert_op_before(
+        module,
+        block_id,
+        before_op,
+        OpName::new("stablehlo", "subtract"),
+        &[x, mean_bcast],
+        IndexMap::new(),
+        out_ty.clone(),
+    );
+    let (norm_val, rms_cnt) =
+        insert_rmsnorm_core_before(module, block_id, before_op, xc, eps, out_ty);
+    (norm_val, 6 + rms_cnt)
+}
+
 pub(super) fn insert_gelu_before(
     module: &mut Module,
     block_id: BlockId,

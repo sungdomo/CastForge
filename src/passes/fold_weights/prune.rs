@@ -35,6 +35,16 @@ impl Pass for ExternalizeWeightsPass {
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let mut modified = 0usize;
+        let mut claimed_keys: HashSet<String> = HashSet::new();
+        for op_id in module.live_ops() {
+            if let Some(Attribute::TensorRef { key, .. }) = module
+                .ops
+                .get(op_id)
+                .and_then(|o| o.attributes.get("value"))
+            {
+                claimed_keys.insert(key.clone());
+            }
+        }
         let blocks: Vec<BlockId> = module.blocks.keys().collect();
 
         for block_id in blocks {
@@ -88,10 +98,17 @@ impl Pass for ExternalizeWeightsPass {
                     let Some(vals) = parse_dense_f32_literal(raw_literal, num_elems) else {
                         continue;
                     };
-                    let key = module.values[val_id]
+                    let base_key = module.values[val_id]
                         .ssa_name
                         .clone()
                         .unwrap_or_else(|| format!("weight_{modified}"));
+                    let mut key = base_key.clone();
+                    let mut suffix = 1usize;
+                    while claimed_keys.contains(&key) {
+                        key = format!("{base_key}_{suffix}");
+                        suffix += 1;
+                    }
+                    claimed_keys.insert(key.clone());
                     module.tensor_store.insert(TensorEntry::from_f32(
                         key.clone(),
                         tensor_ty.clone(),
@@ -210,6 +227,17 @@ fn run_activation_sparsity(module: &mut Module, sparsity: f32) -> Result<PassRes
                 continue;
             }
             let attrs = &mut module.ops[op_id].attributes;
+            if attrs
+                .get("castforge.activation_sparsity")
+                .and_then(|a| a.as_float())
+                == Some(ratio as f64)
+                && attrs
+                    .get("castforge.sparse_activation_mode")
+                    .and_then(|a| a.as_str())
+                    == Some("top_k_magnitude")
+            {
+                continue;
+            }
             attrs.insert(
                 "castforge.activation_sparsity".to_string(),
                 Attribute::Float(ratio as f64),
@@ -260,6 +288,14 @@ impl Pass for PruneStructuredPass {
                 let Some(op) = module.ops.get(op_id) else {
                     continue;
                 };
+                if op
+                    .attributes
+                    .get("castforge.structured_pruned")
+                    .and_then(|a| a.as_bool())
+                    == Some(true)
+                {
+                    continue;
+                }
                 let Some(StableHloOp::DotGeneral {
                     rhs,
                     result: dot_res,
@@ -287,7 +323,7 @@ impl Pass for PruneStructuredPass {
                 };
                 if w_ty.shape.len() != 2 {
                     continue;
-                }
+                };
                 let (Dim::Static(rows_i64), Dim::Static(cols_i64)) =
                     (&w_ty.shape[0], &w_ty.shape[1])
                 else {
@@ -353,6 +389,10 @@ impl Pass for PruneStructuredPass {
                 module
                     .tensor_store
                     .insert(TensorEntry::from_f32(store_key, new_w_ty, pruned_vals));
+                module.ops[op_id].attributes.insert(
+                    "castforge.structured_pruned".to_string(),
+                    Attribute::Bool(true),
+                );
 
                 if let Some(mut dot_out_ty) = module.values[dot_res].ty.as_tensor().cloned() {
                     if let Some(last_dim) = dot_out_ty.shape.last_mut() {
@@ -362,19 +402,46 @@ impl Pass for PruneStructuredPass {
                     module.values[dot_res].ty = updated_out_ty.clone();
 
                     for fn_op_id in module.functions() {
-                        if let Some(Attribute::Type(Type::Function { inputs, results })) = module
-                            .ops[fn_op_id]
+                        let Some(&reg_id) = module.ops[fn_op_id].regions.first() else {
+                            continue;
+                        };
+                        let Some(&fn_blk_id) = module.regions[reg_id].blocks.first() else {
+                            continue;
+                        };
+                        let Some(&ret_op_id) = module.blocks[fn_blk_id].ops.last() else {
+                            continue;
+                        };
+                        let Some(ret_op) = module.ops.get(ret_op_id) else {
+                            continue;
+                        };
+                        if !ret_op.is_op("func", "return") {
+                            continue;
+                        }
+                        let ret_indices: Vec<usize> = ret_op
+                            .operands
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(idx, &opnd)| (opnd == dot_res).then_some(idx))
+                            .collect();
+                        if ret_indices.is_empty() {
+                            continue;
+                        }
+                        if let Some(Attribute::Type(Type::Function {
+                            inputs,
+                            mut results,
+                        })) = module.ops[fn_op_id]
                             .attributes
                             .get("function_type")
                             .cloned()
-                            && results.len() == 1
                         {
+                            for idx in ret_indices {
+                                if idx < results.len() {
+                                    results[idx] = updated_out_ty.clone();
+                                }
+                            }
                             module.ops[fn_op_id].attributes.insert(
                                 "function_type".to_string(),
-                                Attribute::Type(Type::Function {
-                                    inputs,
-                                    results: vec![updated_out_ty.clone()],
-                                }),
+                                Attribute::Type(Type::Function { inputs, results }),
                             );
                         }
                     }
@@ -411,7 +478,10 @@ impl Pass for Prune2To4Pass {
         let mut modified = 0usize;
         let mut rhs_weights: HashSet<ValueId> = HashSet::new();
 
-        for (_, op) in module.ops.iter_mut() {
+        for op_id in module.live_ops() {
+            let Some(op) = module.ops.get_mut(op_id) else {
+                continue;
+            };
             if op.is_op("stablehlo", "dot_general") && op.operands.len() >= 2 {
                 rhs_weights.insert(op.operands[1]);
                 if op.attributes.get("sparsity").and_then(|a| a.as_str()) != Some("2:4") {
@@ -426,6 +496,11 @@ impl Pass for Prune2To4Pass {
         for &vid in &rhs_weights {
             if let ValueDef::OpResult { op: prod_op, .. } = module.values[vid].def
                 && module.ops[prod_op].is_op("stablehlo", "constant")
+                && module.ops[prod_op]
+                    .attributes
+                    .get("castforge.sparsity")
+                    .and_then(|a| a.as_str())
+                    != Some("2:4")
             {
                 const_ops.push((prod_op, vid));
             }
@@ -443,29 +518,19 @@ impl Pass for Prune2To4Pass {
                 continue;
             };
             apply_2to4_mask(&mut vals);
-
-            match val_attr {
-                Attribute::TensorRef { key, ty } => {
-                    module.tensor_store.insert(TensorEntry::from_f32(
-                        key.clone(),
-                        TensorType::new(ty.shape.clone(), DType::F32),
-                        vals,
-                    ));
-                    modified += 1;
-                }
-                Attribute::DenseElements { ty, .. } => {
-                    let lit = format_dense_f32_literal(&vals, &ty.shape);
-                    module.ops[op_id].attributes.insert(
-                        "value".to_string(),
-                        Attribute::DenseElements {
-                            ty,
-                            raw_literal: lit,
-                        },
-                    );
-                    modified += 1;
-                }
-                _ => {}
-            }
+            let ssa_name = module.values[vid].ssa_name.clone();
+            let new_val_attr =
+                module
+                    .tensor_store
+                    .update_f32_constant(ssa_name.as_deref(), &val_attr, t_ty, vals);
+            module.ops[op_id]
+                .attributes
+                .insert("value".to_string(), new_val_attr);
+            module.ops[op_id].attributes.insert(
+                "castforge.sparsity".to_string(),
+                Attribute::String("2:4".to_string()),
+            );
+            modified += 1;
         }
 
         Ok(PassResult {

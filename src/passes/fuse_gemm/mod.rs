@@ -120,7 +120,7 @@ impl Pass for FuseDequantMatmulPass {
         }
         Ok(PassResult {
             pass_name: self.name().to_string(),
-            changed: created > 0,
+            changed: created > 0 || removed > 0,
             ops_removed: removed,
             ops_modified: 0,
             ops_created: created,
@@ -148,7 +148,7 @@ impl Pass for FuseMatmulEpiloguePass {
         }
         Ok(PassResult {
             pass_name: self.name().to_string(),
-            changed: created > 0,
+            changed: created > 0 || removed > 0,
             ops_removed: removed,
             ops_modified: 0,
             ops_created: created,
@@ -396,6 +396,7 @@ pub(crate) fn emit_horizontal_dot_group(
         op_mut.name = OpName::new("stablehlo", "slice");
         op_mut.operands = SmallVec::from_slice(&[dot_fused_val]);
         op_mut.attributes = slice_attrs;
+        op_mut.custom_syntax = true;
         let _ = cand.result_val;
         col_off += n_i64;
         modified += 1;

@@ -5,7 +5,9 @@
 use crate::codegen::{
     TargetConfig, build_memory_plan, sanitize_ident, tensor_len, tensor_shape_dims, value_ident,
 };
-use crate::ir::{LoopKernel, LoopModule, LoopStmt, Module, Payload, Translator, ValueId};
+use crate::ir::{
+    Attribute, LoopKernel, LoopModule, LoopStmt, Module, Payload, Translator, ValueId,
+};
 use anyhow::Result;
 use std::collections::HashMap;
 
@@ -163,9 +165,22 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                     .as_tensor()
                     .map(tensor_shape_dims)
                     .unwrap_or_else(|| vec![1, 1]);
+                let packed_rhs = op
+                    .attributes
+                    .get("packed_rhs")
+                    .is_some_and(|a| matches!(a, Attribute::Bool(true)))
+                    || op
+                        .attributes
+                        .get("rhs_contracting_dimensions")
+                        .and_then(|a| a.as_int_slice())
+                        .is_some_and(|v| v == [1]);
                 let m = *lhs_dims.first().unwrap_or(&1);
                 let k = *lhs_dims.get(1).unwrap_or(&1);
-                let n = *rhs_dims.get(1).unwrap_or(&1);
+                let n = if packed_rhs {
+                    *rhs_dims.first().unwrap_or(&1)
+                } else {
+                    *rhs_dims.get(1).unwrap_or(&1)
+                };
                 let tm = cfg.tile_m.max(1).min(m.max(1));
                 let tn = cfg.tile_n.max(1).min(n.max(1));
                 let tk = cfg.tile_k.max(1).min(k.max(1));
@@ -173,11 +188,38 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                     "GEMM {m}x{k}x{n} ({op_name}) tiles=({tm},{tn},{tk}) order={}",
                     cfg.loop_order.as_str()
                 )));
-                let rhs_term = if op_name == "fused_dequant_matmul" && op.operands.len() >= 3 {
-                    let sc = value_ident(module, op.operands[2], &mut names, &mut counter);
-                    format!("({rhs}[p * {n} + j] * {sc}[j])")
+                let raw_rhs_idx = if packed_rhs {
+                    format!("{rhs}[j * {k} + p]")
                 } else {
                     format!("{rhs}[p * {n} + j]")
+                };
+                let rhs_term = if op_name == "fused_dequant_matmul" && op.operands.len() >= 3 {
+                    let sc = value_ident(module, op.operands[2], &mut names, &mut counter);
+                    format!("({raw_rhs_idx} * {sc}[j])")
+                } else if op_name == "fused_qmatmul" {
+                    let q_sc: f32 = op
+                        .attributes
+                        .get("scale")
+                        .and_then(|a| match a {
+                            Attribute::Float(f) => Some(*f as f32),
+                            _ => None,
+                        })
+                        .unwrap_or(1.0);
+                    let q_zp: i64 = op
+                        .attributes
+                        .get("zero_point")
+                        .and_then(|a| match a {
+                            Attribute::Int(i) => Some(*i),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    if (q_sc - 1.0_f32).abs() > 1e-7 || q_zp != 0 {
+                        format!("(((float)({raw_rhs_idx} - {q_zp})) * {q_sc:.6}f)")
+                    } else {
+                        raw_rhs_idx
+                    }
+                } else {
+                    raw_rhs_idx
                 };
                 let init_assign = LoopStmt::Assign {
                     dst: dst.clone(),
@@ -220,7 +262,9 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                     body: vec![j_loop],
                 };
                 let mut i_body = vec![init_j_loop, p_loop];
-                if op_name == "fused_matmul_epilogue" && op.operands.len() >= 3 {
+                if matches!(op_name, "fused_matmul_epilogue" | "fused_qmatmul")
+                    && op.operands.len() >= 3
+                {
                     let bias = value_ident(module, op.operands[2], &mut names, &mut counter);
                     let act = op
                         .attributes
@@ -228,15 +272,31 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                         .or_else(|| op.attributes.get("activation"))
                         .and_then(|a| a.as_str())
                         .unwrap_or("none");
+                    let (base_act, has_res) = if let Some(stripped) = act.strip_suffix("_residual")
+                    {
+                        (stripped, true)
+                    } else {
+                        (act, false)
+                    };
                     let base = format!("({dst}[i * {n} + j] + {bias}[j])");
-                    let ep_expr = match act {
+                    let act_expr = match base_act {
                         "relu" | "bias_relu" => format!("fmaxf({base}, 0.0f)"),
                         "silu" | "bias_silu" => format!("({base} / (1.0f + expf(-{base})))"),
                         "gelu" | "bias_gelu" => {
                             format!("(0.5f * {base} * (1.0f + tanhf(0.79788456f * {base})))")
                         }
                         "tanh" | "bias_tanh" => format!("tanhf({base})"),
+                        "bias_scale" if op.operands.len() >= 4 => {
+                            let sc = value_ident(module, op.operands[3], &mut names, &mut counter);
+                            format!("({base} * {sc}[j])")
+                        }
                         _ => base,
+                    };
+                    let ep_expr = if has_res && let Some(&res_id) = op.operands.last() {
+                        let res = value_ident(module, res_id, &mut names, &mut counter);
+                        format!("({act_expr} + {res}[i * {n} + j])")
+                    } else {
+                        act_expr
                     };
                     i_body.push(LoopStmt::For {
                         var: "j".to_string(),

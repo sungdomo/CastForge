@@ -121,8 +121,9 @@ impl CsePass {
                 }
 
                 for &nested_reg in &op.regions {
+                    let mut child_env = block_env.clone();
                     let (rem, modif) =
-                        self.process_region(module, nested_reg, &mut block_env, value_leader);
+                        self.process_region(module, nested_reg, &mut child_env, value_leader);
                     removed += rem;
                     modified += modif;
                 }

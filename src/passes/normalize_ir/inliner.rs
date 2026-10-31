@@ -237,13 +237,14 @@ impl Pass for InlineCallsPass {
                         })
                         .collect();
 
+                    let cloned_regions = module.clone_regions_local(&src_op.regions, &mut val_map);
                     let cloned_id = module.add_operation(
                         block_id,
                         src_op.name.clone(),
                         mapped_operands,
                         res_types,
                         src_op.attributes.clone(),
-                        Vec::new(),
+                        cloned_regions,
                         src_op.custom_syntax,
                         src_op.location.clone(),
                     );

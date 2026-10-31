@@ -2,7 +2,7 @@
 
 use crate::ir::{
     Attribute, BlockId, DType, Dim, Location, Module, OpId, OpName, Operation, TensorType, Type,
-    Value, ValueDef, ValueId, format_dense_f32_literal,
+    Value, ValueDef, ValueId,
 };
 use crate::passes::{Pass, PassResult};
 use crate::stablehlo::StableHloOp;
@@ -265,7 +265,14 @@ impl Pass for RotateHadamardPass {
                 let Some(op) = module.ops.get(op_id).cloned() else {
                     continue;
                 };
-                if !op.is_op("stablehlo", "constant") || op.results.is_empty() {
+                if !op.is_op("stablehlo", "constant")
+                    || op.results.is_empty()
+                    || op
+                        .attributes
+                        .get("castforge.hadamard_rotated")
+                        .and_then(|a| a.as_bool())
+                        == Some(true)
+                {
                     continue;
                 }
                 let res_id = op.results[0];
@@ -274,7 +281,7 @@ impl Pass for RotateHadamardPass {
                 };
                 if t_ty.shape.len() != 2 {
                     continue;
-                }
+                };
                 let (Dim::Static(k_dim), Dim::Static(n_dim)) = (&t_ty.shape[0], &t_ty.shape[1])
                 else {
                     continue;
@@ -283,7 +290,7 @@ impl Pass for RotateHadamardPass {
                 let n = *n_dim as usize;
                 if k < 2 || n == 0 {
                     continue;
-                }
+                };
                 let Some(val_attr) = op.attributes.get("value").cloned() else {
                     continue;
                 };
@@ -318,13 +325,19 @@ impl Pass for RotateHadamardPass {
                     }
                 }
 
-                let new_val = Attribute::DenseElements {
-                    ty: t_ty.clone(),
-                    raw_literal: format_dense_f32_literal(&w_data, &t_ty.shape),
-                };
-                module.ops[op_id]
-                    .attributes
-                    .insert("value".to_string(), new_val);
+                let ssa = module.values[res_id].ssa_name.clone();
+                let new_val = module.tensor_store.update_f32_constant(
+                    ssa.as_deref(),
+                    &val_attr,
+                    t_ty,
+                    w_data,
+                );
+                let op_mut = &mut module.ops[op_id];
+                op_mut.attributes.insert("value".to_string(), new_val);
+                op_mut.attributes.insert(
+                    "castforge.hadamard_rotated".to_string(),
+                    Attribute::Bool(true),
+                );
                 for (_, user_op) in module.ops.iter_mut() {
                     if user_op.operands.contains(&res_id) {
                         user_op.attributes.insert(
@@ -417,7 +430,13 @@ pub(super) fn run_fp4_quantize(
             let Some(op) = module.ops.get(op_id).cloned() else {
                 continue;
             };
-            if !op.is_op("stablehlo", "constant") {
+            if !op.is_op("stablehlo", "constant")
+                || op
+                    .attributes
+                    .get("castforge.quant_scheme")
+                    .and_then(|a| a.as_str())
+                    == Some(scheme_label)
+            {
                 continue;
             }
             let Some(&res_id) = op.results.first() else {
@@ -452,10 +471,11 @@ pub(super) fn run_fp4_quantize(
                 }
             }
 
-            let new_val = Attribute::DenseElements {
-                ty: t_ty.clone(),
-                raw_literal: format_dense_f32_literal(&data, &t_ty.shape),
-            };
+            let ssa = module.values[res_id].ssa_name.clone();
+            let new_val =
+                module
+                    .tensor_store
+                    .update_f32_constant(ssa.as_deref(), &val_attr, t_ty, data);
             let op_mut = &mut module.ops[op_id];
             op_mut.attributes.insert("value".to_string(), new_val);
             op_mut.attributes.insert(
@@ -705,7 +725,14 @@ pub(super) fn run_qat_ste(module: &mut Module, bits: u8) -> Result<PassResult> {
             let Some(op) = module.ops.get(op_id).cloned() else {
                 continue;
             };
-            if !op.is_op("stablehlo", "constant") || op.results.is_empty() {
+            if !op.is_op("stablehlo", "constant")
+                || op.results.is_empty()
+                || op
+                    .attributes
+                    .get("castforge.qat_ste")
+                    .and_then(|a| a.as_bool())
+                    == Some(true)
+            {
                 continue;
             }
             let res_id = op.results[0];
@@ -732,15 +759,15 @@ pub(super) fn run_qat_ste(module: &mut Module, bits: u8) -> Result<PassResult> {
                 .map(|&v| (v / scale).round().clamp(qmin, qmax) * scale)
                 .collect();
 
-            let raw_literal = format_dense_f32_literal(&fake_quant, &t_ty.shape);
-            let op_mut = &mut module.ops[op_id];
-            op_mut.attributes.insert(
-                "value".to_string(),
-                Attribute::DenseElements {
-                    ty: t_ty,
-                    raw_literal,
-                },
+            let ssa = module.values[res_id].ssa_name.clone();
+            let new_val = module.tensor_store.update_f32_constant(
+                ssa.as_deref(),
+                &val_attr,
+                t_ty,
+                fake_quant,
             );
+            let op_mut = &mut module.ops[op_id];
+            op_mut.attributes.insert("value".to_string(), new_val);
             op_mut
                 .attributes
                 .insert("castforge.qat_ste".to_string(), Attribute::Bool(true));

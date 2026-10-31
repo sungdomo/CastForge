@@ -179,6 +179,19 @@ impl Default for LowerTensorCoresPass {
     }
 }
 
+fn set_attr_if_changed(
+    attrs: &mut indexmap::IndexMap<String, Attribute>,
+    key: &str,
+    val: Attribute,
+) -> bool {
+    if attrs.get(key) == Some(&val) {
+        false
+    } else {
+        attrs.insert(key.to_string(), val);
+        true
+    }
+}
+
 impl Pass for LowerTensorCoresPass {
     fn name(&self) -> &'static str {
         "lower-tensor-cores"
@@ -199,7 +212,11 @@ impl Pass for LowerTensorCoresPass {
             "ampere" | "wmma" => "nvcuda::wmma::mma_sync",
             _ => "wgmma.mma_async.sync.aligned",
         };
-        for (_, op) in module.ops.iter_mut() {
+        let live_ops = module.live_ops();
+        for op_id in live_ops {
+            let Some(op) = module.ops.get_mut(op_id) else {
+                continue;
+            };
             let is_gemm = op.is_op("stablehlo", "dot_general")
                 || (op.is_op("stablehlo", "composite")
                     && op
@@ -208,37 +225,49 @@ impl Pass for LowerTensorCoresPass {
                         .and_then(|a| a.as_str())
                         .is_some_and(|n| n.contains("matmul") || n.contains("attention")));
             if is_gemm {
-                op.attributes.insert(
-                    "castforge.tensor_core_arch".to_string(),
+                let mut changed_op = false;
+                changed_op |= set_attr_if_changed(
+                    &mut op.attributes,
+                    "castforge.tensor_core_arch",
                     Attribute::String(self.arch.clone()),
                 );
-                op.attributes.insert(
-                    "castforge.tensor_core_intrinsic".to_string(),
+                changed_op |= set_attr_if_changed(
+                    &mut op.attributes,
+                    "castforge.tensor_core_intrinsic",
                     Attribute::String(instr.to_string()),
                 );
-                op.attributes.insert(
-                    "castforge.mma_shape".to_string(),
+                changed_op |= set_attr_if_changed(
+                    &mut op.attributes,
+                    "castforge.mma_shape",
                     Attribute::DenseIntArray(vec![self.mma_m, self.mma_n, self.mma_k]),
                 );
                 if is_blackwell {
-                    op.attributes.insert(
-                        "castforge.tmem_allocated".to_string(),
+                    changed_op |= set_attr_if_changed(
+                        &mut op.attributes,
+                        "castforge.tmem_allocated",
                         Attribute::Bool(true),
                     );
-                    op.attributes.insert(
-                        "castforge.tmem_columns".to_string(),
+                    changed_op |= set_attr_if_changed(
+                        &mut op.attributes,
+                        "castforge.tmem_columns",
                         Attribute::Int(self.tmem_columns.max(64) as i64),
                     );
                 }
                 if self.warp_specialized || is_blackwell {
-                    op.attributes.insert(
-                        "castforge.warp_specialized".to_string(),
+                    changed_op |= set_attr_if_changed(
+                        &mut op.attributes,
+                        "castforge.warp_specialized",
                         Attribute::Bool(true),
                     );
-                    op.attributes
-                        .insert("castforge.tma_multicast".to_string(), Attribute::Bool(true));
+                    changed_op |= set_attr_if_changed(
+                        &mut op.attributes,
+                        "castforge.tma_multicast",
+                        Attribute::Bool(true),
+                    );
                 }
-                modified += 1;
+                if changed_op {
+                    modified += 1;
+                }
             }
         }
         Ok(PassResult {
@@ -301,31 +330,40 @@ impl Pass for TileLoopsPass {
                     continue;
                 }
                 let attrs = &mut module.ops[op_id].attributes;
+                let mut changed_op = false;
                 if self.tile_m > 0 && self.tile_n > 0 && self.tile_k > 0 {
-                    attrs.insert(
-                        "loop_tile_m".to_string(),
+                    changed_op |= set_attr_if_changed(
+                        attrs,
+                        "loop_tile_m",
                         Attribute::Int(self.tile_m as i64),
                     );
-                    attrs.insert(
-                        "loop_tile_n".to_string(),
+                    changed_op |= set_attr_if_changed(
+                        attrs,
+                        "loop_tile_n",
                         Attribute::Int(self.tile_n as i64),
                     );
-                    attrs.insert(
-                        "loop_tile_k".to_string(),
+                    changed_op |= set_attr_if_changed(
+                        attrs,
+                        "loop_tile_k",
                         Attribute::Int(self.tile_k as i64),
                     );
                 }
                 if self.l2_tile > 0 {
-                    attrs.insert(
-                        "loop_l2_tile".to_string(),
+                    changed_op |= set_attr_if_changed(
+                        attrs,
+                        "loop_l2_tile",
                         Attribute::Int(self.l2_tile as i64),
                     );
                 }
                 if self.reg_m > 1 && self.reg_n > 1 {
-                    attrs.insert("loop_reg_m".to_string(), Attribute::Int(self.reg_m as i64));
-                    attrs.insert("loop_reg_n".to_string(), Attribute::Int(self.reg_n as i64));
+                    changed_op |=
+                        set_attr_if_changed(attrs, "loop_reg_m", Attribute::Int(self.reg_m as i64));
+                    changed_op |=
+                        set_attr_if_changed(attrs, "loop_reg_n", Attribute::Int(self.reg_n as i64));
                 }
-                modified += 1;
+                if changed_op {
+                    modified += 1;
+                }
             }
         }
 
@@ -383,21 +421,24 @@ impl Pass for PermuteLoopsPass {
                     Some(StableHloOp::DotGeneral { .. })
                 );
                 let attrs = &mut module.ops[op_id].attributes;
+                let mut changed_op = false;
                 if is_gemm {
-                    attrs.insert(
-                        "loop_order".to_string(),
+                    changed_op |= set_attr_if_changed(
+                        attrs,
+                        "loop_order",
                         Attribute::String(self.order.to_ascii_lowercase()),
                     );
                     if self.skew {
-                        attrs.insert("loop_skew".to_string(), Attribute::Bool(true));
+                        changed_op |=
+                            set_attr_if_changed(attrs, "loop_skew", Attribute::Bool(true));
                     }
-                    modified += 1;
                 }
                 if self.collapse {
-                    attrs.insert("loop_collapse".to_string(), Attribute::Bool(true));
-                    if !is_gemm {
-                        modified += 1;
-                    }
+                    changed_op |=
+                        set_attr_if_changed(attrs, "loop_collapse", Attribute::Bool(true));
+                }
+                if changed_op {
+                    modified += 1;
                 }
             }
         }
@@ -458,28 +499,35 @@ impl Pass for UnrollLoopsPass {
                     continue;
                 }
                 let attrs = &mut module.ops[op_id].attributes;
+                let mut changed_op = false;
                 if self.factor > 1 {
-                    attrs.insert(
-                        "loop_unroll".to_string(),
+                    changed_op |= set_attr_if_changed(
+                        attrs,
+                        "loop_unroll",
                         Attribute::Int(self.factor as i64),
                     );
                 }
                 if self.prefetch > 0 {
-                    attrs.insert(
-                        "loop_prefetch".to_string(),
+                    changed_op |= set_attr_if_changed(
+                        attrs,
+                        "loop_prefetch",
                         Attribute::Int(self.prefetch as i64),
                     );
                 }
                 if self.split_k > 1 {
-                    attrs.insert(
-                        "loop_split_k".to_string(),
+                    changed_op |= set_attr_if_changed(
+                        attrs,
+                        "loop_split_k",
                         Attribute::Int(self.split_k as i64),
                     );
                 }
                 if self.double_buffer {
-                    attrs.insert("loop_double_buffer".to_string(), Attribute::Bool(true));
+                    changed_op |=
+                        set_attr_if_changed(attrs, "loop_double_buffer", Attribute::Bool(true));
                 }
-                modified += 1;
+                if changed_op {
+                    modified += 1;
+                }
             }
         }
 
@@ -533,18 +581,24 @@ impl Pass for VectorizeLoopsPass {
                     continue;
                 }
                 let attrs = &mut module.ops[op_id].attributes;
-                attrs.insert("simd_vectorize".to_string(), Attribute::Bool(true));
-                attrs.insert("simd_width".to_string(), Attribute::Int(self.width as i64));
+                let mut changed_op = false;
+                changed_op |= set_attr_if_changed(attrs, "simd_vectorize", Attribute::Bool(true));
+                changed_op |=
+                    set_attr_if_changed(attrs, "simd_width", Attribute::Int(self.width as i64));
                 if !self.isa.is_empty() && self.isa != "scalar" {
-                    attrs.insert(
-                        "simd_isa".to_string(),
+                    changed_op |= set_attr_if_changed(
+                        attrs,
+                        "simd_isa",
                         Attribute::String(self.isa.to_ascii_lowercase()),
                     );
                 }
                 if self.parallel {
-                    attrs.insert("loop_parallel".to_string(), Attribute::Bool(true));
+                    changed_op |=
+                        set_attr_if_changed(attrs, "loop_parallel", Attribute::Bool(true));
                 }
-                modified += 1;
+                if changed_op {
+                    modified += 1;
+                }
             }
         }
 

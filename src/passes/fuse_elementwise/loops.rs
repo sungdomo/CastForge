@@ -49,14 +49,6 @@ impl Pass for FuseLoopsPass {
 
 fn fuse_block_elementwise_chains(module: &mut Module, block_id: BlockId) -> usize {
     let op_ids = module.blocks[block_id].ops.clone();
-    let mut use_counts: HashMap<ValueId, usize> = HashMap::new();
-    for &op_id in &op_ids {
-        if let Some(op) = module.ops.get(op_id) {
-            for &v in &op.operands {
-                *use_counts.entry(v).or_insert(0) += 1;
-            }
-        }
-    }
 
     let mut def_op: HashMap<ValueId, OpId> = HashMap::new();
     for &op_id in &op_ids {
@@ -75,7 +67,7 @@ fn fuse_block_elementwise_chains(module: &mut Module, block_id: BlockId) -> usiz
         let out_ty = &module.values[module.ops[op_id].results[0]].ty;
         for &inp in &module.ops[op_id].operands {
             if let Some(&prod_op_id) = def_op.get(&inp)
-                && use_counts.get(&inp).copied().unwrap_or(0) == 1
+                && module.use_count(inp) == 1
                 && &module.values[inp].ty == out_ty
             {
                 consumed_internally.insert(prod_op_id);
@@ -245,7 +237,10 @@ impl Pass for SplitLoopsPass {
 
                 let out_ty = module.values[results[0]].ty.clone();
                 let mut step_val_map: Vec<Option<ValueId>> = vec![None; raw_steps.len()];
-                let chunks: Vec<&[&str]> = raw_steps.chunks(limit).collect();
+                let chunks = partition_steps_into_chunks(&raw_steps, limit);
+                if chunks.len() <= 1 {
+                    continue;
+                }
                 let mut global_step_offset = 0usize;
 
                 for (chunk_idx, chunk) in chunks.iter().enumerate() {
@@ -286,6 +281,40 @@ impl Pass for SplitLoopsPass {
             ops_created: created,
         })
     }
+}
+
+fn partition_steps_into_chunks<'a>(raw_steps: &'a [&'a str], limit: usize) -> Vec<&'a [&'a str]> {
+    let n = raw_steps.len();
+    let mut last_user: Vec<usize> = (0..n).collect();
+    for (j, &spec) in raw_steps.iter().enumerate() {
+        if let Some((_, rest)) = spec.split_once('(') {
+            let args_part = rest.trim_end_matches(')');
+            for tok in args_part.split(',').filter(|s| !s.is_empty()) {
+                if let Some(s_idx_str) = tok.strip_prefix('s')
+                    && let Ok(i) = s_idx_str.parse::<usize>()
+                    && i < j
+                {
+                    last_user[i] = last_user[i].max(j);
+                }
+            }
+        }
+    }
+
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    while start < n {
+        let max_end = (start + limit).min(n) - 1;
+        let mut chosen_end = start;
+        for cand_end in (start..=max_end).rev() {
+            if cand_end + 1 == n || (start..cand_end).all(|k| last_user[k] <= cand_end) {
+                chosen_end = cand_end;
+                break;
+            }
+        }
+        chunks.push(&raw_steps[start..=chosen_end]);
+        start = chosen_end + 1;
+    }
+    chunks
 }
 
 fn remap_chunk_steps(

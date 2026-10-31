@@ -477,10 +477,41 @@ pub(super) fn register_lowering_passes(reg: &mut PassRegistry) {
                 .get("dedup")
                 .map(|s| s != "false" && s != "0")
                 .unwrap_or(true);
+            let first = opts.get("first").cloned().unwrap_or_default();
+            let second = opts.get("second").cloned().unwrap_or_default();
+            let entry_name = opts
+                .get("entry")
+                .or_else(|| opts.get("name"))
+                .cloned()
+                .unwrap_or_else(|| "composed_main".to_string());
+            let repeat = opts
+                .get("repeat")
+                .or_else(|| opts.get("count"))
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1);
+            let target = opts
+                .get("target")
+                .or_else(|| opts.get("output"))
+                .cloned()
+                .unwrap_or_default();
+            let stop_at = opts
+                .get("stop_at")
+                .or_else(|| opts.get("inputs"))
+                .cloned()
+                .unwrap_or_default();
+            let max_ops = opts.get("max_ops").and_then(|s| s.parse::<usize>().ok());
+            let keep_op = opts.get("keep_op").cloned().unwrap_or_default();
             Ok(Box::new(OutlineSubgraphsPass {
                 mode,
                 dedup,
-                ..Default::default()
+                first,
+                second,
+                entry_name,
+                repeat,
+                target,
+                stop_at,
+                max_ops,
+                keep_op,
             }))
         },
     );
@@ -498,10 +529,13 @@ pub(super) fn register_lowering_passes(reg: &mut PassRegistry) {
                 .or_else(|| opts.get("inputs"))
                 .cloned()
                 .unwrap_or_default();
+            let max_ops = opts.get("max_ops").and_then(|s| s.parse::<usize>().ok());
+            let keep_op = opts.get("keep_op").cloned().unwrap_or_default();
             Ok(Box::new(ExtractSubgraphPass {
                 target,
                 stop_at,
-                ..Default::default()
+                max_ops,
+                keep_op,
             }))
         },
     );

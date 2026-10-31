@@ -136,21 +136,27 @@ impl Pass for TopologicalSortPass {
                 schedule_dfs(module, &orig_ops)
             };
 
-            if sorted != orig_ops || min_mem {
-                if min_mem
-                    && let Some(&target_op) = sorted.iter().rev().find(|&&id| {
-                        module.ops.get(id).is_some_and(|o| {
-                            !o.is_op("func", "return")
-                                && !o.is_op("stablehlo", "return")
-                                && !o.is_op("stablehlo", "constant")
-                        })
+            let mut attr_added = false;
+            if min_mem
+                && let Some(&target_op) = sorted.iter().rev().find(|&&id| {
+                    module.ops.get(id).is_some_and(|o| {
+                        !o.is_op("func", "return")
+                            && !o.is_op("stablehlo", "return")
+                            && !o.is_op("stablehlo", "constant")
                     })
-                {
-                    module.ops[target_op].attributes.insert(
+                })
+                && module.ops[target_op]
+                    .attributes
+                    .insert(
                         "castforge.min_memory_scheduled".to_string(),
                         Attribute::Bool(true),
-                    );
-                }
+                    )
+                    .is_none()
+            {
+                attr_added = true;
+            }
+
+            if sorted != orig_ops || attr_added {
                 module.blocks[block_id].ops = sorted;
                 modified += 1;
             }
@@ -158,10 +164,16 @@ impl Pass for TopologicalSortPass {
 
         if min_mem {
             for fn_id in module.functions() {
-                module.ops[fn_id].attributes.insert(
-                    "castforge.min_memory_scheduled".to_string(),
-                    Attribute::Bool(true),
-                );
+                if module.ops[fn_id]
+                    .attributes
+                    .insert(
+                        "castforge.min_memory_scheduled".to_string(),
+                        Attribute::Bool(true),
+                    )
+                    .is_none()
+                {
+                    modified += 1;
+                }
             }
         }
 
@@ -173,6 +185,32 @@ impl Pass for TopologicalSortPass {
             ops_created: 0,
         })
     }
+}
+
+fn collect_op_operands(module: &Module, op_id: OpId) -> Vec<ValueId> {
+    let mut vals = Vec::new();
+    let Some(op) = module.ops.get(op_id) else {
+        return vals;
+    };
+    vals.extend(op.operands.iter().copied());
+    let mut region_stack = op.regions.clone();
+    while let Some(reg_id) = region_stack.pop() {
+        let Some(reg) = module.regions.get(reg_id) else {
+            continue;
+        };
+        for &blk_id in &reg.blocks {
+            let Some(blk) = module.blocks.get(blk_id) else {
+                continue;
+            };
+            for &inner_op_id in &blk.ops {
+                if let Some(inner_op) = module.ops.get(inner_op_id) {
+                    vals.extend(inner_op.operands.iter().copied());
+                    region_stack.extend(inner_op.regions.iter().copied());
+                }
+            }
+        }
+    }
+    vals
 }
 
 fn schedule_dfs(module: &Module, orig_ops: &[OpId]) -> Vec<OpId> {
@@ -191,13 +229,11 @@ fn schedule_dfs(module: &Module, orig_ops: &[OpId]) -> Vec<OpId> {
         if !visited.insert(op_id) {
             return;
         }
-        if let Some(op) = module.ops.get(op_id) {
-            for &operand in &op.operands {
-                if let ValueDef::OpResult { op: prod_op, .. } = module.values[operand].def
-                    && block_op_set.contains(&prod_op)
-                {
-                    visit(prod_op, module, block_op_set, visited, sorted);
-                }
+        for operand in collect_op_operands(module, op_id) {
+            if let ValueDef::OpResult { op: prod_op, .. } = module.values[operand].def
+                && block_op_set.contains(&prod_op)
+            {
+                visit(prod_op, module, block_op_set, visited, sorted);
             }
         }
         sorted.push(op_id);
@@ -240,9 +276,9 @@ fn schedule_min_memory(module: &Module, orig_ops: &[OpId]) -> Vec<OpId> {
 
     for &op_id in &non_term_ops {
         in_degree.insert(op_id, 0);
-        if let Some(op) = module.ops.get(op_id) {
+        if module.ops.contains_key(op_id) {
             let mut preds: HashSet<OpId> = HashSet::new();
-            for &v in &op.operands {
+            for v in collect_op_operands(module, op_id) {
                 *remaining_uses.entry(v).or_insert(0) += 1;
                 if let ValueDef::OpResult { op: prod_op, .. } = module.values[v].def
                     && block_op_set.contains(&prod_op)
@@ -258,10 +294,8 @@ fn schedule_min_memory(module: &Module, orig_ops: &[OpId]) -> Vec<OpId> {
         }
     }
     for &term_id in &terminators {
-        if let Some(op) = module.ops.get(term_id) {
-            for &v in &op.operands {
-                *remaining_uses.entry(v).or_insert(0) += 1;
-            }
+        for v in collect_op_operands(module, term_id) {
+            *remaining_uses.entry(v).or_insert(0) += 1;
         }
     }
 
@@ -287,7 +321,7 @@ fn schedule_min_memory(module: &Module, orig_ops: &[OpId]) -> Vec<OpId> {
                 op.results.iter().map(|&r| val_bytes(module, r)).sum()
             };
             let mut freed_bytes: i64 = 0;
-            for &v in &op.operands {
+            for v in collect_op_operands(module, op_id) {
                 if remaining_uses.get(&v).copied().unwrap_or(0) == 1 {
                     freed_bytes += val_bytes(module, v);
                 }
@@ -304,11 +338,9 @@ fn schedule_min_memory(module: &Module, orig_ops: &[OpId]) -> Vec<OpId> {
         let chosen = ready.remove(0);
         scheduled.push(chosen);
 
-        if let Some(op) = module.ops.get(chosen) {
-            for &v in &op.operands {
-                if let Some(cnt) = remaining_uses.get_mut(&v) {
-                    *cnt = cnt.saturating_sub(1);
-                }
+        for v in collect_op_operands(module, chosen) {
+            if let Some(cnt) = remaining_uses.get_mut(&v) {
+                *cnt = cnt.saturating_sub(1);
             }
         }
         if let Some(succs) = users.get(&chosen) {

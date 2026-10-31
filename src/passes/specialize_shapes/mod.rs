@@ -126,17 +126,11 @@ pub(crate) fn specialize_and_resize_single_traversal(
         let args = module.blocks[block_id].arguments.clone();
         let ops = module.block_ops(block_id);
 
-        let mut weight_rhs_vals: HashSet<ValueId> = HashSet::new();
-        if new_batch.is_some() {
-            for &op_id in &ops {
-                if let Some(op) = module.ops.get(op_id)
-                    && op.is_op("stablehlo", "dot_general")
-                    && op.operands.len() >= 2
-                {
-                    weight_rhs_vals.insert(op.operands[1]);
-                }
-            }
-        }
+        let weight_rhs_vals: HashSet<ValueId> = if new_batch.is_some() {
+            collect_non_batch_weight_operands(module, &ops)
+        } else {
+            HashSet::new()
+        };
 
         if do_specialize {
             for &arg_val in &args {
@@ -483,14 +477,41 @@ fn infer_op_result_shape(
                 }
             }
             StableHloOp::Composite { name, inputs, .. } => {
-                if name == "castforge.fused_matmul_epilogue" && inputs.len() >= 2 {
+                if matches!(
+                    name.as_str(),
+                    "castforge.fused_matmul_epilogue" | "castforge.fused_qmatmul"
+                ) && inputs.len() >= 2
+                {
                     if let (Some(lt), Some(rt)) = (
                         module.values[inputs[0]].ty.as_tensor(),
                         module.values[inputs[1]].ty.as_tensor(),
                     ) && lt.shape.len() == 2
                         && rt.shape.len() == 2
                     {
-                        inferred_shape = Some(vec![lt.shape[0].clone(), rt.shape[1].clone()]);
+                        let packed = op
+                            .attributes
+                            .get("packed_rhs")
+                            .is_some_and(|a| matches!(a, Attribute::Bool(true)))
+                            || op
+                                .attributes
+                                .get("rhs_contracting_dimensions")
+                                .and_then(|a| a.as_int_slice())
+                                .is_some_and(|v| v == [1]);
+                        let n_dim = if packed {
+                            rt.shape[0].clone()
+                        } else {
+                            rt.shape[1].clone()
+                        };
+                        inferred_shape = Some(vec![lt.shape[0].clone(), n_dim]);
+                    }
+                } else if name == "castforge.fused_gated_mlp" && inputs.len() >= 4 {
+                    if let (Some(lt), Some(dt)) = (
+                        module.values[inputs[0]].ty.as_tensor(),
+                        module.values[inputs[3]].ty.as_tensor(),
+                    ) && lt.shape.len() == 2
+                        && dt.shape.len() == 2
+                    {
+                        inferred_shape = Some(vec![lt.shape[0].clone(), dt.shape[1].clone()]);
                     }
                 } else if let Some(&first_in) = inputs.first()
                     && let Some(in_t) = module.values[first_in].ty.as_tensor()
@@ -524,4 +545,63 @@ fn set_leading_dim(module: &mut Module, vid: ValueId, old_batch: i64, new_batch:
         return true;
     }
     false
+}
+
+pub(crate) fn collect_non_batch_weight_operands(
+    module: &Module,
+    ops: &[crate::ir::OpId],
+) -> HashSet<ValueId> {
+    let mut weight_rhs_vals = HashSet::new();
+    for &op_id in ops {
+        let Some(op) = module.ops.get(op_id) else {
+            continue;
+        };
+        if (op.is_op("stablehlo", "dot_general") || op.is_op("stablehlo", "convolution"))
+            && op.operands.len() >= 2
+        {
+            weight_rhs_vals.insert(op.operands[1]);
+        } else if op.is_op("stablehlo", "composite") {
+            let comp_name = op
+                .attributes
+                .get("name")
+                .and_then(|a| a.as_str())
+                .unwrap_or("");
+            match comp_name {
+                "castforge.fused_matmul_epilogue" | "castforge.fused_qmatmul" => {
+                    let has_res = op
+                        .attributes
+                        .get("epilogue")
+                        .and_then(|a| a.as_str())
+                        .is_some_and(|s| s.ends_with("_residual"));
+                    let end = if has_res {
+                        op.operands.len().saturating_sub(1)
+                    } else {
+                        op.operands.len()
+                    };
+                    for &w in op.operands.get(1..end).unwrap_or(&[]) {
+                        weight_rhs_vals.insert(w);
+                    }
+                }
+                "castforge.fused_gated_mlp"
+                | "castforge.fused_rmsnorm"
+                | "castforge.fused_layernorm" => {
+                    for &w in op.operands.get(1..).unwrap_or(&[]) {
+                        weight_rhs_vals.insert(w);
+                    }
+                }
+                "castforge.fused_residual_rmsnorm" => {
+                    for &w in op.operands.get(2..).unwrap_or(&[]) {
+                        weight_rhs_vals.insert(w);
+                    }
+                }
+                "castforge.fused_moe" => {
+                    for &w in op.operands.get(1..3).unwrap_or(&[]) {
+                        weight_rhs_vals.insert(w);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    weight_rhs_vals
 }

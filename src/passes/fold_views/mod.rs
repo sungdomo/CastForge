@@ -255,6 +255,8 @@ pub(crate) fn fold_all_views_single_pass(module: &mut Module) -> Result<(usize, 
                         continue;
                     };
                     let unary_name = module.ops[op_id].name.clone();
+                    let unary_custom = module.ops[op_id].custom_syntax;
+                    let bcast_custom = module.ops[bcast_id].custom_syntax;
                     let small_ty = module.values[small_x].ty.clone();
                     let big_ty = module.values[result].ty.clone();
                     if small_ty == big_ty {
@@ -265,6 +267,7 @@ pub(crate) fn fold_all_views_single_pass(module: &mut Module) -> Result<(usize, 
                     bcast_mut.name = unary_name;
                     bcast_mut.operands = SmallVec::from_slice(&[small_x]);
                     bcast_mut.attributes.clear();
+                    bcast_mut.custom_syntax = unary_custom;
                     module.values[operand].ty = small_ty;
 
                     let unary_mut = &mut module.ops[op_id];
@@ -275,6 +278,7 @@ pub(crate) fn fold_all_views_single_pass(module: &mut Module) -> Result<(usize, 
                         "broadcast_dimensions".to_string(),
                         Attribute::DenseIntArray(broadcast_dimensions),
                     );
+                    unary_mut.custom_syntax = bcast_custom;
                     modified += 1;
                 }
 
@@ -326,6 +330,15 @@ pub(crate) fn fold_all_views_single_pass(module: &mut Module) -> Result<(usize, 
                             Attribute::DenseIntArray(limits.clone()),
                         );
                         modified += 1;
+                    }
+
+                    if starts.iter().all(|&s| s == 0)
+                        && module.values[cur_operand].ty == module.values[result].ty
+                    {
+                        module.replace_all_uses(result, cur_operand);
+                        dead_ops.insert(op_id);
+                        removed += 1;
+                        continue;
                     }
 
                     if let ValueDef::OpResult { op: prod_id, .. } = module.values[cur_operand].def
@@ -425,8 +438,23 @@ pub(crate) fn fold_all_views_single_pass(module: &mut Module) -> Result<(usize, 
                             prod_op.attributes.get("value")
                         && !raw_literal.trim().starts_with('[')
                         && let Some(res_ty) = module.values[result].ty.as_tensor().cloned()
+                        && let Ok(val) = raw_literal.trim().parse::<f64>()
                     {
-                        let lit = raw_literal.clone();
+                        let lit = if res_ty.dtype.is_float() {
+                            if raw_literal.contains('.') || raw_literal.contains('e') {
+                                raw_literal.clone()
+                            } else {
+                                format!("{val:.1}")
+                            }
+                        } else if res_ty.dtype == DType::I1 {
+                            if val != 0.0 {
+                                "true".to_string()
+                            } else {
+                                "false".to_string()
+                            }
+                        } else {
+                            format!("{}", val as i64)
+                        };
                         let op_mut = &mut module.ops[op_id];
                         op_mut.name = OpName::new("stablehlo", "constant");
                         op_mut.operands.clear();
@@ -504,6 +532,7 @@ fn try_sink_transpose_through_elementwise(
             op_mut.name = prod_op.name;
             op_mut.operands = SmallVec::from_slice(&[tx]);
             op_mut.attributes = prod_op.attributes;
+            op_mut.custom_syntax = prod_op.custom_syntax;
             dead_ops.insert(prod_op_id);
             *modified += 1;
             *removed += 1;
@@ -526,13 +555,18 @@ fn try_sink_transpose_through_elementwise(
                 created,
                 modified,
             );
-            let trhs = insert_folded_transpose_before(
-                module, block_id, op_id, rhs, perm, trans_ty, dead_ops, created, modified,
-            );
+            let trhs = if rhs == lhs {
+                tlhs
+            } else {
+                insert_folded_transpose_before(
+                    module, block_id, op_id, rhs, perm, trans_ty, dead_ops, created, modified,
+                )
+            };
             let op_mut = &mut module.ops[op_id];
             op_mut.name = prod_op.name;
             op_mut.operands = SmallVec::from_slice(&[tlhs, trhs]);
             op_mut.attributes = prod_op.attributes;
+            op_mut.custom_syntax = prod_op.custom_syntax;
             dead_ops.insert(prod_op_id);
             *modified += 1;
             *removed += 1;

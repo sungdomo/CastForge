@@ -423,3 +423,226 @@ fn test_externalize_safetensors_roundtrip_and_weight_surgery() {
     assert_eq!(resolved_ext, vec![20.0, 30.0]);
     let _ = std::fs::remove_file(&tmp_path);
 }
+
+#[test]
+fn test_passes_audit_fixes() {
+    use castforge::codegen::{evaluate_module, verify_module_numerics};
+    let registry = PassRegistry::with_builtin_passes();
+
+    // 1. Reassociation with shared constant c2 must not corrupt other users of c2
+    let shared_reassoc_mlir = r#"
+module @shared_reassoc {
+  func.func @main(%x: tensor<1x2xf32>) -> tensor<1x2xf32> {
+    %c1 = stablehlo.constant dense<2.0> : tensor<1x2xf32>
+    %c2 = stablehlo.constant dense<3.0> : tensor<1x2xf32>
+    %t1 = stablehlo.add %x, %c1 : tensor<1x2xf32>
+    %t2 = stablehlo.add %t1, %c2 : tensor<1x2xf32>
+    %out = stablehlo.multiply %t2, %c2 : tensor<1x2xf32>
+    func.return %out : tensor<1x2xf32>
+  }
+}
+"#;
+    let orig_reassoc = parse_mlir(shared_reassoc_mlir).unwrap();
+    let mut opt_reassoc = orig_reassoc.clone();
+    PassManager::from_pipeline_str(&registry, "canonicalize")
+        .unwrap()
+        .run(&mut opt_reassoc)
+        .unwrap();
+    let rep = verify_module_numerics(&orig_reassoc, &opt_reassoc, 1e-5).unwrap();
+    assert!(rep.passed, "shared constant reassociation corrupted c2");
+
+    // 2. Non-zero maximum must NOT fuse into bias_relu; commuted maximum(0.0, dot+bias) MUST fuse
+    let non_zero_max_mlir = "\
+module @non_zero_max {
+  func.func @main(%x: tensor<2x2xf32>, %w: tensor<2x2xf32>, %b: tensor<2x2xf32>) \
+      -> tensor<2x2xf32> {
+    %c5 = stablehlo.constant dense<5.0> : tensor<2x2xf32>
+    %dot = stablehlo.dot_general %x, %w, contracting_dims = [1] x [0] \
+        : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+    %add = stablehlo.add %dot, %b : tensor<2x2xf32>
+    %max = stablehlo.maximum %add, %c5 : tensor<2x2xf32>
+    func.return %max : tensor<2x2xf32>
+  }
+}
+";
+    let orig_max = parse_mlir(non_zero_max_mlir).unwrap();
+    let mut opt_max = orig_max.clone();
+    PassManager::from_pipeline_str(&registry, "fuse-matmul-epilogue")
+        .unwrap()
+        .run(&mut opt_max)
+        .unwrap();
+    let max_printed = print_mlir(&opt_max);
+    assert!(
+        !max_printed.contains("bias_relu"),
+        "maximum with 5.0 must not fuse into bias_relu"
+    );
+    assert!(
+        verify_module_numerics(&orig_max, &opt_max, 1e-5)
+            .unwrap()
+            .passed
+    );
+
+    let commuted_relu_mlir = "\
+module @commuted_relu {
+  func.func @main(%x: tensor<2x2xf32>, %w: tensor<2x2xf32>, %b: tensor<2x2xf32>) \
+      -> tensor<2x2xf32> {
+    %z = stablehlo.constant dense<0.0> : tensor<2x2xf32>
+    %dot = stablehlo.dot_general %x, %w, contracting_dims = [1] x [0] \
+        : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+    %add = stablehlo.add %dot, %b : tensor<2x2xf32>
+    %max = stablehlo.maximum %z, %add : tensor<2x2xf32>
+    func.return %max : tensor<2x2xf32>
+  }
+}
+";
+    let mut opt_comm_relu = parse_mlir(commuted_relu_mlir).unwrap();
+    PassManager::from_pipeline_str(&registry, "fuse-matmul-epilogue")
+        .unwrap()
+        .run(&mut opt_comm_relu)
+        .unwrap();
+    assert!(print_mlir(&opt_comm_relu).contains("bias_relu"));
+
+    // 3. Order-independent transitive private call reachability in DCE
+    let call_chain_mlir = r#"
+module @call_chain {
+  func.func @main(%x: tensor<1x2xf32>) -> tensor<1x2xf32> {
+    %y = func.call @priv_a(%x) : (tensor<1x2xf32>) -> tensor<1x2xf32>
+    func.return %y : tensor<1x2xf32>
+  }
+  func.func private @priv_a(%a: tensor<1x2xf32>) -> tensor<1x2xf32> {
+    %b = func.call @priv_b(%a) : (tensor<1x2xf32>) -> tensor<1x2xf32>
+    func.return %b : tensor<1x2xf32>
+  }
+  func.func private @priv_b(%u: tensor<1x2xf32>) -> tensor<1x2xf32> {
+    %v = stablehlo.add %u, %u : tensor<1x2xf32>
+    func.return %v : tensor<1x2xf32>
+  }
+  func.func private @priv_dead(%d: tensor<1x2xf32>) -> tensor<1x2xf32> {
+    func.return %d : tensor<1x2xf32>
+  }
+}
+"#;
+    let mut call_mod = parse_mlir(call_chain_mlir).unwrap();
+    PassManager::from_pipeline_str(&registry, "dce")
+        .unwrap()
+        .run(&mut call_mod)
+        .unwrap();
+    let dce_printed = print_mlir(&call_mod);
+    assert!(dce_printed.contains("@priv_a"));
+    assert!(dce_printed.contains("@priv_b"));
+    assert!(!dce_printed.contains("@priv_dead"));
+    let out_vals = evaluate_module(&call_mod, &[vec![1.5, -2.0]]).unwrap();
+    assert_eq!(out_vals[0], vec![3.0, -4.0]);
+
+    // 4. DecomposeCompositesPass for bias_relu_residual & StripAttributesPass for schedule_loops
+    let res_epi_mlir = "\
+module @res_epi {
+  func.func @main(%x: tensor<2x2xf32>, %w: tensor<2x2xf32>, %b: tensor<2x2xf32>, \
+      %r: tensor<2x2xf32>) -> tensor<2x2xf32> {
+    %z = stablehlo.constant dense<0.0> : tensor<2x2xf32>
+    %dot = stablehlo.dot_general %x, %w, contracting_dims = [1] x [0] \
+        : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+    %add = stablehlo.add %dot, %b : tensor<2x2xf32>
+    %relu = stablehlo.maximum %add, %z : tensor<2x2xf32>
+    %out = stablehlo.add %relu, %r : tensor<2x2xf32>
+    func.return %out : tensor<2x2xf32>
+  }
+}
+";
+    let orig_res = parse_mlir(res_epi_mlir).unwrap();
+    let mut fused_res = orig_res.clone();
+    PassManager::from_pipeline_str(
+        &registry,
+        "fuse-matmul-epilogue,schedule-loops,decompose-composites,strip-attributes,normalize-ssa",
+    )
+    .unwrap()
+    .run(&mut fused_res)
+    .unwrap();
+    let stripped_printed = print_mlir(&fused_res);
+    assert!(!stripped_printed.contains("loop_tile_m"));
+    assert!(!stripped_printed.contains("simd_vectorize"));
+    assert!(
+        verify_module_numerics(&orig_res, &fused_res, 1e-5)
+            .unwrap()
+            .passed
+    );
+
+    // 5. SplitLoopsPass DAG cross-chunk reference preservation + FuseAddMax commuted
+    let dag_loop_mlir = "\
+module @dag_loop {
+  func.func @main(%x: tensor<2xf32>, %y: tensor<2xf32>) -> tensor<2xf32> {
+    %s0 = stablehlo.add %x, %y : tensor<2xf32>
+    %s1 = stablehlo.exponential %s0 : tensor<2xf32>
+    %s2 = stablehlo.multiply %s1, %y : tensor<2xf32>
+    %s3 = stablehlo.tanh %s2 : tensor<2xf32>
+    func.return %s3 : tensor<2xf32>
+  }
+}
+";
+    let orig_dag = parse_mlir(dag_loop_mlir).unwrap();
+    let mut split_dag = orig_dag.clone();
+    PassManager::from_pipeline_str(&registry, "fuse-loops,split-loops,decompose-composites")
+        .unwrap()
+        .run(&mut split_dag)
+        .unwrap();
+    assert!(
+        verify_module_numerics(&orig_dag, &split_dag, 1e-5)
+            .unwrap()
+            .passed
+    );
+
+    // 6. TopologicalSortPass min_memory idempotency & parameterize-constants -> freeze-inputs
+    let mut param_mod = parse_mlir(
+        "module @p {\n  func.func @main(%x: tensor<2xf32>) -> tensor<2xf32> {\n    \
+         %w = stablehlo.constant dense<[2.0, 3.0]> : tensor<2xf32>\n    \
+         %y = stablehlo.add %x, %w : tensor<2xf32>\n    \
+         func.return %y : tensor<2xf32>\n  }\n}\n",
+    )
+    .unwrap();
+    let orig_param = param_mod.clone();
+    PassManager::from_pipeline_str(&registry, "parameterize-constants,freeze-inputs")
+        .unwrap()
+        .run(&mut param_mod)
+        .unwrap();
+    assert!(
+        verify_module_numerics(&orig_param, &param_mod, 1e-5)
+            .unwrap()
+            .passed
+    );
+    let mut topo_pm =
+        PassManager::from_pipeline_str(&registry, "topological-sort(schedule=min_memory)").unwrap();
+    let r1 = topo_pm.run(&mut param_mod).unwrap();
+    assert!(r1[0].changed);
+    let r2 = topo_pm.run(&mut param_mod).unwrap();
+    assert!(!r2[0].changed);
+
+    // 7. Loop schedule pass idempotency and mma_tile / outline-subgraphs option wiring
+    let mut gemm_mod = parse_mlir(
+        "module @g {\n  func.func @main(%a: tensor<16x16xf32>, %b: tensor<16x16xf32>) \
+         -> tensor<16x16xf32> {\n    %0 = stablehlo.dot_general %a, %b, \
+         contracting_dims = [1] x [0] : (tensor<16x16xf32>, tensor<16x16xf32>) -> \
+         tensor<16x16xf32>\n    %1 = stablehlo.abs %0 : tensor<16x16xf32>\n    \
+         func.return %1 : tensor<16x16xf32>\n  }\n}\n",
+    )
+    .unwrap();
+    let mut sched_pm = PassManager::from_pipeline_str(
+        &registry,
+        "lower-tensor-cores(mma_tile=64x128x32),tile-loops,permute-loops,\
+         unroll-loops,vectorize-loops,pad-for-tiling",
+    )
+    .unwrap();
+    let s1 = sched_pm.run(&mut gemm_mod).unwrap();
+    assert!(s1.iter().all(|r| r.changed));
+    let s2 = sched_pm.run(&mut gemm_mod).unwrap();
+    assert!(s2.iter().all(|r| !r.changed));
+    assert!(gemm_mod.ops.values().any(|op| {
+        op.attributes.get("castforge.mma_shape")
+            == Some(&castforge::ir::Attribute::DenseIntArray(vec![64, 128, 32]))
+    }));
+
+    let mut sub_pm =
+        PassManager::from_pipeline_str(&registry, "outline-subgraphs(mode=extract,target=%0)")
+            .unwrap();
+    let sub_res = sub_pm.run(&mut gemm_mod).unwrap();
+    assert!(sub_res[0].changed);
+}

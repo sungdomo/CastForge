@@ -8,8 +8,7 @@ pub mod prune;
 pub use prune::*;
 
 use crate::ir::{
-    Attribute, BlockId, DType, Dim, Module, OpId, TensorBacking, TensorType, Type, ValueDef,
-    ValueId, format_dense_f32_literal,
+    Attribute, BlockId, DType, Dim, Module, OpId, TensorType, Type, ValueDef, ValueId,
 };
 use crate::passes::{DeadCodeEliminationPass, Pass, PassResult};
 use crate::stablehlo::StableHloOp;
@@ -243,23 +242,13 @@ fn try_fold_norm_weight_at_op(module: &mut Module, op_id: OpId) -> bool {
         }
     }
 
-    match &w_attr {
-        Attribute::TensorRef { key, .. } => {
-            if let Some(entry) = module.tensor_store.get_mut(key) {
-                entry.backing = TensorBacking::F32Data(w_vals);
-            }
-        }
-        _ => {
-            let raw_literal = format_dense_f32_literal(&w_vals, &w_ty.shape);
-            module.ops[w_op_id].attributes.insert(
-                "value".to_string(),
-                Attribute::DenseElements {
-                    ty: w_ty,
-                    raw_literal,
-                },
-            );
-        }
-    }
+    let ssa = module.values[rhs].ssa_name.clone();
+    let new_w_attr = module
+        .tensor_store
+        .update_f32_constant(ssa.as_deref(), &w_attr, w_ty, w_vals);
+    module.ops[w_op_id]
+        .attributes
+        .insert("value".to_string(), new_w_attr);
 
     module.ops[op_id].operands[0] = x_val;
     true
@@ -366,6 +355,9 @@ fn try_fold_bn_scale(
     scale_val: ValueId,
     mul_out: ValueId,
 ) -> Option<()> {
+    if module.use_count(linear_val) != 1 {
+        return None;
+    }
     let ValueDef::OpResult { op: lin_op_id, .. } = module.values[linear_val].def else {
         return None;
     };
@@ -381,6 +373,9 @@ fn try_fold_bn_scale(
     );
 
     let w_val = lin_op.operands[1];
+    if module.use_count(w_val) != 1 {
+        return None;
+    }
     let ValueDef::OpResult { op: w_op_id, .. } = module.values[w_val].def else {
         return None;
     };
@@ -445,18 +440,10 @@ fn try_fold_bn_scale(
         }
     }
 
-    let new_w_attr = match w_attr {
-        Attribute::TensorRef { key, ty } => {
-            if let Some(entry) = module.tensor_store.get_mut(&key) {
-                entry.backing = TensorBacking::F32Data(w_data);
-            }
-            Attribute::TensorRef { key, ty }
-        }
-        _ => Attribute::DenseElements {
-            ty: w_ty.clone(),
-            raw_literal: format_dense_f32_literal(&w_data, &w_ty.shape),
-        },
-    };
+    let ssa = module.values[w_val].ssa_name.clone();
+    let new_w_attr = module
+        .tensor_store
+        .update_f32_constant(ssa.as_deref(), &w_attr, w_ty, w_data);
     module.ops[w_op_id]
         .attributes
         .insert("value".to_string(), new_w_attr);
@@ -575,31 +562,16 @@ fn try_pack_weight_at_op(
             encoding: w_ty.encoding.clone(),
         };
 
-        match &w_attr {
-            Attribute::TensorRef { key, .. } => {
-                if let Some(entry) = module.tensor_store.get_mut(key) {
-                    entry.ty = packed_ty.clone();
-                    entry.backing = TensorBacking::F32Data(packed_vals);
-                }
-                module.ops[w_op_id].attributes.insert(
-                    "value".to_string(),
-                    Attribute::TensorRef {
-                        key: key.clone(),
-                        ty: packed_ty.clone(),
-                    },
-                );
-            }
-            _ => {
-                let raw_literal = format_dense_f32_literal(&packed_vals, &packed_ty.shape);
-                module.ops[w_op_id].attributes.insert(
-                    "value".to_string(),
-                    Attribute::DenseElements {
-                        ty: packed_ty.clone(),
-                        raw_literal,
-                    },
-                );
-            }
-        }
+        let ssa = module.values[rhs_val].ssa_name.clone();
+        let new_w_attr = module.tensor_store.update_f32_constant(
+            ssa.as_deref(),
+            &w_attr,
+            packed_ty.clone(),
+            packed_vals,
+        );
+        module.ops[w_op_id]
+            .attributes
+            .insert("value".to_string(), new_w_attr);
         module.values[rhs_val].ty = Type::Tensor(packed_ty);
         packed_const_ops.insert(w_op_id);
         modified += 1;

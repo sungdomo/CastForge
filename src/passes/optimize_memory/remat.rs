@@ -76,6 +76,9 @@ impl Pass for RematerializePass {
                 let Some(orig_op) = module.ops.get(def_op_id).cloned() else {
                     continue;
                 };
+                module.ops[def_op_id]
+                    .attributes
+                    .insert("castforge.remat_source".to_string(), Attribute::Bool(true));
                 let out_ty = module.values[old_val].ty.clone();
                 let mut new_attrs = orig_op.attributes.clone();
                 new_attrs.insert("rematerialized".to_string(), Attribute::Bool(true));
@@ -131,6 +134,7 @@ impl Pass for RematerializePass {
 fn is_cheap_remat_candidate(op: &Operation) -> bool {
     if op.name.dialect != "stablehlo"
         || op.attributes.contains_key("rematerialized")
+        || op.attributes.contains_key("castforge.remat_source")
         || op.operands.is_empty()
     {
         return false;
@@ -201,6 +205,7 @@ impl Pass for OffloadActivationsPass {
                     last_use_idx.insert(opnd, idx);
                 }
                 if !op.is_op("stablehlo", "constant")
+                    && !op.attributes.contains_key("castforge.offloaded")
                     && !(op.is_op("stablehlo", "composite")
                         && op.attributes.get("name").and_then(|a| a.as_str())
                             == Some("castforge.host_offload"))
@@ -221,6 +226,9 @@ impl Pass for OffloadActivationsPass {
             }
 
             for (orig_res, prod_op, span) in candidates {
+                module.ops[prod_op]
+                    .attributes
+                    .insert("castforge.offloaded".to_string(), Attribute::Bool(true));
                 let res_ty = module.values[orig_res].ty.clone();
                 let base_ssa = module.values[orig_res]
                     .ssa_name
@@ -284,7 +292,10 @@ pub(super) fn run_selective_remat(module: &mut Module, min_distance: usize) -> R
     let remat_res = RematerializePass { min_distance }.run(module)?;
     let mut modified = remat_res.ops_modified;
 
-    for (_, op) in module.ops.iter_mut() {
+    for op_id in module.live_ops() {
+        let Some(op) = module.ops.get_mut(op_id) else {
+            continue;
+        };
         if op.is_op("stablehlo", "constant")
             || op.is_op("func", "func")
             || op.is_op("func", "return")
@@ -304,11 +315,13 @@ pub(super) fn run_selective_remat(module: &mut Module, min_distance: usize) -> R
         } else {
             "recompute"
         };
-        op.attributes.insert(
+        if op.attributes.insert(
             "castforge.selective_remat".to_string(),
             Attribute::String(policy.to_string()),
-        );
-        modified += 1;
+        ) != Some(Attribute::String(policy.to_string()))
+        {
+            modified += 1;
+        }
     }
 
     Ok(PassResult {

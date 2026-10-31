@@ -191,6 +191,21 @@ fn annotate_block_inplace_and_concat(
         for &operand_id in &module.ops[op_id].operands {
             seen_later_use.insert(operand_id);
         }
+        let mut reg_stack = module.ops[op_id].regions.clone();
+        while let Some(reg_id) = reg_stack.pop() {
+            if let Some(reg) = module.regions.get(reg_id) {
+                for &blk_id in &reg.blocks {
+                    if let Some(blk) = module.blocks.get(blk_id) {
+                        for &inner_op_id in &blk.ops {
+                            if let Some(inner_op) = module.ops.get(inner_op_id) {
+                                seen_later_use.extend(inner_op.operands.iter().copied());
+                                reg_stack.extend(inner_op.regions.iter().copied());
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     modified
@@ -279,20 +294,23 @@ fn try_eliminate_concat_copy_at_op(module: &mut Module, op_id: OpId) -> usize {
             && prod_op.is_pure()
             && !prod_op.is_op("stablehlo", "constant")
         {
-            prod_op.attributes.insert(
+            let mut ch = false;
+            ch |= prod_op.attributes.insert(
                 "castforge.concat_dest".to_string(),
                 Attribute::String(dest_name.clone()),
-            );
-            prod_op.attributes.insert(
+            ) != Some(Attribute::String(dest_name.clone()));
+            ch |= prod_op.attributes.insert(
                 "castforge.concat_axis".to_string(),
                 Attribute::Int(dimension),
-            );
-            prod_op.attributes.insert(
+            ) != Some(Attribute::Int(dimension));
+            ch |= prod_op.attributes.insert(
                 "castforge.concat_elem_offset".to_string(),
                 Attribute::Int(elem_offset),
-            );
+            ) != Some(Attribute::Int(elem_offset));
             routed_any = true;
-            modified += 1;
+            if ch {
+                modified += 1;
+            }
         }
         elem_offset += inp_elems;
     }

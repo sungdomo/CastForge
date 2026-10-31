@@ -552,24 +552,26 @@ impl Pass for QuantizeGroupwisePass {
                     }
                 }
 
-                let new_val = match val_attr {
-                    Attribute::TensorRef { key, ty } => {
-                        if let Some(entry) = module.tensor_store.get_mut(&key) {
-                            entry.backing = TensorBacking::F32Data(deq_f32);
-                        }
-                        Attribute::TensorRef { key, ty }
-                    }
-                    _ => Attribute::DenseElements {
-                        ty: t_ty.clone(),
-                        raw_literal: format_dense_f32_literal(&deq_f32, &t_ty.shape),
-                    },
-                };
-
                 let scheme_str = if self.awq_salient {
                     "awq_groupwise"
                 } else {
                     "gptq_groupwise"
                 };
+                if op
+                    .attributes
+                    .get("castforge.quant_scheme")
+                    .and_then(|a| a.as_str())
+                    == Some(scheme_str)
+                {
+                    continue;
+                }
+                let ssa = module.values[res_id].ssa_name.clone();
+                let new_val = module.tensor_store.update_f32_constant(
+                    ssa.as_deref(),
+                    &val_attr,
+                    t_ty,
+                    deq_f32,
+                );
                 let op_mut = &mut module.ops[op_id];
                 op_mut.attributes.insert("value".to_string(), new_val);
                 op_mut.attributes.insert(
@@ -672,7 +674,14 @@ impl Pass for QuantizeFp8Pass {
                 let Some(op) = module.ops.get(op_id).cloned() else {
                     continue;
                 };
-                if !op.is_op("stablehlo", "constant") || op.results.is_empty() {
+                if !op.is_op("stablehlo", "constant")
+                    || op.results.is_empty()
+                    || op
+                        .attributes
+                        .get("castforge.fp8_format")
+                        .and_then(|a| a.as_str())
+                        == Some(fmt_str)
+                {
                     continue;
                 }
                 let res_id = op.results[0];
@@ -710,13 +719,19 @@ impl Pass for QuantizeFp8Pass {
                     }
                 }
 
-                let new_val = Attribute::DenseElements {
-                    ty: t_ty.clone(),
-                    raw_literal: format_dense_f32_literal(&deq_f32, &t_ty.shape),
-                };
-                module.ops[op_id]
-                    .attributes
-                    .insert("value".to_string(), new_val);
+                let ssa = module.values[res_id].ssa_name.clone();
+                let new_val = module.tensor_store.update_f32_constant(
+                    ssa.as_deref(),
+                    &val_attr,
+                    t_ty,
+                    deq_f32,
+                );
+                let op_mut = &mut module.ops[op_id];
+                op_mut.attributes.insert("value".to_string(), new_val);
+                op_mut.attributes.insert(
+                    "castforge.fp8_format".to_string(),
+                    Attribute::String(fmt_str.to_string()),
+                );
                 for (_, user_op) in module.ops.iter_mut() {
                     if user_op.operands.contains(&res_id) {
                         user_op.attributes.insert(

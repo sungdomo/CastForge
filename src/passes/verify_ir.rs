@@ -23,7 +23,7 @@ impl Pass for VerifyShapesPass {
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         module.verify()?;
-        for (op_id, _) in &module.ops {
+        for op_id in module.live_ops() {
             if let Err(msg) = verify_stablehlo_shapes(module, op_id) {
                 return Err(anyhow!(msg));
             }
@@ -580,8 +580,12 @@ pub fn analyze_roofline(module: &Module, ridge_flops_per_byte: f64) -> RooflineS
     let mut total_params = 0i64;
     let mut total_flops = 0i64;
     let mut total_bytes = 0i64;
+    let live_ops = module.live_ops();
 
-    for (_, op) in &module.ops {
+    for &op_id in &live_ops {
+        let Some(op) = module.ops.get(op_id) else {
+            continue;
+        };
         if op.is_op("func", "func") || op.is_op("func", "return") {
             continue;
         }
@@ -611,7 +615,7 @@ pub fn analyze_roofline(module: &Module, ridge_flops_per_byte: f64) -> RooflineS
     };
 
     RooflineSummary {
-        total_ops: module.ops.len(),
+        total_ops: live_ops.len(),
         total_params,
         total_flops,
         total_bytes_transferred: total_bytes,
@@ -745,8 +749,10 @@ impl Pass for PrintOpStatsPass {
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let mut counts: IndexMap<String, usize> = IndexMap::new();
-        for (_, op) in &module.ops {
-            *counts.entry(op.name.to_string()).or_insert(0) += 1;
+        for op_id in module.live_ops() {
+            if let Some(op) = module.ops.get(op_id) {
+                *counts.entry(op.name.to_string()).or_insert(0) += 1;
+            }
         }
         let roof = analyze_roofline(module, self.ridge_flops_per_byte);
 
@@ -816,6 +822,7 @@ impl Pass for InstrumentProfilingPass {
                 };
                 if op.is_op("func", "return")
                     || op.is_op("stablehlo", "constant")
+                    || op.attributes.contains_key("castforge.profiled")
                     || (op.is_op("stablehlo", "composite")
                         && op.attributes.get("name").and_then(|a| a.as_str())
                             == Some("castforge.profile_region"))
@@ -832,6 +839,9 @@ impl Pass for InstrumentProfilingPass {
                 if !is_target || op.results.is_empty() {
                     continue;
                 }
+                module.ops[op_id]
+                    .attributes
+                    .insert("castforge.profiled".to_string(), Attribute::Bool(true));
 
                 let orig_res = op.results[0];
                 let res_ty = module.values[orig_res].ty.clone();

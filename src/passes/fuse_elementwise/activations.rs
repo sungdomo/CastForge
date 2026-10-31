@@ -299,6 +299,9 @@ pub fn match_silu_val(module: &Module, val_id: ValueId) -> Option<ValueId> {
         return None;
     };
     let sub_op = module.ops.get(sub_op_id)?;
+    if let Some(StableHloOp::Negate { operand, .. }) = StableHloOp::from_op(sub_op) {
+        return (operand == gate).then_some(gate);
+    }
     let StableHloOp::Subtract {
         lhs: zero_val,
         rhs: sub_rhs,

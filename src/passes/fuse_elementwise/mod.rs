@@ -275,21 +275,28 @@ pub(crate) fn try_fuse_add_max_at_op(module: &mut Module, block_id: BlockId, op_
         return false;
     };
 
-    let ValueDef::OpResult { op: add_op_id, .. } = module.values[lhs].def else {
-        return false;
-    };
-    if module.use_count(lhs) != 1 {
-        return false;
+    let mut matched = None;
+    for (add_cand, other_opnd) in [(lhs, rhs), (rhs, lhs)] {
+        let ValueDef::OpResult { op: add_op_id, .. } = module.values[add_cand].def else {
+            continue;
+        };
+        if module.use_count(add_cand) != 1 {
+            continue;
+        };
+        let Some(add_op) = module.ops.get(add_op_id) else {
+            continue;
+        };
+        if let Some(StableHloOp::Add {
+            lhs: add_a,
+            rhs: add_b,
+            ..
+        }) = StableHloOp::from_op(add_op)
+        {
+            matched = Some((add_op_id, add_a, add_b, other_opnd));
+            break;
+        }
     }
-    let Some(add_op) = module.ops.get(add_op_id) else {
-        return false;
-    };
-    let Some(StableHloOp::Add {
-        lhs: add_a,
-        rhs: add_b,
-        ..
-    }) = StableHloOp::from_op(add_op)
-    else {
+    let Some((add_op_id, add_a, add_b, clamp_opnd)) = matched else {
         return false;
     };
 
@@ -305,7 +312,7 @@ pub(crate) fn try_fuse_add_max_at_op(module: &mut Module, block_id: BlockId, op_
 
     let max_op_mut = &mut module.ops[op_id];
     max_op_mut.name = OpName::new("stablehlo", "composite");
-    max_op_mut.operands = SmallVec::from_slice(&[add_a, add_b, rhs]);
+    max_op_mut.operands = SmallVec::from_slice(&[add_a, add_b, clamp_opnd]);
     max_op_mut.attributes = attrs;
     let _ = max_res;
 

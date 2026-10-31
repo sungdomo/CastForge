@@ -1,9 +1,6 @@
 //! LoRA (`bake-lora`) and Weight-Decomposed Low-Rank Adaptation (`bake-dora`) baking passes.
 
-use crate::ir::{
-    Attribute, BlockId, DType, Dim, Module, TensorBacking, ValueDef, ValueId,
-    format_dense_f32_literal,
-};
+use crate::ir::{Attribute, BlockId, DType, Dim, Module, ValueDef, ValueId};
 use crate::passes::{DeadCodeEliminationPass, FoldConstantsPass, Pass, PassResult};
 use crate::stablehlo::StableHloOp;
 use anyhow::Result;
@@ -96,23 +93,14 @@ impl Pass for BakeLoraPass {
                 let Some(w_ty) = module.values[w_res_val].ty.as_tensor().cloned() else {
                     continue;
                 };
-                match &w_attr {
-                    Attribute::TensorRef { key, .. } => {
-                        if let Some(entry) = module.tensor_store.get_mut(key) {
-                            entry.backing = TensorBacking::F32Data(w_vals);
-                        }
-                    }
-                    _ => {
-                        let raw_literal = format_dense_f32_literal(&w_vals, &w_ty.shape);
-                        module.ops[w_op_id].attributes.insert(
-                            "value".to_string(),
-                            Attribute::DenseElements {
-                                ty: w_ty,
-                                raw_literal,
-                            },
-                        );
-                    }
-                }
+                let ssa = module.values[w_res_val].ssa_name.clone();
+                let new_w_attr =
+                    module
+                        .tensor_store
+                        .update_f32_constant(ssa.as_deref(), &w_attr, w_ty, w_vals);
+                module.ops[w_op_id]
+                    .attributes
+                    .insert("value".to_string(), new_w_attr);
 
                 module.replace_all_uses(add_res, base_dot_val);
                 module.remove_op(block_id, op_id);
@@ -153,6 +141,9 @@ fn match_base_and_lora(
     lora_cand: ValueId,
     default_alpha: f32,
 ) -> Option<LoraMatch> {
+    if module.use_count(base_cand) != 1 {
+        return None;
+    }
     let ValueDef::OpResult { op: base_op_id, .. } = module.values[base_cand].def else {
         return None;
     };
@@ -165,6 +156,9 @@ fn match_base_and_lora(
     else {
         return None;
     };
+    if module.use_count(w_val) != 1 {
+        return None;
+    }
     let (w_op_id, k, n) = const_2d_dims(module, w_val)?;
 
     let mut dot_b_val = lora_cand;
@@ -281,6 +275,45 @@ impl Pass for BakeDoraPass {
 }
 
 fn run_bake_dora(module: &mut Module, alpha: f32) -> Result<PassResult> {
+    let mut pre_mags: std::collections::HashMap<crate::ir::OpId, Vec<f32>> =
+        std::collections::HashMap::new();
+    for op_id in module.live_ops() {
+        let Some(op) = module.ops.get(op_id) else {
+            continue;
+        };
+        if !op.is_op("stablehlo", "constant") || op.results.is_empty() {
+            continue;
+        }
+        let res_id = op.results[0];
+        let Some(t_ty) = module.values[res_id].ty.as_tensor() else {
+            continue;
+        };
+        if t_ty.dtype != DType::F32 || t_ty.shape.len() != 2 {
+            continue;
+        }
+        let (Dim::Static(k), Dim::Static(n)) = (&t_ty.shape[0], &t_ty.shape[1]) else {
+            continue;
+        };
+        let (k, n) = (*k as usize, *n as usize);
+        if k == 0 || n == 0 {
+            continue;
+        }
+        if let Some(val_attr) = op.attributes.get("value")
+            && let Some(vals) = module.tensor_store.resolve_f32_attr(val_attr, k * n)
+        {
+            let mut mags = Vec::with_capacity(n);
+            for col in 0..n {
+                let mut sq_sum = 0.0_f32;
+                for row in 0..k {
+                    let v = vals[row * n + col];
+                    sq_sum += v * v;
+                }
+                mags.push(sq_sum.sqrt().max(1e-8));
+            }
+            pre_mags.insert(op_id, mags);
+        }
+    }
+
     let lora_res = BakeLoraPass { alpha }.run(module)?;
     let mut modified = lora_res.ops_modified;
     let blocks: Vec<BlockId> = module.blocks.keys().collect();
@@ -291,7 +324,14 @@ fn run_bake_dora(module: &mut Module, alpha: f32) -> Result<PassResult> {
             let Some(op) = module.ops.get(op_id).cloned() else {
                 continue;
             };
-            if !op.is_op("stablehlo", "constant") || op.results.is_empty() {
+            if !op.is_op("stablehlo", "constant")
+                || op.results.is_empty()
+                || op
+                    .attributes
+                    .get("castforge.dora_baked")
+                    .and_then(|a| a.as_bool())
+                    == Some(true)
+            {
                 continue;
             }
             let res_id = op.results[0];
@@ -315,6 +355,7 @@ fn run_bake_dora(module: &mut Module, alpha: f32) -> Result<PassResult> {
                 continue;
             };
 
+            let orig_mags = pre_mags.get(&op_id);
             let mut col_norms = Vec::with_capacity(n);
             for col in 0..n {
                 let mut sq_sum = 0.0_f32;
@@ -323,24 +364,23 @@ fn run_bake_dora(module: &mut Module, alpha: f32) -> Result<PassResult> {
                     sq_sum += v * v;
                 }
                 let norm = sq_sum.sqrt().max(1e-8);
-                col_norms.push(norm as f64);
-                // DoRA directional normalization + magnitude rescaling:
+                let mag = orig_mags.and_then(|m| m.get(col).copied()).unwrap_or(norm);
+                col_norms.push(mag as f64);
+                // DoRA directional normalization + pre-LoRA magnitude rescaling:
                 // W'_{:, j} = m_j * (V_{:, j} / ||V_{:, j}||_2)
                 for row in 0..k {
                     let dir = vals[row * n + col] / norm;
-                    vals[row * n + col] = norm * dir;
+                    vals[row * n + col] = mag * dir;
                 }
             }
 
-            let raw_literal = format_dense_f32_literal(&vals, &t_ty.shape);
+            let ssa = module.values[res_id].ssa_name.clone();
+            let new_val_attr =
+                module
+                    .tensor_store
+                    .update_f32_constant(ssa.as_deref(), &val_attr, t_ty, vals);
             let op_mut = &mut module.ops[op_id];
-            op_mut.attributes.insert(
-                "value".to_string(),
-                Attribute::DenseElements {
-                    ty: t_ty,
-                    raw_literal,
-                },
-            );
+            op_mut.attributes.insert("value".to_string(), new_val_attr);
             op_mut
                 .attributes
                 .insert("castforge.dora_baked".to_string(), Attribute::Bool(true));

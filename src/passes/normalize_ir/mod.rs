@@ -7,7 +7,9 @@ pub mod outline;
 pub use inliner::*;
 pub use outline::*;
 
-use crate::ir::{Attribute, DType, Location, Module, OpName, TensorType, Type, ValueDef, ValueId};
+use crate::ir::{
+    Attribute, DType, Location, Module, OpName, TensorEntry, TensorType, Type, ValueDef, ValueId,
+};
 use crate::passes::{Pass, PassResult};
 use anyhow::Result;
 use indexmap::IndexMap;
@@ -293,9 +295,20 @@ impl Pass for FreezeInputsPass {
                     ty: t_ty,
                 }
             } else {
+                let raw_literal = if t_ty.dtype.is_float() {
+                    format!("{:.4}", self.value)
+                } else if t_ty.dtype == DType::I1 {
+                    if self.value != 0.0 {
+                        "true".to_string()
+                    } else {
+                        "false".to_string()
+                    }
+                } else {
+                    format!("{}", self.value as i64)
+                };
                 Attribute::DenseElements {
                     ty: t_ty,
-                    raw_literal: format!("{:.4}", self.value),
+                    raw_literal,
                 }
             };
             let mut attrs = IndexMap::new();
@@ -387,6 +400,22 @@ impl Pass for ParameterizeConstantsPass {
                 .ssa_name
                 .clone()
                 .unwrap_or_else(|| format!("param_{hoisted}"));
+            if let Some(t_ty) = ty.as_tensor().cloned()
+                && let Some(val_attr) = op.attributes.get("value").cloned()
+                && let Some(vals) = module
+                    .tensor_store
+                    .resolve_f32_attr(&val_attr, elems.max(1) as usize)
+            {
+                if let Attribute::TensorRef { ref key, .. } = val_attr
+                    && key != &ssa
+                {
+                    module.tensor_store.rename_key(key, ssa.clone());
+                } else if module.tensor_store.get(&ssa).is_none() {
+                    module
+                        .tensor_store
+                        .insert(TensorEntry::from_f32(ssa.clone(), t_ty, vals));
+                }
+            }
             let new_arg = module.add_block_argument(block_id, Some(ssa), ty);
             module.replace_all_uses(res_val, new_arg);
             module.remove_op(block_id, op_id);
@@ -545,34 +574,10 @@ impl Pass for NormalizeSsaPass {
         let mut modified = 0usize;
 
         for fn_id in module.functions() {
-            let reg_id = module.ops[fn_id].regions[0];
-            let blk_id = module.regions[reg_id].blocks[0];
-            let args = module.blocks[blk_id].arguments.clone();
-            for (idx, arg_id) in args.into_iter().enumerate() {
-                let target_name = format!("arg{idx}");
-                if module.values[arg_id].ssa_name.as_deref() != Some(&target_name) {
-                    module.values[arg_id].ssa_name = Some(target_name);
-                    modified += 1;
-                }
-            }
-
-            let ops = module.blocks[blk_id].ops.clone();
+            let regions = module.ops[fn_id].regions.clone();
             let mut val_counter = 0usize;
-            for op_id in ops {
-                let results: Vec<ValueId> = module.ops[op_id].results.to_vec();
-                for res_id in results {
-                    let target_name = format!("{pfx}{val_counter}");
-                    val_counter += 1;
-                    if module.values[res_id].ssa_name.as_deref() != Some(&target_name) {
-                        module.values[res_id].ssa_name = Some(target_name);
-                        modified += 1;
-                    }
-                }
-                let mut pairs: Vec<(String, Attribute)> =
-                    module.ops[op_id].attributes.drain(..).collect();
-                pairs.sort_by(|a, b| a.0.cmp(&b.0));
-                let sorted: IndexMap<String, Attribute> = pairs.into_iter().collect();
-                module.ops[op_id].attributes = sorted;
+            for reg_id in regions {
+                normalize_region_ssa(module, reg_id, pfx, &mut val_counter, &mut modified);
             }
         }
 
@@ -583,6 +588,64 @@ impl Pass for NormalizeSsaPass {
             ops_modified: modified,
             ops_created: 0,
         })
+    }
+}
+
+fn normalize_region_ssa(
+    module: &mut Module,
+    reg_id: crate::ir::RegionId,
+    pfx: &str,
+    val_counter: &mut usize,
+    modified: &mut usize,
+) {
+    let Some(reg) = module.regions.get(reg_id) else {
+        return;
+    };
+    let blocks = reg.blocks.clone();
+    for blk_id in blocks {
+        let args = module.blocks[blk_id].arguments.clone();
+        for (idx, arg_id) in args.into_iter().enumerate() {
+            let target_name = format!("arg{idx}");
+            if module.values[arg_id].ssa_name.as_deref() != Some(&target_name) {
+                module.values[arg_id].ssa_name = Some(target_name);
+                *modified += 1;
+            }
+        }
+
+        let ops = module.blocks[blk_id].ops.clone();
+        for op_id in ops {
+            let is_const = module.ops[op_id].is_op("stablehlo", "constant");
+            let is_tensor_ref = matches!(
+                module.ops[op_id].attributes.get("value"),
+                Some(Attribute::TensorRef { .. })
+            );
+            let results: Vec<ValueId> = module.ops[op_id].results.to_vec();
+            for res_id in results {
+                let target_name = format!("{pfx}{}", *val_counter);
+                *val_counter += 1;
+                if module.values[res_id].ssa_name.as_deref() != Some(&target_name) {
+                    if is_const
+                        && !is_tensor_ref
+                        && let Some(old_name) = module.values[res_id].ssa_name.clone()
+                    {
+                        module
+                            .tensor_store
+                            .rename_key(&old_name, target_name.clone());
+                    }
+                    module.values[res_id].ssa_name = Some(target_name);
+                    *modified += 1;
+                }
+            }
+            let nested_regions = module.ops[op_id].regions.clone();
+            for nested_reg in nested_regions {
+                normalize_region_ssa(module, nested_reg, pfx, val_counter, modified);
+            }
+            let mut pairs: Vec<(String, Attribute)> =
+                module.ops[op_id].attributes.drain(..).collect();
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            let sorted: IndexMap<String, Attribute> = pairs.into_iter().collect();
+            module.ops[op_id].attributes = sorted;
+        }
     }
 }
 
@@ -658,26 +721,52 @@ fn is_transient_attribute(k: &str) -> bool {
         "l2_tile",
         "reg_tile_m",
         "reg_tile_n",
+        "loop_tile_m",
+        "loop_tile_n",
+        "loop_tile_k",
+        "loop_l2_tile",
+        "loop_reg_m",
+        "loop_reg_n",
         "loop_order",
         "collapse_loops",
+        "loop_collapse",
         "skew_loops",
+        "loop_skew",
         "unroll_factor",
+        "loop_unroll",
         "prefetch_distance",
+        "loop_prefetch",
         "split_k",
+        "loop_split_k",
         "double_buffer",
+        "loop_double_buffer",
         "vector_width",
+        "simd_vectorize",
+        "simd_width",
         "simd_isa",
         "parallel_m",
+        "loop_parallel",
         "inplace_operand",
+        "rematerialized",
         "sparsity",
         "data_layout",
         "pad_align",
+        "pad_deltas",
         "padded_mnk",
+        "packed_rhs",
+        "quant_mode",
+        "lhs_scale",
+        "rhs_scale",
+        "calibration_samples",
+        "compute_precision",
+        "amp_cast",
+        "autodiff_role",
         "spmd_sharding",
         "num_devices",
         "async_overlap",
         "coalesced_collectives",
         "stream_id",
+        "stream_synchronized",
         "unroll_step",
     ];
     k.starts_with("castforge.") || TRANSIENT_KEYS.contains(&k)

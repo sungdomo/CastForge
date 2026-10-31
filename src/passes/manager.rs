@@ -572,5 +572,14 @@ fn is_known_pass_option_alias(key: &str) -> bool {
             | "name"
             | "count"
             | "min_elements"
+            | "schedule"
+            | "mma_tile"
+            | "first"
+            | "second"
+            | "entry"
+            | "repeat"
+            | "stop_at"
+            | "max_ops"
+            | "keep_op"
     )
 }

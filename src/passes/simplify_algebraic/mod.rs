@@ -83,8 +83,9 @@ impl Pass for SimplifyAlgebraicPass {
                 }
 
                 // 2. Algebraic identities, commutative canonicalization, and reassociation
-                match try_simplify_algebraic_op(module, op_id) {
-                    AlgOutcome::ModifiedAndDone => {
+                match try_simplify_algebraic_op(module, block_id, op_id) {
+                    AlgOutcome::ModifiedAndDone(c) => {
+                        created += c;
                         modified += 1;
                         continue;
                     }

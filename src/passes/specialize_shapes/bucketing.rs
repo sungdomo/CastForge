@@ -1,12 +1,14 @@
 //! Static Batch Dimension Resizer (`resize-batch`) and Multi-Bucket Shape Cloner
 //! (`bucket-shapes`).
 
-use super::{SpecializeShapesPass, specialize_and_resize_single_traversal};
+use super::{
+    SpecializeShapesPass, collect_non_batch_weight_operands, specialize_and_resize_single_traversal,
+};
 use crate::ir::{Attribute, Dim, Module, OpName, Type, ValueId};
 use crate::passes::{Pass, PassResult};
 use anyhow::Result;
 use smallvec::SmallVec;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Static Batch Dimension Resizer Pass (`resize-batch`).
 #[derive(Debug, Clone)]
@@ -102,13 +104,7 @@ impl Pass for BucketShapesPass {
             })
             .unwrap_or(1);
 
-        let mut weight_rhs_vals: HashSet<ValueId> = HashSet::new();
-        for &op_id in &src_ops {
-            let op = &module.ops[op_id];
-            if op.is_op("stablehlo", "dot_general") && op.operands.len() >= 2 {
-                weight_rhs_vals.insert(op.operands[1]);
-            }
-        }
+        let weight_rhs_vals = collect_non_batch_weight_operands(module, &src_ops);
 
         let mod_body = module.body_block();
         let mut created_fns = 0usize;
@@ -166,13 +162,14 @@ impl Pass for BucketShapesPass {
                     ty.shape[0] = Dim::Static(b_size);
                 }
 
+                let cloned_regions = module.clone_regions_local(&op.regions, &mut val_map);
                 let new_op_id = module.add_operation(
                     dst_blk,
                     op.name,
                     mapped_operands,
                     res_specs,
                     attrs,
-                    Vec::new(),
+                    cloned_regions,
                     op.custom_syntax,
                     op.location,
                 );

@@ -1,6 +1,7 @@
 //! Quantized Dequant-MatMul and Generalized MatMul Epilogue Fusion patterns.
 
 use crate::ir::{Attribute, BlockId, DType, Module, OpId, OpName, ValueDef, ValueId};
+use crate::passes::FoldConstantsPass;
 use crate::passes::fuse_elementwise::{match_gelu_op, match_silu_val};
 use crate::stablehlo::StableHloOp;
 use indexmap::IndexMap;
@@ -105,6 +106,7 @@ pub(super) fn try_fuse_epilogue_at_op(
     // 1. SiLU epilogue (`divide(add_val, 1 + exp(-add_val))`)
     if let StableHloOp::Divide { result, .. } = hlo
         && let Some(add_val) = match_silu_val(module, result)
+        && module.use_count(add_val) <= 2
         && let Some(MatmulAddMatch {
             lhs,
             rhs,
@@ -136,6 +138,7 @@ pub(super) fn try_fuse_epilogue_at_op(
 
     // 2. GELU epilogue (`0.5 * add_val * (1 + tanh(...))`)
     if let Some(add_val) = match_gelu_op(module, op)
+        && module.use_count(add_val) <= 4
         && let Some(MatmulAddMatch {
             lhs,
             rhs,
@@ -167,10 +170,21 @@ pub(super) fn try_fuse_epilogue_at_op(
 
     match hlo {
         StableHloOp::Maximum {
-            lhs: add_val,
-            rhs: zero_val,
+            lhs: m_lhs,
+            rhs: m_rhs,
             ..
         } => {
+            let relu_operands =
+                if FoldConstantsPass::const_splat(module, m_rhs).is_some_and(|v| v == 0.0) {
+                    Some((m_lhs, m_rhs))
+                } else if FoldConstantsPass::const_splat(module, m_lhs).is_some_and(|v| v == 0.0) {
+                    Some((m_rhs, m_lhs))
+                } else {
+                    None
+                };
+            let Some((add_val, zero_val)) = relu_operands else {
+                return (0, 0);
+            };
             let Some(MatmulAddMatch {
                 add_op_id,
                 dot_op_id,

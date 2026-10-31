@@ -130,6 +130,7 @@ pub(super) fn fuse_norm_single_traversal(
                 if try_upgrade_unscaled_rmsnorm(module, op_id, lhs, rhs)
                     || try_upgrade_unscaled_rmsnorm(module, op_id, rhs, lhs)
                 {
+                    modified += 1;
                     continue;
                 }
                 if let Some((x_val, weight_val, eps_f64)) = match_scaled_rmsnorm(module, lhs, rhs)
@@ -164,6 +165,7 @@ pub(super) fn fuse_norm_single_traversal(
                     if try_upgrade_layernorm_beta(module, op_id, lhs, rhs)
                         || try_upgrade_layernorm_beta(module, op_id, rhs, lhs)
                     {
+                        modified += 1;
                         continue;
                     }
                     if let Some((x_val, gamma_opt, beta_opt, eps)) =
@@ -183,6 +185,7 @@ pub(super) fn fuse_norm_single_traversal(
                     if try_upgrade_layernorm_gamma(module, op_id, lhs, rhs)
                         || try_upgrade_layernorm_gamma(module, op_id, rhs, lhs)
                     {
+                        modified += 1;
                         continue;
                     }
                     if let Some((x_val, gamma_val, eps)) = match_core_layernorm_val(module, lhs)
@@ -245,19 +248,23 @@ pub(super) fn fuse_norm_single_traversal(
                             .and_then(|a| a.as_str())
                             .is_some_and(|n| n.contains("log_softmax") || n.contains("matmul")));
                 if is_ce_target && let Some(op_mut) = module.ops.get_mut(op_id) {
-                    op_mut.attributes.insert(
+                    let chunk_val = ce_chunk_size.max(64);
+                    let mut ch = false;
+                    ch |= op_mut.attributes.insert(
                         "castforge.fused_linear_cross_entropy".to_string(),
                         Attribute::Bool(true),
-                    );
-                    op_mut.attributes.insert(
+                    ) != Some(Attribute::Bool(true));
+                    ch |= op_mut.attributes.insert(
                         "castforge.ce_chunk_size".to_string(),
-                        Attribute::Int(ce_chunk_size.max(64)),
-                    );
-                    op_mut.attributes.insert(
+                        Attribute::Int(chunk_val),
+                    ) != Some(Attribute::Int(chunk_val));
+                    ch |= op_mut.attributes.insert(
                         "castforge.materialize_logits".to_string(),
                         Attribute::Bool(false),
-                    );
-                    modified += 1;
+                    ) != Some(Attribute::Bool(false));
+                    if ch {
+                        modified += 1;
+                    }
                 }
             }
         }
@@ -272,6 +279,9 @@ fn try_upgrade_unscaled_rmsnorm(
     norm_cand: ValueId,
     weight_val: ValueId,
 ) -> bool {
+    if module.use_count(norm_cand) != 1 {
+        return false;
+    }
     let ValueDef::OpResult { op: norm_op_id, .. } = module.values[norm_cand].def else {
         return false;
     };
@@ -301,6 +311,9 @@ fn try_upgrade_layernorm_gamma(
     ln_cand: ValueId,
     gamma_val: ValueId,
 ) -> bool {
+    if module.use_count(ln_cand) != 1 {
+        return false;
+    }
     let ValueDef::OpResult { op: ln_op_id, .. } = module.values[ln_cand].def else {
         return false;
     };
@@ -328,6 +341,9 @@ fn try_upgrade_layernorm_beta(
     ln_cand: ValueId,
     beta_val: ValueId,
 ) -> bool {
+    if module.use_count(ln_cand) != 1 {
+        return false;
+    }
     let ValueDef::OpResult { op: ln_op_id, .. } = module.values[ln_cand].def else {
         return false;
     };

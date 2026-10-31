@@ -50,6 +50,13 @@ impl DType {
             DType::QuantUniform { storage_type, .. } => storage_type.bit_width(),
         }
     }
+
+    pub fn is_float(&self) -> bool {
+        matches!(
+            self,
+            DType::F8E4M3FN | DType::F8E5M2 | DType::F16 | DType::BF16 | DType::F32 | DType::F64
+        )
+    }
 }
 
 impl fmt::Display for DType {
@@ -306,6 +313,20 @@ impl Attribute {
         self.as_splat_f64()
             .map(|v| (v - 1.0).abs() < f64::EPSILON)
             .unwrap_or(false)
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Attribute::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    pub fn as_float(&self) -> Option<f64> {
+        match self {
+            Attribute::Float(f) => Some(*f),
+            _ => None,
+        }
     }
 }
 
@@ -787,6 +808,141 @@ impl Module {
                 }
             }
         }
+    }
+
+    /// Deep-clones `src_regions` from `src_module` into `self`, updating `val_map`.
+    pub fn clone_regions_from(
+        &mut self,
+        src_module: &Module,
+        src_regions: &[RegionId],
+        val_map: &mut std::collections::HashMap<ValueId, ValueId>,
+    ) -> Vec<RegionId> {
+        let mut cloned_regs = Vec::with_capacity(src_regions.len());
+        for &src_reg_id in src_regions {
+            let Some(src_reg) = src_module.regions.get(src_reg_id) else {
+                continue;
+            };
+            let mut dst_blocks = Vec::with_capacity(src_reg.blocks.len());
+            for &src_blk_id in &src_reg.blocks {
+                let Some(src_blk) = src_module.blocks.get(src_blk_id) else {
+                    continue;
+                };
+                let dst_blk = self.create_block(src_blk.label.clone());
+                for &arg_id in &src_blk.arguments {
+                    let v = &src_module.values[arg_id];
+                    let new_arg =
+                        self.add_block_argument(dst_blk, v.ssa_name.clone(), v.ty.clone());
+                    val_map.insert(arg_id, new_arg);
+                }
+                for &op_id in &src_blk.ops {
+                    let Some(op) = src_module.ops.get(op_id) else {
+                        continue;
+                    };
+                    let mapped_operands: SmallVec<[ValueId; 4]> = op
+                        .operands
+                        .iter()
+                        .map(|&v| val_map.get(&v).copied().unwrap_or(v))
+                        .collect();
+                    let res_specs: Vec<(Option<String>, Type)> = op
+                        .results
+                        .iter()
+                        .map(|&r| {
+                            let rv = &src_module.values[r];
+                            (rv.ssa_name.clone(), rv.ty.clone())
+                        })
+                        .collect();
+                    let child_regs = self.clone_regions_from(src_module, &op.regions, val_map);
+                    let new_op_id = self.add_operation(
+                        dst_blk,
+                        op.name.clone(),
+                        mapped_operands,
+                        res_specs,
+                        op.attributes.clone(),
+                        child_regs,
+                        op.custom_syntax,
+                        op.location.clone(),
+                    );
+                    for (&old_r, &new_r) in
+                        op.results.iter().zip(self.ops[new_op_id].results.iter())
+                    {
+                        val_map.insert(old_r, new_r);
+                    }
+                }
+                dst_blocks.push(dst_blk);
+            }
+            cloned_regs.push(self.create_region(dst_blocks));
+        }
+        cloned_regs
+    }
+
+    /// Deep-clones `src_regions` within `self`, updating `val_map`.
+    pub fn clone_regions_local(
+        &mut self,
+        src_regions: &[RegionId],
+        val_map: &mut std::collections::HashMap<ValueId, ValueId>,
+    ) -> Vec<RegionId> {
+        let mut cloned_regs = Vec::with_capacity(src_regions.len());
+        for &src_reg_id in src_regions {
+            let Some(src_blocks) = self.regions.get(src_reg_id).map(|r| r.blocks.clone()) else {
+                continue;
+            };
+            let mut dst_blocks = Vec::with_capacity(src_blocks.len());
+            for src_blk_id in src_blocks {
+                let Some((label, args, ops)) = self
+                    .blocks
+                    .get(src_blk_id)
+                    .map(|b| (b.label.clone(), b.arguments.clone(), b.ops.clone()))
+                else {
+                    continue;
+                };
+                let dst_blk = self.create_block(label);
+                for arg_id in args {
+                    let (ssa_name, ty) = {
+                        let v = &self.values[arg_id];
+                        (v.ssa_name.clone(), v.ty.clone())
+                    };
+                    let new_arg = self.add_block_argument(dst_blk, ssa_name, ty);
+                    val_map.insert(arg_id, new_arg);
+                }
+                for op_id in ops {
+                    let Some(op) = self.ops.get(op_id).cloned() else {
+                        continue;
+                    };
+                    let mapped_operands: SmallVec<[ValueId; 4]> = op
+                        .operands
+                        .iter()
+                        .map(|&v| val_map.get(&v).copied().unwrap_or(v))
+                        .collect();
+                    let res_specs: Vec<(Option<String>, Type)> = op
+                        .results
+                        .iter()
+                        .map(|&r| {
+                            let rv = &self.values[r];
+                            (rv.ssa_name.clone(), rv.ty.clone())
+                        })
+                        .collect();
+                    let child_regs = self.clone_regions_local(&op.regions, val_map);
+                    let new_op_id = self.add_operation(
+                        dst_blk,
+                        op.name,
+                        mapped_operands,
+                        res_specs,
+                        op.attributes,
+                        child_regs,
+                        op.custom_syntax,
+                        op.location,
+                    );
+                    for (&old_r, &new_r) in
+                        op.results.iter().zip(self.ops[new_op_id].results.iter())
+                    {
+                        val_map.insert(old_r, new_r);
+                    }
+                }
+                dst_blocks.push(dst_blk);
+            }
+            cloned_regs.push(self.create_region(dst_blocks));
+        }
+        cloned_regs
     }
 
     /// Verifies structural integrity of the IR (all SSA ValueIds, OpIds, BlockIds, and RegionIds

@@ -66,31 +66,53 @@ impl Pass for DeadCodeEliminationPass {
             }
         }
 
-        // 2. Process private functions: either eliminate unreferenced private symbols outright
-        //    or sweep referenced private function bodies in reverse.
+        // 2. Process private functions: iteratively sweep newly-referenced private functions
+        //    (order-independent call-graph reachability), then eliminate unreferenced ones.
         let root_block = module.body_block();
         let mut dead_fns: HashSet<OpId> = HashSet::new();
-        for fn_op_id in private_funcs.into_iter().rev() {
-            let op = &module.ops[fn_op_id];
-            let sym_name = op
-                .attributes
-                .get("sym_name")
-                .and_then(|a| a.as_str())
-                .unwrap_or("");
-            if self.include_symbols && !referenced_symbols.contains(sym_name) {
-                let regions = op.regions.clone();
-                for reg_id in regions {
-                    let fn_blocks = module.regions[reg_id].blocks.clone();
-                    for blk_id in fn_blocks {
-                        visited_blocks.insert(blk_id);
-                        for inner_op in module.blocks[blk_id].ops.drain(..) {
-                            module.ops.remove(inner_op);
+        if self.include_symbols {
+            let mut swept_priv: HashSet<OpId> = HashSet::new();
+            loop {
+                let mut progress = false;
+                for &fn_op_id in private_funcs.iter().rev() {
+                    if swept_priv.contains(&fn_op_id) {
+                        continue;
+                    }
+                    let sym_name = module.ops[fn_op_id]
+                        .attributes
+                        .get("sym_name")
+                        .and_then(|a| a.as_str())
+                        .unwrap_or("");
+                    if referenced_symbols.contains(sym_name) {
+                        swept_priv.insert(fn_op_id);
+                        progress = true;
+                        let regions = module.ops[fn_op_id].regions.clone();
+                        for reg_id in regions.into_iter().rev() {
+                            removed += sweep_region_reverse(
+                                module,
+                                reg_id,
+                                self.include_symbols,
+                                &mut live_values,
+                                &mut referenced_symbols,
+                                &mut visited_blocks,
+                            );
                         }
                     }
                 }
-                dead_fns.insert(fn_op_id);
-            } else {
-                let regions = op.regions.clone();
+                if !progress {
+                    break;
+                }
+            }
+            for fn_op_id in private_funcs {
+                if !swept_priv.contains(&fn_op_id) {
+                    let regions = module.ops[fn_op_id].regions.clone();
+                    purge_regions_recursively(module, &regions, &mut visited_blocks);
+                    dead_fns.insert(fn_op_id);
+                }
+            }
+        } else {
+            for fn_op_id in private_funcs.into_iter().rev() {
+                let regions = module.ops[fn_op_id].regions.clone();
                 for reg_id in regions.into_iter().rev() {
                     removed += sweep_region_reverse(
                         module,
@@ -189,17 +211,7 @@ fn sweep_block_reverse(
             && !op.results.is_empty()
             && op.results.iter().all(|res| !live_values.contains(res));
         if is_dead {
-            for reg_id in &op.regions {
-                if let Some(reg) = module.regions.get(*reg_id) {
-                    let inner_blocks = reg.blocks.clone();
-                    for blk_id in inner_blocks {
-                        visited_blocks.insert(blk_id);
-                        for inner_op in module.blocks[blk_id].ops.drain(..) {
-                            module.ops.remove(inner_op);
-                        }
-                    }
-                }
-            }
+            purge_regions_recursively(module, &op.regions, visited_blocks);
             dead_in_block.insert(op_id);
             continue;
         }
@@ -241,4 +253,26 @@ fn sweep_block_reverse(
         }
     }
     removed
+}
+
+fn purge_regions_recursively(
+    module: &mut Module,
+    regions: &[RegionId],
+    visited_blocks: &mut HashSet<BlockId>,
+) {
+    for &reg_id in regions {
+        let Some(reg) = module.regions.remove(reg_id) else {
+            continue;
+        };
+        for blk_id in reg.blocks {
+            visited_blocks.insert(blk_id);
+            if let Some(blk) = module.blocks.remove(blk_id) {
+                for inner_op_id in blk.ops {
+                    if let Some(inner_op) = module.ops.remove(inner_op_id) {
+                        purge_regions_recursively(module, &inner_op.regions, visited_blocks);
+                    }
+                }
+            }
+        }
+    }
 }

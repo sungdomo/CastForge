@@ -315,13 +315,16 @@ fn shard_tp_ring_and_coalesce_single_traversal(
                     module.blocks[block_id].ops.pop();
                     let ar_res = module.ops[ar_id].results[0];
 
-                    for (other_id, other_op) in module.ops.iter_mut() {
+                    let blk_ops: Vec<OpId> = module.blocks[block_id].ops.clone();
+                    for other_id in blk_ops {
                         if other_id == op_id || other_id == ar_id {
                             continue;
                         }
-                        for opnd in &mut other_op.operands {
-                            if *opnd == add_res {
-                                *opnd = ar_res;
+                        if let Some(other_op) = module.ops.get_mut(other_id) {
+                            for opnd in &mut other_op.operands {
+                                if *opnd == add_res {
+                                    *opnd = ar_res;
+                                }
                             }
                         }
                     }
@@ -522,19 +525,24 @@ impl Pass for ShardPipelineParallelPass {
                 .collect();
             let total = compute_ops.len().max(1);
             for (idx, op_id) in compute_ops.into_iter().enumerate() {
-                let stage = (idx * num_stages) / total;
+                let stage = ((idx * num_stages) / total) as i64;
                 if let Some(op) = module.ops.get_mut(op_id) {
-                    op.attributes.insert(
-                        "castforge.pp_stage".to_string(),
-                        Attribute::Int(stage as i64),
-                    );
-                    op.attributes.insert(
+                    let mut ch = false;
+                    ch |= op
+                        .attributes
+                        .insert("castforge.pp_stage".to_string(), Attribute::Int(stage))
+                        != Some(Attribute::Int(stage));
+                    ch |= op.attributes.insert(
                         "castforge.pp_schedule".to_string(),
                         Attribute::String(self.schedule.clone()),
-                    );
-                    op.attributes
-                        .insert("castforge.pp_microbatches".to_string(), Attribute::Int(mb));
-                    modified += 1;
+                    ) != Some(Attribute::String(self.schedule.clone()));
+                    ch |= op
+                        .attributes
+                        .insert("castforge.pp_microbatches".to_string(), Attribute::Int(mb))
+                        != Some(Attribute::Int(mb));
+                    if ch {
+                        modified += 1;
+                    }
                 }
             }
         }
@@ -770,21 +778,26 @@ fn run_fsdp_sharding(module: &mut Module, num_devices: usize) -> Result<PassResu
                                 || n == "castforge.fused_qmatmul"
                         }));
             if is_gemm {
-                op.attributes
-                    .insert("castforge.fsdp_sharded".to_string(), Attribute::Bool(true));
-                op.attributes.insert(
+                let mut ch = false;
+                ch |= op
+                    .attributes
+                    .insert("castforge.fsdp_sharded".to_string(), Attribute::Bool(true))
+                    != Some(Attribute::Bool(true));
+                ch |= op.attributes.insert(
                     "castforge.fsdp_devices".to_string(),
                     Attribute::Int(devices),
-                );
-                op.attributes.insert(
+                ) != Some(Attribute::Int(devices));
+                ch |= op.attributes.insert(
                     "castforge.fsdp_prefetch".to_string(),
                     Attribute::String("all_gather".to_string()),
-                );
-                op.attributes.insert(
+                ) != Some(Attribute::String("all_gather".to_string()));
+                ch |= op.attributes.insert(
                     "castforge.grad_sync".to_string(),
                     Attribute::String("reduce_scatter".to_string()),
-                );
-                modified += 1;
+                ) != Some(Attribute::String("reduce_scatter".to_string()));
+                if ch {
+                    modified += 1;
+                }
             }
         }
     }
@@ -843,19 +856,26 @@ fn run_expert_parallelism(module: &mut Module, num_devices: usize) -> Result<Pas
                                 || n == "castforge.fused_matmul_epilogue"
                         }));
             if is_moe_or_gemm {
-                op.attributes
-                    .insert("castforge.ep_sharded".to_string(), Attribute::Bool(true));
-                op.attributes
-                    .insert("castforge.ep_devices".to_string(), Attribute::Int(devices));
-                op.attributes.insert(
+                let mut ch = false;
+                ch |= op
+                    .attributes
+                    .insert("castforge.ep_sharded".to_string(), Attribute::Bool(true))
+                    != Some(Attribute::Bool(true));
+                ch |= op
+                    .attributes
+                    .insert("castforge.ep_devices".to_string(), Attribute::Int(devices))
+                    != Some(Attribute::Int(devices));
+                ch |= op.attributes.insert(
                     "castforge.ep_dispatch".to_string(),
                     Attribute::String("all_to_all".to_string()),
-                );
-                op.attributes.insert(
+                ) != Some(Attribute::String("all_to_all".to_string()));
+                ch |= op.attributes.insert(
                     "castforge.ep_combine".to_string(),
                     Attribute::String("all_to_all".to_string()),
-                );
-                modified += 1;
+                ) != Some(Attribute::String("all_to_all".to_string()));
+                if ch {
+                    modified += 1;
+                }
             }
         }
     }

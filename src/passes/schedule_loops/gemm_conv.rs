@@ -63,16 +63,17 @@ impl Pass for PadForTilingPass {
                 };
                 let (pm, pk, pn) = (round_up(*m), round_up(*k), round_up(*n));
                 let dst = &mut module.ops[op_id].attributes;
-                dst.insert("pad_align".to_string(), Attribute::Int(align));
-                dst.insert(
-                    "padded_mnk".to_string(),
-                    Attribute::DenseIntArray(vec![pm, pn, pk]),
-                );
-                dst.insert(
-                    "pad_deltas".to_string(),
-                    Attribute::DenseIntArray(vec![pm - m, pn - n, pk - k]),
-                );
-                modified += 1;
+                let padded_mnk = Attribute::DenseIntArray(vec![pm, pn, pk]);
+                let pad_deltas = Attribute::DenseIntArray(vec![pm - m, pn - n, pk - k]);
+                if dst.get("pad_align") != Some(&Attribute::Int(align))
+                    || dst.get("padded_mnk") != Some(&padded_mnk)
+                    || dst.get("pad_deltas") != Some(&pad_deltas)
+                {
+                    dst.insert("pad_align".to_string(), Attribute::Int(align));
+                    dst.insert("padded_mnk".to_string(), padded_mnk);
+                    dst.insert("pad_deltas".to_string(), pad_deltas);
+                    modified += 1;
+                }
             }
         }
 

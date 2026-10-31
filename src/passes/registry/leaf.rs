@@ -8,16 +8,20 @@ pub(super) fn register_leaf_passes(reg: &mut PassRegistry) {
         "topological-sort",
         "Reorders operations for SSA def-before-use and optional peak-memory minimization",
         |opts| {
-            let mode = opts.get("mode").cloned().unwrap_or_else(|| {
-                if opts
-                    .get("min_memory")
-                    .is_some_and(|v| v == "true" || v == "1")
-                {
-                    "min_memory".to_string()
-                } else {
-                    "standard".to_string()
-                }
-            });
+            let mode = opts
+                .get("mode")
+                .or_else(|| opts.get("schedule"))
+                .cloned()
+                .unwrap_or_else(|| {
+                    if opts
+                        .get("min_memory")
+                        .is_some_and(|v| v == "true" || v == "1")
+                    {
+                        "min_memory".to_string()
+                    } else {
+                        "standard".to_string()
+                    }
+                });
             Ok(Box::new(TopologicalSortPass { mode }))
         },
     );
@@ -779,6 +783,20 @@ pub(super) fn register_leaf_passes(reg: &mut PassRegistry) {
                 .or_else(|| opts.get("tensor_cores"))
                 .cloned()
                 .unwrap_or_else(|| "hopper_wgmma".to_string());
+            let mut mma_m = 16i64;
+            let mut mma_n = 16i64;
+            let mut mma_k = 16i64;
+            if let Some(tile_str) = opts.get("mma_tile").or_else(|| opts.get("tile")) {
+                let parts: Vec<i64> = tile_str
+                    .split(['x', 'X', ',', '_'])
+                    .filter_map(|p| p.trim().parse::<i64>().ok())
+                    .collect();
+                if parts.len() == 3 {
+                    mma_m = parts[0];
+                    mma_n = parts[1];
+                    mma_k = parts[2];
+                }
+            }
             let warp_specialized = opts
                 .get("warp_specialized")
                 .map(|s| s == "true" || s == "1")
@@ -789,9 +807,9 @@ pub(super) fn register_leaf_passes(reg: &mut PassRegistry) {
                 .unwrap_or(512);
             Ok(Box::new(LowerTensorCoresPass {
                 arch,
-                mma_m: 16,
-                mma_n: 16,
-                mma_k: 16,
+                mma_m,
+                mma_n,
+                mma_k,
                 warp_specialized,
                 tmem_columns,
             }))

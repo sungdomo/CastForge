@@ -124,7 +124,10 @@ impl Pass for LowerPagedAttentionPass {
         let block_size = self.page_block_size.max(4) as i64;
         let max_blocks = self.max_blocks.max(1) as i64;
 
-        for (_, op) in module.ops.iter_mut() {
+        for op_id in module.live_ops() {
+            let Some(op) = module.ops.get_mut(op_id) else {
+                continue;
+            };
             let is_attn = op.is_op("stablehlo", "composite")
                 && op
                     .attributes
@@ -132,19 +135,22 @@ impl Pass for LowerPagedAttentionPass {
                     .and_then(|a| a.as_str())
                     .is_some_and(|n| n == "castforge.fused_attention");
             if is_attn {
-                op.attributes.insert(
+                let mut ch = false;
+                ch |= op.attributes.insert(
                     "castforge.paged_attention".to_string(),
                     Attribute::Bool(true),
-                );
-                op.attributes.insert(
+                ) != Some(Attribute::Bool(true));
+                ch |= op.attributes.insert(
                     "castforge.page_block_size".to_string(),
                     Attribute::Int(block_size),
-                );
-                op.attributes.insert(
+                ) != Some(Attribute::Int(block_size));
+                ch |= op.attributes.insert(
                     "castforge.max_blocks".to_string(),
                     Attribute::Int(max_blocks),
-                );
-                modified += 1;
+                ) != Some(Attribute::Int(max_blocks));
+                if ch {
+                    modified += 1;
+                }
             }
         }
 
@@ -180,7 +186,11 @@ impl Pass for LowerFlashDecodingPass {
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let mut modified = 0usize;
-        for (_, op) in module.ops.iter_mut() {
+        let split_val = self.split_kv.max(2) as i64;
+        for op_id in module.live_ops() {
+            let Some(op) = module.ops.get_mut(op_id) else {
+                continue;
+            };
             let is_attn = op.is_op("stablehlo", "composite")
                 && op
                     .attributes
@@ -188,19 +198,22 @@ impl Pass for LowerFlashDecodingPass {
                     .and_then(|a| a.as_str())
                     .is_some_and(|n| n == "castforge.fused_attention");
             if is_attn {
-                op.attributes.insert(
+                let mut ch = false;
+                ch |= op.attributes.insert(
                     "castforge.flash_decoding".to_string(),
                     Attribute::Bool(true),
-                );
-                op.attributes.insert(
-                    "castforge.split_kv".to_string(),
-                    Attribute::Int(self.split_kv.max(2) as i64),
-                );
-                op.attributes.insert(
+                ) != Some(Attribute::Bool(true));
+                ch |= op
+                    .attributes
+                    .insert("castforge.split_kv".to_string(), Attribute::Int(split_val))
+                    != Some(Attribute::Int(split_val));
+                ch |= op.attributes.insert(
                     "castforge.partial_lse_reduce".to_string(),
                     Attribute::Bool(true),
-                );
-                modified += 1;
+                ) != Some(Attribute::Bool(true));
+                if ch {
+                    modified += 1;
+                }
             }
         }
         Ok(PassResult {
@@ -239,7 +252,12 @@ impl Pass for LowerTreeAttentionPass {
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let mut modified = 0usize;
-        for (_, op) in module.ops.iter_mut() {
+        let draft_val = self.draft_tokens.max(1) as i64;
+        let depth_val = self.tree_depth.max(1) as i64;
+        for op_id in module.live_ops() {
+            let Some(op) = module.ops.get_mut(op_id) else {
+                continue;
+            };
             let is_attn = op.is_op("stablehlo", "composite")
                 && op
                     .attributes
@@ -247,19 +265,22 @@ impl Pass for LowerTreeAttentionPass {
                     .and_then(|a| a.as_str())
                     .is_some_and(|n| n == "castforge.fused_attention");
             if is_attn {
-                op.attributes.insert(
+                let mut ch = false;
+                ch |= op.attributes.insert(
                     "castforge.speculative_tree".to_string(),
                     Attribute::Bool(true),
-                );
-                op.attributes.insert(
+                ) != Some(Attribute::Bool(true));
+                ch |= op.attributes.insert(
                     "castforge.draft_tokens".to_string(),
-                    Attribute::Int(self.draft_tokens.max(1) as i64),
-                );
-                op.attributes.insert(
+                    Attribute::Int(draft_val),
+                ) != Some(Attribute::Int(draft_val));
+                ch |= op.attributes.insert(
                     "castforge.tree_depth".to_string(),
-                    Attribute::Int(self.tree_depth.max(1) as i64),
-                );
-                modified += 1;
+                    Attribute::Int(depth_val),
+                ) != Some(Attribute::Int(depth_val));
+                if ch {
+                    modified += 1;
+                }
             }
         }
         Ok(PassResult {

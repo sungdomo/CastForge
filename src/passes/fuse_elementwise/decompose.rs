@@ -2,9 +2,10 @@
 //! into primitive `stablehlo` operations for targets without specialized composite kernels.
 
 use super::decompose_helpers::{
-    half_col_type, insert_gelu_before, insert_op_before, insert_rmsnorm_core_before,
-    insert_scalar_const_before, insert_silu_denom_before, insert_slice_2d_before,
-    insert_splat_tensor_before, insert_zero_tensor_before, reduced_row_type,
+    half_col_type, insert_gelu_before, insert_layernorm_core_before, insert_op_before,
+    insert_rmsnorm_core_before, insert_scalar_const_before, insert_silu_denom_before,
+    insert_slice_2d_before, insert_splat_tensor_before, insert_zero_tensor_before,
+    reduced_row_type,
 };
 use crate::ir::{Attribute, BlockId, DType, Module, OpName, TensorType, Type};
 use crate::passes::{Pass, PassResult};
@@ -78,6 +79,12 @@ impl Pass for DecomposeCompositesPass {
                             .and_then(|a| a.as_str())
                             .unwrap_or("bias")
                             .to_string();
+                        let (base_ep, has_residual) =
+                            if let Some(base) = epilogue.strip_suffix("_residual") {
+                                (base, true)
+                            } else {
+                                (epilogue.as_str(), false)
+                            };
                         let mut dot_attrs = IndexMap::new();
                         for k in [
                             "lhs_batching_dimensions",
@@ -100,85 +107,183 @@ impl Pass for DecomposeCompositesPass {
                         );
                         created += 1;
 
-                        match epilogue.as_str() {
-                            "bias_relu" if inputs.len() >= 4 => {
-                                let add_val = insert_op_before(
-                                    module,
-                                    block_id,
-                                    op_id,
-                                    OpName::new("stablehlo", "add"),
-                                    &[dot_val, inputs[2]],
-                                    IndexMap::new(),
-                                    out_ty,
-                                );
-                                let op_mut = &mut module.ops[op_id];
-                                op_mut.name = OpName::new("stablehlo", "maximum");
-                                op_mut.operands = SmallVec::from_slice(&[add_val, inputs[3]]);
-                                op_mut.attributes.clear();
-                                created += 1;
-                                modified += 1;
+                        if !has_residual {
+                            match base_ep {
+                                "bias_relu" if inputs.len() >= 4 => {
+                                    let add_val = insert_op_before(
+                                        module,
+                                        block_id,
+                                        op_id,
+                                        OpName::new("stablehlo", "add"),
+                                        &[dot_val, inputs[2]],
+                                        IndexMap::new(),
+                                        out_ty,
+                                    );
+                                    let op_mut = &mut module.ops[op_id];
+                                    op_mut.name = OpName::new("stablehlo", "maximum");
+                                    op_mut.operands = SmallVec::from_slice(&[add_val, inputs[3]]);
+                                    op_mut.attributes.clear();
+                                    created += 1;
+                                    modified += 1;
+                                }
+                                "bias_tanh" => {
+                                    let add_val = insert_op_before(
+                                        module,
+                                        block_id,
+                                        op_id,
+                                        OpName::new("stablehlo", "add"),
+                                        &[dot_val, inputs[2]],
+                                        IndexMap::new(),
+                                        out_ty,
+                                    );
+                                    let op_mut = &mut module.ops[op_id];
+                                    op_mut.name = OpName::new("stablehlo", "tanh");
+                                    op_mut.operands = SmallVec::from_slice(&[add_val]);
+                                    op_mut.attributes.clear();
+                                    created += 1;
+                                    modified += 1;
+                                }
+                                "bias_silu" => {
+                                    let add_val = insert_op_before(
+                                        module,
+                                        block_id,
+                                        op_id,
+                                        OpName::new("stablehlo", "add"),
+                                        &[dot_val, inputs[2]],
+                                        IndexMap::new(),
+                                        out_ty.clone(),
+                                    );
+                                    let denom_val = insert_silu_denom_before(
+                                        module, block_id, op_id, add_val, &out_ty,
+                                    );
+                                    let op_mut = &mut module.ops[op_id];
+                                    op_mut.name = OpName::new("stablehlo", "divide");
+                                    op_mut.operands = SmallVec::from_slice(&[add_val, denom_val]);
+                                    op_mut.attributes.clear();
+                                    created += 6;
+                                    modified += 1;
+                                }
+                                "bias_gelu" => {
+                                    let add_val = insert_op_before(
+                                        module,
+                                        block_id,
+                                        op_id,
+                                        OpName::new("stablehlo", "add"),
+                                        &[dot_val, inputs[2]],
+                                        IndexMap::new(),
+                                        out_ty.clone(),
+                                    );
+                                    let gelu_val = insert_gelu_before(
+                                        module, block_id, op_id, add_val, &out_ty,
+                                    );
+                                    let zero_t =
+                                        insert_zero_tensor_before(module, block_id, op_id, &out_ty);
+                                    let op_mut = &mut module.ops[op_id];
+                                    op_mut.name = OpName::new("stablehlo", "add");
+                                    op_mut.operands = SmallVec::from_slice(&[gelu_val, zero_t]);
+                                    op_mut.attributes.clear();
+                                    created += 10;
+                                    modified += 1;
+                                }
+                                "bias_scale" if inputs.len() >= 4 => {
+                                    let add_val = insert_op_before(
+                                        module,
+                                        block_id,
+                                        op_id,
+                                        OpName::new("stablehlo", "add"),
+                                        &[dot_val, inputs[2]],
+                                        IndexMap::new(),
+                                        out_ty,
+                                    );
+                                    let op_mut = &mut module.ops[op_id];
+                                    op_mut.name = OpName::new("stablehlo", "multiply");
+                                    op_mut.operands = SmallVec::from_slice(&[add_val, inputs[3]]);
+                                    op_mut.attributes.clear();
+                                    created += 1;
+                                    modified += 1;
+                                }
+                                _ => {
+                                    let op_mut = &mut module.ops[op_id];
+                                    op_mut.name = OpName::new("stablehlo", "add");
+                                    op_mut.operands = SmallVec::from_slice(&[dot_val, inputs[2]]);
+                                    op_mut.attributes.clear();
+                                    modified += 1;
+                                }
                             }
-                            "bias_tanh" => {
-                                let add_val = insert_op_before(
-                                    module,
-                                    block_id,
-                                    op_id,
-                                    OpName::new("stablehlo", "add"),
-                                    &[dot_val, inputs[2]],
-                                    IndexMap::new(),
-                                    out_ty,
-                                );
-                                let op_mut = &mut module.ops[op_id];
-                                op_mut.name = OpName::new("stablehlo", "tanh");
-                                op_mut.operands = SmallVec::from_slice(&[add_val]);
-                                op_mut.attributes.clear();
-                                created += 1;
-                                modified += 1;
-                            }
-                            "bias_silu" => {
-                                let add_val = insert_op_before(
-                                    module,
-                                    block_id,
-                                    op_id,
-                                    OpName::new("stablehlo", "add"),
-                                    &[dot_val, inputs[2]],
-                                    IndexMap::new(),
-                                    out_ty.clone(),
-                                );
-                                let denom_val = insert_silu_denom_before(
-                                    module, block_id, op_id, add_val, &out_ty,
-                                );
-                                let op_mut = &mut module.ops[op_id];
-                                op_mut.name = OpName::new("stablehlo", "divide");
-                                op_mut.operands = SmallVec::from_slice(&[add_val, denom_val]);
-                                op_mut.attributes.clear();
-                                created += 6;
-                                modified += 1;
-                            }
-                            "bias_scale" if inputs.len() >= 4 => {
-                                let add_val = insert_op_before(
-                                    module,
-                                    block_id,
-                                    op_id,
-                                    OpName::new("stablehlo", "add"),
-                                    &[dot_val, inputs[2]],
-                                    IndexMap::new(),
-                                    out_ty,
-                                );
-                                let op_mut = &mut module.ops[op_id];
-                                op_mut.name = OpName::new("stablehlo", "multiply");
-                                op_mut.operands = SmallVec::from_slice(&[add_val, inputs[3]]);
-                                op_mut.attributes.clear();
-                                created += 1;
-                                modified += 1;
-                            }
-                            _ => {
-                                let op_mut = &mut module.ops[op_id];
-                                op_mut.name = OpName::new("stablehlo", "add");
-                                op_mut.operands = SmallVec::from_slice(&[dot_val, inputs[2]]);
-                                op_mut.attributes.clear();
-                                modified += 1;
-                            }
+                        } else if let Some(&res_in) = inputs.last() {
+                            let add_val = insert_op_before(
+                                module,
+                                block_id,
+                                op_id,
+                                OpName::new("stablehlo", "add"),
+                                &[dot_val, inputs[2]],
+                                IndexMap::new(),
+                                out_ty.clone(),
+                            );
+                            created += 1;
+                            let act_val = match base_ep {
+                                "bias_relu" if inputs.len() >= 5 => {
+                                    created += 1;
+                                    insert_op_before(
+                                        module,
+                                        block_id,
+                                        op_id,
+                                        OpName::new("stablehlo", "maximum"),
+                                        &[add_val, inputs[3]],
+                                        IndexMap::new(),
+                                        out_ty.clone(),
+                                    )
+                                }
+                                "bias_tanh" => {
+                                    created += 1;
+                                    insert_op_before(
+                                        module,
+                                        block_id,
+                                        op_id,
+                                        OpName::new("stablehlo", "tanh"),
+                                        &[add_val],
+                                        IndexMap::new(),
+                                        out_ty.clone(),
+                                    )
+                                }
+                                "bias_silu" => {
+                                    let denom_val = insert_silu_denom_before(
+                                        module, block_id, op_id, add_val, &out_ty,
+                                    );
+                                    created += 6;
+                                    insert_op_before(
+                                        module,
+                                        block_id,
+                                        op_id,
+                                        OpName::new("stablehlo", "divide"),
+                                        &[add_val, denom_val],
+                                        IndexMap::new(),
+                                        out_ty.clone(),
+                                    )
+                                }
+                                "bias_gelu" => {
+                                    created += 8;
+                                    insert_gelu_before(module, block_id, op_id, add_val, &out_ty)
+                                }
+                                "bias_scale" if inputs.len() >= 5 => {
+                                    created += 1;
+                                    insert_op_before(
+                                        module,
+                                        block_id,
+                                        op_id,
+                                        OpName::new("stablehlo", "multiply"),
+                                        &[add_val, inputs[3]],
+                                        IndexMap::new(),
+                                        out_ty.clone(),
+                                    )
+                                }
+                                _ => add_val,
+                            };
+                            let op_mut = &mut module.ops[op_id];
+                            op_mut.name = OpName::new("stablehlo", "add");
+                            op_mut.operands = SmallVec::from_slice(&[act_val, res_in]);
+                            op_mut.attributes.clear();
+                            modified += 1;
                         }
                     }
                     "castforge.fused_swiglu" if inputs.len() >= 2 => {
@@ -373,6 +478,126 @@ impl Pass for DecomposeCompositesPass {
                         op_mut.name = OpName::new("stablehlo", "multiply");
                         op_mut.operands = SmallVec::from_slice(&[norm_val, w_val]);
                         op_mut.attributes.clear();
+                        modified += 1;
+                    }
+                    "castforge.fused_layernorm" if !inputs.is_empty() => {
+                        let eps = match op.attributes.get("eps") {
+                            Some(Attribute::Float(f)) => *f as f32,
+                            _ => 1e-5,
+                        };
+                        let (norm_val, c_cnt) = insert_layernorm_core_before(
+                            module, block_id, op_id, inputs[0], eps, &out_ty,
+                        );
+                        created += c_cnt;
+                        let w_val = inputs.get(1).copied().unwrap_or_else(|| {
+                            created += 1;
+                            insert_splat_tensor_before(module, block_id, op_id, &out_ty, 1.0)
+                        });
+                        if let Some(&b_val) = inputs.get(2) {
+                            let scaled = insert_op_before(
+                                module,
+                                block_id,
+                                op_id,
+                                OpName::new("stablehlo", "multiply"),
+                                &[norm_val, w_val],
+                                IndexMap::new(),
+                                out_ty,
+                            );
+                            created += 1;
+                            let op_mut = &mut module.ops[op_id];
+                            op_mut.name = OpName::new("stablehlo", "add");
+                            op_mut.operands = SmallVec::from_slice(&[scaled, b_val]);
+                            op_mut.attributes.clear();
+                            modified += 1;
+                        } else {
+                            let op_mut = &mut module.ops[op_id];
+                            op_mut.name = OpName::new("stablehlo", "multiply");
+                            op_mut.operands = SmallVec::from_slice(&[norm_val, w_val]);
+                            op_mut.attributes.clear();
+                            modified += 1;
+                        }
+                    }
+                    "castforge.fused_gated_mlp" if inputs.len() >= 4 => {
+                        let (x, w_gate, w_up, w_down) =
+                            (inputs[0], inputs[1], inputs[2], inputs[3]);
+                        let is_gelu = op
+                            .attributes
+                            .get("activation")
+                            .and_then(|a| a.as_str())
+                            .is_some_and(|s| s.eq_ignore_ascii_case("gelu"));
+                        let hid_ty = if let (Some(xt), Some(wt)) = (
+                            module.values[x].ty.as_tensor(),
+                            module.values[w_gate].ty.as_tensor(),
+                        ) && xt.shape.len() == 2
+                            && wt.shape.len() == 2
+                        {
+                            Type::Tensor(TensorType {
+                                shape: vec![xt.shape[0].clone(), wt.shape[1].clone()],
+                                dtype: xt.dtype.clone(),
+                                encoding: None,
+                            })
+                        } else {
+                            out_ty.clone()
+                        };
+                        let mut dot_attrs = IndexMap::new();
+                        dot_attrs.insert(
+                            "lhs_contracting_dimensions".to_string(),
+                            Attribute::DenseIntArray(vec![1]),
+                        );
+                        dot_attrs.insert(
+                            "rhs_contracting_dimensions".to_string(),
+                            Attribute::DenseIntArray(vec![0]),
+                        );
+                        let gate = insert_op_before(
+                            module,
+                            block_id,
+                            op_id,
+                            OpName::new("stablehlo", "dot_general"),
+                            &[x, w_gate],
+                            dot_attrs.clone(),
+                            hid_ty.clone(),
+                        );
+                        let up = insert_op_before(
+                            module,
+                            block_id,
+                            op_id,
+                            OpName::new("stablehlo", "dot_general"),
+                            &[x, w_up],
+                            dot_attrs.clone(),
+                            hid_ty.clone(),
+                        );
+                        created += 2;
+                        let act_val = if is_gelu {
+                            created += 8;
+                            insert_gelu_before(module, block_id, op_id, gate, &hid_ty)
+                        } else {
+                            let denom =
+                                insert_silu_denom_before(module, block_id, op_id, gate, &hid_ty);
+                            created += 6;
+                            insert_op_before(
+                                module,
+                                block_id,
+                                op_id,
+                                OpName::new("stablehlo", "divide"),
+                                &[gate, denom],
+                                IndexMap::new(),
+                                hid_ty.clone(),
+                            )
+                        };
+                        let hidden = insert_op_before(
+                            module,
+                            block_id,
+                            op_id,
+                            OpName::new("stablehlo", "multiply"),
+                            &[act_val, up],
+                            IndexMap::new(),
+                            hid_ty,
+                        );
+                        created += 1;
+                        let op_mut = &mut module.ops[op_id];
+                        op_mut.name = OpName::new("stablehlo", "dot_general");
+                        op_mut.operands = SmallVec::from_slice(&[hidden, w_down]);
+                        op_mut.attributes = dot_attrs;
                         modified += 1;
                     }
                     "castforge.fused_gelu" if !inputs.is_empty() => {

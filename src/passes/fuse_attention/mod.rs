@@ -6,7 +6,7 @@ pub use serving::*;
 
 use crate::ir::{Attribute, BlockId, Module, OpName, ValueDef, ValueId};
 use crate::passes::fuse_norm::try_fuse_softmax_at_op;
-use crate::passes::{DeadCodeEliminationPass, Pass, PassResult};
+use crate::passes::{DeadCodeEliminationPass, FoldConstantsPass, Pass, PassResult};
 use crate::stablehlo::StableHloOp;
 use anyhow::Result;
 use indexmap::IndexMap;
@@ -213,33 +213,40 @@ impl Pass for FuseAttentionPass {
 
                 if has_rope_scaling && (is_dot || is_fused_rope || is_fused_attn) {
                     let attrs = &mut module.ops[op_id].attributes;
-                    attrs.insert(
+                    let mut ch = false;
+                    ch |= attrs.insert(
                         "castforge.rope_scaling".to_string(),
                         Attribute::String(rope_scaling_kind.clone()),
-                    );
-                    attrs.insert(
+                    ) != Some(Attribute::String(rope_scaling_kind.clone()));
+                    ch |= attrs.insert(
                         "castforge.rope_factor".to_string(),
                         Attribute::Float(eff_rope_factor),
-                    );
-                    attrs.insert(
+                    ) != Some(Attribute::Float(eff_rope_factor));
+                    ch |= attrs.insert(
                         "castforge.rope_mscale".to_string(),
                         Attribute::Float(rope_mscale),
-                    );
-                    modified += 1;
+                    ) != Some(Attribute::Float(rope_mscale));
+                    if ch {
+                        modified += 1;
+                    }
                 }
 
                 if (self.logit_softcap.is_some() || self.qk_norm) && (is_dot || is_fused_attn) {
                     let attrs = &mut module.ops[op_id].attributes;
+                    let mut ch = false;
                     if let Some(cap) = self.logit_softcap {
-                        attrs.insert(
-                            "castforge.logit_softcap".to_string(),
-                            Attribute::Float(cap.max(1.0)),
-                        );
+                        let c = cap.max(1.0);
+                        ch |= attrs
+                            .insert("castforge.logit_softcap".to_string(), Attribute::Float(c))
+                            != Some(Attribute::Float(c));
                     }
                     if self.qk_norm {
-                        attrs.insert("castforge.qk_norm".to_string(), Attribute::Bool(true));
+                        ch |= attrs.insert("castforge.qk_norm".to_string(), Attribute::Bool(true))
+                            != Some(Attribute::Bool(true));
                     }
-                    modified += 1;
+                    if ch {
+                        modified += 1;
+                    }
                 }
 
                 if do_kv_cache
@@ -286,32 +293,41 @@ impl Pass for FuseAttentionPass {
                     && (is_kv_update || is_fused_attn)
                 {
                     let attrs = &mut module.ops[op_id].attributes;
-                    attrs.insert(
+                    let mut ch = false;
+                    ch |= attrs.insert(
                         "castforge.kv_cache_dtype".to_string(),
                         Attribute::String(dt.clone()),
-                    );
-                    attrs.insert(
+                    ) != Some(Attribute::String(dt.clone()));
+                    ch |= attrs.insert(
                         "castforge.kv_per_head_scale".to_string(),
                         Attribute::Bool(true),
-                    );
-                    modified += 1;
+                    ) != Some(Attribute::Bool(true));
+                    if ch {
+                        modified += 1;
+                    }
                 }
 
                 if do_window && (is_dot || is_fused_attn) {
                     let attrs = &mut module.ops[op_id].attributes;
-                    attrs.insert(
+                    let w_val = self.window_size.max(16) as i64;
+                    let s_val = self.sink_tokens as i64;
+                    let mut ch = false;
+                    ch |= attrs.insert(
                         "castforge.sliding_window".to_string(),
-                        Attribute::Int(self.window_size.max(16) as i64),
-                    );
-                    attrs.insert(
+                        Attribute::Int(w_val),
+                    ) != Some(Attribute::Int(w_val));
+                    ch |= attrs.insert(
                         "castforge.attention_sinks".to_string(),
-                        Attribute::Int(self.sink_tokens as i64),
-                    );
-                    modified += 1;
+                        Attribute::Int(s_val),
+                    ) != Some(Attribute::Int(s_val));
+                    if ch {
+                        modified += 1;
+                    }
                 }
 
                 if do_kv_share && (is_dot || is_fused_attn) {
                     let is_comp = is_fused_attn && module.ops[op_id].operands.len() >= 3;
+                    let mut ch = false;
                     if attn_idx.is_multiple_of(share_stride) {
                         if is_comp {
                             donor_kv = Some((
@@ -319,18 +335,27 @@ impl Pass for FuseAttentionPass {
                                 module.ops[op_id].operands[2],
                             ));
                         }
-                    } else if is_comp && let Some((dk, dv)) = donor_kv {
+                    } else if is_comp
+                        && let Some((dk, dv)) = donor_kv
+                        && (module.ops[op_id].operands[1] != dk
+                            || module.ops[op_id].operands[2] != dv)
+                    {
                         module.ops[op_id].operands[1] = dk;
                         module.ops[op_id].operands[2] = dv;
+                        ch = true;
                     }
                     let attrs = &mut module.ops[op_id].attributes;
-                    attrs.insert("castforge.kv_shared".to_string(), Attribute::Bool(true));
-                    attrs.insert(
+                    let stride_val = share_stride as i64;
+                    ch |= attrs.insert("castforge.kv_shared".to_string(), Attribute::Bool(true))
+                        != Some(Attribute::Bool(true));
+                    ch |= attrs.insert(
                         "castforge.kv_share_stride".to_string(),
-                        Attribute::Int(share_stride as i64),
-                    );
+                        Attribute::Int(stride_val),
+                    ) != Some(Attribute::Int(stride_val));
                     attn_idx += 1;
-                    modified += 1;
+                    if ch {
+                        modified += 1;
+                    }
                 }
 
                 if do_ssm
@@ -340,23 +365,28 @@ impl Pass for FuseAttentionPass {
                             .is_some_and(|n| n.contains("attention") || n.contains("matmul")))
                 {
                     let attrs = &mut module.ops[op_id].attributes;
-                    attrs.insert(
+                    let st_dim = self.state_dim.max(16) as i64;
+                    let ch_sz = self.ssm_chunk_size.max(8) as i64;
+                    let mut ch = false;
+                    ch |= attrs.insert(
                         "castforge.ssm_chunk_scan".to_string(),
                         Attribute::Bool(true),
-                    );
-                    attrs.insert(
+                    ) != Some(Attribute::Bool(true));
+                    ch |= attrs.insert(
                         "castforge.ssm_kind".to_string(),
                         Attribute::String(k.clone()),
-                    );
-                    attrs.insert(
+                    ) != Some(Attribute::String(k.clone()));
+                    ch |= attrs.insert(
                         "castforge.ssm_state_dim".to_string(),
-                        Attribute::Int(self.state_dim.max(16) as i64),
-                    );
-                    attrs.insert(
+                        Attribute::Int(st_dim),
+                    ) != Some(Attribute::Int(st_dim));
+                    ch |= attrs.insert(
                         "castforge.ssm_chunk_size".to_string(),
-                        Attribute::Int(self.ssm_chunk_size.max(8) as i64),
-                    );
-                    modified += 1;
+                        Attribute::Int(ch_sz),
+                    ) != Some(Attribute::Int(ch_sz));
+                    if ch {
+                        modified += 1;
+                    }
                 }
             }
         }
@@ -519,6 +549,9 @@ fn unwrap_optional_scale(module: &Module, val: ValueId) -> (ValueId, f64) {
 }
 
 fn extract_scalar_constant(module: &Module, val: ValueId) -> Option<f64> {
+    if let Some(splat) = FoldConstantsPass::const_splat(module, val) {
+        return Some(splat);
+    }
     let ValueDef::OpResult { op: op_id, .. } = module.values[val].def else {
         return None;
     };
@@ -690,9 +723,13 @@ fn match_rotate_half(module: &Module, val: ValueId) -> Option<ValueId> {
     }
 
     let neg_slice_val = match_negated_value(module, inputs[0])?;
-    let x_hi = match_slice_source(module, neg_slice_val)?;
-    let x_lo = match_slice_source(module, inputs[1])?;
-    if x_hi == x_lo { Some(x_lo) } else { None }
+    let (x_hi, s_hi) = match_slice_source_with_starts(module, neg_slice_val)?;
+    let (x_lo, s_lo) = match_slice_source_with_starts(module, inputs[1])?;
+    if x_hi == x_lo && s_hi != s_lo {
+        Some(x_lo)
+    } else {
+        None
+    }
 }
 
 fn match_negated_value(module: &Module, val: ValueId) -> Option<ValueId> {
@@ -712,35 +749,23 @@ fn match_negated_value(module: &Module, val: ValueId) -> Option<ValueId> {
 }
 
 fn is_zero_constant(module: &Module, val: ValueId) -> bool {
-    let ValueDef::OpResult { op: op_id, .. } = module.values[val].def else {
-        return false;
-    };
-    let Some(op) = module.ops.get(op_id) else {
-        return false;
-    };
-    let Some(StableHloOp::Constant { value, .. }) = StableHloOp::from_op(op) else {
-        return false;
-    };
-    match value {
-        Attribute::Float(f) => f.abs() < 1e-9,
-        Attribute::Int(i) => i == 0,
-        Attribute::DenseElements { raw_literal, .. } => raw_literal
-            .trim()
-            .parse::<f64>()
-            .is_ok_and(|f| f.abs() < 1e-9),
-        _ => false,
-    }
+    FoldConstantsPass::const_splat(module, val).is_some_and(|f| f.abs() < 1e-9)
 }
 
-fn match_slice_source(module: &Module, val: ValueId) -> Option<ValueId> {
+fn match_slice_source_with_starts(module: &Module, val: ValueId) -> Option<(ValueId, Vec<i64>)> {
     let ValueDef::OpResult { op: op_id, .. } = module.values[val].def else {
         return None;
     };
     let op = module.ops.get(op_id)?;
-    let StableHloOp::Slice { operand, .. } = StableHloOp::from_op(op)? else {
+    let StableHloOp::Slice {
+        operand,
+        start_indices,
+        ..
+    } = StableHloOp::from_op(op)?
+    else {
         return None;
     };
-    Some(operand)
+    Some((operand, start_indices))
 }
 
 /// DeepSeek-V2/V3 Multi-Head Latent Attention Pass (`fuse-mla`).
@@ -765,7 +790,11 @@ impl Pass for FuseMlaPass {
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let mut modified = 0usize;
-        for (_, op) in module.ops.iter_mut() {
+        let rank_val = self.latent_rank.max(16);
+        for op_id in module.live_ops() {
+            let Some(op) = module.ops.get_mut(op_id) else {
+                continue;
+            };
             let is_target = op.is_op("stablehlo", "dot_general")
                 || (op.is_op("stablehlo", "composite")
                     && op
@@ -774,19 +803,22 @@ impl Pass for FuseMlaPass {
                         .and_then(|a| a.as_str())
                         .is_some_and(|n| n == "castforge.fused_attention"));
             if is_target {
-                op.attributes.insert(
+                let mut ch = false;
+                ch |= op.attributes.insert(
                     "castforge.mla_compressed_kv".to_string(),
                     Attribute::Bool(true),
-                );
-                op.attributes.insert(
+                ) != Some(Attribute::Bool(true));
+                ch |= op.attributes.insert(
                     "castforge.mla_latent_rank".to_string(),
-                    Attribute::Int(self.latent_rank.max(16)),
-                );
-                op.attributes.insert(
+                    Attribute::Int(rank_val),
+                ) != Some(Attribute::Int(rank_val));
+                ch |= op.attributes.insert(
                     "castforge.mla_w_uk_absorbed".to_string(),
                     Attribute::Bool(true),
-                );
-                modified += 1;
+                ) != Some(Attribute::Bool(true));
+                if ch {
+                    modified += 1;
+                }
             }
         }
         Ok(PassResult {

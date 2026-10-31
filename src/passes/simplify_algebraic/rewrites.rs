@@ -12,11 +12,15 @@ use smallvec::SmallVec;
 pub(super) enum AlgOutcome {
     Unchanged,
     SwappedOnly,
-    ModifiedAndDone,
+    ModifiedAndDone(usize),
     Replaced(bool),
 }
 
-pub(super) fn try_simplify_algebraic_op(module: &mut Module, op_id: OpId) -> AlgOutcome {
+pub(super) fn try_simplify_algebraic_op(
+    module: &mut Module,
+    block_id: BlockId,
+    op_id: OpId,
+) -> AlgOutcome {
     let Some(op) = module.ops.get(op_id) else {
         return AlgOutcome::Unchanged;
     };
@@ -56,15 +60,10 @@ pub(super) fn try_simplify_algebraic_op(module: &mut Module, op_id: OpId) -> Alg
                 && let Some(c2_ty) = module.values[rhs].ty.as_tensor().cloned()
             {
                 let sum_lit = format_splat(c1 + c2);
-                module.ops[c2_op_id].attributes.insert(
-                    "value".to_string(),
-                    Attribute::DenseElements {
-                        ty: c2_ty,
-                        raw_literal: sum_lit,
-                    },
+                let created = update_or_clone_reassoc_const(
+                    module, block_id, op_id, lhs, c1_val, rhs, c2_op_id, x, c2_ty, sum_lit,
                 );
-                module.ops[op_id].operands[0] = x;
-                return AlgOutcome::ModifiedAndDone;
+                return AlgOutcome::ModifiedAndDone(created);
             }
         }
         StableHloOp::Multiply { lhs, rhs, .. } => {
@@ -81,15 +80,10 @@ pub(super) fn try_simplify_algebraic_op(module: &mut Module, op_id: OpId) -> Alg
                 && let Some(c2_ty) = module.values[rhs].ty.as_tensor().cloned()
             {
                 let prod_lit = format_splat(c1 * c2);
-                module.ops[c2_op_id].attributes.insert(
-                    "value".to_string(),
-                    Attribute::DenseElements {
-                        ty: c2_ty,
-                        raw_literal: prod_lit,
-                    },
+                let created = update_or_clone_reassoc_const(
+                    module, block_id, op_id, lhs, c1_val, rhs, c2_op_id, x, c2_ty, prod_lit,
                 );
-                module.ops[op_id].operands[0] = x;
-                return AlgOutcome::ModifiedAndDone;
+                return AlgOutcome::ModifiedAndDone(created);
             }
         }
         _ => {}
@@ -111,41 +105,37 @@ pub(super) fn try_simplify_algebraic_op(module: &mut Module, op_id: OpId) -> Alg
                 raw_literal: "0.0".to_string(),
             },
         );
-        return AlgOutcome::ModifiedAndDone;
+        return AlgOutcome::ModifiedAndDone(0);
     }
 
     let replacement: Option<(ValueId, ValueId)> = match hlo {
         StableHloOp::Add { lhs, rhs, result } => {
-            if const_attr(module, rhs).is_some_and(|a| a.is_splat_zero()) {
+            if is_splat_zero(module, rhs) {
                 Some((result, lhs))
-            } else if const_attr(module, lhs).is_some_and(|a| a.is_splat_zero()) {
+            } else if is_splat_zero(module, lhs) {
                 Some((result, rhs))
             } else {
                 None
             }
         }
         StableHloOp::Subtract { lhs, rhs, result } => {
-            if const_attr(module, rhs).is_some_and(|a| a.is_splat_zero()) {
+            if is_splat_zero(module, rhs) {
                 Some((result, lhs))
             } else {
                 None
             }
         }
         StableHloOp::Multiply { lhs, rhs, result } => {
-            if const_attr(module, rhs).is_some_and(|a| a.is_splat_one())
-                || const_attr(module, lhs).is_some_and(|a| a.is_splat_zero())
-            {
+            if is_splat_one(module, rhs) || is_splat_zero(module, lhs) {
                 Some((result, lhs))
-            } else if const_attr(module, lhs).is_some_and(|a| a.is_splat_one())
-                || const_attr(module, rhs).is_some_and(|a| a.is_splat_zero())
-            {
+            } else if is_splat_one(module, lhs) || is_splat_zero(module, rhs) {
                 Some((result, rhs))
             } else {
                 None
             }
         }
         StableHloOp::Divide { lhs, rhs, result } => {
-            if const_attr(module, rhs).is_some_and(|a| a.is_splat_one()) {
+            if is_splat_one(module, rhs) {
                 Some((result, lhs))
             } else {
                 None
@@ -305,6 +295,68 @@ fn const_attr(module: &Module, val_id: ValueId) -> Option<&Attribute> {
 
 fn is_constant(module: &Module, val_id: ValueId) -> bool {
     const_attr(module, val_id).is_some()
+}
+
+fn is_splat_zero(module: &Module, val_id: ValueId) -> bool {
+    const_attr(module, val_id).is_some_and(|a| a.is_splat_zero())
+        || FoldConstantsPass::const_splat(module, val_id).is_some_and(|v| v == 0.0)
+}
+
+fn is_splat_one(module: &Module, val_id: ValueId) -> bool {
+    const_attr(module, val_id).is_some_and(|a| a.is_splat_one())
+        || FoldConstantsPass::const_splat(module, val_id).is_some_and(|v| (v - 1.0).abs() < 1e-9)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_or_clone_reassoc_const(
+    module: &mut Module,
+    block_id: BlockId,
+    op_id: OpId,
+    lhs: ValueId,
+    c1_val: ValueId,
+    rhs: ValueId,
+    c2_op_id: OpId,
+    x: ValueId,
+    c2_ty: crate::ir::TensorType,
+    raw_literal: String,
+) -> usize {
+    let rhs_uses = module.use_count(rhs);
+    let can_mutate_c2 = (c1_val != rhs && rhs_uses == 1)
+        || (c1_val == rhs && rhs_uses == 2 && module.use_count(lhs) == 1);
+    if can_mutate_c2 {
+        if let Some(ref ssa) = module.values[rhs].ssa_name {
+            module.tensor_store.remove(ssa);
+        }
+        module.ops[c2_op_id].attributes.insert(
+            "value".to_string(),
+            Attribute::DenseElements {
+                ty: c2_ty,
+                raw_literal,
+            },
+        );
+        module.ops[op_id].operands[0] = x;
+        0
+    } else {
+        let new_c_val = insert_op_before(
+            module,
+            block_id,
+            op_id,
+            OpName::new("stablehlo", "constant"),
+            &[],
+            crate::ir::Type::Tensor(c2_ty.clone()),
+        );
+        if let ValueDef::OpResult { op: new_c_op, .. } = module.values[new_c_val].def {
+            module.ops[new_c_op].attributes.insert(
+                "value".to_string(),
+                Attribute::DenseElements {
+                    ty: c2_ty,
+                    raw_literal,
+                },
+            );
+        }
+        module.ops[op_id].operands = SmallVec::from_slice(&[x, new_c_val]);
+        1
+    }
 }
 
 fn format_splat(v: f64) -> String {

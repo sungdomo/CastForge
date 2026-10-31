@@ -676,65 +676,118 @@ impl Pass for AutodiffPass {
                             &mut created,
                         );
                     }
-                    StableHloOp::DotGeneral { lhs, rhs, .. } => {
+                    StableHloOp::DotGeneral {
+                        lhs,
+                        rhs,
+                        dimension_numbers: dims,
+                        ..
+                    } => {
                         let lhs_ty = module.values[lhs].ty.clone();
                         let rhs_ty = module.values[rhs].ty.clone();
                         let lhs_dims = tensor_dims(&lhs_ty);
                         let rhs_dims = tensor_dims(&rhs_ty);
                         if lhs_dims.len() == 2 && rhs_dims.len() == 2 {
-                            let bt_ty = Type::Tensor(TensorType {
-                                shape: vec![Dim::Static(rhs_dims[1]), Dim::Static(rhs_dims[0])],
-                                dtype: DType::F32,
-                                encoding: None,
-                            });
+                            let lhs_dt = lhs_ty
+                                .as_tensor()
+                                .map(|t| t.dtype.clone())
+                                .unwrap_or(DType::F32);
+                            let rhs_dt = rhs_ty
+                                .as_tensor()
+                                .map(|t| t.dtype.clone())
+                                .unwrap_or(DType::F32);
                             let mut t_attrs = IndexMap::new();
                             t_attrs.insert(
                                 "permutation".to_string(),
                                 Attribute::DenseIntArray(vec![1, 0]),
                             );
-                            let bt = insert_vjp_op(
-                                module,
-                                block_id,
-                                ret_op_id,
-                                OpName::new("stablehlo", "transpose"),
-                                &[rhs],
-                                t_attrs.clone(),
-                                bt_ty,
-                            );
-                            let dlhs = insert_vjp_op(
-                                module,
-                                block_id,
-                                ret_op_id,
-                                OpName::new("stablehlo", "dot_general"),
-                                &[dy, bt],
-                                dot_2d_attrs(),
-                                lhs_ty,
-                            );
+                            let rhs_transposed = dims.rhs_contracting_dimensions == [1];
+                            let (dlhs, drhs) = if rhs_transposed {
+                                let dlhs = insert_vjp_op(
+                                    module,
+                                    block_id,
+                                    ret_op_id,
+                                    OpName::new("stablehlo", "dot_general"),
+                                    &[dy, rhs],
+                                    dot_2d_attrs(),
+                                    lhs_ty,
+                                );
+                                let dy_dims = tensor_dims(&out_ty);
+                                let dyt_ty = Type::Tensor(TensorType {
+                                    shape: vec![Dim::Static(dy_dims[1]), Dim::Static(dy_dims[0])],
+                                    dtype: rhs_dt,
+                                    encoding: None,
+                                });
+                                let dyt = insert_vjp_op(
+                                    module,
+                                    block_id,
+                                    ret_op_id,
+                                    OpName::new("stablehlo", "transpose"),
+                                    &[dy],
+                                    t_attrs,
+                                    dyt_ty,
+                                );
+                                let drhs = insert_vjp_op(
+                                    module,
+                                    block_id,
+                                    ret_op_id,
+                                    OpName::new("stablehlo", "dot_general"),
+                                    &[dyt, lhs],
+                                    dot_2d_attrs(),
+                                    rhs_ty,
+                                );
+                                created += 3;
+                                (dlhs, drhs)
+                            } else {
+                                let bt_ty = Type::Tensor(TensorType {
+                                    shape: vec![Dim::Static(rhs_dims[1]), Dim::Static(rhs_dims[0])],
+                                    dtype: rhs_dt,
+                                    encoding: None,
+                                });
+                                let bt = insert_vjp_op(
+                                    module,
+                                    block_id,
+                                    ret_op_id,
+                                    OpName::new("stablehlo", "transpose"),
+                                    &[rhs],
+                                    t_attrs.clone(),
+                                    bt_ty,
+                                );
+                                let dlhs = insert_vjp_op(
+                                    module,
+                                    block_id,
+                                    ret_op_id,
+                                    OpName::new("stablehlo", "dot_general"),
+                                    &[dy, bt],
+                                    dot_2d_attrs(),
+                                    lhs_ty,
+                                );
 
-                            let at_ty = Type::Tensor(TensorType {
-                                shape: vec![Dim::Static(lhs_dims[1]), Dim::Static(lhs_dims[0])],
-                                dtype: DType::F32,
-                                encoding: None,
-                            });
-                            let at = insert_vjp_op(
-                                module,
-                                block_id,
-                                ret_op_id,
-                                OpName::new("stablehlo", "transpose"),
-                                &[lhs],
-                                t_attrs,
-                                at_ty,
-                            );
-                            let drhs = insert_vjp_op(
-                                module,
-                                block_id,
-                                ret_op_id,
-                                OpName::new("stablehlo", "dot_general"),
-                                &[at, dy],
-                                dot_2d_attrs(),
-                                rhs_ty,
-                            );
-                            created += 4;
+                                let at_ty = Type::Tensor(TensorType {
+                                    shape: vec![Dim::Static(lhs_dims[1]), Dim::Static(lhs_dims[0])],
+                                    dtype: lhs_dt,
+                                    encoding: None,
+                                });
+                                let at = insert_vjp_op(
+                                    module,
+                                    block_id,
+                                    ret_op_id,
+                                    OpName::new("stablehlo", "transpose"),
+                                    &[lhs],
+                                    t_attrs,
+                                    at_ty,
+                                );
+                                let drhs = insert_vjp_op(
+                                    module,
+                                    block_id,
+                                    ret_op_id,
+                                    OpName::new("stablehlo", "dot_general"),
+                                    &[at, dy],
+                                    dot_2d_attrs(),
+                                    rhs_ty,
+                                );
+                                created += 4;
+                                (dlhs, drhs)
+                            };
                             accumulate_grad(
                                 module,
                                 block_id,

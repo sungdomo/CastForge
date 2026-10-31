@@ -213,13 +213,20 @@ impl Pass for OutlineKernelsPass {
                 .map(|(i, t)| (Some(format!("k_res{i}")), t.clone()))
                 .collect();
 
+            let mut kernel_val_map: HashMap<ValueId, ValueId> = op
+                .operands
+                .iter()
+                .copied()
+                .zip(kernel_args.iter().copied())
+                .collect();
+            let cloned_regions = module.clone_regions_local(&op.regions, &mut kernel_val_map);
             let inner_op_id = module.add_operation(
                 kernel_block,
                 op.name.clone(),
                 kernel_args,
                 kernel_res_specs,
                 op.attributes.clone(),
-                Vec::new(),
+                cloned_regions,
                 op.custom_syntax,
                 op.location.clone(),
             );
@@ -377,13 +384,14 @@ pub fn link_modules(base: &mut Module, other: &Module) -> Result<usize> {
                     (rv.ssa_name.clone(), rv.ty.clone())
                 })
                 .collect();
+            let cloned_regions = base.clone_regions_from(other, &op.regions, &mut val_map);
             let new_op_id = base.add_operation(
                 dst_blk,
                 op.name.clone(),
                 mapped_operands,
                 res_specs,
                 op.attributes.clone(),
-                Vec::new(),
+                cloned_regions,
                 op.custom_syntax,
                 op.location.clone(),
             );
@@ -618,7 +626,12 @@ impl Pass for UnrollCallsPass {
                 let Some(op) = module.ops.get(op_id).cloned() else {
                     continue;
                 };
-                if !op.is_op("func", "call") || op.operands.is_empty() || op.results.len() != 1 {
+                if !op.is_op("func", "call")
+                    || op.operands.is_empty()
+                    || op.results.len() != 1
+                    || op.attributes.contains_key("unroll_step")
+                    || op.attributes.contains_key("castforge.unrolled")
+                {
                     continue;
                 }
                 let orig_res = op.results[0];
@@ -626,6 +639,10 @@ impl Pass for UnrollCallsPass {
                 if module.values[op.operands[0]].ty != res_ty {
                     continue;
                 }
+
+                module.ops[op_id]
+                    .attributes
+                    .insert("castforge.unrolled".to_string(), Attribute::Bool(true));
 
                 let mut cur_val = orig_res;
                 let mut new_call_ids: Vec<OpId> = Vec::with_capacity(repeat - 1);

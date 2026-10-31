@@ -535,16 +535,20 @@ impl PassRegistry {
             "canonicalize",
             "Composite canonicalization & topological/peak-memory scheduler (mode=all|min_memory)",
             |opts| {
-                let mode = opts.get("mode").cloned().unwrap_or_else(|| {
-                    if opts
-                        .get("min_memory")
-                        .is_some_and(|v| v == "true" || v == "1")
-                    {
-                        "min_memory".to_string()
-                    } else {
-                        "all".to_string()
-                    }
-                });
+                let mode = opts
+                    .get("mode")
+                    .or_else(|| opts.get("schedule"))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        if opts
+                            .get("min_memory")
+                            .is_some_and(|v| v == "true" || v == "1")
+                        {
+                            "min_memory".to_string()
+                        } else {
+                            "all".to_string()
+                        }
+                    });
                 let toposort = opts
                     .get("toposort")
                     .is_some_and(|v| v == "true" || v == "1");

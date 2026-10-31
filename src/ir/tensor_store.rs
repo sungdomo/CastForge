@@ -231,6 +231,57 @@ impl TensorStore {
         self.entries.get_mut(name)
     }
 
+    pub fn remove(&mut self, name: &str) -> Option<TensorEntry> {
+        self.entries.shift_remove(name)
+    }
+
+    pub fn rename_key(&mut self, old_name: &str, new_name: String) {
+        if old_name == new_name {
+            return;
+        }
+        if let Some(mut entry) = self.entries.shift_remove(old_name) {
+            entry.name = new_name.clone();
+            self.entries.insert(new_name, entry);
+        }
+    }
+
+    /// Updates a constant's `f32` data in both its operation `Attribute` (`TensorRef` or
+    /// `DenseElements`) and any corresponding `TensorStore` entry (keyed by `TensorRef` or
+    /// `ssa_name`).
+    pub fn update_f32_constant(
+        &mut self,
+        ssa_name: Option<&str>,
+        old_attr: &Attribute,
+        new_ty: TensorType,
+        new_vals: Vec<f32>,
+    ) -> Attribute {
+        match old_attr {
+            Attribute::TensorRef { key, .. } => {
+                if let Some(entry) = self.entries.get_mut(key) {
+                    entry.ty = new_ty.clone();
+                    entry.backing = TensorBacking::F32Data(new_vals);
+                }
+                Attribute::TensorRef {
+                    key: key.clone(),
+                    ty: new_ty,
+                }
+            }
+            _ => {
+                let raw_literal = format_dense_f32_literal(&new_vals, &new_ty.shape);
+                if let Some(name) = ssa_name
+                    && let Some(entry) = self.entries.get_mut(name)
+                {
+                    entry.ty = new_ty.clone();
+                    entry.backing = TensorBacking::F32Data(new_vals);
+                }
+                Attribute::DenseElements {
+                    ty: new_ty,
+                    raw_literal,
+                }
+            }
+        }
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&String, &TensorEntry)> {
         self.entries.iter()
     }
