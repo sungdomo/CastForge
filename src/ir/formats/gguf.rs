@@ -62,8 +62,15 @@ pub fn import_gguf_bytes(bytes: &[u8]) -> Result<Module> {
     if !(2..=3).contains(&version) {
         bail!("Unsupported GGUF version: {version}");
     }
-    let tensor_count = read_u64(bytes, &mut cursor)? as usize;
-    let kv_count = read_u64(bytes, &mut cursor)? as usize;
+    let tensor_count_u64 = read_u64(bytes, &mut cursor)?;
+    let kv_count_u64 = read_u64(bytes, &mut cursor)?;
+    if tensor_count_u64 > 65_536 || kv_count_u64 > 65_536 {
+        bail!(
+            "GGUF header counts (tensors={tensor_count_u64}, kv={kv_count_u64}) exceed safety limit"
+        );
+    }
+    let tensor_count = tensor_count_u64 as usize;
+    let kv_count = kv_count_u64 as usize;
 
     let mut model_name = "gguf_model".to_string();
     let mut alignment = GGUF_DEFAULT_ALIGNMENT;
@@ -87,10 +94,26 @@ pub fn import_gguf_bytes(bytes: &[u8]) -> Result<Module> {
     let mut infos = Vec::with_capacity(tensor_count);
     for _ in 0..tensor_count {
         let name = read_gguf_string(bytes, &mut cursor)?;
-        let n_dims = read_u32(bytes, &mut cursor)? as usize;
+        let n_dims_u32 = read_u32(bytes, &mut cursor)?;
+        if n_dims_u32 > 16 {
+            bail!("GGUF tensor `{name}` rank {n_dims_u32} exceeds maximum rank 16");
+        }
+        let n_dims = n_dims_u32 as usize;
         let mut raw_dims = Vec::with_capacity(n_dims);
+        let mut checked_elems = 1usize;
         for _ in 0..n_dims {
-            raw_dims.push(read_u64(bytes, &mut cursor)? as i64);
+            let d = read_u64(bytes, &mut cursor)?;
+            let di = i64::try_from(d).context("GGUF dimension overflows i64")?;
+            if di < 0 {
+                bail!("GGUF tensor `{name}` has negative dimension {di}");
+            }
+            checked_elems = checked_elems
+                .checked_mul((di.max(1)) as usize)
+                .ok_or_else(|| anyhow!("GGUF tensor `{name}` dimension product overflow"))?;
+            if checked_elems > crate::ir::TensorType::MAX_TENSOR_ELEMENTS as usize {
+                bail!("GGUF tensor `{name}` exceeds max tensor element limit");
+            }
+            raw_dims.push(di);
         }
         // GGUF stores dimensions inner-most first; reverse into row-major [M, N]
         raw_dims.reverse();
@@ -390,8 +413,11 @@ fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
 }
 
 fn read_gguf_string(bytes: &[u8], cursor: &mut usize) -> Result<String> {
-    let len = read_u64(bytes, cursor)? as usize;
-    let end = *cursor + len;
+    let len_u64 = read_u64(bytes, cursor)?;
+    let len = usize::try_from(len_u64).context("GGUF string length overflow")?;
+    let end = cursor
+        .checked_add(len)
+        .ok_or_else(|| anyhow!("GGUF string offset overflow"))?;
     let slice = bytes
         .get(*cursor..end)
         .ok_or_else(|| anyhow!("Unexpected EOF reading GGUF string"))?;

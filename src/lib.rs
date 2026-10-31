@@ -3,6 +3,7 @@
 
 pub mod cli;
 pub mod codegen;
+pub mod ffi;
 pub mod ir;
 pub mod passes;
 

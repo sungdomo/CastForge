@@ -561,16 +561,34 @@ impl TensorStore {
     /// Load tensors from a `.safetensors` byte slice into this `TensorStore`.
     pub fn load_safetensors_bytes(&mut self, bytes: &[u8]) -> Result<usize, std::io::Error> {
         use std::io;
+        const MAX_HEADER_LEN: usize = 100 * 1024 * 1024;
         if bytes.len() < 8 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "Safetensors buffer shorter than 8-byte header length",
             ));
         }
-        let header_len = u64::from_le_bytes([
+        let header_len_u64 = u64::from_le_bytes([
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]) as usize;
-        let data_start = 8usize.saturating_add(header_len);
+        ]);
+        let header_len = usize::try_from(header_len_u64).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Safetensors header length overflows usize",
+            )
+        })?;
+        if header_len > MAX_HEADER_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Safetensors header length {header_len} exceeds 100 MiB limit"),
+            ));
+        }
+        let data_start = 8usize.checked_add(header_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Safetensors header offset overflow",
+            )
+        })?;
         if bytes.len() < data_start {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -598,8 +616,30 @@ impl TensorStore {
                     format!("Invalid data_offsets [{start}, {end}] for tensor `{name}`"),
                 ));
             }
+            let mut shape = Vec::with_capacity(hdr.shape.len());
+            let mut elem_prod = 1i64;
+            for &d in &hdr.shape {
+                let di = i64::try_from(d).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Dimension {d} overflows i64 for tensor `{name}`"),
+                    )
+                })?;
+                elem_prod = elem_prod.checked_mul(di.max(1)).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Dimension product overflow for tensor `{name}`"),
+                    )
+                })?;
+                if elem_prod > TensorType::MAX_TENSOR_ELEMENTS {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Tensor `{name}` exceeds max element limit"),
+                    ));
+                }
+                shape.push(Dim::Static(di));
+            }
             let slice = &body_slice[start..end];
-            let shape: Vec<Dim> = hdr.shape.iter().map(|&d| Dim::Static(d as i64)).collect();
 
             match hdr.dtype.as_str() {
                 "F32" => {
@@ -694,5 +734,74 @@ impl TensorStore {
     ) -> Result<usize, std::io::Error> {
         let bytes = std::fs::read(path)?;
         self.load_safetensors_bytes(&bytes)
+    }
+
+    /// Lazily index a `.safetensors` file on disk by reading ONLY its JSON header and registering
+    /// `TensorBacking::ExternalFile` slice descriptors without loading weight payloads into RAM.
+    pub fn load_safetensors_lazy_file(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<usize, std::io::Error> {
+        use std::io::{self, Read};
+        let path_ref = path.as_ref();
+        let mut file = std::fs::File::open(path_ref)?;
+        let file_len = file.metadata()?.len();
+        if file_len < 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Safetensors file shorter than 8-byte header",
+            ));
+        }
+        let mut len_buf = [0u8; 8];
+        file.read_exact(&mut len_buf)?;
+        let header_len = u64::from_le_bytes(len_buf);
+        if header_len > 100 * 1024 * 1024 || 8 + header_len > file_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid or truncated Safetensors header length",
+            ));
+        }
+        let mut header_bytes = vec![0u8; header_len as usize];
+        file.read_exact(&mut header_bytes)?;
+        let data_base = 8u64 + header_len;
+        let raw_map: IndexMap<String, serde_json::Value> = serde_json::from_slice(&header_bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        let mut count = 0usize;
+        for (name, val) in raw_map {
+            if name == "__metadata__" {
+                continue;
+            }
+            let hdr: SafeTensorEntryHeader = serde_json::from_value(val)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let [start, end] = hdr.data_offsets;
+            let abs_start = data_base.saturating_add(start as u64);
+            let abs_end = data_base.saturating_add(end as u64);
+            if start > end || abs_end > file_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("Out-of-bounds data_offsets for tensor `{name}`"),
+                ));
+            }
+            let dtype = match hdr.dtype.as_str() {
+                "F16" => DType::F16,
+                "BF16" => DType::BF16,
+                "I8" => DType::I8,
+                "U8" => DType::U8,
+                _ => DType::F32,
+            };
+            let shape: Vec<Dim> = hdr.shape.iter().map(|&d| Dim::Static(d as i64)).collect();
+            self.insert(TensorEntry {
+                name,
+                ty: TensorType::new(shape, dtype),
+                backing: TensorBacking::ExternalFile {
+                    path: path_ref.to_path_buf(),
+                    offset: abs_start,
+                    length: (end - start) as u64,
+                },
+            });
+            count += 1;
+        }
+        Ok(count)
     }
 }

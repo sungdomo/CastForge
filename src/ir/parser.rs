@@ -21,6 +21,9 @@ pub struct MlirParser {
     pub(crate) value_map: HashMap<String, ValueId>,
 }
 
+/// Maximum nested region depth allowed during parsing to prevent stack overflow on crafted inputs.
+pub const MAX_REGION_NESTING_DEPTH: usize = 64;
+
 impl Default for MlirParser {
     fn default() -> Self {
         Self::new()
@@ -103,6 +106,14 @@ impl MlirParser {
             }
 
             if line.starts_with("func.func ") {
+                if block_stack.len() >= MAX_REGION_NESTING_DEPTH {
+                    return Err(ParseError::Syntax {
+                        line: line_no,
+                        message: format!(
+                            "Region nesting depth exceeds limit ({MAX_REGION_NESTING_DEPTH})"
+                        ),
+                    });
+                }
                 let fn_blk = self.parse_func_header(&mut module, line, line_no)?;
                 block_stack.push(fn_blk);
                 continue;
@@ -112,6 +123,14 @@ impl MlirParser {
             if let Some(sub_blk) =
                 self.parse_operation_line(&mut module, current_block, line, line_no)?
             {
+                if block_stack.len() >= MAX_REGION_NESTING_DEPTH {
+                    return Err(ParseError::Syntax {
+                        line: line_no,
+                        message: format!(
+                            "Region nesting depth exceeds limit ({MAX_REGION_NESTING_DEPTH})"
+                        ),
+                    });
+                }
                 block_stack.push(sub_blk);
             }
         }
@@ -1139,10 +1158,32 @@ pub fn parse_type(s: &str, line_no: usize) -> Result<Type, ParseError> {
             message: format!("Unknown tensor element type `{dtype_str}` in `{s}`"),
         })?;
         let mut shape = Vec::with_capacity(tokens.len().saturating_sub(1));
+        let mut prod = 1i64;
         for &dim_tok in &tokens[..tokens.len().saturating_sub(1)] {
             if dim_tok == "?" {
                 shape.push(Dim::Dynamic);
             } else if let Ok(n) = dim_tok.parse::<i64>() {
+                if n < 0 {
+                    return Err(ParseError::Syntax {
+                        line: line_no,
+                        message: format!("Negative static dimension `{n}` in `{s}`"),
+                    });
+                }
+                prod = prod
+                    .checked_mul(n.max(1))
+                    .ok_or_else(|| ParseError::Syntax {
+                        line: line_no,
+                        message: format!("Tensor dimension product overflow in `{s}`"),
+                    })?;
+                if prod > TensorType::MAX_TENSOR_ELEMENTS {
+                    return Err(ParseError::Syntax {
+                        line: line_no,
+                        message: format!(
+                            "Tensor element count {prod} exceeds limit ({}) in `{s}`",
+                            TensorType::MAX_TENSOR_ELEMENTS
+                        ),
+                    });
+                }
                 shape.push(Dim::Static(n));
             } else {
                 shape.push(Dim::Symbolic(dim_tok.to_string()));

@@ -75,9 +75,18 @@ pub fn import_onnx_json(json_str: &str) -> Result<Module> {
     let mut shapes: HashMap<String, Vec<i64>> = HashMap::new();
 
     for inp in &spec.inputs {
+        if inp.shape.iter().any(|&d| d < 0) {
+            bail!("ONNX input `{}` has negative static dimension", inp.name);
+        }
         shapes.insert(inp.name.clone(), inp.shape.clone());
     }
     for init in &spec.initializers {
+        if init.shape.iter().any(|&d| d < 0) {
+            bail!(
+                "ONNX initializer `{}` has negative static dimension",
+                init.name
+            );
+        }
         shapes.insert(init.name.clone(), init.shape.clone());
     }
 
@@ -254,7 +263,13 @@ pub fn import_onnx_json(json_str: &str) -> Result<Module> {
                 )?;
             }
             "Concat" => {
-                let axis = node.attrs.get("axis").and_then(|v| v.as_i64()).unwrap_or(0);
+                let raw_axis = node.attrs.get("axis").and_then(|v| v.as_i64()).unwrap_or(0);
+                let rank = (node.output_shape.len() as i64).max(1);
+                let axis = if raw_axis < 0 {
+                    (rank + raw_axis).max(0)
+                } else {
+                    raw_axis
+                };
                 let ins: Vec<String> = node
                     .inputs
                     .iter()
@@ -297,7 +312,7 @@ pub fn import_onnx_json(json_str: &str) -> Result<Module> {
                     "ReduceProd" => ("stablehlo.multiply", "1.0"),
                     _ => ("stablehlo.add", "0.0"),
                 };
-                let axis = node
+                let raw_axis = node
                     .attrs
                     .get("axis")
                     .and_then(|v| v.as_i64())
@@ -309,6 +324,12 @@ pub fn import_onnx_json(json_str: &str) -> Result<Module> {
                             .and_then(|x| x.as_i64())
                     })
                     .unwrap_or(1);
+                let rank = (in0_sh.len() as i64).max(1);
+                let axis = if raw_axis < 0 {
+                    (rank + raw_axis).max(0)
+                } else {
+                    raw_axis
+                };
                 writeln!(
                     mlir,
                     "    %{z} = stablehlo.constant dense<{init_lit}> : tensor<f32>"
@@ -344,10 +365,73 @@ pub fn import_onnx_json(json_str: &str) -> Result<Module> {
                     in_tys.join(", ")
                 )?;
             }
-            "Reshape" => {
+            "Reshape" | "Unsqueeze" | "Squeeze" | "Flatten" => {
                 writeln!(
                     mlir,
                     "    %{out_name} = stablehlo.reshape %{in0} : ({in0_ty}) -> {out_ty}"
+                )?;
+            }
+            "Einsum" => {
+                let eq = node
+                    .attrs
+                    .get("equation")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("ij,jk->ik")
+                    .replace(' ', "");
+                if node.inputs.len() >= 2 {
+                    let in1 =
+                        sanitize_name(node.inputs.get(1).ok_or_else(|| anyhow!("Einsum rhs"))?);
+                    let in1_sh = shapes
+                        .get(&node.inputs[1])
+                        .cloned()
+                        .unwrap_or_else(|| vec![1, 1]);
+                    let in1_ty = format!("tensor<{}xf32>", fmt_shape(&in1_sh));
+                    let (lhs_c, rhs_c) = if eq.ends_with("->ij") && eq.starts_with("ik,jk") {
+                        (1, 1)
+                    } else {
+                        (
+                            (in0_sh.len().saturating_sub(1)) as i64,
+                            (in1_sh.len().saturating_sub(2)) as i64,
+                        )
+                    };
+                    writeln!(
+                        mlir,
+                        "    %{out_name} = stablehlo.dot_general %{in0}, %{in1}, \
+                         contracting_dims = [{lhs_c}] x [{rhs_c}] \
+                         : ({in0_ty}, {in1_ty}) -> {out_ty}"
+                    )?;
+                } else {
+                    writeln!(
+                        mlir,
+                        "    %{out_name} = stablehlo.transpose %{in0}, dims = [1, 0] \
+                         : ({in0_ty}) -> {out_ty}"
+                    )?;
+                }
+            }
+            "Tile" => {
+                let axis = node.output_shape.len().saturating_sub(1);
+                let in_dim = in0_sh.get(axis).copied().unwrap_or(1).max(1);
+                let out_dim = node.output_shape.get(axis).copied().unwrap_or(in_dim);
+                let repeats = (out_dim / in_dim).max(1) as usize;
+                let ins = vec![format!("%{in0}"); repeats].join(", ");
+                let in_tys = vec![in0_ty.clone(); repeats].join(", ");
+                writeln!(
+                    mlir,
+                    "    %{out_name} = \"stablehlo.concatenate\"({ins}) \
+                     {{dimension = {axis}}} : ({in_tys}) -> {out_ty}"
+                )?;
+            }
+            "TopK" => {
+                let k = node
+                    .attrs
+                    .get("k")
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| node.output_shape.last().copied())
+                    .unwrap_or(1);
+                writeln!(
+                    mlir,
+                    "    %{out_name} = \"castforge.topk\"(%{in0}) {{k = {k}}} \
+                     : ({in0_ty}) -> {out_ty}"
                 )?;
             }
             "Transpose" => {
@@ -532,7 +616,7 @@ pub fn import_onnx_json(json_str: &str) -> Result<Module> {
                      interior_padding = [{inter}]}} : ({in0_ty}, tensor<f32>) -> {out_ty}"
                 )?;
             }
-            "ScatterElements" | "scatter" => {
+            "ScatterElements" | "ScatterND" | "scatter" => {
                 let idx_name = sanitize_name(
                     node.inputs
                         .get(1)

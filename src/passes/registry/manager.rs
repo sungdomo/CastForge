@@ -109,6 +109,20 @@ pub struct PassTraceStep {
     pub module: Module,
 }
 
+/// Structured telemetry record captured per pass invocation for enterprise observability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PassTelemetry {
+    pub iteration: usize,
+    pub pass_name: String,
+    pub changed: bool,
+    pub elapsed_us: u64,
+    pub live_ops_before: usize,
+    pub live_ops_after: usize,
+    pub ops_created: usize,
+    pub ops_modified: usize,
+    pub ops_removed: usize,
+}
+
 /// Key-value options passed to a Pass via CLI (`pass(k=v)`) or config file (`TOML`/`JSON`).
 pub type PassOptions = IndexMap<String, String>;
 
@@ -346,6 +360,46 @@ impl PassManager {
             }
         }
         Ok(steps)
+    }
+
+    /// Execute the pipeline and capture structured [`PassTelemetry`] metrics (wall-clock timing,
+    /// op counts before/after, and mutation counters) per pass invocation.
+    pub fn run_with_telemetry(&mut self, module: &mut Module) -> Result<Vec<PassTelemetry>> {
+        let mut telemetry = Vec::new();
+        for iter in 0..self.max_iterations.max(1) {
+            let mut any_changed = false;
+            for pass in &mut self.passes {
+                let live_ops_before = module.live_ops().len();
+                let t0 = std::time::Instant::now();
+                let res = pass.run(module)?;
+                let elapsed_us = t0.elapsed().as_micros() as u64;
+                if self.verify_after_each_pass {
+                    module.verify()?;
+                }
+                let live_ops_after = module.live_ops().len();
+                any_changed |= res.changed;
+                telemetry.push(PassTelemetry {
+                    iteration: iter,
+                    pass_name: res.pass_name,
+                    changed: res.changed,
+                    elapsed_us,
+                    live_ops_before,
+                    live_ops_after,
+                    ops_created: res.ops_created,
+                    ops_modified: res.ops_modified,
+                    ops_removed: res.ops_removed,
+                });
+            }
+            if !any_changed {
+                break;
+            }
+        }
+        Ok(telemetry)
+    }
+
+    /// Serialize a slice of [`PassTelemetry`] records into pretty-printed JSON.
+    pub fn telemetry_to_json(telemetry: &[PassTelemetry]) -> Result<String> {
+        Ok(serde_json::to_string_pretty(telemetry)?)
     }
 }
 

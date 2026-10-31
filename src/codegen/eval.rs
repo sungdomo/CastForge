@@ -1006,6 +1006,32 @@ fn eval_stablehlo_op(
                     }
                 }
                 out
+            } else if name == "castforge.topk" && !inputs.is_empty() {
+                let x = get_v(inputs[0]);
+                let in_dims = module.values[inputs[0]]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_else(|| vec![1, x.len().max(1)]);
+                let in_cols = *in_dims.last().unwrap_or(&x.len().max(1)).max(&1);
+                let out_dims = module.values[res_val]
+                    .ty
+                    .as_tensor()
+                    .map(tensor_shape_dims)
+                    .unwrap_or_else(|| vec![1, res_len]);
+                let k = *out_dims.last().unwrap_or(&1).max(&1);
+                let rows = (res_len / k).max(1);
+                let mut out = vec![0.0_f32; res_len];
+                for r in 0..rows {
+                    let start = (r * in_cols).min(x.len());
+                    let end = (start + in_cols).min(x.len());
+                    let mut row_vals: Vec<f32> = x[start..end].to_vec();
+                    row_vals.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                    for c in 0..k {
+                        out[r * k + c] = row_vals.get(c).copied().unwrap_or(0.0);
+                    }
+                }
+                out
             } else if name == "castforge.fused_rmsnorm" && !inputs.is_empty() {
                 let x = get_v(inputs[0]);
                 let w_opt = inputs.get(1).map(|&v| get_v(v));

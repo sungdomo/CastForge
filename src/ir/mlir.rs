@@ -140,15 +140,31 @@ impl TensorType {
         self.shape.len()
     }
 
+    /// Maximum allowed number of elements in a single static tensor (`10^9` elements).
+    pub const MAX_TENSOR_ELEMENTS: i64 = 1_000_000_000;
+
     pub fn num_elements(&self) -> Option<i64> {
         let mut prod = 1i64;
         for d in &self.shape {
             match d {
-                Dim::Static(n) => prod = prod.checked_mul(*n)?,
+                Dim::Static(n) if *n >= 0 => prod = prod.checked_mul(*n)?,
                 _ => return None,
             }
         }
         Some(prod)
+    }
+
+    /// Returns the checked byte footprint of this static tensor, or `None` if dynamic/overflowing.
+    pub fn checked_byte_len(&self) -> Option<usize> {
+        let elems = usize::try_from(self.num_elements()?).ok()?;
+        let elem_bytes = match &self.dtype {
+            DType::I1 | DType::I4 | DType::I8 | DType::U8 | DType::F8E4M3FN | DType::F8E5M2 => 1,
+            DType::I16 | DType::U16 | DType::F16 | DType::BF16 => 2,
+            DType::I32 | DType::U32 | DType::F32 => 4,
+            DType::I64 | DType::U64 | DType::F64 | DType::Index => 8,
+            DType::QuantUniform { .. } => 1,
+        };
+        elems.checked_mul(elem_bytes)
     }
 }
 

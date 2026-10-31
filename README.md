@@ -40,14 +40,14 @@ support.
   targets: **Rust**, **C99**, **WebGPU WGSL**, **NVIDIA CUDA (`.cu`)**, **Apple Metal (`.metal`)**,
   **AMD ROCm HIP (`.hip.cpp`)**, and **Khronos OpenCL (`.cl`)**, plus **C/C++ FFI Header (`.h`)**
   and **Native Shared Libraries (`.so`/`.dylib`)**.
-- [`src/cli`](src/cli): The `castforge` command-line tool (`chain`, `opt`, `viz`, `codegen`,
-  `autotune`, `import`, `export`, `link`, `profile`, `run`, `parse`, `list-passes`, plus direct
-  pass subcommands), invoked by [`src/main.rs`](src/main.rs) and exported alongside all modules in
-  [`src/lib.rs`](src/lib.rs).
-- [`tests/`](tests) & [`benches/`](benches): 9 test suites (`ai_opt_tests.rs`, `codegen_tests.rs`,
-  `frontend_tests.rs`, `fuzz_invariance_tests.rs`, `loop_ir_tests.rs`, `perf_scaling_tests.rs`,
-  `pipeline_tests.rs`, `regression_roundtrip_tests.rs`, `unit_negative_tests.rs`) and the compiler
-  benchmark suite (`benches/compiler_bench.rs`).
+- [`src/cli`](src/cli) & [`src/ffi.rs`](src/ffi.rs): The `castforge` command-line tool (`chain`,
+  `opt`, `viz`, `codegen`, `autotune`, `import`, `export`, `link`, `profile`, `run`, `parse`,
+  `list-passes`, plus direct pass subcommands), panic-safe `extern "C"` ABI (`include/castforge.h`),
+  and Python `ctypes` SDK (`bindings/python/castforge.py`).
+- [`tests/`](tests) & [`benches/`](benches): 10 test suites (`ai_opt_tests.rs`, `codegen_tests.rs`,
+  `commercial_readiness_tests.rs`, `frontend_tests.rs`, `fuzz_invariance_tests.rs`,
+  `loop_ir_tests.rs`, `perf_scaling_tests.rs`, `pipeline_tests.rs`,
+  `regression_roundtrip_tests.rs`, `unit_negative_tests.rs`) and `benches/compiler_bench.rs`.
 
 ## Built-in Hierarchical A-to-B Translator Passes & Presets (38 Top-Level + 77 Leaf Passes)
 
