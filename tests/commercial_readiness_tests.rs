@@ -692,3 +692,47 @@ fn test_chained_prefix_cache_block_hashing_and_adapter_salt() {
     let hashes_diff = hash_prefix_token_blocks(&prompt_a, &cfg_diff_salt).unwrap();
     assert_ne!(hashes_a[0], hashes_diff[0]);
 }
+
+#[test]
+fn test_strided_nan_check_sanitizer_pass_and_gpu_lowering() {
+    // 5 floating-point compute ops (indices 0, 1, 2, 3, 4).
+    // With `sanitize-numerics(stride=2,all=true,clamp_max=1024)`, only indices 0, 2, 4
+    // (3 out of 5 ops) should receive `castforge.nan_guard`!
+    let mlir = r#"
+module @strided_nan_check {
+  func.func @main(%x: tensor<2x4xf32>, %y: tensor<2x4xf32>) -> tensor<2x4xf32> {
+    %0 = stablehlo.add %x, %y : tensor<2x4xf32>
+    %1 = stablehlo.multiply %0, %x : tensor<2x4xf32>
+    %2 = stablehlo.subtract %1, %y : tensor<2x4xf32>
+    %3 = stablehlo.exponential %2 : tensor<2x4xf32>
+    %4 = stablehlo.tanh %3 : tensor<2x4xf32>
+    func.return %4 : tensor<2x4xf32>
+  }
+}
+"#;
+    let mut module = parse_mlir(mlir).unwrap();
+    let reg = PassRegistry::with_builtin_passes();
+    let mut pm = PassManager::from_pipeline_str(
+        &reg,
+        "sanitize-numerics(stride=2,all=true,clamp_max=1024.0)",
+    )
+    .unwrap();
+    let res = pm.run(&mut module).unwrap();
+    assert_eq!(res[0].ops_created, 3);
+
+    let printed = castforge::ir::print_mlir(&module);
+    assert!(printed.contains("sample_index = 0"));
+    assert!(printed.contains("sample_index = 2"));
+    assert!(printed.contains("sample_index = 4"));
+    assert!(!printed.contains("sample_index = 1"));
+    assert!(!printed.contains("sample_index = 3"));
+
+    // Verify CUDA and C codegen emit finite clamps for `castforge.nan_guard`
+    let backend_reg = BackendRegistry::with_builtin_backends();
+    let cuda_src = backend_reg
+        .generate("cuda", &module, &TargetConfig::default())
+        .unwrap();
+    assert!(cuda_src.contains("isnan("));
+    assert!(cuda_src.contains("-1024.0f"));
+    assert!(cuda_src.contains("1024.0f"));
+}

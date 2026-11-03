@@ -645,6 +645,14 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                         body.push(LoopStmt::Comment(format!("PROF_MARK:{pid}:{label}")));
                         a.clone()
                     }
+                    ("nan_guard", [a]) => {
+                        let cmax = op
+                            .attributes
+                            .get("clamp_max")
+                            .and_then(|v| v.as_float())
+                            .unwrap_or(65504.0) as f32;
+                        format!("(isnan({a}) ? 0.0f : fminf(fmaxf({a}, -{cmax:.1}f), {cmax:.1}f))")
+                    }
                     _ => format!("{op_str}({})", ops_str.join(", ")),
                 };
                 body.push(LoopStmt::For {

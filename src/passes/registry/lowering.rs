@@ -635,7 +635,20 @@ pub(super) fn register_lowering_passes(reg: &mut PassRegistry) {
                 .get("eps")
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(1e-6);
-            Ok(Box::new(SanitizeNumericsPass { clamp_max, eps }))
+            let stride = opts
+                .get("stride")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1)
+                .max(1);
+            let check_all_floats = opts
+                .get("all")
+                .is_some_and(|s| matches!(s.as_str(), "true" | "1" | "yes"));
+            Ok(Box::new(SanitizeNumericsPass {
+                clamp_max,
+                eps,
+                stride,
+                check_all_floats,
+            }))
         },
     );
     reg.register(

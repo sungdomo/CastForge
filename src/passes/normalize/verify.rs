@@ -102,6 +102,8 @@ impl Pass for VerifyIrPass {
                 SanitizeNumericsPass {
                     clamp_max: self.clamp_max,
                     eps: self.eps,
+                    stride: 1,
+                    check_all_floats: false,
                 }
                 .run(module)?,
             );
@@ -444,12 +446,21 @@ impl Pass for BisectPassesPass {
 }
 
 /// Numerical Sanitizer Pass (`sanitize-numerics`).
+///
+/// Supports strided sampling (`stride >= 1`, inspired by Modular `NanCheckPass`) so large
+/// multi-layer models can instrument every `stride`-th floating-point tensor without
+/// blowing up kernel launch count.
 #[derive(Debug, Clone)]
 pub struct SanitizeNumericsPass {
     /// Maximum finite magnitude clamp bound (default: `65504.0`).
     pub clamp_max: f64,
     /// Epsilon floor for denominators and `rsqrt` inputs (default: `1e-6`).
     pub eps: f64,
+    /// Sampling stride across candidate floating-point outputs (`1` = check every candidate).
+    pub stride: usize,
+    /// When `true` (or when `stride > 1`), considers all floating-point compute operations as
+    /// candidates for strided sampling rather than only division/exponential/GEMM ops.
+    pub check_all_floats: bool,
 }
 
 impl Default for SanitizeNumericsPass {
@@ -457,6 +468,8 @@ impl Default for SanitizeNumericsPass {
         Self {
             clamp_max: 65504.0,
             eps: 1e-6,
+            stride: 1,
+            check_all_floats: false,
         }
     }
 }
@@ -474,6 +487,8 @@ impl Pass for SanitizeNumericsPass {
         let mut created = 0usize;
         let clamp = self.clamp_max.abs().max(1.0);
         let eps = self.eps.abs().max(1e-12);
+        let effective_stride = self.stride.max(1);
+        let check_all = self.check_all_floats || effective_stride > 1;
 
         for fn_op_id in module.functions() {
             let Some(&reg_id) = module.ops[fn_op_id].regions.first() else {
@@ -483,23 +498,39 @@ impl Pass for SanitizeNumericsPass {
                 continue;
             };
             let ops = module.blocks[block_id].ops.clone();
+            let mut candidate_idx = 0usize;
 
             for op_id in ops {
                 let Some(op) = module.ops.get(op_id).cloned() else {
                     continue;
                 };
-                if op.is_op("stablehlo", "composite")
-                    && op.attributes.get("name").and_then(|a| a.as_str())
-                        == Some("castforge.nan_guard")
+                if op.is_op("func", "return")
+                    || op.is_op("stablehlo", "constant")
+                    || (op.is_op("stablehlo", "composite")
+                        && op.attributes.get("name").and_then(|a| a.as_str())
+                            == Some("castforge.nan_guard"))
                 {
                     continue;
                 }
 
-                let is_sensitive = matches!(
-                    op.name.name.as_str(),
-                    "divide" | "rsqrt" | "exponential" | "convert" | "dot_general"
-                );
-                if !is_sensitive || op.results.is_empty() {
+                let is_candidate = if check_all {
+                    op.results
+                        .first()
+                        .and_then(|&v| module.values[v].ty.as_tensor())
+                        .is_some_and(|t| t.dtype.is_float())
+                } else {
+                    matches!(
+                        op.name.name.as_str(),
+                        "divide" | "rsqrt" | "exponential" | "convert" | "dot_general"
+                    )
+                };
+                if !is_candidate || op.results.is_empty() {
+                    continue;
+                }
+
+                let current_sample = candidate_idx;
+                candidate_idx += 1;
+                if effective_stride > 1 && !current_sample.is_multiple_of(effective_stride) {
                     continue;
                 }
 
@@ -518,6 +549,14 @@ impl Pass for SanitizeNumericsPass {
                 );
                 attrs.insert("clamp_max".to_string(), Attribute::Float(clamp));
                 attrs.insert("eps".to_string(), Attribute::Float(eps));
+                attrs.insert(
+                    "sample_index".to_string(),
+                    Attribute::Int(current_sample as i64),
+                );
+                attrs.insert(
+                    "sample_stride".to_string(),
+                    Attribute::Int(effective_stride as i64),
+                );
 
                 let guard_op_id = module.add_operation(
                     block_id,
