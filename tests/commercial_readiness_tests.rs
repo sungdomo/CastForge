@@ -8,7 +8,7 @@ use castforge::ffi::{
 };
 use castforge::ir::formats::{import_gguf_bytes, import_onnx_json};
 use castforge::ir::{DType, Dim, TensorBacking, TensorEntry, TensorStore, TensorType, parse_mlir};
-use castforge::passes::{PassManager, PassRegistry};
+use castforge::passes::{EngineKvFormat, PassManager, PassRegistry, analyze_kv_layer_groups};
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
 
@@ -266,4 +266,66 @@ fn test_extended_onnx_operators_einsum_tile_topk_and_negative_axes() {
     // top2 = [[2, 2], [4, 4]]
     // ReduceSum(axis=-1) = [4.0, 8.0]
     assert_eq!(out, vec![4.0, 8.0]);
+}
+
+#[test]
+fn test_engine_kv_formats_and_heterogeneous_kv_layer_groups() {
+    // Verify all 4 physical KV-cache layouts (NHD, HND, CrossLayer, MlaLatent)
+    assert_eq!(
+        EngineKvFormat::Nhd.physical_shape(32, 64, 16, 8, 128),
+        vec![2, 64, 16, 8, 128]
+    );
+    assert_eq!(
+        EngineKvFormat::Hnd.physical_shape(32, 64, 16, 8, 128),
+        vec![2, 64, 8, 16, 128]
+    );
+    assert_eq!(
+        EngineKvFormat::CrossLayer.physical_shape(32, 64, 16, 8, 128),
+        vec![64, 32, 2, 16, 8, 128]
+    );
+    assert_eq!(
+        EngineKvFormat::MlaLatent.physical_shape(32, 64, 16, 1, 512),
+        vec![64, 16, 512]
+    );
+    assert!(
+        EngineKvFormat::CrossLayer
+            .index_expr("b", "l", "kv", "t", "h", "d")
+            .contains("* NL + l")
+    );
+
+    // Build a 2-layer attention module and lower with `kv_format=cross_layer`
+    let mlir = r#"
+module @paged_kv_test {
+  func.func @main(%q: tensor<2x4xf32>, %k: tensor<2x4xf32>, %v: tensor<2x4xf32>)
+      -> tensor<2x4xf32> {
+    %a0 = stablehlo.composite %q, %k, %v
+      {name = "castforge.fused_attention", decomposition = @fused_attention_impl}
+      : (tensor<2x4xf32>, tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+    %a1 = stablehlo.composite %a0, %k, %v
+      {name = "castforge.fused_attention", decomposition = @fused_attention_impl}
+      : (tensor<2x4xf32>, tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+    func.return %a1 : tensor<2x4xf32>
+  }
+}
+"#;
+    let mut module = parse_mlir(mlir).unwrap();
+    let reg = PassRegistry::with_builtin_passes();
+    let mut pm = PassManager::from_pipeline_str(
+        &reg,
+        "lower-paged-attention(page_block_size=16,max_blocks=32,kv_format=cross_layer)",
+    )
+    .unwrap();
+    pm.run(&mut module).unwrap();
+
+    let groups = analyze_kv_layer_groups(&module);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].format, EngineKvFormat::CrossLayer);
+    assert_eq!(groups[0].layer_indices, vec![0, 1]);
+    assert_eq!(groups[0].page_block_size, 16);
+    assert_eq!(groups[0].head_size, 4);
+
+    let printed = castforge::ir::print_mlir(&module);
+    assert!(printed.contains("castforge.kv_format = \"cross_layer\""));
+    assert!(printed.contains("32, 2, 2, 16, 1, 4"));
+    assert!(printed.contains("castforge.kv_layer_group = 0"));
 }

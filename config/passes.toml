@@ -211,6 +211,7 @@ options = [
   { name = "kv_lora_rank", default = "512", desc = "Latent KV compression rank for MLA" },
   { name = "max_seq_len", default = "2048", desc = "Maximum sequence length for KV cache" },
   { name = "page_block_size", default = "16", desc = "Tokens per page block for PagedAttention" },
+  { name = "kv_format", default = "nhd", desc = "Physical KV layout (nhd|hnd|cross_layer|mla)" },
   { name = "split_kv", default = "4", desc = "Parallel KV splits for Flash-Decoding" },
 ]
 
@@ -904,6 +905,7 @@ child_passes = []
 options = [
   { name = "page_block_size", default = "16", desc = "Number of tokens per physical KV page" },
   { name = "max_blocks", default = "64", desc = "Maximum page blocks per sequence" },
+  { name = "kv_format", default = "nhd", desc = "Physical KV layout (nhd|hnd|cross_layer|mla)" },
 ]
 
 [[pass]]

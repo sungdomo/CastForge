@@ -511,9 +511,15 @@ pub(super) fn register_leaf_passes(reg: &mut PassRegistry) {
                 .get("max_blocks")
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(64);
+            let kv_format = opts
+                .get("kv_format")
+                .or_else(|| opts.get("format"))
+                .cloned()
+                .unwrap_or_else(|| "nhd".to_string());
             Ok(Box::new(LowerPagedAttentionPass {
                 page_block_size,
                 max_blocks,
+                kv_format,
             }))
         },
     );

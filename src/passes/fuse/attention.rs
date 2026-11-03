@@ -38,6 +38,7 @@ pub struct FuseAttentionPass {
     pub logit_softcap: Option<f64>,
     pub qk_norm: bool,
     pub kv_dtype: Option<String>,
+    pub kv_format: String,
     pub state_dim: usize,
     pub ssm_chunk_size: usize,
 }
@@ -61,6 +62,7 @@ impl Default for FuseAttentionPass {
             logit_softcap: None,
             qk_norm: false,
             kv_dtype: None,
+            kv_format: "nhd".to_string(),
             state_dim: 128,
             ssm_chunk_size: 64,
         }
@@ -401,6 +403,7 @@ impl Pass for FuseAttentionPass {
                 LowerPagedAttentionPass {
                     page_block_size: self.page_block_size,
                     max_blocks: self.max_blocks,
+                    kv_format: self.kv_format.clone(),
                 }
                 .run(module)?,
             );

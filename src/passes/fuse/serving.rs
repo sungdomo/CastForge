@@ -95,10 +95,184 @@ pub(super) fn insert_kv_cache_op(
     kv_val
 }
 
+/// Physical KV-cache memory layout handed to or emitted for a serving engine (vLLM, SGLang,
+/// TensorRT-LLM, LMCache).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EngineKvFormat {
+    /// `[2, num_blocks, block_size, num_heads, head_size]` (vLLM FlashAttention default NHD).
+    Nhd,
+    /// `[2, num_blocks, num_heads, block_size, head_size]` (vLLM FlashInfer / TRT-LLM HND).
+    Hnd,
+    /// `[num_blocks, num_layers, 2, block_size, num_heads, head_size]` (Cross-Layer bulk DMA).
+    CrossLayer,
+    /// `[num_blocks, block_size, kv_lora_rank]` (DeepSeek MLA compressed single-head latent KV).
+    MlaLatent,
+}
+
+impl EngineKvFormat {
+    /// Parses a layout identifier (`"nhd"`, `"hnd"`, `"cross_layer"`, `"mla"`).
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "hnd" | "flashinfer" => Self::Hnd,
+            "cross_layer" | "cross-layer" | "cross" => Self::CrossLayer,
+            "mla" | "mla_latent" | "latent" => Self::MlaLatent,
+            _ => Self::Nhd,
+        }
+    }
+
+    /// Canonical lowercase identifier for IR attributes and codegen.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Nhd => "nhd",
+            Self::Hnd => "hnd",
+            Self::CrossLayer => "cross_layer",
+            Self::MlaLatent => "mla_latent",
+        }
+    }
+
+    /// Returns `true` if a single KV pool block spans all layers (`CrossLayer`).
+    pub fn is_cross_layer(&self) -> bool {
+        matches!(self, Self::CrossLayer)
+    }
+
+    /// Returns `true` if `num_heads` precedes `block_size` (`Hnd`).
+    pub fn is_hnd(&self) -> bool {
+        matches!(self, Self::Hnd)
+    }
+
+    /// Returns `true` if K and V are compressed into a single latent vector (`MlaLatent`).
+    pub fn is_mla(&self) -> bool {
+        matches!(self, Self::MlaLatent)
+    }
+
+    /// Computes the physical tensor shape for this KV-cache layout.
+    pub fn physical_shape(
+        &self,
+        num_layers: i64,
+        num_blocks: i64,
+        block_size: i64,
+        num_heads: i64,
+        head_size: i64,
+    ) -> Vec<i64> {
+        let nl = num_layers.max(1);
+        let nb = num_blocks.max(1);
+        let bs = block_size.max(1);
+        let nh = num_heads.max(1);
+        let hs = head_size.max(1);
+        match self {
+            Self::Nhd => vec![2, nb, bs, nh, hs],
+            Self::Hnd => vec![2, nb, nh, bs, hs],
+            Self::CrossLayer => vec![nb, nl, 2, bs, nh, hs],
+            Self::MlaLatent => vec![nb, bs, hs],
+        }
+    }
+
+    /// Synthesizes a linear index expression for addressing `(blk, layer, kv, tok, head, dim)`.
+    pub fn index_expr(
+        &self,
+        blk: &str,
+        layer: &str,
+        kv: &str,
+        tok: &str,
+        head: &str,
+        dim: &str,
+    ) -> String {
+        match self {
+            Self::Nhd => format!("((({kv} * NB + {blk}) * BS + {tok}) * NH + {head}) * HS + {dim}"),
+            Self::Hnd => format!("((({kv} * NB + {blk}) * NH + {head}) * BS + {tok}) * HS + {dim}"),
+            Self::CrossLayer => format!(
+                "(((({blk} * NL + {layer}) * 2 + {kv}) * BS + {tok}) * NH + {head}) * HS + {dim}"
+            ),
+            Self::MlaLatent => format!("({blk} * BS + {tok}) * HS + {dim}"),
+        }
+    }
+}
+
+/// Homogeneous group of attention/SSM layers sharing identical physical KV-cache geometry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvLayerGroup {
+    pub group_id: usize,
+    pub format: EngineKvFormat,
+    pub page_block_size: i64,
+    pub head_size: i64,
+    pub sliding_window: Option<i64>,
+    pub layer_indices: Vec<usize>,
+    pub bytes_per_page: u64,
+}
+
+/// Partitions all `castforge.fused_attention` operations in `module` into homogeneous
+/// [`KvLayerGroup`]s by `(format, page_block_size, head_size, sliding_window)`.
+pub fn analyze_kv_layer_groups(module: &Module) -> Vec<KvLayerGroup> {
+    use crate::ir::Dim;
+    let mut groups: Vec<KvLayerGroup> = Vec::new();
+    let mut layer_idx = 0usize;
+
+    for op_id in module.live_ops() {
+        let op = &module.ops[op_id];
+        let is_attn = op.is_op("stablehlo", "composite")
+            && op
+                .attributes
+                .get("name")
+                .and_then(|a| a.as_str())
+                .is_some_and(|n| n == "castforge.fused_attention");
+        if !is_attn {
+            continue;
+        }
+        let fmt_str = op
+            .attributes
+            .get("castforge.kv_format")
+            .and_then(|a| a.as_str())
+            .unwrap_or("nhd");
+        let format = EngineKvFormat::parse(fmt_str);
+        let page_block_size = match op.attributes.get("castforge.page_block_size") {
+            Some(Attribute::Int(v)) => (*v).max(1),
+            _ => 16,
+        };
+        let sliding_window = match op.attributes.get("castforge.sliding_window") {
+            Some(Attribute::Int(v)) => Some(*v),
+            _ => None,
+        };
+        let head_size = op
+            .operands
+            .first()
+            .and_then(|&v| module.values[v].ty.as_tensor())
+            .and_then(|t| match t.shape.last() {
+                Some(Dim::Static(d)) if *d > 0 => Some(*d),
+                _ => None,
+            })
+            .unwrap_or(64);
+        let kv_factor: u64 = if format.is_mla() { 1 } else { 2 };
+        let bytes_per_page = kv_factor * (page_block_size as u64) * (head_size as u64) * 2;
+
+        if let Some(existing) = groups.iter_mut().find(|g| {
+            g.format == format
+                && g.page_block_size == page_block_size
+                && g.head_size == head_size
+                && g.sliding_window == sliding_window
+        }) {
+            existing.layer_indices.push(layer_idx);
+        } else {
+            let group_id = groups.len();
+            groups.push(KvLayerGroup {
+                group_id,
+                format,
+                page_block_size,
+                head_size,
+                sliding_window,
+                layer_indices: vec![layer_idx],
+                bytes_per_page,
+            });
+        }
+        layer_idx += 1;
+    }
+    groups
+}
+
 /// PagedAttention Block-Table Lowering Pass (`lower-paged-attention`).
 pub struct LowerPagedAttentionPass {
     pub page_block_size: usize,
     pub max_blocks: usize,
+    pub kv_format: String,
 }
 
 impl Default for LowerPagedAttentionPass {
@@ -106,6 +280,7 @@ impl Default for LowerPagedAttentionPass {
         Self {
             page_block_size: 16,
             max_blocks: 64,
+            kv_format: "nhd".to_string(),
         }
     }
 }
@@ -116,40 +291,82 @@ impl Pass for LowerPagedAttentionPass {
     }
 
     fn description(&self) -> &'static str {
-        "Lowers fused_attention to vLLM-style PagedAttention with block-table KV addressing"
+        "Lowers fused_attention to vLLM/LMCache PagedAttention with physical KV layout descriptors"
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        use crate::ir::Dim;
         let mut modified = 0usize;
         let block_size = self.page_block_size.max(4) as i64;
         let max_blocks = self.max_blocks.max(1) as i64;
+        let fmt = EngineKvFormat::parse(&self.kv_format);
 
-        for op_id in module.live_ops() {
+        let attn_ops: Vec<OpId> = module
+            .live_ops()
+            .into_iter()
+            .filter(|&op_id| {
+                let op = &module.ops[op_id];
+                op.is_op("stablehlo", "composite")
+                    && op
+                        .attributes
+                        .get("name")
+                        .and_then(|a| a.as_str())
+                        .is_some_and(|n| n == "castforge.fused_attention")
+            })
+            .collect();
+        let num_layers = attn_ops.len().max(1) as i64;
+
+        for &op_id in &attn_ops {
+            let head_size = module.ops[op_id]
+                .operands
+                .first()
+                .and_then(|&v| module.values[v].ty.as_tensor())
+                .and_then(|t| match t.shape.last() {
+                    Some(Dim::Static(d)) if *d > 0 => Some(*d),
+                    _ => None,
+                })
+                .unwrap_or(64);
+            let phys_shape = fmt.physical_shape(num_layers, max_blocks, block_size, 1, head_size);
             let Some(op) = module.ops.get_mut(op_id) else {
                 continue;
             };
-            let is_attn = op.is_op("stablehlo", "composite")
-                && op
-                    .attributes
-                    .get("name")
-                    .and_then(|a| a.as_str())
-                    .is_some_and(|n| n == "castforge.fused_attention");
-            if is_attn {
-                let mut ch = false;
-                ch |= op.attributes.insert(
-                    "castforge.paged_attention".to_string(),
-                    Attribute::Bool(true),
-                ) != Some(Attribute::Bool(true));
-                ch |= op.attributes.insert(
-                    "castforge.page_block_size".to_string(),
-                    Attribute::Int(block_size),
-                ) != Some(Attribute::Int(block_size));
-                ch |= op.attributes.insert(
-                    "castforge.max_blocks".to_string(),
-                    Attribute::Int(max_blocks),
-                ) != Some(Attribute::Int(max_blocks));
-                if ch {
-                    modified += 1;
+            let mut ch = false;
+            ch |= op.attributes.insert(
+                "castforge.paged_attention".to_string(),
+                Attribute::Bool(true),
+            ) != Some(Attribute::Bool(true));
+            ch |= op.attributes.insert(
+                "castforge.page_block_size".to_string(),
+                Attribute::Int(block_size),
+            ) != Some(Attribute::Int(block_size));
+            ch |= op.attributes.insert(
+                "castforge.max_blocks".to_string(),
+                Attribute::Int(max_blocks),
+            ) != Some(Attribute::Int(max_blocks));
+            ch |= op.attributes.insert(
+                "castforge.kv_format".to_string(),
+                Attribute::String(fmt.as_str().to_string()),
+            ) != Some(Attribute::String(fmt.as_str().to_string()));
+            ch |= op.attributes.insert(
+                "castforge.kv_physical_shape".to_string(),
+                Attribute::DenseIntArray(phys_shape.clone()),
+            ) != Some(Attribute::DenseIntArray(phys_shape));
+            if ch {
+                modified += 1;
+            }
+        }
+
+        // Stamp homogeneous KV layer group IDs onto each attention op
+        let groups = analyze_kv_layer_groups(module);
+        for group in &groups {
+            for &layer_idx in &group.layer_indices {
+                if let Some(&op_id) = attn_ops.get(layer_idx)
+                    && let Some(op) = module.ops.get_mut(op_id)
+                {
+                    op.attributes.insert(
+                        "castforge.kv_layer_group".to_string(),
+                        Attribute::Int(group.group_id as i64),
+                    );
                 }
             }
         }

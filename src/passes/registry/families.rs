@@ -415,6 +415,7 @@ impl PassRegistry {
                         } else if opts.contains_key("page_block_size")
                             || opts.contains_key("block_size")
                             || opts.contains_key("max_blocks")
+                            || opts.contains_key("kv_format")
                         {
                             "paged".to_string()
                         } else if opts.contains_key("split_kv") || opts.contains_key("splits") {
@@ -498,6 +499,11 @@ impl PassRegistry {
                     .and_then(|s| s.parse::<f64>().ok());
                 let qk_norm = opts.get("qk_norm").is_some_and(|v| v == "true" || v == "1");
                 let kv_dtype = opts.get("kv_dtype").cloned();
+                let kv_format = opts
+                    .get("kv_format")
+                    .or_else(|| opts.get("format"))
+                    .cloned()
+                    .unwrap_or_else(|| "nhd".to_string());
                 let state_dim = opts
                     .get("state_dim")
                     .and_then(|s| s.parse::<usize>().ok())
@@ -524,6 +530,7 @@ impl PassRegistry {
                     logit_softcap,
                     qk_norm,
                     kv_dtype,
+                    kv_format,
                     state_dim,
                     ssm_chunk_size,
                 }))
