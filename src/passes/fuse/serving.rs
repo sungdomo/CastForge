@@ -7070,3 +7070,154 @@ pub fn merge_parallel_matmuls(module: &mut Module) -> usize {
 
     merged_groups
 }
+
+/// Forward and backward dimension correspondence across a reshape operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReshapeDimMapping {
+    /// For each input axis `i`, the ordered list of output axes that receive its volume.
+    pub forward: Vec<Vec<usize>>,
+    /// For each output axis `j`, the ordered list of input axes that contribute to its volume.
+    pub backward: Vec<Vec<usize>>,
+}
+
+/// Computes the bidirectional dimension correspondence between `before` and `after` reshape
+/// shapes using two-pointer cumulative volume matching.
+///
+/// Positive entries represent statically known dimensions (`> 0`), while negative entries
+/// represent symbolic/dynamic dimension identifiers (`< 0`). Zero-sized dimensions, mismatched
+/// static volumes, or mixed static/dynamic dimensions return `None`.
+pub fn analyze_static_reshape_dim_mapping(
+    before: &[i64],
+    after: &[i64],
+) -> Option<ReshapeDimMapping> {
+    if before.is_empty() || after.is_empty() {
+        return None;
+    }
+    if before.contains(&0) || after.contains(&0) {
+        return None;
+    }
+
+    let calc_static_volume = |dims: &[i64]| -> Option<i64> {
+        let mut total = 1i64;
+        for &d in dims {
+            if d > 0 {
+                total = total.checked_mul(d)?;
+            }
+        }
+        Some(total)
+    };
+
+    let before_total = calc_static_volume(before)?;
+    let after_total = calc_static_volume(after)?;
+    if before_total != after_total {
+        return None;
+    }
+
+    // Verify dynamic dimension sequence compatibility.
+    let before_dyn: Vec<i64> = before.iter().copied().filter(|&d| d < 0).collect();
+    let after_dyn: Vec<i64> = after.iter().copied().filter(|&d| d < 0).collect();
+    if before_dyn != after_dyn {
+        return None;
+    }
+
+    let mut forward = vec![Vec::new(); before.len()];
+    let mut backward = vec![Vec::new(); after.len()];
+
+    let starts_with_static = before[0] > 0;
+    let step: isize = if starts_with_static { 1 } else { -1 };
+    let mut b_idx: isize = if starts_with_static {
+        0
+    } else {
+        before.len() as isize - 1
+    };
+    let mut a_idx: isize = if starts_with_static {
+        0
+    } else {
+        after.len() as isize - 1
+    };
+
+    let mut b_vol = 1i64;
+    let mut a_vol = 1i64;
+    let mut b_enabled = true;
+    let mut a_enabled = true;
+
+    while b_vol != before_total || a_vol != after_total {
+        if b_idx < 0 || b_idx >= before.len() as isize || a_idx < 0 || a_idx >= after.len() as isize
+        {
+            return None;
+        }
+        let b_dim = before[b_idx as usize];
+        let a_dim = after[a_idx as usize];
+        let b_is_static = b_dim > 0;
+        let a_is_static = a_dim > 0;
+
+        if b_is_static != a_is_static {
+            return None;
+        }
+
+        if b_is_static {
+            if b_enabled {
+                b_vol = b_vol.checked_mul(b_dim)?;
+            }
+            if a_enabled {
+                a_vol = a_vol.checked_mul(a_dim)?;
+            }
+
+            b_enabled = b_vol <= a_vol;
+            a_enabled = a_vol <= b_vol;
+
+            if b_dim != 1 && a_dim != 1 {
+                forward[b_idx as usize].push(a_idx as usize);
+                backward[a_idx as usize].push(b_idx as usize);
+            }
+        } else if b_vol != a_vol || b_dim != a_dim || !b_enabled || !a_enabled {
+            return None;
+        }
+
+        if b_enabled {
+            b_idx += step;
+        }
+        if a_enabled {
+            a_idx += step;
+        }
+    }
+
+    if !starts_with_static {
+        for map in &mut forward {
+            map.reverse();
+        }
+        for map in &mut backward {
+            map.reverse();
+        }
+    }
+
+    Some(ReshapeDimMapping { forward, backward })
+}
+
+/// Maps a split or slice axis `axis` through a reshape from `before` to `after`.
+///
+/// Trailing unit (`1`) dimensions starting at `axis` are skipped until a non-unit static
+/// dimension is found. Returns `None` if no non-unit static dimension is found or if that
+/// dimension is merged with a left-neighbor dimension in `after`.
+pub fn map_axis_through_static_reshape(
+    before: &[i64],
+    after: &[i64],
+    axis: usize,
+) -> Option<usize> {
+    let mapping = analyze_static_reshape_dim_mapping(before, after)?;
+    let mut mapped_axis = axis;
+    while mapped_axis < before.len() && before[mapped_axis] == 1 {
+        mapped_axis += 1;
+    }
+    if mapped_axis >= before.len() || before[mapped_axis] <= 0 {
+        return None;
+    }
+    let &new_axis = mapping.forward.get(mapped_axis)?.first()?;
+    let backward_sources = mapping.backward.get(new_axis)?;
+    let could_mix = backward_sources.len() > 1;
+    let axis_is_first = backward_sources.first().copied() == Some(mapped_axis);
+    if could_mix && !axis_is_first {
+        return None;
+    }
+    Some(new_axis)
+}

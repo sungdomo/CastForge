@@ -23,8 +23,9 @@ use castforge::passes::{
     KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope,
     KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy, LayerGroupPayloadSharder,
     P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable, P2PPeerSpec, PassManager, PassRegistry,
-    ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST, TOKEN_WIRE_STRIDE, WarmPrefetchJobTable,
-    WarmPrefetchStatus, analyze_kv_layer_groups, annotate_squeeze_unsqueeze_reshapes,
+    ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST, ReshapeDimMapping, TOKEN_WIRE_STRIDE,
+    WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
+    analyze_static_reshape_dim_mapping, annotate_squeeze_unsqueeze_reshapes,
     anonymize_symbolic_dims, await_hanging_effect_chains, coalesce_partitioning_slices_to_split,
     compress_splat_constants, decode_kv_fs_filename, decode_kv_storage_key,
     defer_allocs_to_first_use, direct_copy_format_supported, downsample_subchunk_swa_block_ids,
@@ -35,13 +36,13 @@ use castforge::passes::{
     hash_packed_token_blocks_be, hash_prefix_token_blocks, hoist_exec_invariant_ops,
     hoist_symbolic_dim_expressions, is_supported_arch_dtype, legalize_rowwise_reduction_launch,
     longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
-    mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops, merge_duplicate_shape_ops,
-    merge_identical_functions, merge_parallel_matmuls, num_packed_tokens, pack_token_ids_be,
-    plan_cacheblend_retrieve, plan_cacheblend_token_reorder, plan_concat_in_place,
-    plan_dynamic_memory_pool, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
-    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
-    recalculate_subchunk_blocks_to_skip, reuse_dead_loop_buffers, stamp_fused_provenance,
-    unfold_chunk_range, unique_blend_token_coverage, unpack_token_ids_be,
+    map_axis_through_static_reshape, mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops,
+    merge_duplicate_shape_ops, merge_identical_functions, merge_parallel_matmuls,
+    num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve, plan_cacheblend_token_reorder,
+    plan_concat_in_place, plan_dynamic_memory_pool, plan_jenga_kv_geometry,
+    plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
+    re_rope_key_in_place, recalculate_subchunk_blocks_to_skip, reuse_dead_loop_buffers,
+    stamp_fused_provenance, unfold_chunk_range, unique_blend_token_coverage, unpack_token_ids_be,
     validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
@@ -2679,4 +2680,58 @@ module @parallel_matmul_return_only {
 "#;
     let mut ret_module = parse_mlir(return_only_mlir).expect("valid MLIR");
     assert_eq!(merge_parallel_matmuls(&mut ret_module), 0);
+}
+
+#[test]
+fn test_static_reshape_dim_mapping_and_axis_through_reshape() {
+    // 1. Static prefix with trailing dynamic dim: [3, 5, 6, -1] -> [15, 3, 2, -1]
+    let before = [3, 5, 6, -1];
+    let after = [15, 3, 2, -1];
+    let mapping = analyze_static_reshape_dim_mapping(&before, &after).expect("supported mapping");
+    assert_eq!(
+        mapping,
+        ReshapeDimMapping {
+            forward: vec![vec![0], vec![0], vec![1, 2], vec![]],
+            backward: vec![vec![0, 1], vec![2], vec![2], vec![]],
+        }
+    );
+
+    // Axis 0 (`3`) merges with right neighbor (`5`) into output axis 0 (`15`), which is valid:
+    assert_eq!(map_axis_through_static_reshape(&before, &after, 0), Some(0));
+    // Axis 1 (`5`) merges with left neighbor (`3`) into output axis 0 (`15`), which is rejected:
+    assert_eq!(map_axis_through_static_reshape(&before, &after, 1), None);
+    // Axis 2 (`6`) splits into output axes 1 (`3`) and 2 (`2`), mapping to outer split axis 1:
+    assert_eq!(map_axis_through_static_reshape(&before, &after, 2), Some(1));
+    // Axis 3 (`-1`, dynamic) cannot be statically mapped:
+    assert_eq!(map_axis_through_static_reshape(&before, &after, 3), None);
+
+    // 2. Leading dynamic dim (right-to-left scan + reversed order): [-1, 3, 5, 6] -> [-1, 15, 3, 2]
+    let dyn_lead_before = [-1, 3, 5, 6];
+    let dyn_lead_after = [-1, 15, 3, 2];
+    let rev_mapping = analyze_static_reshape_dim_mapping(&dyn_lead_before, &dyn_lead_after)
+        .expect("supported right-to-left mapping");
+    assert_eq!(
+        rev_mapping,
+        ReshapeDimMapping {
+            forward: vec![vec![], vec![1], vec![1], vec![2, 3]],
+            backward: vec![vec![], vec![1, 2], vec![3], vec![3]],
+        }
+    );
+    assert_eq!(
+        map_axis_through_static_reshape(&dyn_lead_before, &dyn_lead_after, 3),
+        Some(2)
+    );
+
+    // 3. Skipping leading unit (`1`) dimensions when mapping an axis:
+    let unit_before = [1, 1, 4, 8];
+    let unit_after = [32];
+    assert_eq!(
+        map_axis_through_static_reshape(&unit_before, &unit_after, 0),
+        Some(0)
+    );
+
+    // 4. Rejections: zero dimensions, mismatched volumes, or static/dynamic mixing:
+    assert!(analyze_static_reshape_dim_mapping(&[0, 2], &[0, 4]).is_none());
+    assert!(analyze_static_reshape_dim_mapping(&[3, 5], &[16]).is_none());
+    assert!(analyze_static_reshape_dim_mapping(&[3, -1, 5], &[15, -1]).is_none());
 }
