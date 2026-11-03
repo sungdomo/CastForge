@@ -29875,3 +29875,226 @@ pub fn outline_structured_map_loops(module: &mut Module) -> usize {
 
     outlined
 }
+
+/// Extracts a Python stack trace from an operation's attributes or named location.
+fn extract_op_python_stack_trace(op: &Operation) -> Option<String> {
+    for key in ["python_stack_trace", "stack_trace"] {
+        if let Some(Attribute::String(s)) = op.attributes.get(key)
+            && !s.is_empty()
+        {
+            return Some(s.clone());
+        }
+    }
+    if let crate::ir::Location::Named(name) = &op.location
+        && let Some(rest) = name.strip_prefix("python_frame:")
+        && !rest.is_empty()
+    {
+        return Some(rest.to_string());
+    }
+    None
+}
+
+/// Embeds Python stack traces into `mgp.assert` diagnostic messages and materializes
+/// `"source_notes"` metadata across operations while stripping non-serializable frame wrappers.
+///
+/// For each operation carrying a `python_stack_trace` attribute or a `Location::Named` prefixed
+/// with `"python_frame:"`:
+/// 1. If the operation is `mgp.assert`, prepends `\nSource Traceback:\n<trace>\nerror: ` to its
+///    `"msg"` attribute (if not already attached).
+/// 2. Records `"source_notes"` on the operation and unwraps the outer `python_frame:` location to
+///    `Location::Unknown`.
+///
+/// Returns the number of operations whose Python stack traces were materialized.
+pub fn attach_python_stack_traces(module: &mut Module) -> usize {
+    let op_ids: Vec<OpId> = module.ops.keys().collect();
+    let mut materialized = 0usize;
+
+    for op_id in op_ids {
+        let Some(trace) = extract_op_python_stack_trace(&module.ops[op_id]) else {
+            continue;
+        };
+
+        let is_assert = module.ops[op_id].name.full_name() == "mgp.assert";
+        if is_assert {
+            let orig_msg = match module.ops[op_id].attributes.get("msg") {
+                Some(Attribute::String(s)) => s.clone(),
+                _ => String::new(),
+            };
+            if !orig_msg.starts_with("\nSource Traceback:\n") {
+                let formatted = format!("\nSource Traceback:\n{trace}\nerror: {orig_msg}");
+                module.ops[op_id]
+                    .attributes
+                    .insert("msg".to_string(), Attribute::String(formatted));
+            }
+        }
+
+        module.ops[op_id]
+            .attributes
+            .shift_remove("python_stack_trace");
+        module.ops[op_id]
+            .attributes
+            .insert("source_notes".to_string(), Attribute::String(trace));
+        if let crate::ir::Location::Named(name) = &module.ops[op_id].location
+            && name.starts_with("python_frame:")
+        {
+            module.ops[op_id].location = crate::ir::Location::Unknown;
+        }
+        materialized += 1;
+    }
+
+    materialized
+}
+
+/// Recursively collects all `BlockId`s inside `region_id` (including nested op regions).
+fn collect_region_blocks_recursive(
+    module: &Module,
+    region_id: crate::ir::RegionId,
+    out: &mut Vec<BlockId>,
+) {
+    for &blk_id in &module.regions[region_id].blocks {
+        out.push(blk_id);
+        for &op_id in &module.blocks[blk_id].ops {
+            for &sub_reg in &module.ops[op_id].regions {
+                collect_region_blocks_recursive(module, sub_reg, out);
+            }
+        }
+    }
+}
+
+/// Rewrites control-flow operations (`grt.if`, `mo.if`, `grt.while`, `mo.while`) so their regions
+/// are isolated from above by threading free outer SSA values through explicit operands, block
+/// arguments, and (for loop-like ops) region terminators and results.
+///
+/// For `grt.while` / `mo.while` condition regions (region 0 when two regions exist), newly
+/// threaded values are inserted immediately before the final boolean condition operand of the
+/// terminator (`mef.output` / `mo.output` / `grt.yield`).
+///
+/// Returns the number of control-flow operations rewritten.
+pub fn fixup_isolated_from_above_regions(module: &mut Module) -> usize {
+    let op_ids: Vec<OpId> = module.ops.keys().collect();
+    let mut fixed_ops = 0usize;
+
+    for cf_id in op_ids {
+        let full_name = module.ops[cf_id].name.full_name();
+        let is_loop_like = matches!(full_name.as_str(), "grt.while" | "mo.while");
+        let is_branch_like = matches!(full_name.as_str(), "grt.if" | "mo.if");
+        if !is_loop_like && !is_branch_like {
+            continue;
+        }
+        let regions = module.ops[cf_id].regions.clone();
+        if regions.is_empty() {
+            continue;
+        }
+
+        // Collect all blocks and values defined inside `cf_id`'s regions:
+        let mut all_sub_blocks = Vec::new();
+        for &r in &regions {
+            collect_region_blocks_recursive(module, r, &mut all_sub_blocks);
+        }
+        let mut defined_inside = std::collections::HashSet::<ValueId>::new();
+        for &b in &all_sub_blocks {
+            for &arg in &module.blocks[b].arguments {
+                defined_inside.insert(arg);
+            }
+            for &op in &module.blocks[b].ops {
+                for &res in &module.ops[op].results {
+                    defined_inside.insert(res);
+                }
+            }
+        }
+
+        // Find free values referenced inside `cf_id`'s regions in deterministic order:
+        let mut free_values = Vec::<ValueId>::new();
+        for &b in &all_sub_blocks {
+            for &op in &module.blocks[b].ops {
+                for &operand in &module.ops[op].operands {
+                    if !defined_inside.contains(&operand) && !free_values.contains(&operand) {
+                        free_values.push(operand);
+                    }
+                }
+            }
+        }
+        if free_values.is_empty() {
+            continue;
+        }
+
+        // 1. Append `free_values` to `cf_id` operands:
+        for &fv in &free_values {
+            module.ops[cf_id].operands.push(fv);
+        }
+
+        // 2. If loop-like, append corresponding results to `cf_id`:
+        if is_loop_like {
+            let next_idx = module.ops[cf_id].results.len();
+            for (offset, &fv) in free_values.iter().enumerate() {
+                let ty = module.values[fv].ty.clone();
+                let res_val = module.values.insert(crate::ir::mlir::Value {
+                    id: ValueId::default(),
+                    ssa_name: None,
+                    ty,
+                    def: crate::ir::mlir::ValueDef::OpResult {
+                        op: cf_id,
+                        index: (next_idx + offset) as u32,
+                    },
+                });
+                module.values[res_val].id = res_val;
+                module.ops[cf_id].results.push(res_val);
+            }
+        }
+
+        // 3. Thread `free_values` into each region's entry block and rewrite uses:
+        let num_regions = regions.len();
+        for (reg_idx, &reg_id) in regions.iter().enumerate() {
+            let Some(&entry_blk) = module.regions[reg_id].blocks.first() else {
+                continue;
+            };
+            let mut reg_blocks = Vec::new();
+            collect_region_blocks_recursive(module, reg_id, &mut reg_blocks);
+
+            let mut fv_to_barg = std::collections::HashMap::<ValueId, ValueId>::new();
+            let mut new_bargs = Vec::with_capacity(free_values.len());
+            for &fv in &free_values {
+                let ty = module.values[fv].ty.clone();
+                let barg = module.add_block_argument(entry_blk, None, ty);
+                fv_to_barg.insert(fv, barg);
+                new_bargs.push(barg);
+            }
+
+            for &b in &reg_blocks {
+                for &op in &module.blocks[b].ops {
+                    for operand in &mut module.ops[op].operands {
+                        if let Some(&mapped) = fv_to_barg.get(operand) {
+                            *operand = mapped;
+                        }
+                    }
+                }
+            }
+
+            // If loop-like, also forward `new_bargs` through the region's output terminator:
+            if is_loop_like && let Some(&term_op) = module.blocks[entry_blk].ops.last() {
+                let term_name = module.ops[term_op].name.full_name();
+                if matches!(
+                    term_name.as_str(),
+                    "mef.output" | "mo.output" | "grt.yield" | "scf.yield"
+                ) {
+                    let before_last = num_regions == 2 && reg_idx == 0;
+                    if before_last && !module.ops[term_op].operands.is_empty() {
+                        let last_opd = module.ops[term_op].operands.pop().unwrap();
+                        for &barg in &new_bargs {
+                            module.ops[term_op].operands.push(barg);
+                        }
+                        module.ops[term_op].operands.push(last_opd);
+                    } else {
+                        for &barg in &new_bargs {
+                            module.ops[term_op].operands.push(barg);
+                        }
+                    }
+                }
+            }
+        }
+
+        fixed_ops += 1;
+    }
+
+    fixed_ops
+}

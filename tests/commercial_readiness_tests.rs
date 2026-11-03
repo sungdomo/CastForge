@@ -8640,3 +8640,119 @@ fn test_outline_structured_kernel_bodies_wraps_elementwise_and_rotates_index_arg
     assert_eq!(m.ops[closure_id].operands.len(), 2);
     assert_eq!(m.blocks[body_blk].arguments, vec![loop_idx, in_x, out_y]);
 }
+
+#[test]
+fn test_attach_python_stack_traces_and_fixup_isolated_from_above_regions() {
+    use castforge::ir::Attribute;
+    use castforge::ir::mlir::OpName;
+    use castforge::passes::{attach_python_stack_traces, fixup_isolated_from_above_regions};
+
+    let src = concat!(
+        "module {\n",
+        "  func.func @trace_and_isolation(\n",
+        "    %cond_in: i1,\n",
+        "    %outer_val: tensor<4xf32>\n",
+        "  ) -> tensor<4xf32> {\n",
+        "    \"mgp.assert\"(%cond_in) {msg = \"Shape mismatch\",",
+        " python_stack_trace = \"  File 'model.py', line 42, in forward\"} : (i1) -> ()\n",
+        "    return %outer_val : tensor<4xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(src).unwrap();
+    let fn_id = m.functions()[0];
+    let fn_blk = m.regions[m.ops[fn_id].regions[0]].blocks[0];
+    let assert_op = m.blocks[fn_blk].ops[0];
+    let args = m.blocks[fn_blk].arguments.clone();
+    let (cond_in, outer_val) = (args[0], args[1]);
+    let i1_ty = m.values[cond_in].ty.clone();
+    let t_ty = m.values[outer_val].ty.clone();
+
+    // 1. `attach_python_stack_traces` embeds the Python traceback into `mgp.assert`'s `"msg"`
+    // and materializes `"source_notes"` while removing `"python_stack_trace"`:
+    let attached = attach_python_stack_traces(&mut m);
+    assert_eq!(attached, 1);
+    assert_eq!(
+        m.ops[assert_op].attributes.get("msg"),
+        Some(&Attribute::String(
+            "\nSource Traceback:\n  File 'model.py', line 42, in forward\nerror: Shape mismatch"
+                .to_string()
+        ))
+    );
+    assert_eq!(
+        m.ops[assert_op].attributes.get("source_notes"),
+        Some(&Attribute::String(
+            "  File 'model.py', line 42, in forward".to_string()
+        ))
+    );
+    assert!(
+        !m.ops[assert_op]
+            .attributes
+            .contains_key("python_stack_trace")
+    );
+
+    // 2. Build a `grt.while(%outer_val)` with 2 regions (`cond` and `body`) where `body` directly
+    // references `%cond_in` as a free value from the outer block:
+    let cond_blk = m.create_block(None);
+    let cond_arg0 = m.add_block_argument(cond_blk, None, t_ty.clone());
+    let cond_out_op = m.add_operation(
+        cond_blk,
+        OpName::new("mef", "output"),
+        smallvec::smallvec![cond_arg0, cond_in],
+        vec![],
+        indexmap::IndexMap::new(),
+        vec![],
+        false,
+        Location::Unknown,
+    );
+    let cond_reg = m.create_region(vec![cond_blk]);
+
+    let body_blk = m.create_block(None);
+    let body_arg0 = m.add_block_argument(body_blk, None, t_ty.clone());
+    let body_out_op = m.add_operation(
+        body_blk,
+        OpName::new("mef", "output"),
+        smallvec::smallvec![body_arg0],
+        vec![],
+        indexmap::IndexMap::new(),
+        vec![],
+        false,
+        Location::Unknown,
+    );
+    let body_reg = m.create_region(vec![body_blk]);
+
+    let while_op = m.add_operation(
+        fn_blk,
+        OpName::new("grt", "while"),
+        smallvec::smallvec![outer_val],
+        vec![(None, t_ty)],
+        indexmap::IndexMap::new(),
+        vec![cond_reg, body_reg],
+        false,
+        Location::Unknown,
+    );
+
+    let fixed = fixup_isolated_from_above_regions(&mut m);
+    assert_eq!(fixed, 1);
+
+    // `grt.while` now takes `(%outer_val, %cond_in)` and returns 2 results:
+    assert_eq!(m.ops[while_op].operands.as_slice(), &[outer_val, cond_in]);
+    assert_eq!(m.ops[while_op].results.len(), 2);
+    assert_eq!(m.values[m.ops[while_op].results[1]].ty, i1_ty);
+
+    // In `cond_blk`, the newly threaded block arg is placed before the last condition output:
+    assert_eq!(m.blocks[cond_blk].arguments.len(), 2);
+    let cond_free_barg = m.blocks[cond_blk].arguments[1];
+    assert_eq!(
+        m.ops[cond_out_op].operands.as_slice(),
+        &[cond_arg0, cond_free_barg, cond_free_barg]
+    );
+
+    // In `body_blk`, the newly threaded block arg is appended to `mef.output`:
+    assert_eq!(m.blocks[body_blk].arguments.len(), 2);
+    let body_free_barg = m.blocks[body_blk].arguments[1];
+    assert_eq!(
+        m.ops[body_out_op].operands.as_slice(),
+        &[body_arg0, body_free_barg]
+    );
+}
