@@ -16470,3 +16470,192 @@ pub fn defer_buffer_allocations_to_mutators(module: &mut Module) -> usize {
 
     deferred_count
 }
+
+// ============================================================================
+// Batch 19 Step 5: Execute-Invariant Code Motion Fixed-Point Partitioner
+// ============================================================================
+
+/// Result of the fixed-point execute-invariant code motion analysis over a function block.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExecInvariantPartition {
+    /// Operations that must remain in the runtime execute region.
+    pub unliftable_ops: Vec<OpId>,
+    /// Operations that can be hoisted into the compile-time/init region.
+    pub liftable_ops: Vec<OpId>,
+    /// Liftable operations that must also be cloned into the execute region because their results
+    /// cannot be conveyed through the context cache and are consumed by unliftable/cloned ops.
+    pub clone_ops: Vec<OpId>,
+}
+
+/// Returns `true` if `op` is considered trivial to recompute (`is_trivial = true` or
+/// `index.constant` / `arith.constant`).
+fn is_trivial_exec_op(op: &Operation) -> bool {
+    let full = op.name.full_name();
+    matches!(full.as_str(), "index.constant" | "arith.constant")
+        || matches!(op.attributes.get("is_trivial"), Some(Attribute::Bool(true)))
+}
+
+/// Returns `true` if `op` is recomputable (`recomputable = true` or trivial constant).
+fn is_recomputable_exec_op(op: &Operation) -> bool {
+    is_trivial_exec_op(op)
+        || matches!(
+            op.attributes.get("recomputable"),
+            Some(Attribute::Bool(true))
+        )
+}
+
+/// Returns `true` if a value produced by `op` can be conveyed across init/execute via context
+/// cache (`can_be_conveyed = true`, or defaults to `true` unless `can_be_conveyed = false`).
+fn can_op_results_be_conveyed(op: &Operation) -> bool {
+    !matches!(
+        op.attributes.get("can_be_conveyed"),
+        Some(Attribute::Bool(false))
+    )
+}
+
+/// Performs the fixed-point execute-invariant code motion analysis over the entry block of the
+/// first function in `module`:
+/// 1. **Forwards (`DependsOnArgs`)**: Marks ops that depend on non-chain block arguments, have
+///    `unliftable = true` or `has_alias = true`, contain nested regions, are terminators
+///    (`func.return`), or consume results of unliftable ops.
+/// 2. **Backwards (`SuppressTrivial`)**: Marks trivial ops as unliftable if all of their users
+///    are already unliftable.
+/// 3. **Backwards (`SuppressMutated`)**: Marks an op as unliftable if any of its results is
+///    mutated by an unliftable op (`op_mutates_buffer`).
+/// 4. Iterates (1)–(3) to a fixed point, then runs **Backwards (`NeedToClone`)** to identify
+///    liftable recomputable ops whose results cannot be conveyed via context cache and are used
+///    by unliftable or cloned ops.
+pub fn analyze_exec_invariant_code_motion(module: &Module) -> ExecInvariantPartition {
+    let funcs = module.functions();
+    if funcs.is_empty() {
+        return ExecInvariantPartition::default();
+    }
+    let func_id = funcs[0];
+    if module.ops[func_id].regions.is_empty() {
+        return ExecInvariantPartition::default();
+    }
+    let reg_id = module.ops[func_id].regions[0];
+    if module.regions[reg_id].blocks.is_empty() {
+        return ExecInvariantPartition::default();
+    }
+    let blk_id = module.regions[reg_id].blocks[0];
+    let ops = &module.blocks[blk_id].ops;
+
+    // Collect runtime block arguments that taint consumers in the execute region.
+    let runtime_args: IndexSet<ValueId> = module.blocks[blk_id].arguments.iter().copied().collect();
+
+    let mut unliftable: IndexSet<OpId> = IndexSet::new();
+
+    loop {
+        let orig_count = unliftable.len();
+
+        // 1. Forwards: DependsOnArgs & dataflow propagation.
+        for &op_id in ops {
+            if unliftable.contains(&op_id) {
+                continue;
+            }
+            let op = &module.ops[op_id];
+            let full = op.name.full_name();
+            let forced_unliftable = full == "func.return"
+                || !op.regions.is_empty()
+                || matches!(op.attributes.get("unliftable"), Some(Attribute::Bool(true)))
+                || (full == "mgp.buffer.constant.external"
+                    && matches!(op.attributes.get("has_alias"), Some(Attribute::Bool(true))));
+            let uses_runtime_arg = op.operands.iter().any(|v| runtime_args.contains(v));
+            let uses_unliftable = op.operands.iter().any(|&v| {
+                matches!(
+                    module.values[v].def,
+                    ValueDef::OpResult { op: def_op, .. } if unliftable.contains(&def_op)
+                )
+            });
+
+            if forced_unliftable || uses_runtime_arg || uses_unliftable {
+                unliftable.insert(op_id);
+            }
+        }
+
+        // 2. Backwards: SuppressTrivial.
+        for &op_id in ops.iter().rev() {
+            if unliftable.contains(&op_id) {
+                continue;
+            }
+            let op = &module.ops[op_id];
+            if !is_trivial_exec_op(op) || op.results.is_empty() {
+                continue;
+            }
+            let mut has_user = false;
+            let mut all_users_unliftable = true;
+            for &cand_id in ops {
+                if cand_id == op_id {
+                    continue;
+                }
+                let cand = &module.ops[cand_id];
+                if op.results.iter().any(|r| cand.operands.contains(r)) {
+                    has_user = true;
+                    if !unliftable.contains(&cand_id) {
+                        all_users_unliftable = false;
+                        break;
+                    }
+                }
+            }
+            if has_user && all_users_unliftable {
+                unliftable.insert(op_id);
+            }
+        }
+
+        // 3. Backwards: SuppressMutated.
+        for &op_id in ops.iter().rev() {
+            if unliftable.contains(&op_id) {
+                continue;
+            }
+            let op = &module.ops[op_id];
+            let mutated_by_unliftable = op.results.iter().any(|&res_val| {
+                ops.iter().any(|&user_id| {
+                    unliftable.contains(&user_id)
+                        && op_mutates_buffer(&module.ops[user_id], res_val)
+                })
+            });
+            if mutated_by_unliftable {
+                unliftable.insert(op_id);
+            }
+        }
+
+        if unliftable.len() == orig_count {
+            break;
+        }
+    }
+
+    // 4. Backwards: NeedToClone for liftable recomputable ops with non-conveyable results.
+    let mut clone_set: IndexSet<OpId> = IndexSet::new();
+    for &op_id in ops.iter().rev() {
+        if unliftable.contains(&op_id) {
+            continue;
+        }
+        let op = &module.ops[op_id];
+        if !is_recomputable_exec_op(op) || can_op_results_be_conveyed(op) {
+            continue;
+        }
+        let used_by_exec = op.results.iter().any(|&res_val| {
+            ops.iter().any(|&user_id| {
+                (unliftable.contains(&user_id) || clone_set.contains(&user_id))
+                    && module.ops[user_id].operands.contains(&res_val)
+            })
+        });
+        if used_by_exec {
+            clone_set.insert(op_id);
+        }
+    }
+
+    let mut partition = ExecInvariantPartition::default();
+    for &op_id in ops {
+        if unliftable.contains(&op_id) {
+            partition.unliftable_ops.push(op_id);
+        } else {
+            partition.liftable_ops.push(op_id);
+            if clone_set.contains(&op_id) {
+                partition.clone_ops.push(op_id);
+            }
+        }
+    }
+    partition
+}

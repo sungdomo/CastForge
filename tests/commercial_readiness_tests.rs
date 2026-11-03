@@ -5123,3 +5123,61 @@ fn test_defer_buffer_allocations_to_mutators_and_join_chains() {
         ]
     );
 }
+
+#[test]
+fn test_analyze_exec_invariant_code_motion_fixed_point() {
+    use castforge::passes::analyze_exec_invariant_code_motion;
+
+    let mlir = concat!(
+        "module @eicm {\n",
+        "  func.func @main(%x: tensor<4xf32>) -> tensor<4xf32> {\n",
+        "    %w = mgp.buffer.constant : () -> tensor<4xf32>\n",
+        "    %view = mgp.buffer.view %w {recomputable = true, can_be_conveyed = false}",
+        " : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %triv = index.constant : () -> tensor<1xi64>\n",
+        "    %alloc = mgp.buffer.alloc %view : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %mut = mo.mutable.store %alloc, %x, %triv",
+        " : (tensor<4xf32>, tensor<4xf32>, tensor<1xi64>) -> tensor<4xf32>\n",
+        "    return %mut : tensor<4xf32>\n",
+        "  }\n",
+        "}\n",
+    );
+
+    let m = parse_mlir(mlir).expect("valid MLIR");
+    let part = analyze_exec_invariant_code_motion(&m);
+
+    let liftable_names: Vec<String> = part
+        .liftable_ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    let unliftable_names: Vec<String> = part
+        .unliftable_ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    let clone_names: Vec<String> = part
+        .clone_ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+
+    // `%w` and `%view` are liftable; `%alloc` is mutated by unliftable `%mut` so `SuppressMutated`
+    // pulls `%alloc` into `unliftable_ops`, which in turn causes `NeedToClone` to mark `%view`
+    // (non-conveyable recomputable) as needing a clone in the execute region. `%triv` is only
+    // used by `%mut` so `SuppressTrivial` marks `%triv` unliftable.
+    assert_eq!(
+        liftable_names,
+        vec!["mgp.buffer.constant", "mgp.buffer.view"]
+    );
+    assert_eq!(
+        unliftable_names,
+        vec![
+            "index.constant",
+            "mgp.buffer.alloc",
+            "mo.mutable.store",
+            "func.return"
+        ]
+    );
+    assert_eq!(clone_names, vec!["mgp.buffer.view"]);
+}
