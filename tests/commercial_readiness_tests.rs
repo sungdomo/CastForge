@@ -15,16 +15,17 @@ use castforge::ir::{
 };
 use castforge::passes::{
     ArcKvEvictionPolicy, AsymK16V8Codec, CBChunkMatch, CBGroupSpec, CacheBlendRopeSpec,
-    CacheGenCdfCodec, ChainedBlockHashConfig, DEFAULT_MAX_KERNELS_IN_FUSION_SET, EngineKvFormat,
-    KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode, KvPageSpec,
-    KvSaltQuotaRegistry, KvScaleScope, PassManager, PassRegistry, analyze_kv_layer_groups,
-    anonymize_symbolic_dims, compress_splat_constants, direct_copy_format_supported,
-    elide_redundant_state_transfers, flatten_elementwise_chains, fuse_locations,
-    fuse_reshape_epilogue, fuse_sole_use_prologues, hash_prefix_token_blocks,
-    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
-    mark_cuda_graph_stable_tensors, merge_identical_functions, plan_cacheblend_retrieve,
-    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
-    promote_narrow_accumulators, re_rope_key_in_place, stamp_fused_provenance,
+    CacheGenCdfCodec, ChainedBlockHashConfig, DEFAULT_MAX_KERNELS_IN_FUSION_SET, DeviceTargetArch,
+    EngineKvFormat, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode,
+    KvPageSpec, KvSaltQuotaRegistry, KvScaleScope, PassManager, PassRegistry,
+    analyze_kv_layer_groups, anonymize_symbolic_dims, compress_splat_constants,
+    direct_copy_format_supported, elide_redundant_state_transfers, flatten_elementwise_chains,
+    fuse_locations, fuse_reshape_epilogue, fuse_sole_use_prologues, hash_prefix_token_blocks,
+    is_supported_arch_dtype, longest_full_attention_hit, longest_joint_prefix_hit,
+    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_identical_functions,
+    plan_cacheblend_retrieve, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
+    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
+    stamp_fused_provenance, validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -1303,4 +1304,59 @@ fn test_elide_redundant_state_transfers_store_load_and_dead_store() {
     assert!(!printed.contains("kv_offload"));
     assert!(!printed.contains("kv_reload"));
     assert!(printed.contains("return %p2 : tensor<4xf32>"));
+}
+
+#[test]
+fn test_validate_target_device_dtypes_across_cpu_wgsl_and_gpu_profiles() {
+    assert!(is_supported_arch_dtype(
+        DeviceTargetArch::X86_64,
+        &DType::BF16
+    ));
+    assert!(is_supported_arch_dtype(
+        DeviceTargetArch::X86_64,
+        &DType::F16
+    ));
+    assert!(!is_supported_arch_dtype(
+        DeviceTargetArch::X86_64,
+        &DType::F8E4M3FN
+    ));
+    assert!(is_supported_arch_dtype(
+        DeviceTargetArch::AArch64,
+        &DType::BF16
+    ));
+    assert!(!is_supported_arch_dtype(
+        DeviceTargetArch::AArch64,
+        &DType::F16
+    ));
+    assert!(!is_supported_arch_dtype(
+        DeviceTargetArch::Wgsl,
+        &DType::BF16
+    ));
+    assert!(is_supported_arch_dtype(
+        DeviceTargetArch::GpuSm90,
+        &DType::F8E4M3FN
+    ));
+
+    let mlir = concat!(
+        "module @validate_devices {\n",
+        "  func.func @main(%x: tensor<4xf8E4M3FN>) -> tensor<4xf8E4M3FN> {\n",
+        "    %0 = stablehlo.abs %x : tensor<4xf8E4M3FN>\n",
+        "    func.return %0 : tensor<4xf8E4M3FN>\n",
+        "  }\n",
+        "}\n",
+    );
+    let module = parse_mlir(mlir).unwrap();
+
+    // `GpuSm90` supports `f8E4M3FN` natively -> 0 diagnostics
+    assert!(validate_target_device_dtypes(&module, DeviceTargetArch::GpuSm90).is_empty());
+
+    // `X86_64` rejects sub-16-bit floats (`f8E4M3FN`) on both block arg and `stablehlo.abs`
+    let x86_diags = validate_target_device_dtypes(&module, DeviceTargetArch::X86_64);
+    assert_eq!(x86_diags.len(), 2);
+    assert_eq!(x86_diags[0].dtype, DType::F8E4M3FN);
+    assert!(
+        x86_diags[0]
+            .message
+            .contains("The f8E4M3FN data type is not supported on device 'cpu:x86_64'.")
+    );
 }

@@ -3250,3 +3250,136 @@ pub fn elide_redundant_state_transfers(module: &mut Module) -> usize {
     }
     elided
 }
+
+/// Target hardware architecture profile for device/dtype validation
+/// (inspired by Modular `ValidateDevicesPass.cpp`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceTargetArch {
+    /// x86_64 CPU: supports `f32`/`f64`, integers, `bf16`, and `f16`; rejects sub-16-bit floats
+    /// (`f8E4M3FN`, `f8E5M2`).
+    X86_64,
+    /// AArch64 CPU: supports `f32`/`f64`, integers, and `bf16`; rejects `f16` and sub-16-bit
+    /// floats (`f8E4M3FN`, `f8E5M2`) per Modular `isSupportedArchDTypeCombination`.
+    AArch64,
+    /// WebGPU WGSL: supports `f32`, `f16`, `i32`, `ui32`; rejects `bf16`, `f8`, and `f64`.
+    Wgsl,
+    /// Modern GPU (`sm_90` / `gfx942`): supports all floating-point and integer dtypes including
+    /// `f8E4M3FN` and `f8E5M2`.
+    GpuSm90,
+}
+
+impl DeviceTargetArch {
+    pub fn default_device_label(self) -> &'static str {
+        match self {
+            Self::X86_64 => "cpu:x86_64",
+            Self::AArch64 => "cpu:aarch64",
+            Self::Wgsl => "gpu:wgsl",
+            Self::GpuSm90 => "gpu:0",
+        }
+    }
+}
+
+/// Returns `true` if `dtype` is natively supported on `arch`
+/// (inspired by Modular `ValidateDevicesPass.cpp` `isSupportedArchDTypeCombination`).
+pub fn is_supported_arch_dtype(arch: DeviceTargetArch, dtype: &DType) -> bool {
+    match arch {
+        DeviceTargetArch::X86_64 => {
+            if matches!(dtype, DType::BF16 | DType::F16) {
+                return true;
+            }
+            !(dtype.is_float() && dtype.bit_width() < 32)
+        }
+        DeviceTargetArch::AArch64 => {
+            if matches!(dtype, DType::BF16) {
+                return true;
+            }
+            !(dtype.is_float() && dtype.bit_width() < 32)
+        }
+        DeviceTargetArch::Wgsl => matches!(
+            dtype,
+            DType::F32 | DType::F16 | DType::I32 | DType::U32 | DType::I1 | DType::Index
+        ),
+        DeviceTargetArch::GpuSm90 => true,
+    }
+}
+
+/// Diagnostic emitted when an operation or block argument uses a [`DType`] unsupported by the
+/// target device architecture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceDTypeDiagnostic {
+    pub op_name: String,
+    pub device: String,
+    pub dtype: DType,
+    pub location: Location,
+    pub message: String,
+}
+
+/// Validates that all function arguments and operation result tensor [`DType`]s in `module` are
+/// supported on `arch` (inspired by Modular `ValidateDevicesPass.cpp`).
+pub fn validate_target_device_dtypes(
+    module: &Module,
+    arch: DeviceTargetArch,
+) -> Vec<DeviceDTypeDiagnostic> {
+    let mut diags = Vec::new();
+    let default_dev = arch.default_device_label();
+
+    for fn_op_id in module.functions() {
+        let fn_op = &module.ops[fn_op_id];
+        let Some(&reg_id) = fn_op.regions.first() else {
+            continue;
+        };
+        let Some(&block_id) = module.regions[reg_id].blocks.first() else {
+            continue;
+        };
+        let fn_dev = fn_op
+            .attributes
+            .get("castforge.device")
+            .and_then(|a| a.as_str())
+            .unwrap_or(default_dev);
+
+        for &arg_val in &module.blocks[block_id].arguments {
+            if let Some(tt) = module.values[arg_val].ty.as_tensor()
+                && !is_supported_arch_dtype(arch, &tt.dtype)
+            {
+                let dt_str = tt.dtype.to_string();
+                diags.push(DeviceDTypeDiagnostic {
+                    op_name: "func.func".to_string(),
+                    device: fn_dev.to_string(),
+                    dtype: tt.dtype.clone(),
+                    location: fn_op.location.clone(),
+                    message: format!(
+                        "The {dt_str} data type is not supported on device '{fn_dev}'."
+                    ),
+                });
+            }
+        }
+
+        for &op_id in &module.blocks[block_id].ops {
+            let Some(op) = module.ops.get(op_id) else {
+                continue;
+            };
+            let dev = op
+                .attributes
+                .get("castforge.device")
+                .and_then(|a| a.as_str())
+                .unwrap_or(fn_dev);
+            for &res_val in &op.results {
+                if let Some(tt) = module.values[res_val].ty.as_tensor()
+                    && !is_supported_arch_dtype(arch, &tt.dtype)
+                {
+                    let dt_str = tt.dtype.to_string();
+                    diags.push(DeviceDTypeDiagnostic {
+                        op_name: op.name.to_string(),
+                        device: dev.to_string(),
+                        dtype: tt.dtype.clone(),
+                        location: op.location.clone(),
+                        message: format!(
+                            "The {dt_str} data type is not supported on device '{dev}'."
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    diags
+}
