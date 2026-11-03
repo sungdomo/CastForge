@@ -5586,3 +5586,65 @@ pub fn await_hanging_effect_chains(module: &mut Module) -> usize {
 
     awaited_total
 }
+
+/// Eliminates direct dependency edges of each node in `dag_edges` (`dag_edges[u]` = list of
+/// prerequisite nodes that `u` depends on) that are transitively implied by `u`'s other
+/// prerequisites (`u -> w ->+ v`), using a cycle-safe breadth-first generation walk
+/// (inspired by Modular
+/// `GraphCompiler/lib/MGPDialect/Transforms/SimplifyDeviceGraphDependenciesPass.cpp`
+/// `eliminateImpliedDependencies`).
+///
+/// Returns `(reduced_dag_edges, num_eliminated_edges)`.
+pub fn eliminate_implied_dependencies(dag_edges: &[Vec<usize>]) -> (Vec<Vec<usize>>, usize) {
+    let n = dag_edges.len();
+    let mut reduced = Vec::with_capacity(n);
+    let mut eliminated_count = 0usize;
+
+    for direct in dag_edges {
+        // Deduplicate while preserving original order (`SmallSetVector<Value, 16> needles`).
+        let mut needles: Vec<usize> = Vec::with_capacity(direct.len());
+        for &dep in direct {
+            if !needles.contains(&dep) {
+                needles.push(dep);
+            }
+        }
+        let orig_len = direct.len();
+
+        let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut current_gen: Vec<usize> = Vec::new();
+        for &needle in &needles {
+            if let Some(nexts) = dag_edges.get(needle) {
+                for &nx in nexts {
+                    if !current_gen.contains(&nx) {
+                        current_gen.push(nx);
+                    }
+                }
+            }
+        }
+
+        // Track `visited` so even a malformed cycle cannot hang the pass.
+        while !current_gen.is_empty() {
+            for &v in &current_gen {
+                visited.insert(v);
+            }
+            needles.retain(|v| !current_gen.contains(v));
+
+            let mut next_gen: Vec<usize> = Vec::new();
+            for &val in &current_gen {
+                if let Some(nexts) = dag_edges.get(val) {
+                    for &nx in nexts {
+                        if !visited.contains(&nx) && !next_gen.contains(&nx) {
+                            next_gen.push(nx);
+                        }
+                    }
+                }
+            }
+            current_gen = next_gen;
+        }
+
+        eliminated_count += orig_len.saturating_sub(needles.len());
+        reduced.push(needles);
+    }
+
+    (reduced, eliminated_count)
+}

@@ -25,9 +25,9 @@ use castforge::passes::{
     analyze_kv_layer_groups, anonymize_symbolic_dims, await_hanging_effect_chains,
     compress_splat_constants, decode_kv_fs_filename, decode_kv_storage_key,
     defer_allocs_to_first_use, direct_copy_format_supported, downsample_subchunk_swa_block_ids,
-    elide_redundant_state_transfers, encode_kv_fs_filename, encode_kv_storage_key,
-    flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
-    fuse_reshape_epilogue, fuse_sole_use_prologues, hash_packed_token_blocks_be,
+    elide_redundant_state_transfers, eliminate_implied_dependencies, encode_kv_fs_filename,
+    encode_kv_storage_key, flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps,
+    fuse_locations, fuse_reshape_epilogue, fuse_sole_use_prologues, hash_packed_token_blocks_be,
     hash_prefix_token_blocks, hoist_exec_invariant_ops, hoist_symbolic_dim_expressions,
     is_supported_arch_dtype, legalize_rowwise_reduction_launch, longest_full_attention_hit,
     longest_joint_prefix_hit, longest_sliding_window_hit, mark_cuda_graph_stable_tensors,
@@ -2240,4 +2240,21 @@ module @fixup_overhangs {
     // Running `await_hanging_effect_chains` a second time is idempotent (`%offload` is now used
     // by `castforge.chain_await`!)
     assert_eq!(await_hanging_effect_chains(&mut module), 0);
+}
+
+#[test]
+fn test_eliminate_implied_dependencies_transitive_reduction_and_cycle_safety() {
+    // Node 0: []
+    // Node 1: [0]
+    // Node 2: [1, 0] -> edge `2 -> 0` is implied transitively via `2 -> 1 -> 0`!
+    // Node 3: [2, 1, 0] -> edges `3 -> 1` and `3 -> 0` are implied via `3 -> 2 -> 1 -> 0`!
+    let dag = vec![vec![], vec![0], vec![1, 0], vec![2, 1, 0]];
+    let (reduced, eliminated) = eliminate_implied_dependencies(&dag);
+    assert_eq!(eliminated, 3);
+    assert_eq!(reduced, vec![vec![], vec![0], vec![1], vec![2]]);
+
+    // Malformed cycle (`0 -> 1 -> 0`) must terminate cleanly without hanging
+    let cyclic = vec![vec![1], vec![0]];
+    let (_, cyc_elim) = eliminate_implied_dependencies(&cyclic);
+    assert_eq!(cyc_elim, 2);
 }
