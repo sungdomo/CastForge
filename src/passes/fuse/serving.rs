@@ -4933,3 +4933,148 @@ pub fn hoist_exec_invariant_ops(module: &mut Module) -> usize {
 
     cached_nontrivial
 }
+
+fn is_complex_symbolic_expr(sym: &str) -> bool {
+    !sym.is_empty() && !sym.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn rewrite_type_symbolic_exprs(ty: &mut Type, expr_to_alias: &IndexMap<String, String>) -> bool {
+    match ty {
+        Type::Tensor(tt) => {
+            let mut changed = false;
+            for dim in &mut tt.shape {
+                if let Dim::Symbolic(s) = dim
+                    && is_complex_symbolic_expr(s)
+                {
+                    let alias = expr_to_alias
+                        .get(s)
+                        .cloned()
+                        .unwrap_or_else(|| format!("param_expr_{}", expr_to_alias.len()));
+                    *s = alias;
+                    changed = true;
+                }
+            }
+            changed
+        }
+        Type::Function { inputs, results } => {
+            let mut changed = false;
+            for inp in inputs {
+                changed |= rewrite_type_symbolic_exprs(inp, expr_to_alias);
+            }
+            for res in results {
+                changed |= rewrite_type_symbolic_exprs(res, expr_to_alias);
+            }
+            changed
+        }
+        Type::Tuple(elems) => {
+            let mut changed = false;
+            for elem in elems {
+                changed |= rewrite_type_symbolic_exprs(elem, expr_to_alias);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn collect_type_symbolic_exprs(ty: &Type, expr_to_alias: &mut IndexMap<String, String>) {
+    match ty {
+        Type::Tensor(tt) => {
+            for dim in &tt.shape {
+                if let Dim::Symbolic(s) = dim
+                    && is_complex_symbolic_expr(s)
+                    && !expr_to_alias.contains_key(s)
+                {
+                    let alias = format!("param_expr_{}", expr_to_alias.len());
+                    expr_to_alias.insert(s.clone(), alias);
+                }
+            }
+        }
+        Type::Function { inputs, results } => {
+            for inp in inputs {
+                collect_type_symbolic_exprs(inp, expr_to_alias);
+            }
+            for res in results {
+                collect_type_symbolic_exprs(res, expr_to_alias);
+            }
+        }
+        Type::Tuple(elems) => {
+            for elem in elems {
+                collect_type_symbolic_exprs(elem, expr_to_alias);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Hoists compound symbolic dimension expressions (e.g., `Dim::Symbolic("batch*seq")`,
+/// `Dim::Symbolic("seq+1")`) out of tensor types into deduplicated function-level parameter
+/// declarations (`param_expr_0`, `param_expr_1`, ...) stored in `castforge.param_expr_decls`,
+/// rewriting all tensor shapes in the function to reference the hoisted parameter aliases
+/// (inspired by Modular
+/// `GraphCompiler/lib/MODialect/Transforms/HoistParameterExpressionsPass.cpp`).
+///
+/// Returns the total number of distinct symbolic parameter expressions hoisted across the module.
+pub fn hoist_symbolic_dim_expressions(module: &mut Module) -> usize {
+    let mut total_hoisted = 0usize;
+    let func_ids = module.functions();
+
+    for func_id in func_ids {
+        let mut expr_to_alias: IndexMap<String, String> = IndexMap::new();
+
+        if let Some(Attribute::Type(ty)) = module.ops[func_id].attributes.get("function_type") {
+            collect_type_symbolic_exprs(ty, &mut expr_to_alias);
+        }
+
+        let reg_ids = module.ops[func_id].regions.clone();
+        let mut val_ids = Vec::new();
+        for reg_id in reg_ids {
+            let block_ids = module.regions[reg_id].blocks.clone();
+            for block_id in block_ids {
+                for &arg_val in &module.blocks[block_id].arguments {
+                    val_ids.push(arg_val);
+                }
+                for &op_id in &module.blocks[block_id].ops {
+                    if let Some(op) = module.ops.get(op_id) {
+                        for &res_val in &op.results {
+                            val_ids.push(res_val);
+                        }
+                    }
+                }
+            }
+        }
+
+        for &val_id in &val_ids {
+            if let Some(v_info) = module.values.get(val_id) {
+                collect_type_symbolic_exprs(&v_info.ty, &mut expr_to_alias);
+            }
+        }
+
+        if expr_to_alias.is_empty() {
+            continue;
+        }
+        total_hoisted += expr_to_alias.len();
+
+        for &val_id in &val_ids {
+            if let Some(v_info) = module.values.get_mut(val_id) {
+                rewrite_type_symbolic_exprs(&mut v_info.ty, &expr_to_alias);
+            }
+        }
+
+        if let Some(func_op) = module.ops.get_mut(func_id) {
+            if let Some(Attribute::Type(ty)) = func_op.attributes.get_mut("function_type") {
+                rewrite_type_symbolic_exprs(ty, &expr_to_alias);
+            }
+            let decls: IndexMap<String, Attribute> = expr_to_alias
+                .into_iter()
+                .map(|(expr, alias)| (alias, Attribute::String(expr)))
+                .collect();
+            func_op.attributes.insert(
+                "castforge.param_expr_decls".to_string(),
+                Attribute::Dictionary(decls),
+            );
+        }
+    }
+
+    total_hoisted
+}

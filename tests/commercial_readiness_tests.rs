@@ -27,12 +27,12 @@ use castforge::passes::{
     encode_kv_fs_filename, encode_kv_storage_key, flatten_elementwise_chains,
     fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
     fuse_sole_use_prologues, hash_prefix_token_blocks, hoist_exec_invariant_ops,
-    is_supported_arch_dtype, legalize_rowwise_reduction_launch, longest_full_attention_hit,
-    longest_joint_prefix_hit, longest_sliding_window_hit, mark_cuda_graph_stable_tensors,
-    merge_duplicate_shape_ops, merge_identical_functions, plan_cacheblend_retrieve,
-    plan_concat_in_place, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
-    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
-    reuse_dead_loop_buffers, stamp_fused_provenance, unfold_chunk_range,
+    hoist_symbolic_dim_expressions, is_supported_arch_dtype, legalize_rowwise_reduction_launch,
+    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
+    mark_cuda_graph_stable_tensors, merge_duplicate_shape_ops, merge_identical_functions,
+    plan_cacheblend_retrieve, plan_concat_in_place, plan_jenga_kv_geometry,
+    plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
+    re_rope_key_in_place, reuse_dead_loop_buffers, stamp_fused_provenance, unfold_chunk_range,
     validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
@@ -1927,5 +1927,72 @@ module @exec_invariant {
         !iota_op
             .attributes
             .contains_key("castforge.exec_invariant_init")
+    );
+}
+
+#[test]
+fn test_hoist_symbolic_dim_expressions_deduplication_and_aliasing() {
+    use castforge::ir::{Attribute, Type};
+
+    let mlir = r#"
+module @param_expr {
+  func.func @main(%x: tensor<4x8xf32>) -> tensor<4x8xf32> {
+    %0 = stablehlo.abs %x : tensor<4x8xf32>
+    %1 = stablehlo.negate %0 : tensor<4x8xf32>
+    return %1 : tensor<4x8xf32>
+  }
+}
+"#;
+    let mut module = parse_mlir(mlir).expect("valid MLIR");
+    let func_id = module.functions()[0];
+    let func_block = module.regions[module.ops[func_id].regions[0]].blocks[0];
+    let arg_val = module.blocks[func_block].arguments[0];
+    let op0_res = module.ops[module.blocks[func_block].ops[0]].results[0];
+    let op1_res = module.ops[module.blocks[func_block].ops[1]].results[0];
+
+    // Inject compound symbolic dimension expressions: `"batch*seq"` (used twice) and `"hidden+64"`
+    // plus a simple identifier `"batch"` (which should NOT be hoisted as a complex expression).
+    let complex_ty = Type::Tensor(TensorType {
+        shape: vec![
+            Dim::Symbolic("batch".to_string()),
+            Dim::Symbolic("batch*seq".to_string()),
+            Dim::Symbolic("hidden+64".to_string()),
+        ],
+        dtype: DType::F32,
+        encoding: None,
+    });
+    module.values[arg_val].ty = complex_ty.clone();
+    module.values[op0_res].ty = complex_ty.clone();
+    module.values[op1_res].ty = complex_ty;
+
+    let hoisted = hoist_symbolic_dim_expressions(&mut module);
+    // 2 unique compound expressions (`"batch*seq"` -> `param_expr_0`, `"hidden+64"` -> `1`)
+    assert_eq!(hoisted, 2);
+
+    let Type::Tensor(ref rewritten_tt) = module.values[op0_res].ty else {
+        panic!("expected tensor type");
+    };
+    assert_eq!(
+        rewritten_tt.shape,
+        vec![
+            Dim::Symbolic("batch".to_string()),
+            Dim::Symbolic("param_expr_0".to_string()),
+            Dim::Symbolic("param_expr_1".to_string()),
+        ]
+    );
+
+    let Some(Attribute::Dictionary(decls)) = module.ops[func_id]
+        .attributes
+        .get("castforge.param_expr_decls")
+    else {
+        panic!("expected castforge.param_expr_decls dictionary attribute");
+    };
+    assert_eq!(
+        decls.get("param_expr_0"),
+        Some(&Attribute::String("batch*seq".to_string()))
+    );
+    assert_eq!(
+        decls.get("param_expr_1"),
+        Some(&Attribute::String("hidden+64".to_string()))
     );
 }
