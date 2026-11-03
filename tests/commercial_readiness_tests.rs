@@ -19,16 +19,16 @@ use castforge::passes::{
     EngineKvFormat, FULL_ATTENTION_WINDOW, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
     IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
     KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope,
-    PassManager, PassRegistry, analyze_kv_layer_groups, anonymize_symbolic_dims,
-    compress_splat_constants, defer_allocs_to_first_use, direct_copy_format_supported,
-    elide_redundant_state_transfers, flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps,
-    fuse_locations, fuse_reshape_epilogue, fuse_sole_use_prologues, hash_prefix_token_blocks,
-    is_supported_arch_dtype, longest_full_attention_hit, longest_joint_prefix_hit,
-    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_duplicate_shape_ops,
-    merge_identical_functions, plan_cacheblend_retrieve, plan_jenga_kv_geometry,
-    plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
-    re_rope_key_in_place, stamp_fused_provenance, unfold_chunk_range,
-    validate_target_device_dtypes,
+    PassManager, PassRegistry, WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
+    anonymize_symbolic_dims, compress_splat_constants, defer_allocs_to_first_use,
+    direct_copy_format_supported, elide_redundant_state_transfers, flatten_elementwise_chains,
+    fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
+    fuse_sole_use_prologues, hash_prefix_token_blocks, is_supported_arch_dtype,
+    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
+    mark_cuda_graph_stable_tensors, merge_duplicate_shape_ops, merge_identical_functions,
+    plan_cacheblend_retrieve, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
+    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
+    stamp_fused_provenance, unfold_chunk_range, validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -1593,4 +1593,30 @@ fn test_kv_prefix_bloom_filter_optimal_sizing_and_batch_dedup() {
     bf.clear();
     assert_eq!(bf.item_count(), 0);
     assert_eq!(bf.bits_set(), 0);
+}
+
+#[test]
+fn test_warm_prefetch_job_table_consume_once_lifecycle() {
+    let mut table = WarmPrefetchJobTable::new();
+    assert_eq!(table.poll("req-missing"), WarmPrefetchStatus::Unknown);
+
+    // Submit 2 object groups of 3 keys each (6 total requested keys)
+    table.submit("req-1", &[vec![10, 11, 12], vec![20, 21, 22]]);
+    assert_eq!(table.active_job_count(), 1);
+    assert_eq!(table.poll("req-1"), WarmPrefetchStatus::Pending);
+
+    // Complete with 4 out of 6 keys found in L2
+    assert!(table.record_completion("req-1", &[vec![true, true, false], vec![true, false, true]]));
+
+    // First poll after completion returns `Completed { found_keys: 4, total_keys: 6 }` and drops it
+    assert_eq!(
+        table.poll("req-1"),
+        WarmPrefetchStatus::Completed {
+            found_keys: 4,
+            total_keys: 6,
+        }
+    );
+    assert_eq!(table.active_job_count(), 0);
+    // Subsequent poll for the same request_id returns `Unknown` (consume-once semantics)
+    assert_eq!(table.poll("req-1"), WarmPrefetchStatus::Unknown);
 }

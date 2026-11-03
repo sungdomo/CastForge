@@ -3953,3 +3953,95 @@ impl KvPrefixBloomFilter {
         self.item_count = 0;
     }
 }
+
+/// Status of an asynchronous L2-to-L1 no-lock warm prefetch job
+/// (inspired by LMCache `lmcache/v1/multiprocess/warm_prefetch.py` `WarmStatus`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarmPrefetchStatus {
+    /// Load is still in flight.
+    Pending,
+    /// Load finished; reports `(found_keys, total_keys)` and consumes the job entry.
+    Completed {
+        found_keys: usize,
+        total_keys: usize,
+    },
+    /// Unknown request ID (never submitted, or already completed and consumed by an earlier poll).
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WarmPrefetchEntry {
+    total_keys: usize,
+    completed_found_keys: Option<usize>,
+}
+
+/// Table of in-flight no-lock L2-to-L1 warm-prefetch jobs with **exactly-once** completion
+/// consumption on `poll`
+/// (inspired by LMCache `lmcache/v1/multiprocess/warm_prefetch.py` `WarmPrefetchJobs`).
+///
+/// A warm prefetch loads keys from L2 into L1 without holding L1 read pins. While in flight,
+/// `poll(request_id)` returns [`WarmPrefetchStatus::Pending`]. Once `record_completion` marks the
+/// job finished, the **first** `poll(request_id)` returns [`WarmPrefetchStatus::Completed`] and
+/// removes the job entry so subsequent polls return [`WarmPrefetchStatus::Unknown`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WarmPrefetchJobTable {
+    jobs: IndexMap<String, WarmPrefetchEntry>,
+}
+
+impl WarmPrefetchJobTable {
+    /// Creates an empty warm-prefetch job table.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of currently tracked jobs (pending or unconsumed completed).
+    pub fn active_job_count(&self) -> usize {
+        self.jobs.len()
+    }
+
+    /// Submits a no-lock retain prefetch job across `key_groups` (`[num_groups][num_keys]`).
+    pub fn submit(&mut self, request_id: impl Into<String>, key_groups: &[Vec<u64>]) {
+        let total_keys: usize = key_groups.iter().map(Vec::len).sum();
+        self.jobs.insert(
+            request_id.into(),
+            WarmPrefetchEntry {
+                total_keys,
+                completed_found_keys: None,
+            },
+        );
+    }
+
+    /// Marks `request_id` as completed given per-group hit bitmaps (`[num_groups][num_keys]`),
+    /// counting total loaded keys via popcount across all groups.
+    pub fn record_completion(&mut self, request_id: &str, hit_bitmaps: &[Vec<bool>]) -> bool {
+        let Some(entry) = self.jobs.get_mut(request_id) else {
+            return false;
+        };
+        let found: usize = hit_bitmaps
+            .iter()
+            .flat_map(|row| row.iter())
+            .filter(|&&hit| hit)
+            .count();
+        entry.completed_found_keys = Some(found.min(entry.total_keys));
+        true
+    }
+
+    /// Polls `request_id`: returns [`WarmPrefetchStatus::Pending`] while in flight, pops and
+    /// returns [`WarmPrefetchStatus::Completed`] on the first poll after completion, and returns
+    /// [`WarmPrefetchStatus::Unknown`] thereafter.
+    pub fn poll(&mut self, request_id: &str) -> WarmPrefetchStatus {
+        let Some(entry) = self.jobs.get(request_id) else {
+            return WarmPrefetchStatus::Unknown;
+        };
+        if let Some(found_keys) = entry.completed_found_keys {
+            let total_keys = entry.total_keys;
+            self.jobs.shift_remove(request_id);
+            WarmPrefetchStatus::Completed {
+                found_keys,
+                total_keys,
+            }
+        } else {
+            WarmPrefetchStatus::Pending
+        }
+    }
+}
