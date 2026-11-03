@@ -18,8 +18,8 @@ use castforge::passes::{
     BlendReadGroupSet, BlendTokenRangeMatcher, CBChunkMatch, CBGroupRopeGeometry, CBGroupSpec,
     CacheBlendRopeSpec, CacheEventBatchSpec, CacheEventTier, CacheGenCdfCodec,
     ChainedBlockHashConfig, CoordinatorEventGate, DEFAULT_MAX_KERNELS_IN_FUSION_SET,
-    DeviceTargetArch, DynamicAllocRequest, EngineKvFormat, EventIngestOutcome,
-    FULL_ATTENTION_WINDOW, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
+    DaxGenerationSlotArena, DaxPutOutcome, DeviceTargetArch, DynamicAllocRequest, EngineKvFormat,
+    EventIngestOutcome, FULL_ATTENTION_WINDOW, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
     IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
     KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope,
     KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy, LayerGroupPayloadSharder,
@@ -3049,4 +3049,52 @@ fn test_classify_blend_read_groups_and_cb_group_rope_geometry() {
     assert!(
         compute_cb_group_rope_geometry(16, 16, 1, 576, 64, false, None, Some((500, 64))).is_none()
     );
+}
+
+#[test]
+fn test_dax_generation_slot_arena_read_borrows_deferred_reclaim_and_shrink() {
+    let mut arena = DaxGenerationSlotArena::new(4 * 4096, 4096).expect("4-slot DAX arena");
+    assert_eq!(arena.max_slots(), 4);
+
+    // Insert 3 keys into slots 0, 1, 2:
+    assert_eq!(arena.put(100, 4096), DaxPutOutcome::Inserted);
+    assert_eq!(arena.put(200, 4096), DaxPutOutcome::Inserted);
+    assert_eq!(arena.put(300, 4096), DaxPutOutcome::Inserted);
+    assert_eq!(arena.put(100, 4096), DaxPutOutcome::AlreadyExists);
+    assert_eq!(arena.put(999, 8192), DaxPutOutcome::InvalidSize);
+
+    // Reserve read on key 200 (slot 1, generation 1):
+    let (reservations, hits) = arena.reserve_reads(&[200, 404], false);
+    assert_eq!(hits, vec![true, false]);
+    assert_eq!(reservations.len(), 1);
+    assert_eq!(reservations[0].slot_id, 1);
+    assert_eq!(reservations[0].generation, 1);
+
+    // Evict key 200 while borrowed by an active read:
+    // Key 200 is removed from the index immediately, but slot 1 enters `pending_free`!
+    assert_eq!(arena.delete_many(&[200], false), vec![true]);
+    assert_eq!(arena.exists_many(&[200], false), vec![false]);
+
+    // `usage()` reports 3/4 = 0.75 current usage (slot 1 still borrowed),
+    // and 2/4 = 0.50 post-eviction usage!
+    let (cur_u, post_u) = arena.usage();
+    assert!((cur_u - 0.75).abs() < 1e-9);
+    assert!((post_u - 0.50).abs() < 1e-9);
+
+    // Finalizing the read drains `borrow_count` to 0 and recycles slot 1 into `free_slots`:
+    arena.finalize_reads(&reservations);
+    let (cur_after, post_after) = arena.usage();
+    assert!((cur_after - 0.50).abs() < 1e-9);
+    assert!((post_after - 0.50).abs() < 1e-9);
+
+    // Inserting key 400 reuses recycled slot 1 with incremented generation 2:
+    let (out, slot_info) = arena.begin_put(400, 2048);
+    assert_eq!(out, DaxPutOutcome::Inserted);
+    assert_eq!(slot_info, Some((1, 2, 4096)));
+    assert!(arena.finalize_put(400, false));
+
+    // Highest occupied slot is slot 2 (`0, 1, 2`), so shrinking to 3 slots is valid,
+    // while shrinking to 2 slots is rejected because slot 2 is live:
+    assert!(arena.can_shrink_to(3));
+    assert!(!arena.can_shrink_to(2));
 }

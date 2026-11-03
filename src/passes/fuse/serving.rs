@@ -8359,3 +8359,414 @@ pub fn compute_cb_group_rope_geometry(
         rot_offset: 0,
     })
 }
+
+/// Outcome of reserving or committing a payload in [`DaxGenerationSlotArena`]
+/// (inspired by LMCache `lmcache/v1/distributed/l2_adapters/dax/core.py` `DaxPutFromPtrResult`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaxPutOutcome {
+    /// Payload was newly reserved/committed into a slot.
+    Inserted,
+    /// Key is already committed in the index.
+    AlreadyExists,
+    /// Key already has an active uncommitted write reservation.
+    Inflight,
+    /// Arena has no free slots available.
+    NoSpace,
+    /// Payload size is zero or exceeds `slot_bytes`.
+    InvalidSize,
+}
+
+/// Read reservation pinning a committed DAX slot generation against concurrent recycling
+/// (inspired by LMCache `lmcache/v1/distributed/l2_adapters/dax/core.py` `DaxReadReservation`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaxReadReservation {
+    /// Position of the key in the caller's request slice.
+    pub result_index: usize,
+    /// Reserved key identifier.
+    pub key: u64,
+    /// Byte offset of the slot within the arena (`slot_id * slot_bytes`).
+    pub offset_bytes: u64,
+    /// Payload size in bytes stored in the slot.
+    pub size_bytes: u64,
+    /// Physical slot index.
+    pub slot_id: usize,
+    /// Monotonic slot generation counter at reservation time.
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DaxIndexEntry {
+    offset_bytes: u64,
+    size_bytes: u64,
+    slot_id: usize,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DaxInflightEntry {
+    offset_bytes: u64,
+    size_bytes: u64,
+    slot_id: usize,
+    generation: u64,
+    canceled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DaxSlotState {
+    generation: u64,
+    committed: bool,
+    borrow_count: u32,
+    pending_free: bool,
+}
+
+/// Generational fixed-slot persistent memory (DAX) arena manager with read-borrow reference
+/// counting and deferred `pending_free` slot reclamation
+/// (inspired by LMCache `lmcache/v1/distributed/l2_adapters/dax/core.py` `DaxCore`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaxGenerationSlotArena {
+    slot_bytes: u64,
+    max_slots: usize,
+    next_slot: usize,
+    free_slots: Vec<usize>,
+    index: IndexMap<u64, DaxIndexEntry>,
+    inflight: IndexMap<u64, DaxInflightEntry>,
+    slot_states: IndexMap<usize, DaxSlotState>,
+    external_lock_counts: IndexMap<u64, u32>,
+    active_reads: usize,
+    active_writes: usize,
+}
+
+impl DaxGenerationSlotArena {
+    /// Creates a new arena with `max_dax_size_bytes` capacity partitioned into fixed `slot_bytes`
+    /// slots. Returns `None` if `slot_bytes == 0` or the arena cannot fit at least one slot.
+    pub fn new(max_dax_size_bytes: u64, slot_bytes: u64) -> Option<Self> {
+        if slot_bytes == 0 {
+            return None;
+        }
+        let max_slots = (max_dax_size_bytes / slot_bytes) as usize;
+        if max_slots == 0 {
+            return None;
+        }
+        Some(Self {
+            slot_bytes,
+            max_slots,
+            next_slot: 0,
+            free_slots: Vec::new(),
+            index: IndexMap::new(),
+            inflight: IndexMap::new(),
+            slot_states: IndexMap::new(),
+            external_lock_counts: IndexMap::new(),
+            active_reads: 0,
+            active_writes: 0,
+        })
+    }
+
+    /// Maximum number of fixed-size slots in the arena.
+    pub fn max_slots(&self) -> usize {
+        self.max_slots
+    }
+
+    /// Fixed byte capacity of each slot.
+    pub fn slot_bytes(&self) -> u64 {
+        self.slot_bytes
+    }
+
+    fn allocate_slot(&mut self) -> Option<usize> {
+        if let Some(slot_id) = self.free_slots.pop() {
+            return Some(slot_id);
+        }
+        if self.next_slot < self.max_slots {
+            let slot_id = self.next_slot;
+            self.next_slot += 1;
+            return Some(slot_id);
+        }
+        None
+    }
+
+    fn reserve_slot_state(&mut self, slot_id: usize) -> u64 {
+        let next_gen = self
+            .slot_states
+            .get(&slot_id)
+            .map_or(1, |s| s.generation + 1);
+        self.slot_states.insert(
+            slot_id,
+            DaxSlotState {
+                generation: next_gen,
+                committed: false,
+                borrow_count: 0,
+                pending_free: false,
+            },
+        );
+        next_gen
+    }
+
+    fn schedule_slot_reclaim(&mut self, slot_id: usize, generation: u64) {
+        let Some(state) = self.slot_states.get_mut(&slot_id) else {
+            return;
+        };
+        if state.generation != generation {
+            return;
+        }
+        state.committed = false;
+        if state.borrow_count == 0 {
+            state.pending_free = false;
+            if !self.free_slots.contains(&slot_id) {
+                self.free_slots.push(slot_id);
+            }
+        } else {
+            state.pending_free = true;
+        }
+    }
+
+    fn is_entry_committed(&self, entry: &DaxIndexEntry) -> bool {
+        self.slot_states
+            .get(&entry.slot_id)
+            .is_some_and(|s| s.generation == entry.generation && s.committed)
+    }
+
+    /// Reserves an in-flight write slot for `key` of `size_bytes`, returning the outcome and
+    /// `Some((slot_id, generation, offset_bytes))` when a new slot was allocated.
+    pub fn begin_put(
+        &mut self,
+        key: u64,
+        size_bytes: u64,
+    ) -> (DaxPutOutcome, Option<(usize, u64, u64)>) {
+        if size_bytes == 0 || size_bytes > self.slot_bytes {
+            return (DaxPutOutcome::InvalidSize, None);
+        }
+        if self.index.contains_key(&key) {
+            return (DaxPutOutcome::AlreadyExists, None);
+        }
+        if self.inflight.contains_key(&key) {
+            return (DaxPutOutcome::Inflight, None);
+        }
+        let Some(slot_id) = self.allocate_slot() else {
+            return (DaxPutOutcome::NoSpace, None);
+        };
+        let offset_bytes = (slot_id as u64) * self.slot_bytes;
+        let generation = self.reserve_slot_state(slot_id);
+        self.inflight.insert(
+            key,
+            DaxInflightEntry {
+                offset_bytes,
+                size_bytes,
+                slot_id,
+                generation,
+                canceled: false,
+            },
+        );
+        self.active_writes += 1;
+        (
+            DaxPutOutcome::Inserted,
+            Some((slot_id, generation, offset_bytes)),
+        )
+    }
+
+    /// Finalizes an in-flight write for `key`. Commits the slot if `!write_failed` and the write
+    /// was not force-canceled; otherwise reclaims the slot.
+    pub fn finalize_put(&mut self, key: u64, write_failed: bool) -> bool {
+        self.active_writes = self.active_writes.saturating_sub(1);
+        let Some(inflight) = self.inflight.shift_remove(&key) else {
+            return false;
+        };
+        if inflight.canceled || write_failed {
+            self.schedule_slot_reclaim(inflight.slot_id, inflight.generation);
+            return false;
+        }
+        if let Some(state) = self.slot_states.get_mut(&inflight.slot_id)
+            && state.generation == inflight.generation
+        {
+            state.committed = true;
+            state.pending_free = false;
+        }
+        self.index.insert(
+            key,
+            DaxIndexEntry {
+                offset_bytes: inflight.offset_bytes,
+                size_bytes: inflight.size_bytes,
+                slot_id: inflight.slot_id,
+                generation: inflight.generation,
+            },
+        );
+        true
+    }
+
+    /// Synchronously allocates and commits a slot for `key` (`begin_put` + `finalize_put`).
+    pub fn put(&mut self, key: u64, size_bytes: u64) -> DaxPutOutcome {
+        let (outcome, reserved) = self.begin_put(key, size_bytes);
+        if reserved.is_some() {
+            self.finalize_put(key, false);
+        }
+        outcome
+    }
+
+    /// Checks whether `keys` are committed in the arena, optionally incrementing external lock
+    /// reference counts for hits.
+    pub fn exists_many(&mut self, keys: &[u64], lock: bool) -> Vec<bool> {
+        let mut results = vec![false; keys.len()];
+        for (i, &key) in keys.iter().enumerate() {
+            let Some(&entry) = self.index.get(&key) else {
+                continue;
+            };
+            if !self.is_entry_committed(&entry) {
+                continue;
+            }
+            results[i] = true;
+            if lock {
+                *self.external_lock_counts.entry(key).or_insert(0) += 1;
+            }
+        }
+        results
+    }
+
+    /// Decrements external lock reference counts for `keys`.
+    pub fn unlock_many(&mut self, keys: &[u64]) {
+        for &key in keys {
+            if let Some(count) = self.external_lock_counts.get_mut(&key) {
+                if *count <= 1 {
+                    self.external_lock_counts.shift_remove(&key);
+                } else {
+                    *count -= 1;
+                }
+            }
+        }
+    }
+
+    /// Reserves committed entries for a read pipeline, incrementing each hit slot's
+    /// `borrow_count` so concurrent eviction cannot recycle the physical slot until
+    /// [`Self::finalize_reads`] is called.
+    pub fn reserve_reads(
+        &mut self,
+        keys: &[u64],
+        prefix_only: bool,
+    ) -> (Vec<DaxReadReservation>, Vec<bool>) {
+        let mut reservations = Vec::new();
+        let mut hits = vec![false; keys.len()];
+
+        for (i, &key) in keys.iter().enumerate() {
+            let Some(&entry) = self.index.get(&key) else {
+                if prefix_only {
+                    break;
+                }
+                continue;
+            };
+            let Some(state) = self.slot_states.get_mut(&entry.slot_id) else {
+                if prefix_only {
+                    break;
+                }
+                continue;
+            };
+            if state.generation != entry.generation || !state.committed {
+                if prefix_only {
+                    break;
+                }
+                continue;
+            }
+            state.borrow_count += 1;
+            reservations.push(DaxReadReservation {
+                result_index: i,
+                key,
+                offset_bytes: entry.offset_bytes,
+                size_bytes: entry.size_bytes,
+                slot_id: entry.slot_id,
+                generation: entry.generation,
+            });
+            hits[i] = true;
+        }
+        if !reservations.is_empty() {
+            self.active_reads += 1;
+        }
+        (reservations, hits)
+    }
+
+    /// Releases read reservations and recycles any `pending_free` slots whose `borrow_count`
+    /// reaches zero.
+    pub fn finalize_reads(&mut self, reservations: &[DaxReadReservation]) {
+        if reservations.is_empty() {
+            return;
+        }
+        self.active_reads = self.active_reads.saturating_sub(1);
+        for res in reservations {
+            let Some(state) = self.slot_states.get_mut(&res.slot_id) else {
+                continue;
+            };
+            if state.generation != res.generation {
+                continue;
+            };
+            state.borrow_count = state.borrow_count.saturating_sub(1);
+            if state.pending_free && state.borrow_count == 0 {
+                state.pending_free = false;
+                if !self.free_slots.contains(&res.slot_id) {
+                    self.free_slots.push(res.slot_id);
+                }
+            }
+        }
+    }
+
+    /// Deletes `keys` from the index. When `!force`, externally locked and in-flight keys are
+    /// skipped. Slots with active read borrows enter `pending_free` until borrows drain.
+    pub fn delete_many(&mut self, keys: &[u64], force: bool) -> Vec<bool> {
+        let mut results = vec![false; keys.len()];
+        for (i, &key) in keys.iter().enumerate() {
+            if let Some(inflight) = self.inflight.get_mut(&key) {
+                if !force {
+                    continue;
+                }
+                inflight.canceled = true;
+                self.external_lock_counts.shift_remove(&key);
+                results[i] = true;
+                continue;
+            }
+            let Some(&entry) = self.index.get(&key) else {
+                continue;
+            };
+            if !force && self.external_lock_counts.get(&key).copied().unwrap_or(0) > 0 {
+                continue;
+            }
+            self.index.shift_remove(&key);
+            self.external_lock_counts.shift_remove(&key);
+            self.schedule_slot_reclaim(entry.slot_id, entry.generation);
+            results[i] = true;
+        }
+        results
+    }
+
+    /// Returns `(current_usage, usage_after_ongoing_eviction)` as fractions of `max_slots`.
+    /// The second value subtracts `pending_free` slots that have been evicted from the index but
+    /// are waiting for active read borrows to drain.
+    pub fn usage(&self) -> (f64, f64) {
+        if self.max_slots == 0 {
+            return (0.0, 0.0);
+        }
+        let live_slot_count = self.next_slot.saturating_sub(self.free_slots.len());
+        let pending_reclaim_count = self.slot_states.values().filter(|s| s.pending_free).count();
+        let current_usage = (live_slot_count as f64) / (self.max_slots as f64);
+        let post_eviction_slots = live_slot_count.saturating_sub(pending_reclaim_count);
+        let usage_after_eviction = (post_eviction_slots as f64) / (self.max_slots as f64);
+        (current_usage, usage_after_eviction)
+    }
+
+    /// Returns `true` iff every committed, non-canceled in-flight, or borrowed slot has
+    /// `slot_id < new_max_slots`.
+    pub fn can_shrink_to(&self, new_max_slots: usize) -> bool {
+        if new_max_slots == 0 {
+            return false;
+        }
+        for entry in self.index.values() {
+            if self.is_entry_committed(entry) && entry.slot_id >= new_max_slots {
+                return false;
+            }
+        }
+        for inflight in self.inflight.values() {
+            if !inflight.canceled && inflight.slot_id >= new_max_slots {
+                return false;
+            }
+        }
+        for (&slot_id, state) in &self.slot_states {
+            if slot_id >= new_max_slots && state.borrow_count > 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
