@@ -7292,3 +7292,81 @@ fn test_outline_routines_and_outline_async_routines() {
     );
     assert_eq!(m.functions().len(), 3);
 }
+
+#[test]
+fn test_wrap_funcs_with_trace_and_rewrite_opaque_types() {
+    use castforge::ir::{Attribute, Location, OpName, Operation, Type};
+    use castforge::passes::{rewrite_opaque_types, wrap_funcs_with_trace};
+    use indexmap::IndexMap;
+    use smallvec::SmallVec;
+
+    let mlir_src = concat!(
+        "module {\n",
+        "  func.func @rt_stub(%x: tensor<4xf32>) -> tensor<4xf32> {\n",
+        "    %setup = \"castforge.tensor.create\"(%x) : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %dispatched = \"castforge.call.opaque\"(%setup) {callee = @k0}",
+        " : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %dispatched : tensor<4xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(mlir_src).expect("valid mlir");
+    let func_id = m.functions()[0];
+    m.ops[func_id]
+        .attributes
+        .insert("abi".to_string(), Attribute::String("runtime".to_string()));
+
+    let wrapped = wrap_funcs_with_trace(&mut m);
+    assert_eq!(wrapped, 1);
+
+    // Entry block now has: [setup_op, castforge.with_trace, func.return]:
+    let blk_id = m.regions[m.ops[func_id].regions[0]].blocks[0];
+    assert_eq!(m.blocks[blk_id].ops.len(), 3);
+    assert!(m.ops[m.blocks[blk_id].ops[0]].is_op("castforge", "tensor.create"));
+    let trace_op = m.blocks[blk_id].ops[1];
+    assert!(m.ops[trace_op].is_op("castforge", "with_trace"));
+    let trace_blk = m.regions[m.ops[trace_op].regions[0]].blocks[0];
+    assert_eq!(m.blocks[trace_blk].ops.len(), 2);
+    assert!(m.ops[m.blocks[trace_blk].ops[0]].is_op("castforge", "call.opaque"));
+    assert!(m.ops[m.blocks[trace_blk].ops[1]].is_op("castforge", "yield"));
+
+    // Test `rewrite_opaque_types`: qualify `!mo.opaque<"KvCollection">` ->
+    // `!mo.opaque<"nn.kv_cache.KvCollection">`:
+    let arg_val = m.blocks[blk_id].arguments[0];
+    m.values[arg_val].ty = Type::Opaque("!mo.opaque<\"KvCollection\">".to_string());
+    let mut mapping = IndexMap::new();
+    mapping.insert(
+        "KvCollection".to_string(),
+        Attribute::String("nn.kv_cache.KvCollection".to_string()),
+    );
+    let rewritten = rewrite_opaque_types(&mut m, &mapping).expect("rewrite succeeds");
+    assert_eq!(rewritten, 1);
+    assert_eq!(
+        m.values[arg_val].ty,
+        Type::Opaque("!mo.opaque<\"nn.kv_cache.KvCollection\">".to_string())
+    );
+
+    // Registering a kernel.decl `pkg.ops.MyKernelStruct` and referencing it as an unqualified
+    // opaque data type `!mo.opaque<"MyKernelStruct">` must be rejected:
+    let root_blk = m.regions[m.root_region].blocks[0];
+    let decl_op = m.ops.insert_with_key(|id| Operation {
+        id,
+        name: OpName::new("castforge", "kernel.decl"),
+        operands: SmallVec::new(),
+        results: SmallVec::new(),
+        attributes: {
+            let mut a = IndexMap::new();
+            a.insert(
+                "sym_name".to_string(),
+                Attribute::String("pkg.ops.MyKernelStruct".to_string()),
+            );
+            a
+        },
+        regions: Vec::new(),
+        custom_syntax: false,
+        location: Location::Unknown,
+    });
+    m.blocks[root_blk].ops.push(decl_op);
+    m.values[arg_val].ty = Type::Opaque("!mo.opaque<\"MyKernelStruct\">".to_string());
+    assert!(rewrite_opaque_types(&mut m, &mapping).is_err());
+}

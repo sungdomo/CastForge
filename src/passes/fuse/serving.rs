@@ -23842,3 +23842,248 @@ pub fn outline_async_routines(module: &mut Module) -> usize {
 
     outlined
 }
+
+/// Wraps the dispatch suffix of runtime-ABI (`"abi" = "runtime"` or `"mogg"`) functions in a
+/// `castforge.with_trace` (`mogg.with_trace`) region:
+/// - Keeps setup operations (before the first call-like op) outside the trace region so passes
+///   that rebuild dispatch from outside can still reach setup values.
+/// - Moves all ops starting at the first call-like op (`castforge.call*`, `mogg.call*`,
+///   `func.call`) up to (but excluding) the terminator into `castforge.with_trace`'s body block,
+///   appends `castforge.yield` with the terminator's original operands, and forwards the
+///   `castforge.with_trace` results into the function terminator.
+pub fn wrap_funcs_with_trace(module: &mut Module) -> usize {
+    use crate::ir::mlir::{Block, OpName, Region};
+
+    let mut wrapped = 0usize;
+    let func_ids = module.functions();
+
+    for func_id in func_ids {
+        let abi = module.ops[func_id]
+            .attributes
+            .get("abi")
+            .and_then(|a| a.as_str())
+            .unwrap_or("");
+        if abi != "runtime" && abi != "mogg" {
+            continue;
+        }
+        if module.ops[func_id].regions.is_empty() {
+            continue;
+        }
+        let body_reg = module.ops[func_id].regions[0];
+        if module.regions[body_reg].blocks.is_empty() {
+            continue;
+        }
+        let entry_blk = module.regions[body_reg].blocks[0];
+        let block_ops = module.blocks[entry_blk].ops.clone();
+        if block_ops.len() < 2 {
+            continue;
+        }
+
+        // Skip if already wrapped in `with_trace`.
+        if block_ops.iter().any(|&oid| {
+            let f = module.ops[oid].name.full_name();
+            f == "castforge.with_trace" || f == "mogg.with_trace"
+        }) {
+            continue;
+        }
+
+        let term_id = *block_ops.last().unwrap();
+        let mut setup_ops: Vec<OpId> = Vec::new();
+        let mut traced_ops: Vec<OpId> = Vec::new();
+        let mut seen_call = false;
+
+        for &oid in &block_ops[..block_ops.len() - 1] {
+            let full = module.ops[oid].name.full_name();
+            if full == "func.call"
+                || full.starts_with("castforge.call")
+                || full.starts_with("mogg.call")
+            {
+                seen_call = true;
+            }
+            if seen_call {
+                traced_ops.push(oid);
+            } else {
+                setup_ops.push(oid);
+            }
+        }
+
+        if traced_ops.is_empty() {
+            continue;
+        }
+
+        let loc = module.ops[func_id].location.clone();
+        let term_operands = module.ops[term_id].operands.clone();
+        let term_types: Vec<Type> = term_operands
+            .iter()
+            .map(|&v| module.values[v].ty.clone())
+            .collect();
+
+        let trace_blk = module.blocks.insert_with_key(|bid| Block {
+            id: bid,
+            label: None,
+            arguments: Vec::new(),
+            ops: Vec::new(),
+        });
+        let yield_loc = loc.clone();
+        let yield_id = module.ops.insert_with_key(|oid| Operation {
+            id: oid,
+            name: OpName::new("castforge", "yield"),
+            operands: term_operands,
+            results: SmallVec::new(),
+            attributes: IndexMap::new(),
+            regions: Vec::new(),
+            custom_syntax: false,
+            location: yield_loc,
+        });
+        traced_ops.push(yield_id);
+        module.blocks[trace_blk].ops = traced_ops;
+
+        let trace_reg = module.regions.insert_with_key(|rid| Region {
+            id: rid,
+            blocks: vec![trace_blk],
+        });
+
+        let trace_id = module.ops.insert_with_key(|oid| Operation {
+            id: oid,
+            name: OpName::new("castforge", "with_trace"),
+            operands: SmallVec::new(),
+            results: SmallVec::new(),
+            attributes: IndexMap::new(),
+            regions: vec![trace_reg],
+            custom_syntax: false,
+            location: loc,
+        });
+        let mut trace_results: SmallVec<[ValueId; 4]> = SmallVec::new();
+        for (idx, ty) in term_types.into_iter().enumerate() {
+            let rv = module.values.insert_with_key(|vid| Value {
+                id: vid,
+                ssa_name: None,
+                ty,
+                def: ValueDef::OpResult {
+                    op: trace_id,
+                    index: idx as u32,
+                },
+            });
+            module.ops[trace_id].results.push(rv);
+            trace_results.push(rv);
+        }
+
+        module.ops[term_id].operands = trace_results;
+        setup_ops.push(trace_id);
+        setup_ops.push(term_id);
+        module.blocks[entry_blk].ops = setup_ops;
+        wrapped += 1;
+    }
+
+    wrapped
+}
+
+fn rewrite_single_opaque_type(
+    ty: &mut Type,
+    mapping: &IndexMap<String, Attribute>,
+    kernel_leaves: &std::collections::HashSet<String>,
+) -> Result<usize, String> {
+    match ty {
+        Type::Opaque(raw) => {
+            // Match `!mo.opaque<"Symbol"...>` or `!castforge.opaque<"Symbol"...>`
+            for prefix in ["!mo.opaque<\"", "!castforge.opaque<\""] {
+                if let Some(after) = raw.strip_prefix(prefix)
+                    && let Some((sym, tail)) = after.split_once('"')
+                {
+                    if let Some(qual_attr) = mapping.get(sym)
+                        && let Some(qual_str) = qual_attr.as_str()
+                    {
+                        if qual_str != sym {
+                            *raw = format!("{prefix}{qual_str}\"{tail}");
+                            return Ok(1);
+                        }
+                        return Ok(0);
+                    }
+                    if !sym.contains('.') && kernel_leaves.contains(sym) {
+                        return Err(format!(
+                            "opaque type '{sym}' refers to a registered kernel struct; kernel \
+                             structs are implementations resolved by registration, not opaque \
+                             data types"
+                        ));
+                    }
+                }
+            }
+            Ok(0)
+        }
+        Type::Tuple(items) => {
+            let mut sum = 0usize;
+            for item in items {
+                sum += rewrite_single_opaque_type(item, mapping, kernel_leaves)?;
+            }
+            Ok(sum)
+        }
+        Type::Function { inputs, results } => {
+            let mut sum = 0usize;
+            for inp in inputs {
+                sum += rewrite_single_opaque_type(inp, mapping, kernel_leaves)?;
+            }
+            for res in results {
+                sum += rewrite_single_opaque_type(res, mapping, kernel_leaves)?;
+            }
+            Ok(sum)
+        }
+        _ => Ok(0),
+    }
+}
+
+/// Qualifies short `!mo.opaque<"Symbol">` and `!castforge.opaque<"Symbol">` types across the
+/// module using a simple-to-qualified dictionary mapping (`mapping`), while rejecting any
+/// unqualified opaque type whose symbol matches the leaf name of a registered `kernel.decl` or
+/// `primitive.decl` in the module.
+pub fn rewrite_opaque_types(
+    module: &mut Module,
+    mapping: &IndexMap<String, Attribute>,
+) -> Result<usize, String> {
+    use std::collections::HashSet;
+
+    let mut kernel_leaves: HashSet<String> = HashSet::new();
+    if let Some(root_reg) = module.regions.get(module.root_region)
+        && let Some(&root_blk) = root_reg.blocks.first()
+    {
+        for &op_id in &module.blocks[root_blk].ops {
+            let full = module.ops[op_id].name.full_name();
+            if matches!(
+                full.as_str(),
+                "castforge.kernel.decl"
+                    | "mogg.kernel.decl"
+                    | "castforge.primitive.decl"
+                    | "mogg.primitive.decl"
+            ) && let Some(sym) = module.ops[op_id]
+                .attributes
+                .get("sym_name")
+                .and_then(|a| a.as_str())
+            {
+                let leaf = sym.rsplit_once('.').map(|(_, r)| r).unwrap_or(sym);
+                kernel_leaves.insert(leaf.to_string());
+            }
+        }
+    }
+
+    if mapping.is_empty() && kernel_leaves.is_empty() {
+        return Ok(0);
+    }
+
+    let mut rewritten = 0usize;
+    let val_ids: Vec<ValueId> = module.values.keys().collect();
+    for vid in val_ids {
+        rewritten +=
+            rewrite_single_opaque_type(&mut module.values[vid].ty, mapping, &kernel_leaves)?;
+    }
+
+    let op_ids: Vec<OpId> = module.ops.keys().collect();
+    for oid in op_ids {
+        let attr_keys: Vec<String> = module.ops[oid].attributes.keys().cloned().collect();
+        for k in attr_keys {
+            if let Some(Attribute::Type(ty)) = module.ops[oid].attributes.get_mut(&k) {
+                rewritten += rewrite_single_opaque_type(ty, mapping, &kernel_leaves)?;
+            }
+        }
+    }
+
+    Ok(rewritten)
+}
