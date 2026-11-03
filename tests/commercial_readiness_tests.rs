@@ -19,18 +19,19 @@ use castforge::passes::{
     EngineKvFormat, FULL_ATTENTION_WINDOW, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
     IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
     KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope,
-    LayerGroupPayloadSharder, PassManager, PassRegistry, ROWWISE_CHEAP_OP_COST,
+    KvStorageKeySpec, LayerGroupPayloadSharder, PassManager, PassRegistry, ROWWISE_CHEAP_OP_COST,
     ROWWISE_EXPENSIVE_OP_COST, WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
-    anonymize_symbolic_dims, compress_splat_constants, defer_allocs_to_first_use,
-    direct_copy_format_supported, elide_redundant_state_transfers, flatten_elementwise_chains,
-    fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
-    fuse_sole_use_prologues, hash_prefix_token_blocks, is_supported_arch_dtype,
-    legalize_rowwise_reduction_launch, longest_full_attention_hit, longest_joint_prefix_hit,
-    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_duplicate_shape_ops,
-    merge_identical_functions, plan_cacheblend_retrieve, plan_concat_in_place,
-    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
-    promote_narrow_accumulators, re_rope_key_in_place, stamp_fused_provenance, unfold_chunk_range,
-    validate_target_device_dtypes,
+    anonymize_symbolic_dims, compress_splat_constants, decode_kv_fs_filename,
+    decode_kv_storage_key, defer_allocs_to_first_use, direct_copy_format_supported,
+    elide_redundant_state_transfers, encode_kv_fs_filename, encode_kv_storage_key,
+    flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
+    fuse_reshape_epilogue, fuse_sole_use_prologues, hash_prefix_token_blocks,
+    is_supported_arch_dtype, legalize_rowwise_reduction_launch, longest_full_attention_hit,
+    longest_joint_prefix_hit, longest_sliding_window_hit, mark_cuda_graph_stable_tensors,
+    merge_duplicate_shape_ops, merge_identical_functions, plan_cacheblend_retrieve,
+    plan_concat_in_place, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
+    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
+    stamp_fused_provenance, unfold_chunk_range, validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -1752,4 +1753,38 @@ module @rowwise_cost {
         sm_op.attributes.get("castforge.rowwise_cols"),
         Some(&Attribute::Int(128))
     );
+}
+
+#[test]
+fn test_reversible_kv_storage_key_and_fs_filename_codec() {
+    let unsalted = KvStorageKeySpec {
+        model_name: "meta-llama/Llama-3-8B".to_string(),
+        kv_rank: 3,
+        object_group_id: 1,
+        chunk_hash: 0x0123_4567_89ab_cdef,
+        cache_salt: String::new(),
+    };
+    let wire = encode_kv_storage_key(&unsalted);
+    // Unsalted key omits trailing `@salt`
+    assert_eq!(wire, "meta-llama/Llama-3-8B@00000003@1@0123456789abcdef");
+    assert_eq!(decode_kv_storage_key(&wire), Some(unsalted.clone()));
+
+    let fs_name = encode_kv_fs_filename(&unsalted);
+    assert_eq!(
+        fs_name,
+        "meta-llama-SEP-Llama-3-8B@0x00000003@1@0123456789abcdef.data"
+    );
+    assert_eq!(decode_kv_fs_filename(&fs_name), Some(unsalted));
+
+    let salted = KvStorageKeySpec {
+        model_name: "deepseek-ai/DeepSeek-V3".to_string(),
+        kv_rank: 12,
+        object_group_id: 2,
+        chunk_hash: 0xfedc_ba98_7654_3210,
+        cache_salt: "tenant-prod".to_string(),
+    };
+    let salted_fs = encode_kv_fs_filename(&salted);
+    assert!(salted_fs.ends_with("@tenant-prod.data"));
+    assert_eq!(decode_kv_fs_filename(&salted_fs), Some(salted));
+    assert!(decode_kv_fs_filename("missing_extension").is_none());
 }

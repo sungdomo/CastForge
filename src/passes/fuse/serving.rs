@@ -4457,3 +4457,91 @@ pub fn legalize_rowwise_reduction_launch(
 
     plans
 }
+
+/// Canonical L2 object key identity shared across storage and filesystem adapters
+/// (inspired by LMCache `lmcache/v1/distributed/key_codec.py` `ObjectKey`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvStorageKeySpec {
+    /// Model identifier (may contain `/` separators, e.g., `"meta-llama/Llama-3-8B"`).
+    pub model_name: String,
+    /// KV tensor-parallel / pipeline rank.
+    pub kv_rank: u32,
+    /// Heterogeneous object group index (`0` for primary attention group, `1` for sliding/Mamba).
+    pub object_group_id: u32,
+    /// 64-bit prefix chunk hash (`chunk_hash`).
+    pub chunk_hash: u64,
+    /// Optional tenant isolation `cache_salt` (empty string when unsalted).
+    pub cache_salt: String,
+}
+
+/// Encodes `key` into the canonical reversible L2 wire key
+/// `"{model}@{rank:08x}@{group:x}@{hash:016x}[@{salt}]"` (omitting trailing `@{salt}` when
+/// `cache_salt` is empty, matching LMCache `encode_storage_key`).
+pub fn encode_kv_storage_key(key: &KvStorageKeySpec) -> String {
+    if key.cache_salt.is_empty() {
+        format!(
+            "{}@{:08x}@{:x}@{:016x}",
+            key.model_name, key.kv_rank, key.object_group_id, key.chunk_hash
+        )
+    } else {
+        format!(
+            "{}@{:08x}@{:x}@{:016x}@{}",
+            key.model_name, key.kv_rank, key.object_group_id, key.chunk_hash, key.cache_salt
+        )
+    }
+}
+
+/// Encodes `key` into the filesystem L2 adapter filename
+/// `"{model_sep}@0x{rank:08x}@{group:x}@{hash:016x}[@{salt}].data"` where `'/'` in `model_name` is
+/// escaped as `"-SEP-"` (matching LMCache `encode_fs_filename`).
+pub fn encode_kv_fs_filename(key: &KvStorageKeySpec) -> String {
+    let escaped_model = key.model_name.replace('/', "-SEP-");
+    if key.cache_salt.is_empty() {
+        format!(
+            "{escaped_model}@0x{:08x}@{:x}@{:016x}.data",
+            key.kv_rank, key.object_group_id, key.chunk_hash
+        )
+    } else {
+        format!(
+            "{escaped_model}@0x{:08x}@{:x}@{:016x}@{}.data",
+            key.kv_rank, key.object_group_id, key.chunk_hash, key.cache_salt
+        )
+    }
+}
+
+/// Decodes a canonical L2 wire key (`model@rank@group@hash[@salt]`) back into a
+/// [`KvStorageKeySpec`] (matching LMCache `decode_storage_key`).
+pub fn decode_kv_storage_key(encoded: &str) -> Option<KvStorageKeySpec> {
+    let parts: Vec<&str> = encoded.split('@').collect();
+    let (model, rank_str, group_str, hash_str, salt) = match parts.as_slice() {
+        [m, r, g, h] => (*m, *r, *g, *h, ""),
+        [m, r, g, h, s] => (*m, *r, *g, *h, *s),
+        _ => return None,
+    };
+    if model.is_empty() || hash_str.is_empty() {
+        return None;
+    }
+    let rank_clean = rank_str
+        .strip_prefix("0x")
+        .or_else(|| rank_str.strip_prefix("0X"))
+        .unwrap_or(rank_str);
+    let kv_rank = u32::from_str_radix(rank_clean, 16).ok()?;
+    let object_group_id = u32::from_str_radix(group_str, 16).ok()?;
+    let chunk_hash = u64::from_str_radix(hash_str, 16).ok()?;
+    Some(KvStorageKeySpec {
+        model_name: model.to_string(),
+        kv_rank,
+        object_group_id,
+        chunk_hash,
+        cache_salt: salt.to_string(),
+    })
+}
+
+/// Decodes a filesystem L2 filename (`*.data`) back into a [`KvStorageKeySpec`], unescaping
+/// `"-SEP-"` back to `'/'` (matching LMCache `decode_fs_filename`).
+pub fn decode_kv_fs_filename(filename: &str) -> Option<KvStorageKeySpec> {
+    let stem = filename.strip_suffix(".data")?;
+    let mut spec = decode_kv_storage_key(stem)?;
+    spec.model_name = spec.model_name.replace("-SEP-", "/");
+    Some(spec)
+}
