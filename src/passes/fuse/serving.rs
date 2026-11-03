@@ -1765,3 +1765,128 @@ pub fn fuse_sole_use_prologues(module: &mut Module) -> usize {
     }
     fused_count
 }
+
+/// Default maximum number of kernels allowed in a single fused launch sequence
+/// (inspired by Modular `SequenceFusion.cpp` `kMaxKernelsInFusionSet = 16`, `GEX-2986`).
+pub const DEFAULT_MAX_KERNELS_IN_FUSION_SET: usize = 16;
+
+/// A bounded group of consecutive device operations sharing the same execution context
+/// (`device_context` and `stream_id`) that can be dispatched as a single fused sequence
+/// without overflowing kernel constant-parameter memory or deadlocking across streams.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequenceFusionSet {
+    pub set_id: usize,
+    pub device_context: String,
+    pub stream_id: i64,
+    pub op_ids: Vec<OpId>,
+    pub op_names: Vec<String>,
+}
+
+/// Partitions consecutive device kernels into bounded [`SequenceFusionSet`]s (inspired by
+/// Modular `SequenceFusion.cpp`: `useSameContexts` (`GEX-2590`) and `kMaxKernelsInFusionSet`
+/// (`GEX-2986`)).
+///
+/// Breaks the active fusion set whenever:
+/// 1. A collective, host-offload, or explicit barrier operation is encountered (`all_reduce`,
+///    `all_gather`, `reduce_scatter`, `collective_permute`, `kv_offload`, `kv_reload`, or
+///    `castforge.sequence_barrier = true`),
+/// 2. The operation's `(castforge.device, castforge.stream_id)` context differs from the active
+///    set's context (`useSameContexts`), or
+/// 3. The active set reaches `max_kernels_per_set.max(1)` operations.
+///
+/// Each grouped operation is stamped with `castforge.sequence_fusion_set = <set_id>`.
+pub fn plan_kernel_sequence_fusion(
+    module: &mut Module,
+    max_kernels_per_set: usize,
+) -> Vec<SequenceFusionSet> {
+    let cap = max_kernels_per_set.max(1);
+    let mut sets: Vec<SequenceFusionSet> = Vec::new();
+    let mut active: Option<SequenceFusionSet> = None;
+
+    for fn_op_id in module.functions() {
+        let Some(&reg_id) = module.ops[fn_op_id].regions.first() else {
+            continue;
+        };
+        let Some(&block_id) = module.regions[reg_id].blocks.first() else {
+            continue;
+        };
+        let ops = module.blocks[block_id].ops.clone();
+
+        for op_id in ops {
+            let Some(op) = module.ops.get(op_id) else {
+                continue;
+            };
+            // Skip non-kernel metadata/constants and function terminators
+            if op.is_op("func", "return") || op.is_op("stablehlo", "constant") {
+                continue;
+            }
+            let op_short = op.name.name.as_str();
+            let is_barrier = matches!(
+                op_short,
+                "all_reduce"
+                    | "all_gather"
+                    | "reduce_scatter"
+                    | "collective_permute"
+                    | "kv_offload"
+                    | "kv_reload"
+            ) || matches!(
+                op.attributes.get("castforge.sequence_barrier"),
+                Some(Attribute::Bool(true))
+            );
+            if is_barrier {
+                if let Some(finished) = active.take() {
+                    sets.push(finished);
+                }
+                continue;
+            }
+
+            let dev_ctx = match op.attributes.get("castforge.device") {
+                Some(Attribute::String(s)) => s.clone(),
+                _ => "gpu:0".to_string(),
+            };
+            let stream_id = match op.attributes.get("castforge.stream_id") {
+                Some(Attribute::Int(id)) => *id,
+                _ => 0,
+            };
+            let full_name = format!("{}.{}", op.name.dialect, op.name.name);
+
+            let needs_new_set = match &active {
+                None => true,
+                Some(curr) => {
+                    curr.device_context != dev_ctx
+                        || curr.stream_id != stream_id
+                        || curr.op_ids.len() >= cap
+                }
+            };
+            if needs_new_set {
+                if let Some(finished) = active.take() {
+                    sets.push(finished);
+                }
+                let next_id = sets.len();
+                active = Some(SequenceFusionSet {
+                    set_id: next_id,
+                    device_context: dev_ctx,
+                    stream_id,
+                    op_ids: Vec::new(),
+                    op_names: Vec::new(),
+                });
+            }
+
+            let set_id = active.as_ref().unwrap().set_id;
+            if let Some(curr) = active.as_mut() {
+                curr.op_ids.push(op_id);
+                curr.op_names.push(full_name);
+            }
+            if let Some(op_mut) = module.ops.get_mut(op_id) {
+                op_mut.attributes.insert(
+                    "castforge.sequence_fusion_set".to_string(),
+                    Attribute::Int(set_id as i64),
+                );
+            }
+        }
+        if let Some(finished) = active.take() {
+            sets.push(finished);
+        }
+    }
+    sets
+}

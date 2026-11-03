@@ -12,13 +12,13 @@ use castforge::ffi::{
 use castforge::ir::formats::{import_gguf_bytes, import_onnx_json};
 use castforge::ir::{DType, Dim, TensorBacking, TensorEntry, TensorStore, TensorType, parse_mlir};
 use castforge::passes::{
-    AsymK16V8Codec, CacheBlendRopeSpec, ChainedBlockHashConfig, EngineKvFormat,
-    KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode, KvPageSpec,
-    KvScaleScope, PassManager, PassRegistry, analyze_kv_layer_groups, compress_splat_constants,
-    direct_copy_format_supported, fuse_sole_use_prologues, hash_prefix_token_blocks,
-    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
-    mark_cuda_graph_stable_tensors, plan_jenga_kv_geometry, plan_kv_dma_transfer,
-    re_rope_key_in_place,
+    AsymK16V8Codec, CacheBlendRopeSpec, ChainedBlockHashConfig, DEFAULT_MAX_KERNELS_IN_FUSION_SET,
+    EngineKvFormat, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode,
+    KvPageSpec, KvScaleScope, PassManager, PassRegistry, analyze_kv_layer_groups,
+    compress_splat_constants, direct_copy_format_supported, fuse_sole_use_prologues,
+    hash_prefix_token_blocks, longest_full_attention_hit, longest_joint_prefix_hit,
+    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, plan_jenga_kv_geometry,
+    plan_kernel_sequence_fusion, plan_kv_dma_transfer, re_rope_key_in_place,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -880,4 +880,48 @@ module @prologue_fusion {
         .generate("cuda", &module, &TargetConfig::default())
         .unwrap();
     assert!(cuda_src.contains("tanhf("));
+}
+
+#[test]
+fn test_bounded_kernel_sequence_fusion_horizon_and_device_contexts() {
+    assert_eq!(DEFAULT_MAX_KERNELS_IN_FUSION_SET, 16);
+
+    let mlir = r#"
+module @sequence_fusion {
+  func.func @main(%x: tensor<4xf32>) -> tensor<4xf32> {
+    %0 = stablehlo.abs %x : tensor<4xf32>
+    %1 = stablehlo.tanh %0 : tensor<4xf32>
+    %2 = stablehlo.negate %1 : tensor<4xf32>
+    %3 = stablehlo.exponential %2 {castforge.stream_id = 1} : tensor<4xf32>
+    %4 = stablehlo.all_reduce %3 : tensor<4xf32>
+    %5 = stablehlo.log %4 {castforge.device = "gpu:1"} : tensor<4xf32>
+    func.return %5 : tensor<4xf32>
+  }
+}
+"#;
+    let mut module = parse_mlir(mlir).unwrap();
+    // Cap at max_kernels_per_set = 2:
+    // - Set 0: [%0 (abs), %1 (tanh)] on ("gpu:0", stream 0) -> capped at 2
+    // - Set 1: [%2 (negate)] on ("gpu:0", stream 0)
+    // - Set 2: [%3 (exponential)] on ("gpu:0", stream 1) -> context switch (GEX-2590)
+    // - %4 (all_reduce) is a collective barrier -> breaks active set and is excluded
+    // - Set 3: [%5 (log)] on ("gpu:1", stream 0) -> device context switch
+    let sets = plan_kernel_sequence_fusion(&mut module, 2);
+    assert_eq!(sets.len(), 4);
+
+    assert_eq!(sets[0].set_id, 0);
+    assert_eq!(sets[0].device_context, "gpu:0");
+    assert_eq!(sets[0].stream_id, 0);
+    assert_eq!(sets[0].op_names, vec!["stablehlo.abs", "stablehlo.tanh"]);
+
+    assert_eq!(sets[1].set_id, 1);
+    assert_eq!(sets[1].op_names, vec!["stablehlo.negate"]);
+
+    assert_eq!(sets[2].set_id, 2);
+    assert_eq!(sets[2].stream_id, 1);
+    assert_eq!(sets[2].op_names, vec!["stablehlo.exponential"]);
+
+    assert_eq!(sets[3].set_id, 3);
+    assert_eq!(sets[3].device_context, "gpu:1");
+    assert_eq!(sets[3].op_names, vec!["stablehlo.log"]);
 }
