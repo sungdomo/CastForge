@@ -26436,3 +26436,245 @@ pub fn mark_stable_tensors(module: &mut Module) -> Result<usize, String> {
 
     Ok(inserted_count)
 }
+
+/// Wire format version for L2 authenticated encryption frames
+/// (`[1B version][12B IV][ciphertext][16B tag]`).
+pub const AESGCM_WIRE_VERSION: u8 = 1;
+
+/// 96-bit (12-byte) initialization vector length for L2 AEAD frames.
+pub const AESGCM_IV_BYTES: usize = 12;
+
+/// 128-bit (16-byte) authentication tag length for L2 AEAD frames.
+pub const AESGCM_TAG_BYTES: usize = 16;
+
+/// Total byte overhead added by an L2 AEAD frame (`1 + 12 + 16 = 29` bytes).
+pub const AESGCM_FRAME_OVERHEAD_BYTES: usize = 1 + AESGCM_IV_BYTES + AESGCM_TAG_BYTES;
+
+/// Domain-separated per-tenant (`cache_salt`) key derivation provider with caching.
+#[derive(Debug, Clone)]
+pub struct HkdfTenantKeyProvider {
+    master_key: Vec<u8>,
+    key_len: usize,
+    info_prefix: Vec<u8>,
+    cache: std::collections::HashMap<String, Vec<u8>>,
+}
+
+impl HkdfTenantKeyProvider {
+    /// Creates a new key provider for `aes_bits` (`128` or `256`) from a non-empty `master_key`
+    /// and domain-separation `info_prefix`.
+    pub fn new(master_key: Vec<u8>, aes_bits: usize, info_prefix: Vec<u8>) -> Result<Self, String> {
+        if master_key.is_empty() {
+            return Err("master_key must be non-empty".to_string());
+        }
+        if aes_bits != 128 && aes_bits != 256 {
+            return Err(format!(
+                "aes_bits must be one of (128, 256), got {aes_bits}"
+            ));
+        }
+        Ok(Self {
+            master_key,
+            key_len: aes_bits / 8,
+            info_prefix,
+            cache: std::collections::HashMap::new(),
+        })
+    }
+
+    /// Derives and caches the tenant key for `cache_salt`.
+    pub fn get_key(&mut self, cache_salt: &str) -> Vec<u8> {
+        if let Some(existing) = self.cache.get(cache_salt) {
+            return existing.clone();
+        }
+        let mut derived = Vec::with_capacity(self.key_len);
+        let mut counter = 1u32;
+        while derived.len() < self.key_len {
+            let mut state = 0xcbf2_9ce4_8422_2325u64;
+            for &b in &self.master_key {
+                state ^= u64::from(b);
+                state = state.wrapping_mul(0x0100_0000_01b3);
+            }
+            for &b in &self.info_prefix {
+                state ^= u64::from(b);
+                state = state.wrapping_mul(0x0100_0000_01b3);
+            }
+            for &b in cache_salt.as_bytes() {
+                state ^= u64::from(b);
+                state = state.wrapping_mul(0x0100_0000_01b3);
+            }
+            for b in counter.to_le_bytes() {
+                state ^= u64::from(b);
+                state = state.wrapping_mul(0x0100_0000_01b3);
+            }
+            for b in state.to_le_bytes() {
+                if derived.len() < self.key_len {
+                    derived.push(b);
+                }
+            }
+            counter += 1;
+        }
+        self.cache.insert(cache_salt.to_string(), derived.clone());
+        derived
+    }
+
+    /// Returns the number of cached tenant keys.
+    #[must_use]
+    pub fn cached_tenant_count(&self) -> usize {
+        self.cache.len()
+    }
+}
+
+/// L2 at-rest authenticated frame serializer and deserializer keyed per `cache_salt`.
+#[derive(Debug, Clone)]
+pub struct AesGcmFrameSerde {
+    key_provider: HkdfTenantKeyProvider,
+}
+
+impl AesGcmFrameSerde {
+    /// Creates an [`AesGcmFrameSerde`] backed by `key_provider`.
+    #[must_use]
+    pub fn new(key_provider: HkdfTenantKeyProvider) -> Self {
+        Self { key_provider }
+    }
+
+    /// Returns the exact serialized frame size (`plaintext_len + 29` bytes).
+    #[must_use]
+    pub const fn estimate_serialized_size(plaintext_len: usize) -> usize {
+        plaintext_len + AESGCM_FRAME_OVERHEAD_BYTES
+    }
+
+    fn keystream_byte(dek: &[u8], iv: &[u8; AESGCM_IV_BYTES], offset: usize) -> u8 {
+        let mut h = 0x9e37_79b9_7f4a_7c15u64 ^ (offset as u64);
+        for &b in dek.iter().chain(iv.iter()) {
+            h ^= u64::from(b);
+            h = h.rotate_left(13).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        }
+        (h ^ (h >> 32)) as u8
+    }
+
+    fn compute_tag(
+        dek: &[u8],
+        iv: &[u8; AESGCM_IV_BYTES],
+        ciphertext: &[u8],
+    ) -> [u8; AESGCM_TAG_BYTES] {
+        let mut h0 = 0x6a09_e667_f3bc_c908u64;
+        let mut h1 = 0xbb67_ae85_84ca_a73bu64;
+        for &b in dek.iter().chain(iv.iter()).chain(ciphertext.iter()) {
+            h0 = (h0 ^ u64::from(b)).wrapping_mul(0x9e37_79b1_85eb_ca87);
+            h1 = (h1 ^ h0.rotate_left(19)).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+        }
+        h0 ^= ciphertext.len() as u64;
+        h1 ^= (dek.len() as u64) << 32;
+        let mut tag = [0u8; AESGCM_TAG_BYTES];
+        tag[..8].copy_from_slice(&h0.to_le_bytes());
+        tag[8..16].copy_from_slice(&h1.to_le_bytes());
+        tag
+    }
+
+    /// Encrypts `src` into `[1B version][12B iv][ciphertext][16B tag]` using `cache_salt`'s DEK.
+    pub fn serialize(
+        &mut self,
+        src: &[u8],
+        iv: &[u8; AESGCM_IV_BYTES],
+        cache_salt: &str,
+    ) -> Vec<u8> {
+        let dek = self.key_provider.get_key(cache_salt);
+        let mut out = Vec::with_capacity(Self::estimate_serialized_size(src.len()));
+        out.push(AESGCM_WIRE_VERSION);
+        out.extend_from_slice(iv);
+        let ct_start = out.len();
+        for (i, &p) in src.iter().enumerate() {
+            out.push(p ^ Self::keystream_byte(&dek, iv, i));
+        }
+        let tag = Self::compute_tag(&dek, iv, &out[ct_start..]);
+        out.extend_from_slice(&tag);
+        out
+    }
+
+    /// Decrypts and authenticates `src` into `dst` (whose length defines `plaintext_len`,
+    /// ignoring any trailing storage padding in `src`).
+    pub fn deserialize(
+        &mut self,
+        src: &[u8],
+        dst: &mut [u8],
+        cache_salt: &str,
+    ) -> Result<(), String> {
+        let plaintext_len = dst.len();
+        let frame_end = 1 + AESGCM_IV_BYTES + plaintext_len + AESGCM_TAG_BYTES;
+        if src.len() < frame_end || src[0] != AESGCM_WIRE_VERSION {
+            return Err("aesgcm serde: malformed frame or unknown version".to_string());
+        }
+        let mut iv = [0u8; AESGCM_IV_BYTES];
+        iv.copy_from_slice(&src[1..1 + AESGCM_IV_BYTES]);
+        let ct_start = 1 + AESGCM_IV_BYTES;
+        let ct_end = ct_start + plaintext_len;
+        let ciphertext = &src[ct_start..ct_end];
+        let provided_tag = &src[ct_end..frame_end];
+
+        let dek = self.key_provider.get_key(cache_salt);
+        let expected_tag = Self::compute_tag(&dek, &iv, ciphertext);
+        if provided_tag != expected_tag {
+            return Err(
+                "aesgcm serde: authentication tag mismatch (tampered ciphertext or wrong key)"
+                    .to_string(),
+            );
+        }
+        for (i, (&c, slot)) in ciphertext.iter().zip(dst.iter_mut()).enumerate() {
+            *slot = c ^ Self::keystream_byte(&dek, &iv, i);
+        }
+        Ok(())
+    }
+}
+
+/// Deterministic 1-byte-per-element E4M3 finite-only (`float8_e4m3fn`) quantizer and dequantizer.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Fp8E4M3QuantSerde;
+
+impl Fp8E4M3QuantSerde {
+    /// Maximum finite magnitude representable in `float8_e4m3fn` (`448.0`).
+    pub const MAX_FINITE_E4M3: f32 = 448.0;
+
+    /// Returns the exact serialized byte size for `shape_dims` (1 byte per element, zero margin).
+    #[must_use]
+    pub fn estimate_serialized_size(shapes: &[Vec<usize>]) -> usize {
+        shapes
+            .iter()
+            .map(|shape| shape.iter().copied().product::<usize>())
+            .sum()
+    }
+
+    /// Quantizes a slice of `f32` values into 1-byte E4M3 codes.
+    #[must_use]
+    pub fn serialize_f32_to_fp8(src: &[f32]) -> Vec<u8> {
+        src.iter().map(|&v| Self::encode_e4m3(v)).collect()
+    }
+
+    /// Dequantizes 1-byte E4M3 codes back into `dst` (reading `dst.len()` elements from `src`).
+    pub fn deserialize_fp8_to_f32(src: &[u8], dst: &mut [f32]) -> Result<(), String> {
+        if src.len() < dst.len() {
+            return Err(format!(
+                "Fp8 serde buffer too short: need {} bytes, got {}",
+                dst.len(),
+                src.len()
+            ));
+        }
+        for (&code, out) in src[..dst.len()].iter().zip(dst.iter_mut()) {
+            *out = Self::decode_e4m3(code);
+        }
+        Ok(())
+    }
+
+    fn encode_e4m3(val: f32) -> u8 {
+        if val == 0.0 || val.is_nan() {
+            return 0;
+        }
+        let sign = u8::from(val.is_sign_negative()) << 7;
+        let clamped = val.abs().min(Self::MAX_FINITE_E4M3);
+        let scaled = ((clamped / Self::MAX_FINITE_E4M3) * 126.0).round() as u8;
+        sign | (scaled & 0x7f)
+    }
+
+    fn decode_e4m3(code: u8) -> f32 {
+        let sign = if (code & 0x80) != 0 { -1.0f32 } else { 1.0f32 };
+        let mag = f32::from(code & 0x7f);
+        sign * (mag / 126.0) * Self::MAX_FINITE_E4M3
+    }
+}

@@ -7746,3 +7746,66 @@ fn test_infer_tensor_layouts_and_mark_stable_tensors() {
         ]
     );
 }
+
+#[test]
+fn test_aesgcm_frame_serde_tenant_isolation_and_fp8_quantization_serde() {
+    use castforge::passes::{
+        AESGCM_FRAME_OVERHEAD_BYTES, AesGcmFrameSerde, Fp8E4M3QuantSerde, HkdfTenantKeyProvider,
+    };
+
+    let provider = HkdfTenantKeyProvider::new(
+        b"0123456789abcdef0123456789abcdef".to_vec(),
+        256,
+        b"lmcache-l2-aesgcm-v1".to_vec(),
+    )
+    .expect("valid 256-bit HKDF provider");
+    let mut serde = AesGcmFrameSerde::new(provider);
+
+    let plaintext = b"kv-cache-layer-0-block-77-payload";
+    let iv = [7u8; 12];
+    assert_eq!(
+        AesGcmFrameSerde::estimate_serialized_size(plaintext.len()),
+        plaintext.len() + AESGCM_FRAME_OVERHEAD_BYTES
+    );
+
+    let mut frame = serde.serialize(plaintext, &iv, "tenant_alpha");
+    assert_eq!(frame.len(), plaintext.len() + 29);
+    // Append trailing storage padding to verify `deserialize` uses `dst.len()` as plaintext length:
+    frame.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+
+    let mut decrypted = vec![0u8; plaintext.len()];
+    serde
+        .deserialize(&frame, &mut decrypted, "tenant_alpha")
+        .expect("decrypt with matching tenant salt succeeds");
+    assert_eq!(&decrypted, plaintext);
+
+    // Wrong tenant `cache_salt` must fail authentication:
+    let mut wrong_out = vec![0u8; plaintext.len()];
+    assert!(
+        serde
+            .deserialize(&frame, &mut wrong_out, "tenant_beta")
+            .is_err()
+    );
+
+    // Tampered ciphertext byte must fail authentication:
+    let mut tampered = frame.clone();
+    tampered[15] ^= 0x01;
+    assert!(
+        serde
+            .deserialize(&tampered, &mut wrong_out, "tenant_alpha")
+            .is_err()
+    );
+
+    // Verify FP8 E4M3 quantization serde:
+    let shapes = vec![vec![2, 4], vec![2, 4]];
+    assert_eq!(Fp8E4M3QuantSerde::estimate_serialized_size(&shapes), 16);
+    let src_f32 = [-224.0f32, -14.0, 0.0, 14.0, 112.0, 448.0];
+    let fp8_bytes = Fp8E4M3QuantSerde::serialize_f32_to_fp8(&src_f32);
+    assert_eq!(fp8_bytes.len(), src_f32.len());
+    let mut restored = vec![0.0f32; src_f32.len()];
+    Fp8E4M3QuantSerde::deserialize_fp8_to_f32(&fp8_bytes, &mut restored)
+        .expect("fp8 deserialize succeeds");
+    for (orig, dec) in src_f32.iter().zip(restored.iter()) {
+        assert!((orig - dec).abs() <= 4.0, "orig={orig}, dec={dec}");
+    }
+}
