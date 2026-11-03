@@ -4793,3 +4793,67 @@ fn test_hoist_loop_invariant_index_views_preserves_store_transforms() {
     // Store-feeding `map.index.reshape` remains in place:
     assert!(op_names.contains(&"map.index.reshape".to_string()));
 }
+
+#[test]
+fn test_raise_back_contiguous_views_and_slice_dim_matcher() {
+    use castforge::passes::{
+        find_contiguous_slice_dim, match_contiguous_slice_dim, raise_back_contiguous_views,
+    };
+
+    // 1. Contiguous slice dimension matcher:
+    assert_eq!(find_contiguous_slice_dim(&[1, 8, 16]), 1);
+    assert_eq!(
+        match_contiguous_slice_dim(
+            &[1, 8, 16],
+            &[1, 4, 16],
+            &[0, 2, 0],
+            &[1, 6, 16],
+            &[1, 1, 1]
+        ),
+        Some(1)
+    );
+    // Non-contiguous slice (slicing dim 2 when dim 1 is not 1, or step != 1) returns None:
+    assert_eq!(
+        match_contiguous_slice_dim(&[1, 8, 16], &[1, 8, 8], &[0, 0, 0], &[1, 8, 8], &[1, 1, 1]),
+        None
+    );
+    assert_eq!(
+        match_contiguous_slice_dim(
+            &[1, 8, 16],
+            &[1, 4, 16],
+            &[0, 0, 0],
+            &[1, 8, 16],
+            &[1, 2, 1]
+        ),
+        None
+    );
+
+    // 2. Raising `map.iter.elementwise` with body `slice -> reshape -> load` raises in reverse
+    // (`mo.static.reshape` then `mogg.slice`):
+    let mlir = concat!(
+        "module @raise_views {\n",
+        "  func.func @main(%x: tensor<1x8x16xf32>) -> tensor<1x4x16xf32> {\n",
+        "    %y = map.iter.elementwise %x {view_chain = [\"slice\", \"reshape\"],",
+        " in_dims = array<i64: 1, 8, 16>, out_dims = array<i64: 1, 4, 16>,",
+        " starts = array<i64: 0, 2, 0>, stops = array<i64: 1, 6, 16>,",
+        " steps = array<i64: 1, 1, 1>} : (tensor<1x8x16xf32>) -> tensor<1x4x16xf32>\n",
+        "    return %y : tensor<1x4x16xf32>\n",
+        "  }\n",
+        "}\n",
+    );
+    let mut m = parse_mlir(mlir).expect("valid MLIR");
+    let (slices, reshapes) = raise_back_contiguous_views(&mut m);
+    assert_eq!((slices, reshapes), (1, 1));
+
+    let func_id = m.functions()[0];
+    let blk_id = m.regions[m.ops[func_id].regions[0]].blocks[0];
+    let op_names: Vec<String> = m.blocks[blk_id]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        op_names,
+        vec!["mo.static.reshape", "mogg.slice", "func.return"]
+    );
+}

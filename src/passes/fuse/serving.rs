@@ -15494,3 +15494,212 @@ pub fn hoist_loop_invariant_index_views(module: &mut Module) -> usize {
 
     hoisted_count
 }
+
+// ============================================================================
+// Batch 18 Step 3: Contiguous View Chain Raiser
+// ============================================================================
+
+/// Returns the first input dimension index `k` of `in_dims` with extent `!= 1`, or `in_dims.len()`
+/// when all dimensions have extent `1`.
+#[must_use]
+pub fn find_contiguous_slice_dim(in_dims: &[i64]) -> usize {
+    in_dims
+        .iter()
+        .position(|&d| d != 1)
+        .unwrap_or(in_dims.len())
+}
+
+/// Returns `Some(k)` if a slice over `(in_dims, out_dims, starts, stops, steps)` is a contiguous
+/// static unit-step slice along dimension `k = find_contiguous_slice_dim(in_dims)` (all other
+/// dimensions `i != k` retain their full input extent `in_dims[i] == out_dims[i]`, all bounds are
+/// non-negative/static, and `steps[k] == 1`).
+#[must_use]
+pub fn match_contiguous_slice_dim(
+    in_dims: &[i64],
+    out_dims: &[i64],
+    starts: &[i64],
+    stops: &[i64],
+    steps: &[i64],
+) -> Option<usize> {
+    let rank = in_dims.len();
+    if rank == 0
+        || out_dims.len() != rank
+        || starts.len() != rank
+        || stops.len() != rank
+        || steps.len() != rank
+    {
+        return None;
+    }
+    if in_dims.iter().any(|&d| d < 0) || out_dims.iter().any(|&d| d < 0) {
+        return None;
+    }
+    let k = find_contiguous_slice_dim(in_dims);
+    if k >= rank {
+        return None;
+    }
+    for i in 0..rank {
+        if i != k && in_dims[i] != out_dims[i] {
+            return None;
+        }
+    }
+    if starts[k] < 0 || stops[k] < starts[k] || steps[k] != 1 {
+        return None;
+    }
+    Some(k)
+}
+
+#[derive(Debug, Clone)]
+enum RaisableViewStep {
+    Reshape,
+    Slice { start_k: i64, stop_k: i64 },
+}
+
+fn extract_i64_vec_attr(attrs: &IndexMap<String, Attribute>, key: &str) -> Option<Vec<i64>> {
+    match attrs.get(key)? {
+        Attribute::DenseIntArray(v) => Some(v.clone()),
+        Attribute::Array(items) => items
+            .iter()
+            .map(|a| extract_u64_attr(a).map(|u| u as i64))
+            .collect(),
+        _ => None,
+    }
+}
+
+/// Matches a `map.iter.elementwise` op's `"view_chain"` attribute (ordered from output loop index
+/// toward input load, e.g. `["slice", "reshape"]`) and validates that any slice step is a
+/// contiguous static unit-step slice.
+fn match_raisable_view_steps(op: &Operation) -> Option<Vec<RaisableViewStep>> {
+    if op.name.full_name() != "map.iter.elementwise"
+        || op.operands.is_empty()
+        || op.results.len() != 1
+    {
+        return None;
+    }
+    let Attribute::Array(items) = op.attributes.get("view_chain")? else {
+        return None;
+    };
+    if items.is_empty() {
+        return None;
+    }
+    let mut steps = Vec::with_capacity(items.len());
+    for item in items {
+        let kind = item.as_str()?;
+        if kind == "reshape" {
+            steps.push(RaisableViewStep::Reshape);
+        } else if kind == "slice" {
+            let in_dims = extract_i64_vec_attr(&op.attributes, "in_dims")?;
+            let out_dims = extract_i64_vec_attr(&op.attributes, "out_dims")?;
+            let starts = extract_i64_vec_attr(&op.attributes, "starts")?;
+            let stops = extract_i64_vec_attr(&op.attributes, "stops")?;
+            let step_vals = extract_i64_vec_attr(&op.attributes, "steps")?;
+            let k = match_contiguous_slice_dim(&in_dims, &out_dims, &starts, &stops, &step_vals)?;
+            steps.push(RaisableViewStep::Slice {
+                start_k: starts[k],
+                stop_k: stops[k],
+            });
+        } else {
+            return None;
+        }
+    }
+    Some(steps)
+}
+
+/// Raises unfused contiguous `map.iter.elementwise` view kernels back to zero-copy data operations
+/// (`mo.static.reshape` and `mogg.slice`) in reversed (input-to-output) order. Returns
+/// `(num_slices_raised, num_reshapes_raised)`.
+pub fn raise_back_contiguous_views(module: &mut Module) -> (usize, usize) {
+    let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+    let mut slices_raised = 0usize;
+    let mut reshapes_raised = 0usize;
+
+    for block_id in block_ids {
+        let orig_ops = module.blocks[block_id].ops.clone();
+        let mut new_block_ops = Vec::with_capacity(orig_ops.len());
+
+        for op_id in orig_ops {
+            let Some(steps) = match_raisable_view_steps(&module.ops[op_id]) else {
+                new_block_ops.push(op_id);
+                continue;
+            };
+            let in_val = module.ops[op_id].operands[0];
+            let orig_out_val = module.ops[op_id].results[0];
+            let out_ty = module.values[orig_out_val].ty.clone();
+            let loc = module.ops[op_id].location.clone();
+
+            let mut cur_val = in_val;
+            // Body transforms run from output index to input load; data ops run in reverse.
+            for step in steps.iter().rev() {
+                match *step {
+                    RaisableViewStep::Reshape => {
+                        let reshape_op = module.ops.insert_with_key(|id| Operation {
+                            id,
+                            name: OpName::new("mo.static", "reshape"),
+                            operands: SmallVec::from_slice(&[cur_val]),
+                            results: SmallVec::new(),
+                            attributes: IndexMap::new(),
+                            regions: Vec::new(),
+                            custom_syntax: false,
+                            location: loc.clone(),
+                        });
+                        let next_val = module.values.insert_with_key(|id| Value {
+                            id,
+                            ssa_name: None,
+                            ty: out_ty.clone(),
+                            def: ValueDef::OpResult {
+                                op: reshape_op,
+                                index: 0,
+                            },
+                        });
+                        module.ops[reshape_op].results.push(next_val);
+                        new_block_ops.push(reshape_op);
+                        cur_val = next_val;
+                        reshapes_raised += 1;
+                    }
+                    RaisableViewStep::Slice { start_k, stop_k } => {
+                        let mut slice_attrs = IndexMap::new();
+                        slice_attrs.insert("start".to_string(), Attribute::Int(start_k));
+                        slice_attrs.insert("stop".to_string(), Attribute::Int(stop_k));
+                        let slice_op = module.ops.insert_with_key(|id| Operation {
+                            id,
+                            name: OpName::new("mogg", "slice"),
+                            operands: SmallVec::from_slice(&[cur_val]),
+                            results: SmallVec::new(),
+                            attributes: slice_attrs,
+                            regions: Vec::new(),
+                            custom_syntax: false,
+                            location: loc.clone(),
+                        });
+                        let next_val = module.values.insert_with_key(|id| Value {
+                            id,
+                            ssa_name: None,
+                            ty: out_ty.clone(),
+                            def: ValueDef::OpResult {
+                                op: slice_op,
+                                index: 0,
+                            },
+                        });
+                        module.ops[slice_op].results.push(next_val);
+                        new_block_ops.push(slice_op);
+                        cur_val = next_val;
+                        slices_raised += 1;
+                    }
+                }
+            }
+
+            for &cand_op in &module.blocks[block_id].ops {
+                if cand_op == op_id {
+                    continue;
+                }
+                for opd in &mut module.ops[cand_op].operands {
+                    if *opd == orig_out_val {
+                        *opd = cur_val;
+                    }
+                }
+            }
+        }
+
+        module.blocks[block_id].ops = new_block_ops;
+    }
+
+    (slices_raised, reshapes_raised)
+}
