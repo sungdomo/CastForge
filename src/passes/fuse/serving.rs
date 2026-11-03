@@ -29764,3 +29764,114 @@ pub fn decode_grouped_tensor_envelope(
     }
     Ok(groups)
 }
+
+fn structured_loop_body_closure_op_name(loop_op_name: &str) -> Option<&'static str> {
+    match loop_op_name {
+        "map.iter.elementwise" => Some("map.iter.elementwise.body"),
+        "map.iter.reduction" => Some("map.iter.reduction.body"),
+        _ => None,
+    }
+}
+
+/// Wraps structured MAP loop operations (`map.iter.elementwise`, `map.iter.reduction`) in a
+/// `map.iter.opaque` region whose body contains a matching capturing fusion closure
+/// (`map.iter.elementwise.body` or `map.iter.reduction.body`).
+///
+/// The outer `map.iter.opaque` inherits the loop's device attribute (`"cpu:0"` fallback if
+/// unannotated), `fusion_info`, `has_read_effect`, `has_write_effect`, and `dispatch` attributes.
+/// Non-chain inputs and non-chain results become block arguments of the `map.iter.opaque` body and
+/// are passed as captures to the inner closure, while the loop's trailing index block argument is
+/// moved to position `0` of the closure's body block (`[index, captures...]`).
+///
+/// Returns the number of structured loop operations outlined.
+pub fn outline_structured_map_loops(module: &mut Module) -> usize {
+    use crate::ir::mlir::{OpName, Operation, RegionId};
+
+    let mut outlined = 0usize;
+    let region_ids: Vec<RegionId> = module.regions.iter().map(|(r, _)| r).collect();
+    for rid in region_ids {
+        let block_ids = module.regions[rid].blocks.clone();
+        for bid in block_ids {
+            let ops_snapshot = module.blocks[bid].ops.clone();
+            for loop_id in ops_snapshot {
+                let Some(loop_op) = module.ops.get(loop_id).cloned() else {
+                    continue;
+                };
+                let full_name = loop_op.name.full_name();
+                let Some(closure_full_name) = structured_loop_body_closure_op_name(&full_name)
+                else {
+                    continue;
+                };
+                let Some(&old_body_reg) = loop_op.regions.first() else {
+                    continue;
+                };
+                let Some(&old_body_blk) = module.regions[old_body_reg].blocks.first() else {
+                    continue;
+                };
+                if module.blocks[old_body_blk].arguments.is_empty() {
+                    continue;
+                }
+
+                // Move the trailing `index` block argument of `old_body_blk` to index 0:
+                let mut inner_args = module.blocks[old_body_blk].arguments.clone();
+                if let Some(idx_arg) = inner_args.pop() {
+                    inner_args.insert(0, idx_arg);
+                }
+                for (pos, &arg_v) in inner_args.iter().enumerate() {
+                    module.values[arg_v].def = crate::ir::mlir::ValueDef::BlockArgument {
+                        block: old_body_blk,
+                        index: pos as u32,
+                    };
+                }
+                module.blocks[old_body_blk].arguments = inner_args;
+
+                // Build the new `map.iter.opaque` body block and its non-chain capture args:
+                let opaque_blk = module.create_block(None);
+                let mut body_captures = smallvec::SmallVec::<[ValueId; 4]>::new();
+                for &inp in &loop_op.operands {
+                    let ty = module.values[inp].ty.clone();
+                    if !matches!(&ty, Type::Opaque(s) if s == "!mo.chain") {
+                        let barg = module.add_block_argument(opaque_blk, None, ty);
+                        body_captures.push(barg);
+                    }
+                }
+                for &res in &loop_op.results {
+                    let ty = module.values[res].ty.clone();
+                    if !matches!(&ty, Type::Opaque(s) if s == "!mo.chain") {
+                        let barg = module.add_block_argument(opaque_blk, None, ty);
+                        body_captures.push(barg);
+                    }
+                }
+
+                let (closure_dialect, closure_op_short) = closure_full_name
+                    .split_once('.')
+                    .unwrap_or(("map", closure_full_name));
+                let closure_op = module.ops.insert(Operation {
+                    id: OpId::default(),
+                    name: OpName::new(closure_dialect, closure_op_short),
+                    operands: body_captures,
+                    results: smallvec::SmallVec::new(),
+                    attributes: indexmap::IndexMap::new(),
+                    regions: vec![old_body_reg],
+                    custom_syntax: false,
+                    location: loop_op.location.clone(),
+                });
+                module.ops[closure_op].id = closure_op;
+                module.blocks[opaque_blk].ops.push(closure_op);
+
+                let opaque_reg = module.create_region(vec![opaque_blk]);
+                let mut new_attrs = loop_op.attributes.clone();
+                if !new_attrs.contains_key("device") {
+                    new_attrs.insert("device".to_string(), Attribute::String("cpu:0".to_string()));
+                }
+
+                module.ops[loop_id].name = OpName::new("map", "iter.opaque");
+                module.ops[loop_id].attributes = new_attrs;
+                module.ops[loop_id].regions = vec![opaque_reg];
+                outlined += 1;
+            }
+        }
+    }
+
+    outlined
+}

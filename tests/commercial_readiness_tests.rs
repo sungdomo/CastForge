@@ -8550,3 +8550,93 @@ fn test_inline_tensor_and_grouped_tensor_wire_envelopes() {
     assert!(validate_grouped_chunk_indices(0, &[2, 2], 2, Some(4)).is_err());
     assert!(validate_grouped_chunk_indices(0, &[1, 4], 2, Some(4)).is_err());
 }
+
+#[test]
+fn test_outline_structured_kernel_bodies_wraps_elementwise_and_rotates_index_arg() {
+    use castforge::ir::Attribute;
+    use castforge::ir::mlir::OpName;
+    use castforge::passes::outline_structured_map_loops;
+
+    let src = concat!(
+        "module {\n",
+        "  func.func @structured_loop(\n",
+        "    %x: tensor<8xf32>,\n",
+        "    %ch0: !mo.chain\n",
+        "  ) -> (tensor<8xf32>, !mo.chain) {\n",
+        "    return %x, %ch0 : tensor<8xf32>, !mo.chain\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(src).unwrap();
+    let fn_id = m.functions()[0];
+    let fn_blk = m.regions[m.ops[fn_id].regions[0]].blocks[0];
+    let args = m.blocks[fn_blk].arguments.clone();
+    let (x_arg, ch0_arg) = (args[0], args[1]);
+    let t_ty = m.values[x_arg].ty.clone();
+    let ch_ty = m.values[ch0_arg].ty.clone();
+    let idx_ty = castforge::ir::Type::Scalar(DType::Index);
+    let f32_ty = castforge::ir::Type::Scalar(DType::F32);
+
+    // Build `map.iter.elementwise(%x, %ch0)` whose body block has args `[%in_x, %out_y, %idx]`:
+    let body_blk = m.create_block(None);
+    let in_x = m.add_block_argument(body_blk, None, t_ty.clone());
+    let out_y = m.add_block_argument(body_blk, None, t_ty.clone());
+    let loop_idx = m.add_block_argument(body_blk, None, idx_ty.clone());
+    let load_op = m.add_operation(
+        body_blk,
+        OpName::new("map", "load"),
+        smallvec::smallvec![in_x, loop_idx],
+        vec![(None, f32_ty)],
+        indexmap::IndexMap::new(),
+        vec![],
+        false,
+        Location::Unknown,
+    );
+    let loaded = m.ops[load_op].results[0];
+    m.add_operation(
+        body_blk,
+        OpName::new("map", "store"),
+        smallvec::smallvec![loaded, out_y, loop_idx],
+        vec![],
+        indexmap::IndexMap::new(),
+        vec![],
+        false,
+        Location::Unknown,
+    );
+    let body_reg = m.create_region(vec![body_blk]);
+
+    let mut attrs = indexmap::IndexMap::new();
+    attrs.insert("has_read_effect".to_string(), Attribute::Bool(true));
+    let loop_op = m.add_operation(
+        fn_blk,
+        OpName::new("map", "iter.elementwise"),
+        smallvec::smallvec![x_arg, ch0_arg],
+        vec![(None, t_ty), (None, ch_ty)],
+        attrs,
+        vec![body_reg],
+        false,
+        Location::Unknown,
+    );
+
+    let outlined = outline_structured_map_loops(&mut m);
+    assert_eq!(outlined, 1);
+    assert_eq!(m.ops[loop_op].name.full_name(), "map.iter.opaque");
+    assert_eq!(
+        m.ops[loop_op].attributes.get("device"),
+        Some(&Attribute::String("cpu:0".to_string()))
+    );
+
+    // Outer `map.iter.opaque` body has 2 non-chain block args (input `%x`, output `%y`) and
+    // contains a single `map.iter.elementwise.body` closure whose block args are
+    // `[%loop_idx, %in_x, %out_y]`:
+    let opaque_reg = m.ops[loop_op].regions[0];
+    let opaque_blk = m.regions[opaque_reg].blocks[0];
+    assert_eq!(m.blocks[opaque_blk].arguments.len(), 2);
+    let closure_id = m.blocks[opaque_blk].ops[0];
+    assert_eq!(
+        m.ops[closure_id].name.full_name(),
+        "map.iter.elementwise.body"
+    );
+    assert_eq!(m.ops[closure_id].operands.len(), 2);
+    assert_eq!(m.blocks[body_blk].arguments, vec![loop_idx, in_x, out_y]);
+}
