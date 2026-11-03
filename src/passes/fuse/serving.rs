@@ -3383,3 +3383,76 @@ pub fn validate_target_device_dtypes(
     }
     diags
 }
+
+/// Sentinel window value (`-1`) marking a full-attention KV object group that requires the
+/// entire `[0, prefix_len)` chunk prefix (inspired by LMCache `bitmap_ops/fold.py`).
+pub const FULL_ATTENTION_WINDOW: i32 = -1;
+
+/// Half-open chunk range `[lo, hi)` that an object group with `window_chunks` (`<= 0` for full
+/// attention, `w > 0` for sliding window / Mamba) needs to serve a prefix of `prefix_len` chunks.
+pub fn unfold_chunk_range(prefix_len: usize, window_chunks: i32) -> (usize, usize) {
+    if prefix_len == 0 {
+        return (0, 0);
+    }
+    let lo = if window_chunks <= 0 {
+        0
+    } else {
+        prefix_len.saturating_sub(window_chunks as usize)
+    };
+    (lo, prefix_len)
+}
+
+/// Three-stage `fold -> highest_set_bit -> unfold` multi-object-group prefix-cache hit planner
+/// (inspired by LMCache `lmcache/v1/distributed/bitmap_ops/fold.py` `fold_unfold_grouped`).
+///
+/// Given `group_presence` (`[num_groups][num_chunks]` booleans) and `group_windows` (`<= 0` for
+/// full attention, `w > 0` for sliding window of `w` chunks):
+/// 1. `fold`: computes `servable[j]` (`true` iff every group can serve prefix length `j + 1`),
+/// 2. `highest_set_bit`: finds the longest jointly servable prefix `hit_length` (recovering
+///    longer hits even when earlier chunks outside a sliding window were evicted), and
+/// 3. `unfold`: expands `hit_length` into per-group retain masks so only required chunks are
+///    locked and transferred.
+///
+/// Returns `(hit_length, servable_bitmap, retain_masks)`.
+pub fn fold_unfold_hybrid_prefix_bitmaps(
+    group_presence: &[Vec<bool>],
+    group_windows: &[i32],
+) -> (usize, Vec<bool>, Vec<Vec<bool>>) {
+    let num_groups = group_presence.len().min(group_windows.len());
+    if num_groups == 0 {
+        return (0, Vec::new(), Vec::new());
+    }
+    let num_chunks = group_presence[..num_groups]
+        .iter()
+        .map(Vec::len)
+        .min()
+        .unwrap_or(0);
+    if num_chunks == 0 {
+        return (0, Vec::new(), vec![Vec::new(); num_groups]);
+    }
+
+    let mut servable = vec![false; num_chunks];
+    let mut hit_length = 0usize;
+    for (j, slot) in servable.iter_mut().enumerate() {
+        let cand_len = j + 1;
+        let all_ok = (0..num_groups).all(|g| {
+            let (lo, hi) = unfold_chunk_range(cand_len, group_windows[g]);
+            group_presence[g][lo..hi].iter().all(|&present| present)
+        });
+        *slot = all_ok;
+        if all_ok {
+            hit_length = cand_len;
+        }
+    }
+
+    let mut retain_masks = Vec::with_capacity(num_groups);
+    for &win in &group_windows[..num_groups] {
+        let mut mask = vec![false; num_chunks];
+        let (lo, hi) = unfold_chunk_range(hit_length, win);
+        for bit in &mut mask[lo..hi] {
+            *bit = true;
+        }
+        retain_masks.push(mask);
+    }
+    (hit_length, servable, retain_masks)
+}

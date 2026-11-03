@@ -16,16 +16,17 @@ use castforge::ir::{
 use castforge::passes::{
     ArcKvEvictionPolicy, AsymK16V8Codec, CBChunkMatch, CBGroupSpec, CacheBlendRopeSpec,
     CacheGenCdfCodec, ChainedBlockHashConfig, DEFAULT_MAX_KERNELS_IN_FUSION_SET, DeviceTargetArch,
-    EngineKvFormat, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode,
-    KvPageSpec, KvSaltQuotaRegistry, KvScaleScope, PassManager, PassRegistry,
-    analyze_kv_layer_groups, anonymize_symbolic_dims, compress_splat_constants,
+    EngineKvFormat, FULL_ATTENTION_WINDOW, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind,
+    KvBlockPool, KvDmaTransferMode, KvPageSpec, KvSaltQuotaRegistry, KvScaleScope, PassManager,
+    PassRegistry, analyze_kv_layer_groups, anonymize_symbolic_dims, compress_splat_constants,
     direct_copy_format_supported, elide_redundant_state_transfers, flatten_elementwise_chains,
-    fuse_locations, fuse_reshape_epilogue, fuse_sole_use_prologues, hash_prefix_token_blocks,
-    is_supported_arch_dtype, longest_full_attention_hit, longest_joint_prefix_hit,
-    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_identical_functions,
-    plan_cacheblend_retrieve, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
-    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
-    stamp_fused_provenance, validate_target_device_dtypes,
+    fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
+    fuse_sole_use_prologues, hash_prefix_token_blocks, is_supported_arch_dtype,
+    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
+    mark_cuda_graph_stable_tensors, merge_identical_functions, plan_cacheblend_retrieve,
+    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
+    promote_narrow_accumulators, re_rope_key_in_place, stamp_fused_provenance, unfold_chunk_range,
+    validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -1359,4 +1360,33 @@ fn test_validate_target_device_dtypes_across_cpu_wgsl_and_gpu_profiles() {
             .message
             .contains("The f8E4M3FN data type is not supported on device 'cpu:x86_64'.")
     );
+}
+
+#[test]
+fn test_hybrid_prefix_bitmap_fold_unfold_non_monotonic_recovery() {
+    assert_eq!(unfold_chunk_range(4, FULL_ATTENTION_WINDOW), (0, 4));
+    assert_eq!(unfold_chunk_range(4, 2), (2, 4));
+    assert_eq!(unfold_chunk_range(4, 1), (3, 4)); // Mamba w=1
+
+    // 3 object groups over 4 chunks:
+    // - Group 0 (Full attention, w = -1): chunks [0, 1, 2] present, chunk 3 missing
+    // - Group 1 (Sliding window, w = 2): chunk 0 evicted! chunks [1, 2, 3] present
+    // - Group 2 (Mamba state, w = 1): only chunk 2 present!
+    // Notice that at length L = 1 (chunk 0) and L = 2 (chunks 0..2), Group 1 & 2 cannot serve
+    // because chunk 0 is missing, so `servable` is `[false, false, true, false]`!
+    // Picking `highest_set_bit` recovers `hit_length = 3` (`j = 2`)!
+    let presence = vec![
+        vec![true, true, true, false],
+        vec![false, true, true, true],
+        vec![false, false, true, false],
+    ];
+    let windows = vec![FULL_ATTENTION_WINDOW, 2, 1];
+    let (hit_len, servable, retain) = fold_unfold_hybrid_prefix_bitmaps(&presence, &windows);
+
+    assert_eq!(hit_len, 3);
+    assert_eq!(servable, vec![false, false, true, false]);
+    // Unfold retain masks for `hit_len = 3`:
+    assert_eq!(retain[0], vec![true, true, true, false]); // Full attention: [0..3)
+    assert_eq!(retain[1], vec![false, true, true, false]); // Sliding w=2: [1..3)
+    assert_eq!(retain[2], vec![false, false, true, false]); // Mamba w=1: [2..3)
 }
