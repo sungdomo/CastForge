@@ -3663,3 +3663,92 @@ impl GdsSlabAddressManager {
         self.free_regions = merged;
     }
 }
+
+fn expr_contains_ident(text: &str, ident: &str) -> bool {
+    if ident.is_empty() {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let id_len = ident.len();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut start = 0usize;
+    while let Some(rel) = text[start..].find(ident) {
+        let pos = start + rel;
+        let before_ok = pos == 0 || !is_word(bytes[pos - 1]);
+        let after_ok = pos + id_len >= bytes.len() || !is_word(bytes[pos + id_len]);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = pos + 1;
+    }
+    false
+}
+
+fn stmt_references_buffer(stmt: &crate::ir::loops::LoopStmt, buf_name: &str) -> bool {
+    use crate::ir::loops::LoopStmt;
+    match stmt {
+        LoopStmt::Comment(_) | LoopStmt::Alloc { .. } => false,
+        LoopStmt::Assign { dst, index, expr } => {
+            dst == buf_name
+                || expr_contains_ident(index, buf_name)
+                || expr_contains_ident(expr, buf_name)
+        }
+        LoopStmt::For { body, .. } => body.iter().any(|s| stmt_references_buffer(s, buf_name)),
+    }
+}
+
+/// Defers `LoopStmt::Alloc` buffer declarations in each [`crate::ir::loops::LoopKernel`] to
+/// immediately precede their first use (and eliminates dead unused allocations), shrinking buffer
+/// live ranges to reduce peak scratchpad memory
+/// (inspired by Modular `GraphCompiler/lib/MGPDialect/Transforms/DeferAllocsPass.cpp`).
+///
+/// Returns the number of `Alloc` statements that were deferred across computational statements or
+/// eliminated as dead.
+pub fn defer_allocs_to_first_use(loop_module: &mut crate::ir::loops::LoopModule) -> usize {
+    use crate::ir::loops::LoopStmt;
+    let mut moved_or_elided = 0usize;
+    for kernel in &mut loop_module.kernels {
+        let mut allocs: Vec<(String, LoopStmt)> = Vec::new();
+        let mut other_stmts: Vec<(usize, LoopStmt)> = Vec::new();
+        let mut alloc_orig_pos: IndexMap<String, usize> = IndexMap::new();
+
+        for (orig_idx, stmt) in kernel.body.drain(..).enumerate() {
+            if let LoopStmt::Alloc { ref name, .. } = stmt {
+                alloc_orig_pos.insert(name.clone(), orig_idx);
+                allocs.push((name.clone(), stmt));
+            } else {
+                other_stmts.push((orig_idx, stmt));
+            }
+        }
+
+        let mut insertions: Vec<Vec<LoopStmt>> = vec![Vec::new(); other_stmts.len()];
+        for (name, alloc_stmt) in allocs {
+            if let Some(first_use_slot) = other_stmts
+                .iter()
+                .position(|(_, s)| stmt_references_buffer(s, &name))
+            {
+                let orig_pos = alloc_orig_pos.get(&name).copied().unwrap_or(0);
+                // Count as deferred if at least one computational statement (`For` or `Assign`)
+                // originally appeared after `orig_pos` and now precedes `first_use_slot`.
+                let crossed_compute = other_stmts[..first_use_slot].iter().any(|(pos, s)| {
+                    *pos > orig_pos && matches!(s, LoopStmt::For { .. } | LoopStmt::Assign { .. })
+                });
+                if crossed_compute {
+                    moved_or_elided += 1;
+                }
+                insertions[first_use_slot].push(alloc_stmt);
+            } else {
+                // Dead allocation with no references in the kernel body
+                moved_or_elided += 1;
+            }
+        }
+
+        let mut new_body = Vec::with_capacity(other_stmts.len() + alloc_orig_pos.len());
+        for (slot, (_, stmt)) in other_stmts.into_iter().enumerate() {
+            new_body.append(&mut insertions[slot]);
+            new_body.push(stmt);
+        }
+        kernel.body = new_body;
+    }
+    moved_or_elided
+}

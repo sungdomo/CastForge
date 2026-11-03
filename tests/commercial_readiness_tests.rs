@@ -4,7 +4,7 @@
 
 use castforge::codegen::{
     BackendRegistry, CompilationCache, TargetConfig, compute_function_structural_hashes,
-    compute_module_structural_hash, evaluate_module,
+    compute_module_structural_hash, evaluate_module, lower_to_loop_ir,
 };
 use castforge::ffi::{
     castforge_compile_mlir, castforge_free_string, castforge_optimize_mlir, castforge_version,
@@ -20,14 +20,14 @@ use castforge::passes::{
     IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
     KvDmaTransferMode, KvPageSpec, KvSaltQuotaRegistry, KvScaleScope, PassManager, PassRegistry,
     analyze_kv_layer_groups, anonymize_symbolic_dims, compress_splat_constants,
-    direct_copy_format_supported, elide_redundant_state_transfers, flatten_elementwise_chains,
-    fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
-    fuse_sole_use_prologues, hash_prefix_token_blocks, is_supported_arch_dtype,
-    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
-    mark_cuda_graph_stable_tensors, merge_identical_functions, plan_cacheblend_retrieve,
-    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
-    promote_narrow_accumulators, re_rope_key_in_place, stamp_fused_provenance, unfold_chunk_range,
-    validate_target_device_dtypes,
+    defer_allocs_to_first_use, direct_copy_format_supported, elide_redundant_state_transfers,
+    flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
+    fuse_reshape_epilogue, fuse_sole_use_prologues, hash_prefix_token_blocks,
+    is_supported_arch_dtype, longest_full_attention_hit, longest_joint_prefix_hit,
+    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_identical_functions,
+    plan_cacheblend_retrieve, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
+    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
+    stamp_fused_provenance, unfold_chunk_range, validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -1445,4 +1445,86 @@ fn test_gds_slab_address_manager_alignment_all_or_nothing_and_coalescing() {
     mgr.free_region(batch1[1]);
     assert_eq!(mgr.free_fragment_count(), 1);
     assert_eq!(mgr.free_size_bytes(), 16_384);
+}
+
+#[test]
+fn test_defer_allocs_to_first_use_shrinks_loop_ir_live_ranges() {
+    use castforge::ir::loops::{LoopKernel, LoopModule, LoopStmt};
+
+    // Construct a kernel where `buf_late` and `buf_dead` are hoisted to the top of the function
+    // before `buf_early`'s loop, inflating peak live memory across the first loop.
+    let mut loop_mod = LoopModule {
+        name: "defer_test".to_string(),
+        kernels: vec![LoopKernel {
+            name: "main".to_string(),
+            params: vec![("arg0".to_string(), 16)],
+            output: ("out0".to_string(), 16),
+            body: vec![
+                LoopStmt::Alloc {
+                    name: "buf_early".to_string(),
+                    len: 16,
+                },
+                LoopStmt::Alloc {
+                    name: "buf_late".to_string(),
+                    len: 16,
+                },
+                LoopStmt::Alloc {
+                    name: "buf_dead".to_string(),
+                    len: 16,
+                },
+                LoopStmt::For {
+                    var: "i".to_string(),
+                    lower: 0,
+                    upper: 16,
+                    step: 1,
+                    parallel: true,
+                    vectorized: true,
+                    unroll: 4,
+                    body: vec![LoopStmt::Assign {
+                        dst: "buf_early".to_string(),
+                        index: "i".to_string(),
+                        expr: "arg0[i] + 1.0".to_string(),
+                    }],
+                },
+                LoopStmt::For {
+                    var: "i".to_string(),
+                    lower: 0,
+                    upper: 16,
+                    step: 1,
+                    parallel: true,
+                    vectorized: true,
+                    unroll: 4,
+                    body: vec![LoopStmt::Assign {
+                        dst: "buf_late".to_string(),
+                        index: "i".to_string(),
+                        expr: "buf_early[i] * 2.0".to_string(),
+                    }],
+                },
+            ],
+        }],
+    };
+
+    // Also verify `lower_to_loop_ir` + `defer_allocs_to_first_use` works on a parsed MLIR module
+    let mlir = r#"
+module @chain {
+  func.func @main(%x: tensor<8xf32>) -> tensor<8xf32> {
+    %0 = stablehlo.abs %x : tensor<8xf32>
+    %1 = stablehlo.negate %0 : tensor<8xf32>
+    return %1 : tensor<8xf32>
+  }
+}
+"#;
+    let parsed = parse_mlir(mlir).expect("valid MLIR");
+    let mut lowered = lower_to_loop_ir(&parsed, &TargetConfig::default());
+    let _ = defer_allocs_to_first_use(&mut lowered);
+
+    let changed = defer_allocs_to_first_use(&mut loop_mod);
+    // `buf_late` deferred past first `For` loop + `buf_dead` eliminated = 2
+    assert_eq!(changed, 2);
+    let body = &loop_mod.kernels[0].body;
+    assert_eq!(body.len(), 4);
+    assert!(matches!(&body[0], LoopStmt::Alloc { name, .. } if name == "buf_early"));
+    assert!(matches!(&body[1], LoopStmt::For { .. }));
+    assert!(matches!(&body[2], LoopStmt::Alloc { name, .. } if name == "buf_late"));
+    assert!(matches!(&body[3], LoopStmt::For { .. }));
 }
