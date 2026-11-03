@@ -62,8 +62,8 @@ use castforge::passes::{
     plan_cacheblend_retrieve, plan_cacheblend_token_reorder, plan_concat_in_place,
     plan_device_graph_collective_partition, plan_dynamic_memory_pool, plan_jenga_kv_geometry,
     plan_kernel_sequence_fusion, plan_kv_dma_transfer, plan_l1_prefetch_retention,
-    plan_multi_tier_prefetch_load, promote_narrow_accumulators, re_rope_key_in_place,
-    recalculate_subchunk_blocks_to_skip, recognize_composite_activations,
+    plan_multi_tier_prefetch_load, predicate_assert_dependencies, promote_narrow_accumulators,
+    re_rope_key_in_place, recalculate_subchunk_blocks_to_skip, recognize_composite_activations,
     recover_contiguous_or_dim0_padded_view, relax_non_aliasing_mutable_chain_sequences,
     resolve_l1_memory_affinity, reuse_dead_loop_buffers, seal_l2_kv_frame,
     select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
@@ -4346,4 +4346,52 @@ fn test_buffer_dependency_tree_lca_and_insert_explicit_buffer_frees() {
     assert_eq!(m.ops[free_id].operands[0], m.ops[join_id].results[0]);
     assert_eq!(m.ops[free_id].operands[1], m.ops[alloc_id].results[0]);
     assert_eq!(m.ops[epilogue_id].operands[0], m.ops[free_id].results[0]);
+}
+
+#[test]
+fn test_predicate_assert_dependencies_stops_at_first_chain_consumer() {
+    // `%idx` feeds both:
+    //   1. `%cond = stablehlo.compare %idx, %limit` -> `%c_assert = mgp.assert %c0, %cond`
+    //   2. `%scaled = stablehlo.add %idx, %idx` (pure op, no chain)
+    //        -> `%out1, %c1 = mgp.gather %c0, %table, %scaled` (first chain-taking op!)
+    //        -> `%out2, %c2 = mgp.kernel %c1, %out1` (second chain-taking op, inherits via `%c1`)
+    // `predicate_assert_dependencies` predicates `mgp.gather` on `%c_assert` via `mo.chain.create`,
+    // and stops downward propagation at `mgp.gather` so `mgp.kernel` is not redundantly predicated!
+    let mlir = concat!(
+        "module @predicate_asserts {\n",
+        "  func.func @main(%c0: tensor<1xi64>, %idx: tensor<4xi32>, %limit: tensor<4xi32>, ",
+        "%table: tensor<4xf32>) -> tensor<1xi64> {\n",
+        "    %cond = stablehlo.add %idx, %limit : tensor<4xi32>\n",
+        "    %c_assert = mgp.assert %c0, %cond : (tensor<1xi64>, tensor<4xi32>) -> tensor<1xi64>\n",
+        "    %scaled = stablehlo.add %idx, %idx : tensor<4xi32>\n",
+        "    %out1, %c1 = mgp.gather %c0, %table, %scaled ",
+        ": (tensor<1xi64>, tensor<4xf32>, tensor<4xi32>) -> (tensor<4xf32>, tensor<1xi64>)\n",
+        "    %out2, %c2 = mgp.kernel %c1, %out1 ",
+        ": (tensor<1xi64>, tensor<4xf32>) -> (tensor<4xf32>, tensor<1xi64>)\n",
+        "    return %c2 : tensor<1xi64>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(mlir).expect("valid MLIR");
+    assert_eq!(predicate_assert_dependencies(&mut m), 1);
+
+    let func_id = m.functions()[0];
+    let blk_id = m.regions[m.ops[func_id].regions[0]].blocks[0];
+    let ops = &m.blocks[blk_id].ops;
+    // Expected block ops:
+    //   0: stablehlo.add (%cond)
+    //   1: mgp.assert (%c_assert)
+    //   2: stablehlo.add (%scaled)
+    //   3: mo.chain.create (%c0, %c_assert)
+    //   4: mgp.gather
+    //   5: mgp.kernel
+    //   6: func.return
+    assert_eq!(ops.len(), 7);
+    assert!(m.ops[ops[3]].is_op("mo", "chain.create"));
+    assert_eq!(
+        m.ops[ops[3]].operands.as_slice(),
+        &[m.blocks[blk_id].arguments[0], m.ops[ops[1]].results[0]]
+    );
+    assert_eq!(m.ops[ops[4]].operands[0], m.ops[ops[3]].results[0]);
+    assert_eq!(m.ops[ops[5]].operands[0], m.ops[ops[4]].results[1]);
 }

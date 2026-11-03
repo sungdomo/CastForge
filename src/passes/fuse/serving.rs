@@ -13547,3 +13547,212 @@ pub fn insert_explicit_buffer_frees(module: &mut Module) -> usize {
 
     frees_added
 }
+
+// ============================================================================
+// Assert-Dependency Chain Predication Pass
+// (inspired by Modular
+//  `GraphCompiler/lib/MGPDialect/Transforms/PredicateAssertDependenciesPass.cpp`)
+// ============================================================================
+
+fn is_chain_value(module: &Module, val_id: ValueId) -> bool {
+    module
+        .values
+        .get(val_id)
+        .and_then(|v| v.ty.as_tensor())
+        .is_some_and(|tt| tt.shape == [Dim::Static(1)] && tt.dtype == DType::I64)
+}
+
+fn is_assert_op(op: &Operation) -> bool {
+    matches!(op.name.to_string().as_str(), "mgp.assert" | "mo.assert") && !op.results.is_empty()
+}
+
+fn input_chain_operand_index(module: &Module, op: &Operation) -> Option<usize> {
+    if op.is_op("func", "return") || op.is_op("mo", "chain.create") {
+        return None;
+    }
+    op.operands.iter().position(|&v| is_chain_value(module, v))
+}
+
+/// Predicates every chain-taking operation in a block that consumes (directly or transitively
+/// through pure dataflow ops) a value feeding an `mgp.assert` or `mo.assert` operation on that
+/// assertion's output chain.
+///
+/// Stops downward propagation at the first chain-taking operation along each dataflow path so
+/// downstream chain-ordered descendants inherit the assertion dependency transitively without
+/// redundant barriers. Returns the number of operations predicated on additional assertion chains.
+pub fn predicate_assert_dependencies(module: &mut Module) -> usize {
+    let mut predicated_ops = 0usize;
+    let block_ids: Vec<_> = module.blocks.keys().collect();
+
+    for block_id in block_ids {
+        let block_ops = module.blocks[block_id].ops.clone();
+        let in_block: IndexSet<OpId> = block_ops.iter().copied().collect();
+
+        let assert_ids: Vec<OpId> = block_ops
+            .iter()
+            .copied()
+            .filter(|&id| module.ops.get(id).is_some_and(is_assert_op))
+            .collect();
+        if assert_ids.is_empty() {
+            continue;
+        }
+
+        // 1. Upward propagation: find all non-chain values and defining ops that feed each assert.
+        let mut values_that_feed_asserts: IndexMap<ValueId, IndexSet<OpId>> = IndexMap::new();
+        for &assert_id in &assert_ids {
+            let mut visited_ops: IndexSet<OpId> = IndexSet::new();
+            let mut stack: Vec<ValueId> = module.ops[assert_id]
+                .operands
+                .iter()
+                .copied()
+                .filter(|&v| !is_chain_value(module, v))
+                .collect();
+
+            while let Some(val) = stack.pop() {
+                let Some(ValueDef::OpResult { op: def_id, .. }) =
+                    module.values.get(val).map(|v| v.def)
+                else {
+                    values_that_feed_asserts
+                        .entry(val)
+                        .or_default()
+                        .insert(assert_id);
+                    continue;
+                };
+                if !in_block.contains(&def_id) {
+                    values_that_feed_asserts
+                        .entry(val)
+                        .or_default()
+                        .insert(assert_id);
+                    continue;
+                }
+                if !visited_ops.insert(def_id) {
+                    continue;
+                }
+                let def_op = &module.ops[def_id];
+                for &res in &def_op.results {
+                    if !is_chain_value(module, res) {
+                        values_that_feed_asserts
+                            .entry(res)
+                            .or_default()
+                            .insert(assert_id);
+                    }
+                }
+                for &opd in &def_op.operands {
+                    if !is_chain_value(module, opd) {
+                        stack.push(opd);
+                    }
+                }
+            }
+        }
+
+        // 2. Downward propagation: propagate assertion sets to consumers, stopping at the first
+        //    chain-taking op along each path.
+        let mut ops_depending_on_asserts: IndexMap<OpId, IndexSet<OpId>> = IndexMap::new();
+        let seed_entries: Vec<(ValueId, IndexSet<OpId>)> = values_that_feed_asserts
+            .iter()
+            .map(|(&v, s)| (v, s.clone()))
+            .collect();
+
+        for (seed_val, asserts) in seed_entries {
+            let mut worklist: Vec<ValueId> = vec![seed_val];
+            let mut visited_vals: IndexSet<ValueId> = IndexSet::new();
+
+            while let Some(val) = worklist.pop() {
+                if is_chain_value(module, val) || !visited_vals.insert(val) {
+                    continue;
+                }
+                for &user_id in &block_ops {
+                    if assert_ids.contains(&user_id) {
+                        continue;
+                    }
+                    let Some(user_op) = module.ops.get(user_id) else {
+                        continue;
+                    };
+                    if !user_op.operands.contains(&val) {
+                        continue;
+                    }
+                    let entry = ops_depending_on_asserts.entry(user_id).or_default();
+                    let before = entry.len();
+                    entry.extend(asserts.iter().copied());
+                    if entry.len() == before {
+                        continue;
+                    }
+                    if input_chain_operand_index(module, user_op).is_some() {
+                        // Chain-taking op is predicated here; its chain descendants inherit it.
+                        continue;
+                    }
+                    for &res in &user_op.results {
+                        if !is_chain_value(module, res) {
+                            worklist.push(res);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Predicate each chain-taking op on `asserts_it_depends_on \ asserts_it_contributed_to`.
+        for (op_id, depended_asserts) in ops_depending_on_asserts {
+            let Some(op) = module.ops.get(op_id).cloned() else {
+                continue;
+            };
+            let Some(chain_opd_idx) = input_chain_operand_index(module, &op) else {
+                continue;
+            };
+            let mut diff = depended_asserts;
+            if let Some(&first_res) = op.results.first()
+                && let Some(contributed) = values_that_feed_asserts.get(&first_res)
+            {
+                diff.retain(|a| !contributed.contains(a));
+            }
+            if diff.is_empty() {
+                continue;
+            }
+
+            let orig_chain = op.operands[chain_opd_idx];
+            let mut join_operands: SmallVec<[ValueId; 4]> = SmallVec::from_slice(&[orig_chain]);
+            for assert_id in diff {
+                let assert_chain = module.ops[assert_id].results[0];
+                if !join_operands.contains(&assert_chain) {
+                    join_operands.push(assert_chain);
+                }
+            }
+            if join_operands.len() <= 1 {
+                continue;
+            }
+
+            let chain_ty = module.values[orig_chain].ty.clone();
+            let join_op_id = module.ops.insert_with_key(|id| Operation {
+                id,
+                name: OpName::new("mo", "chain.create"),
+                operands: join_operands,
+                results: SmallVec::new(),
+                attributes: IndexMap::new(),
+                regions: Vec::new(),
+                custom_syntax: false,
+                location: op.location.clone(),
+            });
+            let join_val = module.values.insert_with_key(|id| Value {
+                id,
+                ssa_name: None,
+                ty: chain_ty,
+                def: ValueDef::OpResult {
+                    op: join_op_id,
+                    index: 0,
+                },
+            });
+            module.ops[join_op_id].results.push(join_val);
+            if let Some(op_mut) = module.ops.get_mut(op_id) {
+                op_mut.operands[chain_opd_idx] = join_val;
+            }
+            let pos = module.blocks[block_id]
+                .ops
+                .iter()
+                .position(|&id| id == op_id)
+                .unwrap_or(0);
+            module.blocks[block_id].ops.insert(pos, join_op_id);
+            predicated_ops += 1;
+        }
+    }
+
+    predicated_ops
+}
