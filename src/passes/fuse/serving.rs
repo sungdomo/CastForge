@@ -9861,3 +9861,216 @@ pub fn sink_split_through_reshape(module: &mut Module) -> usize {
 
     sunk
 }
+
+/// Sinks or simplifies a sole-use broadcast (`mo.static.broadcast_to` or
+/// `stablehlo.broadcast_in_dim`) feeding a single-axis keep-dims reduction (`mo.reduce_add`,
+/// `mo.reduce_max`, `mo.reduce_min`, `stablehlo.reduce`).
+///
+/// - When reducing along a **non-broadcasted** axis, commutes `reduce(broadcast(x))` into
+///   `broadcast(reduce(x, mapped_axis))`, reducing the smaller pre-broadcast tensor first.
+/// - When reducing along a **broadcast-expanded** axis with an idempotent reduction
+///   (`mo.reduce_max` or `mo.reduce_min`), folds `reduce(broadcast(x))` directly into a single
+///   `broadcast(x)` to the reduced output shape.
+///
+/// Returns the number of broadcast-reduction pairs rewritten.
+pub fn sink_broadcast_through_reduction(module: &mut Module) -> usize {
+    let mut rewritten = 0usize;
+    let block_ids: Vec<_> = module.blocks.keys().collect();
+
+    for block_id in block_ids {
+        let mut use_counts: IndexMap<ValueId, usize> = IndexMap::new();
+        for &op_id in &module.blocks[block_id].ops {
+            if let Some(op) = module.ops.get(op_id) {
+                for &v in &op.operands {
+                    *use_counts.entry(v).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let op_ids = module.blocks[block_id].ops.clone();
+        let mut to_remove: IndexSet<OpId> = IndexSet::new();
+
+        for reduce_id in op_ids {
+            if to_remove.contains(&reduce_id) {
+                continue;
+            }
+            let Some(reduce_op) = module.ops.get(reduce_id).cloned() else {
+                continue;
+            };
+            let reduce_name = reduce_op.name.to_string();
+            if !matches!(
+                reduce_name.as_str(),
+                "mo.reduce_add" | "mo.reduce_max" | "mo.reduce_min" | "stablehlo.reduce"
+            ) || reduce_op.operands.is_empty()
+                || reduce_op.results.len() != 1
+            {
+                continue;
+            }
+
+            let bcast_out_val = reduce_op.operands[0];
+            if use_counts.get(&bcast_out_val).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            let Some(bcast_out_info) = module.values.get(bcast_out_val).cloned() else {
+                continue;
+            };
+            let ValueDef::OpResult { op: bcast_id, .. } = bcast_out_info.def else {
+                continue;
+            };
+            if !module.blocks[block_id].ops.contains(&bcast_id) {
+                continue;
+            }
+            let Some(bcast_op) = module.ops.get(bcast_id).cloned() else {
+                continue;
+            };
+            let bcast_name = bcast_op.name.to_string();
+            if !matches!(
+                bcast_name.as_str(),
+                "mo.static.broadcast_to" | "stablehlo.broadcast_in_dim"
+            ) || bcast_op.operands.is_empty()
+                || bcast_op.results.len() != 1
+                || bcast_op.attributes.get("castforge.device")
+                    != reduce_op.attributes.get("castforge.device")
+            {
+                continue;
+            }
+
+            let bcast_in_val = bcast_op.operands[0];
+            let reduce_out_val = reduce_op.results[0];
+            let (Some(in_info), Some(out_info)) = (
+                module.values.get(bcast_in_val),
+                module.values.get(reduce_out_val),
+            ) else {
+                continue;
+            };
+            let (Type::Tensor(in_tt), Type::Tensor(bcast_tt), Type::Tensor(out_tt)) = (
+                in_info.ty.clone(),
+                bcast_out_info.ty.clone(),
+                out_info.ty.clone(),
+            ) else {
+                continue;
+            };
+
+            let rank_in = in_tt.shape.len();
+            let rank_out = bcast_tt.shape.len();
+            if rank_in == 0 || rank_out < rank_in || out_tt.shape.len() != rank_out {
+                continue;
+            }
+            let extra_dims = rank_out - rank_in;
+            if let Some(bcast_dims) = extract_int_list_attr(&bcast_op, "broadcast_dimensions") {
+                let expected: Vec<i64> = (extra_dims as i64..rank_out as i64).collect();
+                if bcast_dims != expected {
+                    continue;
+                }
+            }
+
+            let axis_i64 = reduce_op
+                .attributes
+                .get("axis")
+                .or_else(|| reduce_op.attributes.get("dimensions"))
+                .and_then(extract_single_int_attr);
+            let Some(axis_raw) = axis_i64 else {
+                continue;
+            };
+            let axis = if axis_raw < 0 {
+                let adj = (rank_out as i64) + axis_raw;
+                if adj < 0 {
+                    continue;
+                }
+                adj as usize
+            } else {
+                axis_raw as usize
+            };
+            if axis >= rank_out || out_tt.shape[axis] != Dim::Static(1) {
+                continue;
+            }
+
+            let is_broadcast_axis = axis < extra_dims
+                || (in_tt.shape[axis - extra_dims] == Dim::Static(1)
+                    && bcast_tt.shape[axis] != Dim::Static(1));
+
+            if is_broadcast_axis {
+                // Idempotent reductions (`reduce_max` / `reduce_min`) over a broadcast-expanded
+                // dimension collapse to `broadcast(x) -> out_tt`.
+                if !matches!(reduce_name.as_str(), "mo.reduce_max" | "mo.reduce_min") {
+                    continue;
+                }
+                if let Some(v_mut) = module.values.get_mut(reduce_out_val) {
+                    v_mut.def = ValueDef::OpResult {
+                        op: bcast_id,
+                        index: 0,
+                    };
+                }
+                if let Some(b_mut) = module.ops.get_mut(bcast_id) {
+                    b_mut.results[0] = reduce_out_val;
+                }
+                module.values.remove(bcast_out_val);
+                to_remove.insert(reduce_id);
+                rewritten += 1;
+            } else {
+                if rank_in <= 1 {
+                    continue;
+                }
+                let mapped_axis = axis - extra_dims;
+                let mut mid_shape = in_tt.shape.clone();
+                mid_shape[mapped_axis] = Dim::Static(1);
+                let mid_tt = TensorType {
+                    shape: mid_shape,
+                    dtype: out_tt.dtype.clone(),
+                    encoding: out_tt.encoding.clone(),
+                };
+
+                if let Some(mid_val_mut) = module.values.get_mut(bcast_out_val) {
+                    mid_val_mut.ty = Type::Tensor(mid_tt);
+                }
+                // Mutate `bcast_id` into the pre-broadcast reduction and `reduce_id` into the
+                // post-reduction broadcast!
+                let mut new_reduce_attrs = reduce_op.attributes.clone();
+                let axis_key = if new_reduce_attrs.contains_key("dimensions")
+                    && !new_reduce_attrs.contains_key("axis")
+                {
+                    "dimensions"
+                } else {
+                    "axis"
+                };
+                new_reduce_attrs.insert(axis_key.into(), Attribute::Int(mapped_axis as i64));
+                let mut new_bcast_attrs = bcast_op.attributes.clone();
+                if new_bcast_attrs.contains_key("shape") {
+                    let out_dims: Option<Vec<i64>> = static_i64_dims(&out_tt);
+                    if let Some(dims) = out_dims {
+                        new_bcast_attrs.insert("shape".into(), Attribute::DenseIntArray(dims));
+                    }
+                }
+
+                let mut extra_reduce_operands: SmallVec<[ValueId; 4]> =
+                    SmallVec::from_slice(&[bcast_in_val]);
+                for &extra_opd in &reduce_op.operands[1..] {
+                    extra_reduce_operands.push(extra_opd);
+                }
+
+                if let Some(first_op) = module.ops.get_mut(bcast_id) {
+                    first_op.name = reduce_op.name.clone();
+                    first_op.operands = extra_reduce_operands;
+                    first_op.attributes = new_reduce_attrs;
+                }
+                if let Some(second_op) = module.ops.get_mut(reduce_id) {
+                    second_op.name = bcast_op.name.clone();
+                    second_op.operands = SmallVec::from_slice(&[bcast_out_val]);
+                    second_op.attributes = new_bcast_attrs;
+                }
+                rewritten += 1;
+            }
+        }
+
+        if !to_remove.is_empty() {
+            module.blocks[block_id]
+                .ops
+                .retain(|id| !to_remove.contains(id));
+            for dead_id in to_remove {
+                module.ops.remove(dead_id);
+            }
+        }
+    }
+
+    rewritten
+}

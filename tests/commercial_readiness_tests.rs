@@ -49,10 +49,11 @@ use castforge::passes::{
     plan_concat_in_place, plan_dynamic_memory_pool, plan_jenga_kv_geometry,
     plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
     re_rope_key_in_place, recalculate_subchunk_blocks_to_skip, recognize_composite_activations,
-    reuse_dead_loop_buffers, select_latest_valid_meta_checkpoint, sink_split_through_reshape,
-    sink_transpose_through_elementwise_and_broadcast, stamp_fused_provenance,
-    swim_reshape_through_slice, unfold_chunk_range, unique_blend_token_coverage,
-    unpack_token_ids_be, unpermute_slice, validate_target_device_dtypes,
+    reuse_dead_loop_buffers, select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
+    sink_split_through_reshape, sink_transpose_through_elementwise_and_broadcast,
+    stamp_fused_provenance, swim_reshape_through_slice, unfold_chunk_range,
+    unique_blend_token_coverage, unpack_token_ids_be, unpermute_slice,
+    validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -3351,5 +3352,62 @@ module @sink_split_reshape {
     assert_eq!(
         m2.values[pre_split_v].ty.as_tensor().unwrap().shape,
         vec![Dim::Static(4), Dim::Static(2), Dim::Static(3)]
+    );
+}
+
+#[test]
+fn test_sink_broadcast_through_reduction_non_broadcast_and_idempotent() {
+    // 1. Non-broadcasted axis (`axis = 2` on `tensor<3x4x8xf32>` broadcast from `tensor<4x8xf32>`):
+    //    Commutes into `mo.reduce_add %x {axis = 1} : (tensor<4x8xf32>) -> tensor<4x1xf32>`
+    //    followed by `mo.static.broadcast_to -> tensor<3x4x1xf32>`!
+    let mlir_non_bcast = r#"
+module @sink_bcast_reduce_non_bcast {
+  func.func @main(%x: tensor<4x8xf32>) -> tensor<3x4x1xf32> {
+    %b = mo.static.broadcast_to %x : (tensor<4x8xf32>) -> tensor<3x4x8xf32>
+    %r = mo.reduce_add %b {axis = 2} : (tensor<3x4x8xf32>) -> tensor<3x4x1xf32>
+    return %r : tensor<3x4x1xf32>
+  }
+}
+"#;
+    let mut m1 = parse_mlir(mlir_non_bcast).expect("valid MLIR");
+    assert_eq!(sink_broadcast_through_reduction(&mut m1), 1);
+    let f1 = m1.functions()[0];
+    let b1 = m1.regions[m1.ops[f1].regions[0]].blocks[0];
+    let ops1 = &m1.blocks[b1].ops;
+    assert_eq!(ops1.len(), 3);
+    assert!(m1.ops[ops1[0]].is_op("mo", "reduce_add"));
+    assert_eq!(
+        m1.ops[ops1[0]].attributes.get("axis"),
+        Some(&castforge::ir::Attribute::Int(1))
+    );
+    assert!(m1.ops[ops1[1]].is_op("mo", "static.broadcast_to"));
+    let mid_v = m1.ops[ops1[0]].results[0];
+    assert_eq!(
+        m1.values[mid_v].ty.as_tensor().unwrap().shape,
+        vec![Dim::Static(4), Dim::Static(1)]
+    );
+
+    // 2. Broadcasted axis (`axis = 1` on `tensor<3x4x8xf32>` broadcast from `tensor<1x8xf32>`)
+    //    with idempotent `mo.reduce_max`: folds directly into a single `mo.static.broadcast_to`!
+    let mlir_idempotent = r#"
+module @sink_bcast_reduce_idempotent {
+  func.func @main(%x: tensor<1x8xf32>) -> tensor<3x1x8xf32> {
+    %b = mo.static.broadcast_to %x : (tensor<1x8xf32>) -> tensor<3x4x8xf32>
+    %r = mo.reduce_max %b {axis = 1} : (tensor<3x4x8xf32>) -> tensor<3x1x8xf32>
+    return %r : tensor<3x1x8xf32>
+  }
+}
+"#;
+    let mut m2 = parse_mlir(mlir_idempotent).expect("valid MLIR");
+    assert_eq!(sink_broadcast_through_reduction(&mut m2), 1);
+    let f2 = m2.functions()[0];
+    let b2 = m2.regions[m2.ops[f2].regions[0]].blocks[0];
+    let ops2 = &m2.blocks[b2].ops;
+    assert_eq!(ops2.len(), 2);
+    assert!(m2.ops[ops2[0]].is_op("mo", "static.broadcast_to"));
+    let out_v = m2.ops[ops2[0]].results[0];
+    assert_eq!(
+        m2.values[out_v].ty.as_tensor().unwrap().shape,
+        vec![Dim::Static(3), Dim::Static(1), Dim::Static(8)]
     );
 }
