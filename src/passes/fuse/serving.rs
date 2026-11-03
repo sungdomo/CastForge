@@ -2852,3 +2852,70 @@ impl ArcKvEvictionPolicy {
         victims
     }
 }
+
+/// Multi-tenant `cache_salt` byte-budget quota registry supporting both strict allowlist
+/// (`get_limit_bytes` -> `0` for unknown tenants) and coordinator bootstrap-exempt
+/// (`effective_limit_bytes` -> `None` until armed) resolution lenses (inspired by LMCache
+/// `lmcache/v1/distributed/quota_manager.py`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KvSaltQuotaRegistry {
+    limits: IndexMap<String, u64>,
+    default_limit_bytes: Option<u64>,
+}
+
+impl KvSaltQuotaRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_quota(&mut self, cache_salt: impl Into<String>, limit_bytes: u64) {
+        self.limits.insert(cache_salt.into(), limit_bytes);
+    }
+
+    pub fn delete_quota(&mut self, cache_salt: &str) -> bool {
+        self.limits.shift_remove(cache_salt).is_some()
+    }
+
+    pub fn has_quota(&self, cache_salt: &str) -> bool {
+        self.limits.contains_key(cache_salt)
+    }
+
+    /// Strict allowlist lens: unregistered salts resolve to `0` bytes so unknown tenant data is
+    /// immediately eligible for eviction on local storage workers.
+    pub fn get_limit_bytes(&self, cache_salt: &str) -> u64 {
+        self.limits.get(cache_salt).copied().unwrap_or(0)
+    }
+
+    pub fn set_default_limit_bytes(&mut self, limit_bytes: Option<u64>) {
+        self.default_limit_bytes = limit_bytes;
+    }
+
+    pub fn get_default_limit_bytes(&self) -> Option<u64> {
+        self.default_limit_bytes
+    }
+
+    /// Coordinator bootstrap-safe lens: returns `Some(limit)` for registered salts, or
+    /// `default_limit_bytes` (`None` = exempt from eviction until the quota controller syncs
+    /// tenant tables and arms enforcement).
+    pub fn effective_limit_bytes(&self, cache_salt: &str) -> Option<u64> {
+        self.limits
+            .get(cache_salt)
+            .copied()
+            .or(self.default_limit_bytes)
+    }
+
+    /// Computes how many bytes `used_bytes` exceeds `cache_salt`'s quota under either the
+    /// strict allowlist lens (`allowlist_lens = true`) or the bootstrap-safe coordinator lens
+    /// (`allowlist_lens = false`).
+    pub fn over_quota_bytes(&self, cache_salt: &str, used_bytes: u64, allowlist_lens: bool) -> u64 {
+        let limit = if allowlist_lens {
+            Some(self.get_limit_bytes(cache_salt))
+        } else {
+            self.effective_limit_bytes(cache_salt)
+        };
+        match limit {
+            None => 0,
+            Some(lim) => used_bytes.saturating_sub(lim),
+        }
+    }
+}

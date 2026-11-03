@@ -17,13 +17,13 @@ use castforge::passes::{
     ArcKvEvictionPolicy, AsymK16V8Codec, CBChunkMatch, CBGroupSpec, CacheBlendRopeSpec,
     CacheGenCdfCodec, ChainedBlockHashConfig, DEFAULT_MAX_KERNELS_IN_FUSION_SET, EngineKvFormat,
     KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode, KvPageSpec,
-    KvScaleScope, PassManager, PassRegistry, analyze_kv_layer_groups, anonymize_symbolic_dims,
-    compress_splat_constants, direct_copy_format_supported, fuse_locations, fuse_reshape_epilogue,
-    fuse_sole_use_prologues, hash_prefix_token_blocks, longest_full_attention_hit,
-    longest_joint_prefix_hit, longest_sliding_window_hit, mark_cuda_graph_stable_tensors,
-    merge_identical_functions, plan_cacheblend_retrieve, plan_jenga_kv_geometry,
-    plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
-    re_rope_key_in_place, stamp_fused_provenance,
+    KvSaltQuotaRegistry, KvScaleScope, PassManager, PassRegistry, analyze_kv_layer_groups,
+    anonymize_symbolic_dims, compress_splat_constants, direct_copy_format_supported,
+    fuse_locations, fuse_reshape_epilogue, fuse_sole_use_prologues, hash_prefix_token_blocks,
+    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
+    mark_cuda_graph_stable_tensors, merge_identical_functions, plan_cacheblend_retrieve,
+    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
+    promote_narrow_accumulators, re_rope_key_in_place, stamp_fused_provenance,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -1208,4 +1208,33 @@ fn test_arc_kv_eviction_policy_ghost_adaptation_and_scan_resistance() {
     assert!(arc.target_t1_size() >= 1.0);
     assert_eq!(arc.b1_len(), 1);
     assert_eq!(arc.t2_len(), 3);
+}
+
+#[test]
+fn test_kv_salt_quota_registry_allowlist_and_bootstrap_exempt_lenses() {
+    let mut reg = KvSaltQuotaRegistry::new();
+    reg.set_quota("tenant_alpha", 4096);
+
+    // 1. Registered tenant resolves to 4096 under both lenses
+    assert!(reg.has_quota("tenant_alpha"));
+    assert_eq!(reg.get_limit_bytes("tenant_alpha"), 4096);
+    assert_eq!(reg.effective_limit_bytes("tenant_alpha"), Some(4096));
+    assert_eq!(reg.over_quota_bytes("tenant_alpha", 5120, false), 1024);
+
+    // 2. Unregistered tenant before `set_default_limit_bytes`:
+    // - Strict allowlist lens resolves to `0` (evicts all 2048 bytes on local workers)
+    // - Coordinator bootstrap lens resolves to `None` (exempt: 0 bytes over quota!)
+    assert!(!reg.has_quota("tenant_unknown"));
+    assert_eq!(reg.get_limit_bytes("tenant_unknown"), 0);
+    assert_eq!(reg.effective_limit_bytes("tenant_unknown"), None);
+    assert_eq!(reg.over_quota_bytes("tenant_unknown", 2048, true), 2048);
+    assert_eq!(reg.over_quota_bytes("tenant_unknown", 2048, false), 0);
+
+    // 3. Arm strict allowlist on coordinator (`set_default_limit_bytes(Some(0))`) after sync
+    reg.set_default_limit_bytes(Some(0));
+    assert_eq!(reg.effective_limit_bytes("tenant_unknown"), Some(0));
+    assert_eq!(reg.over_quota_bytes("tenant_unknown", 2048, false), 2048);
+
+    assert!(reg.delete_quota("tenant_alpha"));
+    assert!(!reg.has_quota("tenant_alpha"));
 }
