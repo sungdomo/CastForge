@@ -14,23 +14,24 @@ use castforge::ir::{
     DType, Dim, Location, TensorBacking, TensorEntry, TensorStore, TensorType, parse_mlir,
 };
 use castforge::passes::{
-    ArcKvEvictionPolicy, AsymK16V8Codec, BLEND_REORDER_LMIN, BlendMatchSpan, BlendObjectGroupKind,
-    BlendReadGroupSet, BlendTokenRangeMatcher, BucketHistogram, CBChunkMatch, CBGroupRopeGeometry,
-    CBGroupSpec, CHUNK_COUNT_HISTOGRAM_BOUNDS, CacheBlendRopeSpec, CacheEventBatchSpec,
-    CacheEventEntrySpec, CacheEventOpKind, CacheEventTier, CacheGenCdfCodec,
+    AffinitySlotRouter, ArcKvEvictionPolicy, AsymK16V8Codec, BLEND_REORDER_LMIN, BlendMatchSpan,
+    BlendObjectGroupKind, BlendReadGroupSet, BlendTokenRangeMatcher, BucketHistogram, CBChunkMatch,
+    CBGroupRopeGeometry, CBGroupSpec, CHUNK_COUNT_HISTOGRAM_BOUNDS, CacheBlendRopeSpec,
+    CacheEventBatchSpec, CacheEventEntrySpec, CacheEventOpKind, CacheEventTier, CacheGenCdfCodec,
     ChainedBlockHashConfig, CollectiveGraphNodeSpec, ContiguousViewPlan, CoordinatorEventGate,
     CoordinatorKeyDirectory, DEFAULT_MAX_KERNELS_IN_FUSION_SET, DaxGenerationSlotArena,
     DaxPutOutcome, DeviceGraphStage, DeviceTargetArch, DynamicAllocRequest, EXCLUDED_ENGINE_GROUP,
     EngineGroupInfoSpec, EngineKvFormat, EventIngestOutcome, FULL_ATTENTION_WINDOW,
-    FdpRawBlockSlotManager, FleetCacheUsageView, FleetWatermarkEvictionController,
-    GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager, IsolatedLruEvictionPolicy,
-    KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode, KvPageSpec,
-    KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope, KvStorageKeySpec, L2FaultInjectConfig,
-    L2FaultInjectPolicy, LayerGroupPayloadSharder, P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable,
-    P2PPeerSpec, PassManager, PassRegistry, PlacementRecord, RAW_BLOCK_META_MAGIC,
-    RAW_BLOCK_SLOT_MAGIC, ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST,
-    RawBlockMetaCheckpointHeader, ReshapeDimMapping, TOKEN_WIRE_STRIDE, TurboQuantPreset,
-    TurboQuantSerdeConfig, WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
+    FdpRawBlockSlotManager, FleetCacheUsageView, FleetInstanceRegistry, FleetMembershipCounters,
+    FleetWatermarkEvictionController, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
+    IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
+    KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope,
+    KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy, LayerGroupPayloadSharder,
+    MpInstanceSpec, P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable, P2PPeerSpec, PassManager,
+    PassRegistry, PlacementRecord, RAW_BLOCK_META_MAGIC, RAW_BLOCK_SLOT_MAGIC,
+    ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST, RawBlockMetaCheckpointHeader,
+    ReshapeDimMapping, TOKEN_WIRE_STRIDE, TurboQuantPreset, TurboQuantSerdeConfig,
+    WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
     analyze_static_reshape_dim_mapping, annotate_squeeze_unsqueeze_reshapes,
     anonymize_symbolic_dims, await_hanging_effect_chains, build_orthonormal_hadamard,
     classify_blend_read_groups, coalesce_exhaustive_gathers_to_split,
@@ -3895,4 +3896,62 @@ fn test_hybrid_engine_group_view_and_token_range_block_slicer() {
     );
     // Unaligned token range (`[128, 512)` is not divisible by `256`) returns `None`:
     assert!(slice_block_ids_per_group(&alloc, &[64, 256, 0], 128, 512).is_none());
+}
+
+#[test]
+fn test_affinity_slot_router_and_fleet_instance_registry() {
+    // 1. Verify `AffinitySlotRouter`:
+    assert!(AffinitySlotRouter::new(0).is_none());
+    let mut router = AffinitySlotRouter::new(2).expect("valid router");
+    assert_eq!(router.slot_for_key(100), (0, true, false));
+    assert_eq!(router.slot_for_key(200), (1, true, false));
+    assert_eq!(router.slot_for_key(100), (0, false, false));
+    // Third distinct key wraps onto slot 0 and marks `is_overflow = true`:
+    assert_eq!(router.slot_for_key(300), (0, true, true));
+    assert_eq!(router.stats(), (3, 1));
+
+    // 2. Verify `FleetInstanceRegistry` registration, heartbeat freshness, and stale eviction:
+    let mut reg = FleetInstanceRegistry::new();
+    let inst_a = MpInstanceSpec {
+        instance_id: "mp-a".to_string(),
+        ip: "10.0.0.1".to_string(),
+        http_port: 8000,
+        registration_time_ms: 1000,
+        last_heartbeat_time_ms: 1000,
+        p2p_advertised_url: "10.0.0.1:8100".to_string(),
+        mq_port: 8100,
+    };
+    let inst_b = MpInstanceSpec {
+        instance_id: "mp-b".to_string(),
+        ip: "10.0.0.2".to_string(),
+        http_port: 8000,
+        registration_time_ms: 1000,
+        last_heartbeat_time_ms: 1000,
+        p2p_advertised_url: String::new(),
+        mq_port: 0,
+    };
+    assert!(!reg.register(inst_a.clone()));
+    assert!(reg.register(inst_a));
+    assert!(!reg.register(inst_b));
+    assert_eq!(reg.len(), 2);
+
+    assert!(reg.update_heartbeat("mp-a", 5000));
+    assert!(!reg.update_heartbeat("mp-ghost", 5000));
+
+    // At `now_ms = 6000` with `timeout_ms = 3000`, `mp-b` (`6000 - 1000 = 5000 > 3000`) expires
+    // while `mp-a` (`6000 - 5000 = 1000 <= 3000`) stays live:
+    assert_eq!(reg.remove_stale(6000, 3000), vec!["mp-b".to_string()]);
+    assert_eq!(reg.len(), 1);
+    assert!(reg.deregister("mp-a").is_some());
+    assert!(reg.is_empty());
+    assert_eq!(
+        reg.counters(),
+        FleetMembershipCounters {
+            registered: 2,
+            re_registered: 1,
+            deregistered: 1,
+            timed_out: 1,
+            unknown_heartbeat: 1,
+        }
+    );
 }

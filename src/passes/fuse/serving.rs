@@ -11587,3 +11587,163 @@ pub fn get_engine_group_indices(
     }
     Some(per_layer)
 }
+
+/// Deterministic worker-slot router that binds each distinct `affinity_key` on first arrival to
+/// `next_slot % num_workers` so all GPU requests from the same client execute sequentially on one
+/// worker without per-instance locks.
+#[derive(Debug, Clone)]
+pub struct AffinitySlotRouter {
+    num_workers: usize,
+    key_to_slot: IndexMap<u64, usize>,
+    next_slot: usize,
+    overflow_bindings: usize,
+}
+
+impl AffinitySlotRouter {
+    /// Creates a new [`AffinitySlotRouter`] with `num_workers` (`>= 1`) worker slots.
+    pub fn new(num_workers: usize) -> Option<Self> {
+        if num_workers == 0 {
+            return None;
+        }
+        Some(Self {
+            num_workers,
+            key_to_slot: IndexMap::new(),
+            next_slot: 0,
+            overflow_bindings: 0,
+        })
+    }
+
+    /// Returns `(worker_slot, is_newly_bound, is_overflow)` for `affinity_key`.
+    pub fn slot_for_key(&mut self, affinity_key: u64) -> (usize, bool, bool) {
+        if let Some(&slot) = self.key_to_slot.get(&affinity_key) {
+            return (slot, false, false);
+        }
+        let slot = self.next_slot % self.num_workers;
+        let is_overflow = self.next_slot >= self.num_workers;
+        self.key_to_slot.insert(affinity_key, slot);
+        self.next_slot += 1;
+        if is_overflow {
+            self.overflow_bindings += 1;
+        }
+        (slot, true, is_overflow)
+    }
+
+    /// Returns `(num_bound_keys, overflow_bindings)`.
+    pub fn stats(&self) -> (usize, usize) {
+        (self.key_to_slot.len(), self.overflow_bindings)
+    }
+}
+
+/// Metadata for a registered multiprocess cache server instance in the coordinator fleet view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MpInstanceSpec {
+    /// Globally unique identifier of the MP server.
+    pub instance_id: String,
+    /// Reachable IP address of the MP server.
+    pub ip: String,
+    /// HTTP port of the MP server.
+    pub http_port: u16,
+    /// Monotonic-clock registration timestamp in milliseconds.
+    pub registration_time_ms: u64,
+    /// Monotonic-clock timestamp of the most recent heartbeat in milliseconds.
+    pub last_heartbeat_time_ms: u64,
+    /// Advertised peer-to-peer URL (empty when P2P is disabled).
+    pub p2p_advertised_url: String,
+    /// ZMQ message-queue port for P2P RPCs (`0` when P2P is disabled).
+    pub mq_port: u16,
+}
+
+/// Cumulative membership-change counters tracked by [`FleetInstanceRegistry`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FleetMembershipCounters {
+    /// New instance registrations.
+    pub registered: u64,
+    /// Re-registrations of an already-present `instance_id`.
+    pub re_registered: u64,
+    /// Explicit deregistrations.
+    pub deregistered: u64,
+    /// Instances removed due to heartbeat expiration.
+    pub timed_out: u64,
+    /// Heartbeats received from an unregistered `instance_id`.
+    pub unknown_heartbeat: u64,
+}
+
+/// Monotonic-clock heartbeat registry of live MP cache servers in the fleet.
+#[derive(Debug, Clone, Default)]
+pub struct FleetInstanceRegistry {
+    instances: IndexMap<String, MpInstanceSpec>,
+    counters: FleetMembershipCounters,
+}
+
+impl FleetInstanceRegistry {
+    /// Creates an empty [`FleetInstanceRegistry`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers or replaces `instance`, returning `true` if `instance_id` was already registered
+    /// (a re-registration) or `false` on first registration.
+    pub fn register(&mut self, instance: MpInstanceSpec) -> bool {
+        let existed = self.instances.contains_key(&instance.instance_id);
+        self.instances
+            .insert(instance.instance_id.clone(), instance);
+        if existed {
+            self.counters.re_registered += 1;
+        } else {
+            self.counters.registered += 1;
+        }
+        existed
+    }
+
+    /// Removes `instance_id` and increments `deregistered` when found.
+    pub fn deregister(&mut self, instance_id: &str) -> Option<MpInstanceSpec> {
+        let removed = self.instances.shift_remove(instance_id);
+        if removed.is_some() {
+            self.counters.deregistered += 1;
+        }
+        removed
+    }
+
+    /// Updates `last_heartbeat_time_ms` for `instance_id`, returning `true` if found or `false`
+    /// (and incrementing `unknown_heartbeat`) if `instance_id` is not registered.
+    pub fn update_heartbeat(&mut self, instance_id: &str, timestamp_ms: u64) -> bool {
+        let Some(inst) = self.instances.get_mut(instance_id) else {
+            self.counters.unknown_heartbeat += 1;
+            return false;
+        };
+        inst.last_heartbeat_time_ms = timestamp_ms;
+        true
+    }
+
+    /// Removes and returns all `instance_id`s whose `now_ms - last_heartbeat_time_ms > timeout_ms`.
+    pub fn remove_stale(&mut self, now_ms: u64, timeout_ms: u64) -> Vec<String> {
+        let expired: Vec<String> = self
+            .instances
+            .iter()
+            .filter_map(|(id, inst)| {
+                (now_ms.saturating_sub(inst.last_heartbeat_time_ms) > timeout_ms)
+                    .then_some(id.clone())
+            })
+            .collect();
+        for id in &expired {
+            self.instances.shift_remove(id);
+        }
+        self.counters.timed_out += expired.len() as u64;
+        expired
+    }
+
+    /// Returns the number of currently registered servers.
+    pub fn len(&self) -> usize {
+        self.instances.len()
+    }
+
+    /// Returns true if no servers are registered.
+    pub fn is_empty(&self) -> bool {
+        self.instances.is_empty()
+    }
+
+    /// Returns the cumulative [`FleetMembershipCounters`].
+    pub fn counters(&self) -> FleetMembershipCounters {
+        self.counters
+    }
+}
