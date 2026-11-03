@@ -5833,3 +5833,84 @@ pub fn coalesce_partitioning_slices_to_split(module: &mut Module) -> usize {
 
     coalesced_groups
 }
+
+/// Returns `Some(axis)` if reshaping from `input_dims` to `output_dims` drops exactly one size-1
+/// dimension at `axis` while leaving all other (static, symbolic, or dynamic) dimensions
+/// unchanged (inspired by Modular `GraphCompiler/lib/MODialect/Patterns/ShapeOpSinking.cpp`
+/// `findSqueezeAxis`).
+pub fn find_squeeze_axis(input_dims: &[Dim], output_dims: &[Dim]) -> Option<usize> {
+    if input_dims.len() != output_dims.len() + 1 {
+        return None;
+    }
+    let offset = (0..input_dims.len())
+        .find(|&i| output_dims.get(i) != Some(&input_dims[i]))
+        .unwrap_or(output_dims.len());
+    if input_dims[offset] != Dim::Static(1) {
+        return None;
+    }
+    if input_dims[..offset] != output_dims[..offset] {
+        return None;
+    }
+    if input_dims[offset + 1..] != output_dims[offset..] {
+        return None;
+    }
+    Some(offset)
+}
+
+/// Returns `Some(axis)` if reshaping from `input_dims` to `output_dims` inserts exactly one size-1
+/// dimension at `axis` while leaving all other dimensions unchanged.
+pub fn find_unsqueeze_axis(input_dims: &[Dim], output_dims: &[Dim]) -> Option<usize> {
+    find_squeeze_axis(output_dims, input_dims)
+}
+
+/// Annotates `stablehlo.reshape` operations that drop or insert a single size-1 dimension with
+/// `castforge.squeeze_axis` or `castforge.unsqueeze_axis`
+/// (inspired by Modular `GraphCompiler/lib/MODialect/Patterns/ShapeOpSinking.cpp`).
+///
+/// Returns the number of squeeze/unsqueeze reshapes annotated.
+pub fn annotate_squeeze_unsqueeze_reshapes(module: &mut Module) -> usize {
+    let mut annotated = 0usize;
+    let op_ids: Vec<_> = module.ops.keys().collect();
+
+    for op_id in op_ids {
+        let Some(op) = module.ops.get(op_id) else {
+            continue;
+        };
+        if !op.is_op("stablehlo", "reshape") || op.operands.len() != 1 || op.results.len() != 1 {
+            continue;
+        }
+        let in_val = op.operands[0];
+        let out_val = op.results[0];
+        let (Some(in_info), Some(out_info)) =
+            (module.values.get(in_val), module.values.get(out_val))
+        else {
+            continue;
+        };
+        let (Type::Tensor(in_tt), Type::Tensor(out_tt)) = (&in_info.ty, &out_info.ty) else {
+            continue;
+        };
+
+        let squeeze = find_squeeze_axis(&in_tt.shape, &out_tt.shape);
+        let unsqueeze = find_unsqueeze_axis(&in_tt.shape, &out_tt.shape);
+
+        if let Some(axis) = squeeze {
+            if let Some(op_mut) = module.ops.get_mut(op_id) {
+                op_mut.attributes.insert(
+                    "castforge.squeeze_axis".to_string(),
+                    Attribute::Int(axis as i64),
+                );
+                annotated += 1;
+            }
+        } else if let Some(axis) = unsqueeze
+            && let Some(op_mut) = module.ops.get_mut(op_id)
+        {
+            op_mut.attributes.insert(
+                "castforge.unsqueeze_axis".to_string(),
+                Attribute::Int(axis as i64),
+            );
+            annotated += 1;
+        }
+    }
+
+    annotated
+}

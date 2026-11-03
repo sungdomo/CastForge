@@ -22,22 +22,23 @@ use castforge::passes::{
     KvScaleScope, KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy,
     LayerGroupPayloadSharder, PassManager, PassRegistry, ROWWISE_CHEAP_OP_COST,
     ROWWISE_EXPENSIVE_OP_COST, TOKEN_WIRE_STRIDE, WarmPrefetchJobTable, WarmPrefetchStatus,
-    analyze_kv_layer_groups, anonymize_symbolic_dims, await_hanging_effect_chains,
-    coalesce_partitioning_slices_to_split, compress_splat_constants, decode_kv_fs_filename,
-    decode_kv_storage_key, defer_allocs_to_first_use, direct_copy_format_supported,
-    downsample_subchunk_swa_block_ids, elide_redundant_state_transfers,
-    eliminate_implied_dependencies, encode_kv_fs_filename, encode_kv_storage_key,
-    flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
-    fuse_reshape_epilogue, fuse_sole_use_prologues, hash_packed_token_blocks_be,
-    hash_prefix_token_blocks, hoist_exec_invariant_ops, hoist_symbolic_dim_expressions,
-    is_supported_arch_dtype, legalize_rowwise_reduction_launch, longest_full_attention_hit,
-    longest_joint_prefix_hit, longest_sliding_window_hit, mark_cuda_graph_stable_tensors,
-    merge_adjacent_parallel_loops, merge_duplicate_shape_ops, merge_identical_functions,
-    num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve, plan_concat_in_place,
-    plan_dynamic_memory_pool, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
-    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
-    recalculate_subchunk_blocks_to_skip, reuse_dead_loop_buffers, stamp_fused_provenance,
-    unfold_chunk_range, unpack_token_ids_be, validate_target_device_dtypes,
+    analyze_kv_layer_groups, annotate_squeeze_unsqueeze_reshapes, anonymize_symbolic_dims,
+    await_hanging_effect_chains, coalesce_partitioning_slices_to_split, compress_splat_constants,
+    decode_kv_fs_filename, decode_kv_storage_key, defer_allocs_to_first_use,
+    direct_copy_format_supported, downsample_subchunk_swa_block_ids,
+    elide_redundant_state_transfers, eliminate_implied_dependencies, encode_kv_fs_filename,
+    encode_kv_storage_key, find_squeeze_axis, find_unsqueeze_axis, flatten_elementwise_chains,
+    fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
+    fuse_sole_use_prologues, hash_packed_token_blocks_be, hash_prefix_token_blocks,
+    hoist_exec_invariant_ops, hoist_symbolic_dim_expressions, is_supported_arch_dtype,
+    legalize_rowwise_reduction_launch, longest_full_attention_hit, longest_joint_prefix_hit,
+    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops,
+    merge_duplicate_shape_ops, merge_identical_functions, num_packed_tokens, pack_token_ids_be,
+    plan_cacheblend_retrieve, plan_concat_in_place, plan_dynamic_memory_pool,
+    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
+    promote_narrow_accumulators, re_rope_key_in_place, recalculate_subchunk_blocks_to_skip,
+    reuse_dead_loop_buffers, stamp_fused_provenance, unfold_chunk_range, unpack_token_ids_be,
+    validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -2320,5 +2321,62 @@ module @slice_to_split {
             .attributes
             .get("castforge.coalesced_split_sizes"),
         Some(&Attribute::DenseIntArray(vec![4, 8, 4]))
+    );
+}
+
+#[test]
+fn test_find_squeeze_unsqueeze_axis_and_reshape_annotation() {
+    use castforge::ir::Attribute;
+
+    // Symbolic + static dims example from Modular `ShapeOpSinking.cpp`:
+    // `[D1, 2, 1, D3]` -> `[D1, 2, D3]` => `Some(2)`
+    let in_dims = vec![
+        Dim::Symbolic("D1".to_string()),
+        Dim::Static(2),
+        Dim::Static(1),
+        Dim::Symbolic("D3".to_string()),
+    ];
+    let out_dims = vec![
+        Dim::Symbolic("D1".to_string()),
+        Dim::Static(2),
+        Dim::Symbolic("D3".to_string()),
+    ];
+    assert_eq!(find_squeeze_axis(&in_dims, &out_dims), Some(2));
+    assert_eq!(find_unsqueeze_axis(&out_dims, &in_dims), Some(2));
+
+    // Mismatched trailing symbolic dim (`[D1, 2, 1, D4]` -> `[D1, 2, D3]`) => `None`
+    let bad_in = vec![
+        Dim::Symbolic("D1".to_string()),
+        Dim::Static(2),
+        Dim::Static(1),
+        Dim::Symbolic("D4".to_string()),
+    ];
+    assert_eq!(find_squeeze_axis(&bad_in, &out_dims), None);
+
+    let mlir = r#"
+module @squeeze_unsqueeze {
+  func.func @main(%x: tensor<4x1x8xf32>) -> tensor<1x4x8xf32> {
+    %sq = stablehlo.reshape %x : (tensor<4x1x8xf32>) -> tensor<4x8xf32>
+    %unsq = stablehlo.reshape %sq : (tensor<4x8xf32>) -> tensor<1x4x8xf32>
+    return %unsq : tensor<1x4x8xf32>
+  }
+}
+"#;
+    let mut module = parse_mlir(mlir).expect("valid MLIR");
+    let count = annotate_squeeze_unsqueeze_reshapes(&mut module);
+    assert_eq!(count, 2);
+
+    let func_id = module.functions()[0];
+    let func_block = module.regions[module.ops[func_id].regions[0]].blocks[0];
+    let ops = &module.blocks[func_block].ops;
+    assert_eq!(
+        module.ops[ops[0]].attributes.get("castforge.squeeze_axis"),
+        Some(&Attribute::Int(1))
+    );
+    assert_eq!(
+        module.ops[ops[1]]
+            .attributes
+            .get("castforge.unsqueeze_axis"),
+        Some(&Attribute::Int(0))
     );
 }
