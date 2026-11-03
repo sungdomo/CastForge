@@ -4751,3 +4751,45 @@ fn test_store_policy_planner_and_binary_trace_stream_codec() {
     assert_eq!(dec_recs2, recs);
     assert!(truncated2);
 }
+
+#[test]
+fn test_hoist_loop_invariant_index_views_preserves_store_transforms() {
+    use castforge::passes::hoist_loop_invariant_index_views;
+
+    // `%idx_r` (`map.index.reshape`) feeds BOTH `map.store` (at operand 1) and `%idx_b`
+    // (`map.index.broadcast`), which feeds `%idx_s` (`map.index.slice`) -> `map.load`.
+    // Only `[%idx_s, %idx_b]` is hoistable; `%idx_r` feeds the store index and must stay!
+    let mlir = concat!(
+        "module @hoist_index_views {\n",
+        "  func.func @main(%in_t: tensor<4xf32>, %out_t: tensor<4xf32>, %idx0: tensor<1xi64>)",
+        " -> tensor<4xf32> {\n",
+        "    %idx_r = map.index.reshape %idx0 : (tensor<1xi64>) -> tensor<1xi64>\n",
+        "    %idx_b = map.index.broadcast %idx_r : (tensor<1xi64>) -> tensor<1xi64>\n",
+        "    %idx_s = map.index.slice %idx_b : (tensor<1xi64>) -> tensor<1xi64>\n",
+        "    %val = map.load %in_t, %idx_s : (tensor<4xf32>, tensor<1xi64>) -> tensor<4xf32>\n",
+        "    %stored = map.store %out_t, %idx_r, %val",
+        " : (tensor<4xf32>, tensor<1xi64>, tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %stored : tensor<4xf32>\n",
+        "  }\n",
+        "}\n",
+    );
+
+    let mut m = parse_mlir(mlir).expect("valid MLIR");
+    let hoisted = hoist_loop_invariant_index_views(&mut m);
+    assert_eq!(hoisted, 2);
+
+    let func_id = m.functions()[0];
+    let blk_id = m.regions[m.ops[func_id].regions[0]].blocks[0];
+    let op_names: Vec<String> = m.blocks[blk_id]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+
+    assert!(op_names.contains(&"map.index.slice.stride".to_string()));
+    assert!(op_names.contains(&"map.index.broadcast.stride".to_string()));
+    assert!(!op_names.contains(&"map.index.slice".to_string()));
+    assert!(!op_names.contains(&"map.index.broadcast".to_string()));
+    // Store-feeding `map.index.reshape` remains in place:
+    assert!(op_names.contains(&"map.index.reshape".to_string()));
+}

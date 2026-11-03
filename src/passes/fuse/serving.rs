@@ -15299,3 +15299,198 @@ pub fn decode_trace_stream(stream: &[u8]) -> Result<(TraceHeader, Vec<TraceRecor
 
     Ok((header, records, had_truncated_tail))
 }
+
+// ============================================================================
+// Batch 18 Step 2: Loop-Invariant Index-Transform View Hoister
+// ============================================================================
+
+/// Returns `true` if `op_name` is a `map.index.*` coordinate transform operation.
+#[must_use]
+pub fn is_map_index_transform_op(op_name: &str) -> bool {
+    matches!(
+        op_name,
+        "map.index.slice" | "map.index.broadcast" | "map.index.reshape" | "map.index.transpose"
+    )
+}
+
+/// Walks backward from `index_val` through `map.index.*` transform ops, returning the chain in
+/// closest-to-load order.
+fn collect_index_transform_chain(module: &Module, index_val: ValueId) -> Vec<OpId> {
+    let mut chain = Vec::new();
+    let mut cur = index_val;
+    while let ValueDef::OpResult { op: def_op, .. } = module.values[cur].def {
+        let op = &module.ops[def_op];
+        if !is_map_index_transform_op(&op.name.full_name()) || op.operands.is_empty() {
+            break;
+        }
+        chain.push(def_op);
+        cur = op.operands[0];
+    }
+    chain
+}
+
+/// Returns `true` if `transform_op`'s output index reaches a `map.store`'s index operand
+/// (`operands[1]`) directly or through further `map.index.*` transforms in `block_id`.
+fn transitively_feeds_store_index(module: &Module, block_id: BlockId, transform_op: OpId) -> bool {
+    let Some(&res0) = module.ops[transform_op].results.first() else {
+        return false;
+    };
+    let mut worklist = vec![res0];
+    let mut visited = IndexSet::new();
+    visited.insert(res0);
+
+    while let Some(idx_val) = worklist.pop() {
+        for &op_id in &module.blocks[block_id].ops {
+            let op = &module.ops[op_id];
+            let full = op.name.full_name();
+            if full == "map.store" {
+                // `map.store` operands: [tensor, index, value] (or [index, value] if 2 operands).
+                let idx_slot = if op.operands.len() >= 3 { 1 } else { 0 };
+                if op.operands.get(idx_slot) == Some(&idx_val) {
+                    return true;
+                }
+            } else if is_map_index_transform_op(&full)
+                && op.operands.first() == Some(&idx_val)
+                && let Some(&next_idx) = op.results.first()
+                && visited.insert(next_idx)
+            {
+                worklist.push(next_idx);
+            }
+        }
+    }
+    false
+}
+
+/// Length of the leading prefix of `chain` (closest-to-load first) that does not transitively
+/// feed any `map.store` index.
+fn hoistable_index_prefix_len(module: &Module, block_id: BlockId, chain: &[OpId]) -> usize {
+    chain
+        .iter()
+        .take_while(|&&op_id| !transitively_feeds_store_index(module, block_id, op_id))
+        .count()
+}
+
+/// Hoists chains of loop-invariant `map.index.*` coordinate transforms feeding `map.load` (that do
+/// not transitively feed a `map.store` index) into `.stride` tensor view operations (e.g.
+/// `map.index.slice.stride`), rewires `map.load` and `map.call_elementwise` to use the outermost
+/// surviving loop index, and erases dead `map.index.*` ops. Returns the number of hoisted view ops.
+pub fn hoist_loop_invariant_index_views(module: &mut Module) -> usize {
+    let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+    let mut hoisted_count = 0usize;
+
+    for block_id in block_ids {
+        let orig_ops = module.blocks[block_id].ops.clone();
+        let loads: Vec<OpId> = orig_ops
+            .iter()
+            .copied()
+            .filter(|&op_id| {
+                module.ops[op_id].name.full_name() == "map.load"
+                    && module.ops[op_id].operands.len() >= 2
+            })
+            .collect();
+
+        for load_op in loads {
+            let tensor_val = module.ops[load_op].operands[0];
+            let index_val = module.ops[load_op].operands[1];
+            let mut chain = collect_index_transform_chain(module, index_val);
+            let prefix = hoistable_index_prefix_len(module, block_id, &chain);
+            if prefix == 0 {
+                continue;
+            }
+            chain.truncate(prefix);
+
+            let outermost_op = *chain.last().unwrap();
+            let outermost_index = module.ops[outermost_op].operands[0];
+            let tensor_ty = module.values[tensor_val].ty.clone();
+
+            let mut cur_tensor = tensor_val;
+            let mut stride_ops_to_insert = Vec::with_capacity(chain.len());
+
+            for &transform_op in &chain {
+                let t_op = &module.ops[transform_op];
+                let stride_name = format!("{}.stride", t_op.name.name);
+                let mut stride_operands = SmallVec::new();
+                stride_operands.push(cur_tensor);
+                for &extra_opd in t_op.operands.iter().skip(1) {
+                    stride_operands.push(extra_opd);
+                }
+                let attrs = t_op.attributes.clone();
+                let loc = t_op.location.clone();
+
+                let stride_op = module.ops.insert_with_key(|id| Operation {
+                    id,
+                    name: OpName::new("map", stride_name),
+                    operands: stride_operands,
+                    results: SmallVec::new(),
+                    attributes: attrs,
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: loc,
+                });
+                let new_view = module.values.insert_with_key(|id| Value {
+                    id,
+                    ssa_name: None,
+                    ty: tensor_ty.clone(),
+                    def: ValueDef::OpResult {
+                        op: stride_op,
+                        index: 0,
+                    },
+                });
+                module.ops[stride_op].results.push(new_view);
+                cur_tensor = new_view;
+                stride_ops_to_insert.push(stride_op);
+                hoisted_count += 1;
+            }
+
+            if let Some(pos) = module.blocks[block_id]
+                .ops
+                .iter()
+                .position(|&id| id == load_op)
+            {
+                for (i, s_op) in stride_ops_to_insert.into_iter().enumerate() {
+                    module.blocks[block_id].ops.insert(pos + i, s_op);
+                }
+            }
+
+            module.ops[load_op].operands[0] = cur_tensor;
+            module.ops[load_op].operands[1] = outermost_index;
+        }
+
+        // Rewire `map.call_elementwise` ops that share a hoistable index chain.
+        let elem_calls: Vec<OpId> = module.blocks[block_id]
+            .ops
+            .iter()
+            .copied()
+            .filter(|&op_id| {
+                module.ops[op_id].name.full_name() == "map.call_elementwise"
+                    && !module.ops[op_id].operands.is_empty()
+            })
+            .collect();
+        for call_op in elem_calls {
+            let idx_val = module.ops[call_op].operands[0];
+            let chain = collect_index_transform_chain(module, idx_val);
+            let prefix = hoistable_index_prefix_len(module, block_id, &chain);
+            if prefix > 0 {
+                let outermost_idx = module.ops[chain[prefix - 1]].operands[0];
+                module.ops[call_op].operands[0] = outermost_idx;
+            }
+        }
+
+        // Erase unused `map.index.*` transforms in reverse order so outer hops become dead too.
+        let transforms: Vec<OpId> = module.blocks[block_id]
+            .ops
+            .iter()
+            .copied()
+            .filter(|&op_id| is_map_index_transform_op(&module.ops[op_id].name.full_name()))
+            .collect();
+        for &t_op in transforms.iter().rev() {
+            if let Some(&res0) = module.ops[t_op].results.first()
+                && count_value_uses_in_block(module, block_id, res0) == 0
+            {
+                module.blocks[block_id].ops.retain(|&id| id != t_op);
+            }
+        }
+    }
+
+    hoisted_count
+}
