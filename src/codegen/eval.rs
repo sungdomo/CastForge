@@ -360,10 +360,34 @@ fn eval_stablehlo_op(
     env: &mut HashMap<ValueId, Vec<f32>>,
 ) -> Result<()> {
     let op = &module.ops[op_id];
+    let prologue_op = op
+        .attributes
+        .get("castforge.prologue_op")
+        .and_then(|a| a.as_str());
+    let first_opnd = op.operands.first().copied();
     let get_v = |vid: ValueId| -> Vec<f32> {
-        env.get(&vid)
+        let mut v = env
+            .get(&vid)
             .cloned()
-            .unwrap_or_else(|| vec![0.0; tensor_len(module, vid)])
+            .unwrap_or_else(|| vec![0.0; tensor_len(module, vid)]);
+        if Some(vid) == first_opnd
+            && let Some(p_op) = prologue_op
+        {
+            for x in &mut v {
+                *x = match p_op {
+                    "negate" => -*x,
+                    "abs" => x.abs(),
+                    "tanh" => x.tanh(),
+                    "exponential" => x.exp(),
+                    "log" => x.ln(),
+                    "sqrt" => x.sqrt(),
+                    "rsqrt" => 1.0 / x.sqrt(),
+                    "logistic" => 1.0 / (1.0 + (-*x).exp()),
+                    _ => *x,
+                };
+            }
+        }
+        v
     };
 
     if op.is_op("stablehlo", "log") && !op.operands.is_empty() {

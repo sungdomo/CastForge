@@ -245,7 +245,25 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                 let fma = LoopStmt::Assign {
                     dst: dst.clone(),
                     index: format!("i * {n} + j"),
-                    expr: format!("{dst}[i * {n} + j] + {lhs}[i * {k} + p] * {rhs_term}"),
+                    expr: {
+                        let raw_lhs = format!("{lhs}[i * {k} + p]");
+                        let lhs_term = match op
+                            .attributes
+                            .get("castforge.prologue_op")
+                            .and_then(|a| a.as_str())
+                        {
+                            Some("negate") => format!("(-({raw_lhs}))"),
+                            Some("abs") => format!("fabsf({raw_lhs})"),
+                            Some("tanh") => format!("tanhf({raw_lhs})"),
+                            Some("exponential") => format!("expf({raw_lhs})"),
+                            Some("log") => format!("logf({raw_lhs})"),
+                            Some("sqrt") => format!("sqrtf({raw_lhs})"),
+                            Some("rsqrt") => format!("(1.0f / sqrtf({raw_lhs}))"),
+                            Some("logistic") => format!("(1.0f / (1.0f + expf(-({raw_lhs}))))"),
+                            _ => raw_lhs,
+                        };
+                        format!("{dst}[i * {n} + j] + {lhs_term} * {rhs_term}")
+                    },
                 };
                 let j_loop = LoopStmt::For {
                     var: "j".to_string(),
@@ -536,7 +554,26 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                     body: vec![LoopStmt::Assign {
                         dst: dst.clone(),
                         index: format!("row * {cols} + col"),
-                        expr: format!("{tbl}[((int){idx_buf}[row]) * {cols} + col]"),
+                        expr: {
+                            let raw_tbl = format!("{tbl}[((int){idx_buf}[row]) * {cols} + col]");
+                            match op
+                                .attributes
+                                .get("castforge.prologue_op")
+                                .and_then(|a| a.as_str())
+                            {
+                                Some("negate") => format!("(-({raw_tbl}))"),
+                                Some("abs") => format!("fabsf({raw_tbl})"),
+                                Some("tanh") => format!("tanhf({raw_tbl})"),
+                                Some("exponential") => format!("expf({raw_tbl})"),
+                                Some("log") => format!("logf({raw_tbl})"),
+                                Some("sqrt") => format!("sqrtf({raw_tbl})"),
+                                Some("rsqrt") => format!("(1.0f / sqrtf({raw_tbl}))"),
+                                Some("logistic") => {
+                                    format!("(1.0f / (1.0f + expf(-({raw_tbl}))))")
+                                }
+                                _ => raw_tbl,
+                            }
+                        },
                     }],
                 };
                 body.push(LoopStmt::For {

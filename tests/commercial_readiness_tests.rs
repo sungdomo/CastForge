@@ -15,9 +15,10 @@ use castforge::passes::{
     AsymK16V8Codec, CacheBlendRopeSpec, ChainedBlockHashConfig, EngineKvFormat,
     KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode, KvPageSpec,
     KvScaleScope, PassManager, PassRegistry, analyze_kv_layer_groups, compress_splat_constants,
-    direct_copy_format_supported, hash_prefix_token_blocks, longest_full_attention_hit,
-    longest_joint_prefix_hit, longest_sliding_window_hit, mark_cuda_graph_stable_tensors,
-    plan_jenga_kv_geometry, plan_kv_dma_transfer, re_rope_key_in_place,
+    direct_copy_format_supported, fuse_sole_use_prologues, hash_prefix_token_blocks,
+    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
+    mark_cuda_graph_stable_tensors, plan_jenga_kv_geometry, plan_kv_dma_transfer,
+    re_rope_key_in_place,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -846,4 +847,37 @@ fn test_kv_dma_transfer_planner_and_pin_chunk_boundary_splitting() {
     assert_eq!(cross_split.entries[0].width_bytes, 1024);
     assert_eq!(cross_split.entries[1].host_offset, 4096);
     assert_eq!(cross_split.entries[1].width_bytes, 3072);
+}
+
+#[test]
+fn test_prologue_input_fusion_into_gather_and_gemm() {
+    let mlir = r#"
+module @prologue_fusion {
+  func.func @main(%x: tensor<4x4xf32>, %w: tensor<4x4xf32>) -> tensor<4x4xf32> {
+    %0 = stablehlo.tanh %x : tensor<4x4xf32>
+    %1 = stablehlo.dot_general %0, %w : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xf32>
+    func.return %1 : tensor<4x4xf32>
+  }
+}
+"#;
+    let mut module = parse_mlir(mlir).unwrap();
+    let x = vec![0.5f32; 16];
+    let w = vec![1.0f32; 16];
+    let out_before = evaluate_module(&module, &[x.clone(), w.clone()]).unwrap();
+
+    let fused = fuse_sole_use_prologues(&mut module);
+    assert_eq!(fused, 1);
+
+    let printed = castforge::ir::print_mlir(&module);
+    assert!(!printed.contains("stablehlo.tanh"));
+    assert!(printed.contains("castforge.prologue_op = \"tanh\""));
+
+    let out_after = evaluate_module(&module, &[x, w]).unwrap();
+    assert_eq!(out_before, out_after);
+
+    let backend_reg = BackendRegistry::with_builtin_backends();
+    let cuda_src = backend_reg
+        .generate("cuda", &module, &TargetConfig::default())
+        .unwrap();
+    assert!(cuda_src.contains("tanhf("));
 }

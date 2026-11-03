@@ -1663,3 +1663,105 @@ pub fn plan_kv_dma_transfer(
         pin_boundary_splits,
     }
 }
+
+/// Fuses sole-use unary elementwise producers (`negate`, `abs`, `tanh`, `exponential`, `log`,
+/// `sqrt`, `rsqrt`, `logistic`, `convert`) into the data-operand prologue of a `dot_general`,
+/// `gather`, or `reduce` consumer (inspired by Modular `PrologueFuser.cpp` & `InputFusion.cpp`).
+///
+/// Eliminates the intermediate producer buffer and evaluates the unary transform on-the-fly
+/// during the consumer's load. Returns the number of prologues fused.
+pub fn fuse_sole_use_prologues(module: &mut Module) -> usize {
+    let mut fused_count = 0usize;
+
+    for fn_op_id in module.functions() {
+        let Some(&reg_id) = module.ops[fn_op_id].regions.first() else {
+            continue;
+        };
+        let Some(&block_id) = module.regions[reg_id].blocks.first() else {
+            continue;
+        };
+        let ops = module.blocks[block_id].ops.clone();
+
+        let mut use_counts: std::collections::HashMap<ValueId, usize> =
+            std::collections::HashMap::new();
+        for &op_id in &ops {
+            if let Some(op) = module.ops.get(op_id) {
+                for &opnd in &op.operands {
+                    *use_counts.entry(opnd).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let mut to_remove: std::collections::HashSet<OpId> = std::collections::HashSet::new();
+
+        for &cons_id in &ops {
+            if to_remove.contains(&cons_id) {
+                continue;
+            }
+            let Some(cons_op) = module.ops.get(cons_id).cloned() else {
+                continue;
+            };
+            let is_eligible_consumer = cons_op.is_op("stablehlo", "dot_general")
+                || cons_op.is_op("stablehlo", "gather")
+                || cons_op.is_op("stablehlo", "reduce");
+            if !is_eligible_consumer
+                || cons_op.operands.is_empty()
+                || cons_op.attributes.contains_key("castforge.prologue_op")
+            {
+                continue;
+            }
+            let first_opnd = cons_op.operands[0];
+            if use_counts.get(&first_opnd).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            let ValueDef::OpResult { op: prod_id, .. } = module.values[first_opnd].def else {
+                continue;
+            };
+            if to_remove.contains(&prod_id) {
+                continue;
+            }
+            let Some(prod_op) = module.ops.get(prod_id).cloned() else {
+                continue;
+            };
+            let is_unary_elementwise = prod_op.name.dialect == "stablehlo"
+                && prod_op.operands.len() == 1
+                && matches!(
+                    prod_op.name.name.as_str(),
+                    "negate"
+                        | "abs"
+                        | "tanh"
+                        | "exponential"
+                        | "log"
+                        | "sqrt"
+                        | "rsqrt"
+                        | "logistic"
+                        | "convert"
+                );
+            if !is_unary_elementwise {
+                continue;
+            }
+
+            let raw_input = prod_op.operands[0];
+            let prod_name = prod_op.name.name.clone();
+            if let Some(cons_mut) = module.ops.get_mut(cons_id) {
+                cons_mut.operands[0] = raw_input;
+                cons_mut.attributes.insert(
+                    "castforge.prologue_op".to_string(),
+                    Attribute::String(prod_name),
+                );
+            }
+            to_remove.insert(prod_id);
+            fused_count += 1;
+        }
+
+        if !to_remove.is_empty() {
+            module.blocks[block_id]
+                .ops
+                .retain(|id| !to_remove.contains(id));
+            for dead_id in to_remove {
+                module.ops.remove(dead_id);
+            }
+        }
+    }
+    fused_count
+}
