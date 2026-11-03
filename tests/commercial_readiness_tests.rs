@@ -6490,3 +6490,107 @@ module {
     assert!(m.ops[m.blocks[gr_except_blk].ops[0]].is_op("castforge", "async_error"));
     assert!(m.ops[m.blocks[gr_except_blk].ops[1]].is_op("castforge", "yield"));
 }
+
+#[test]
+fn test_canonicalize_funcs_for_merge_and_merge_identical_kernel_stubs() {
+    use castforge::ir::Attribute;
+    use castforge::passes::{
+        canonicalize_device_ref_str, canonicalize_funcs_for_merge, merge_identical_kernel_stubs,
+    };
+
+    assert_eq!(
+        canonicalize_device_ref_str("gpu:3"),
+        Some("gpu:0".to_string())
+    );
+    assert_eq!(canonicalize_device_ref_str("gpu:0"), None);
+
+    let mlir_src = concat!(
+        "module {\n",
+        "  func.func @leaf_b(%arg0: tensor<4xf32>) -> tensor<4xf32> {\n",
+        "    %0 = \"stablehlo.exponential\"(%arg0) : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %0 : tensor<4xf32>\n",
+        "  }\n",
+        "  func.func @leaf_a(%arg0: tensor<4xf32>) -> tensor<4xf32> {\n",
+        "    %0 = \"stablehlo.exponential\"(%arg0) : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %0 : tensor<4xf32>\n",
+        "  }\n",
+        "  func.func @caller_b(%arg0: tensor<4xf32>) -> tensor<4xf32> {\n",
+        "    %0 = \"castforge.call\"(%arg0) {callee = @leaf_b}",
+        " : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %0 : tensor<4xf32>\n",
+        "  }\n",
+        "  func.func @caller_a(%arg0: tensor<4xf32>) -> tensor<4xf32> {\n",
+        "    %0 = \"castforge.call\"(%arg0) {callee = @leaf_a}",
+        " : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %0 : tensor<4xf32>\n",
+        "  }\n",
+        "  func.func @entry(%arg0: tensor<4xf32>) -> tensor<4xf32> {\n",
+        "    %0 = \"castforge.compiled_call\"(%arg0) {callee_symbol = @caller_b}",
+        " : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %0 : tensor<4xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(mlir_src).expect("valid mlir");
+    let funcs = m.functions();
+    let f_leaf_b = funcs[0];
+    let f_leaf_a = funcs[1];
+    let f_caller_b = funcs[2];
+    let f_caller_a = funcs[3];
+    let f_entry = funcs[4];
+
+    // Give leaf_b and leaf_a different device ordinals (`gpu:2` vs `gpu:1`) and different
+    // non-SIMD symbolic shape dim names (`batch_x` vs `batch_y`):
+    m.ops[f_leaf_b].attributes.insert(
+        "device_ref".to_string(),
+        Attribute::String("gpu:2".to_string()),
+    );
+    m.ops[f_leaf_a].attributes.insert(
+        "device_ref".to_string(),
+        Attribute::String("gpu:1".to_string()),
+    );
+    let op_b = m.blocks[m.regions[m.ops[f_leaf_b].regions[0]].blocks[0]].ops[0];
+    let op_a = m.blocks[m.regions[m.ops[f_leaf_a].regions[0]].blocks[0]].ops[0];
+    m.ops[op_b].attributes.insert(
+        "shape_dims".to_string(),
+        Attribute::Array(vec![
+            Attribute::String("batch_x".to_string()),
+            Attribute::String("simd:4".to_string()),
+        ]),
+    );
+    m.ops[op_a].attributes.insert(
+        "shape_dims".to_string(),
+        Attribute::Array(vec![
+            Attribute::String("batch_y".to_string()),
+            Attribute::String("simd:4".to_string()),
+        ]),
+    );
+    m.ops[f_caller_b].attributes.insert(
+        "fusion_info".to_string(),
+        Attribute::String("fused_from_layer_2".to_string()),
+    );
+    m.ops[f_caller_a].attributes.insert(
+        "fusion_info".to_string(),
+        Attribute::String("fused_from_layer_1".to_string()),
+    );
+
+    let canon_changes = canonicalize_funcs_for_merge(&mut m);
+    assert_eq!(canon_changes, 4);
+
+    // Bottom-up merge first collapses (@leaf_a, @leaf_b) -> @leaf_a, which makes @caller_a and
+    // @caller_b identical modulo `fusion_info`, collapsing (@caller_a, @caller_b) -> @caller_a
+    // and rewriting @entry's `castforge.compiled_call` to `@caller_a`:
+    let merged = merge_identical_kernel_stubs(&mut m);
+    assert_eq!(merged, 2);
+    assert_eq!(m.functions().len(), 3);
+
+    let entry_blk = m.regions[m.ops[f_entry].regions[0]].blocks[0];
+    let compiled_call_id = m.blocks[entry_blk].ops[0];
+    assert_eq!(
+        m.ops[compiled_call_id]
+            .attributes
+            .get("callee_symbol")
+            .and_then(|a| a.as_str()),
+        Some("caller_a")
+    );
+}

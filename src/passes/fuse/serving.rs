@@ -21470,3 +21470,257 @@ pub fn lookup_constant_resources(module: &mut Module) -> Result<usize, String> {
 
     Ok(rewritten)
 }
+
+/// Canonicalizes a device reference string (such as `"gpu:2"` or `"#device_ref<\"gpu\", 3>"`)
+/// by preserving the device label and resetting its ordinal ID to `0`.
+pub fn canonicalize_device_ref_str(s: &str) -> Option<String> {
+    if let Some((label, id_str)) = s.split_once(':')
+        && !label.is_empty()
+        && id_str.chars().all(|c| c.is_ascii_digit())
+    {
+        let canonical = format!("{label}:0");
+        if canonical != s {
+            return Some(canonical);
+        }
+    }
+    None
+}
+
+fn canonicalize_type_device_refs(ty: &mut Type) -> usize {
+    match ty {
+        Type::Tensor(tt) => {
+            if let Some(enc) = &tt.encoding
+                && let Some(canon) = canonicalize_device_ref_str(enc)
+            {
+                tt.encoding = Some(canon);
+                return 1;
+            }
+            0
+        }
+        Type::Tuple(items) => items.iter_mut().map(canonicalize_type_device_refs).sum(),
+        Type::Function { inputs, results } => {
+            let a: usize = inputs.iter_mut().map(canonicalize_type_device_refs).sum();
+            let b: usize = results.iter_mut().map(canonicalize_type_device_refs).sum();
+            a + b
+        }
+        _ => 0,
+    }
+}
+
+fn canonicalize_attr_for_merge(key: &str, attr: &mut Attribute) -> usize {
+    match attr {
+        Attribute::String(s) if key == "device_ref" || key == "mo.device_ref" => {
+            if let Some(canon) = canonicalize_device_ref_str(s) {
+                *s = canon;
+                return 1;
+            }
+            0
+        }
+        Attribute::Type(ty) => canonicalize_type_device_refs(ty),
+        Attribute::Array(items) if key == "shape_dims" || key == "symbolic_shape" => {
+            let mut changed = 0usize;
+            for item in items.iter_mut() {
+                if let Attribute::String(dim_name) = item
+                    && !dim_name.starts_with("simd:")
+                    && dim_name != "dyn"
+                {
+                    *dim_name = "dyn".to_string();
+                    changed += 1;
+                }
+            }
+            changed
+        }
+        _ => 0,
+    }
+}
+
+/// Canonicalizes top-level functions prior to structural kernel deduplication:
+/// 1. Normalizes device reference ordinal IDs to `0` (`"gpu:3"` -> `"gpu:0"`) in `"device_ref"` /
+///    `"mo.device_ref"` attributes, tensor encodings, and function signature types so kernels that
+///    differ only by target device ordinal can merge.
+/// 2. Normalizes non-SIMD symbolic dimension names in `"shape_dims"` / `"symbolic_shape"` array
+///    attributes to `"dyn"` while preserving `"simd:..."` entries and static integer dimensions.
+///
+/// Returns the total number of attribute and type sub-elements canonicalized.
+pub fn canonicalize_funcs_for_merge(module: &mut Module) -> usize {
+    let mut count = 0usize;
+    let func_ids = module.functions();
+
+    for func_id in func_ids {
+        let keys: Vec<String> = module.ops[func_id].attributes.keys().cloned().collect();
+        for k in keys {
+            if let Some(attr) = module.ops[func_id].attributes.get_mut(&k) {
+                count += canonicalize_attr_for_merge(&k, attr);
+            }
+        }
+
+        let regions = module.ops[func_id].regions.clone();
+        for reg_id in regions {
+            let blocks = module.regions[reg_id].blocks.clone();
+            for blk_id in blocks {
+                let args = module.blocks[blk_id].arguments.clone();
+                for arg_val in args {
+                    count += canonicalize_type_device_refs(&mut module.values[arg_val].ty);
+                }
+                let ops = module.blocks[blk_id].ops.clone();
+                for op_id in ops {
+                    let op_keys: Vec<String> =
+                        module.ops[op_id].attributes.keys().cloned().collect();
+                    for k in op_keys {
+                        if let Some(attr) = module.ops[op_id].attributes.get_mut(&k) {
+                            count += canonicalize_attr_for_merge(&k, attr);
+                        }
+                    }
+                    let res_vals: Vec<ValueId> =
+                        module.ops[op_id].results.iter().copied().collect();
+                    for rv in res_vals {
+                        count += canonicalize_type_device_refs(&mut module.values[rv].ty);
+                    }
+                }
+            }
+        }
+    }
+
+    count
+}
+
+/// Performs bottom-up call-graph kernel stub deduplication across the module:
+/// - Compares functions modulo `"sym_name"`, `"fusion_info"`, and device-ref ordinal IDs,
+/// - Rewrites intra-kernel call edges (`func.call`, `castforge.call`, `castforge.call.async`,
+///   `mogg.call`, `mogg.call.async`) bottom-up so caller hashes see canonicalized callees,
+/// - Selects the lexicographically smallest symbol name as the deterministic canonical stub for
+///   each equivalence class, fuses source locations, and rewrites external
+///   `castforge.compiled_call` / `mogg.compiled_call` ops before erasing duplicate definitions.
+pub fn merge_identical_kernel_stubs(module: &mut Module) -> usize {
+    use std::collections::{HashMap, HashSet};
+
+    // Fixed-point bottom-up pass: each round canonicalizes leaf/inner callees and rewrites callers
+    // until no further equivalence classes collapse.
+    let mut total_merged = 0usize;
+
+    loop {
+        let fns = module.functions();
+        if fns.len() <= 1 {
+            break;
+        }
+
+        type StubEntry = (OpId, String, Location);
+        let mut groups: IndexMap<(String, String, u64), Vec<StubEntry>> = IndexMap::new();
+
+        for &fn_id in &fns {
+            let Some(op) = module.ops.get(fn_id) else {
+                continue;
+            };
+            let Some(sym_name) = op
+                .attributes
+                .get("sym_name")
+                .and_then(|a| a.as_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let Some(&reg_id) = op.regions.first() else {
+                continue;
+            };
+            let sig_str = op
+                .attributes
+                .get("function_type")
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+
+            // Build discardable attribute signature modulo `sym_name`, `fusion_info`, and device ID
+            let mut attr_parts: Vec<String> = Vec::new();
+            for (k, v) in &op.attributes {
+                if k == "sym_name" || k == "fusion_info" || k == "function_type" {
+                    continue;
+                }
+                if (k == "device_ref" || k == "mo.device_ref")
+                    && let Some(s) = v.as_str()
+                {
+                    let label = s.split_once(':').map(|(l, _)| l).unwrap_or(s);
+                    attr_parts.push(format!("{k}={label}"));
+                    continue;
+                }
+                attr_parts.push(format!("{k}={v}"));
+            }
+            attr_parts.sort();
+            let attrs_sig = attr_parts.join(";");
+
+            let body_hash = crate::codegen::compute_region_structural_hash(module, reg_id);
+            groups
+                .entry((sig_str, attrs_sig, body_hash))
+                .or_default()
+                .push((fn_id, sym_name, op.location.clone()));
+        }
+
+        let mut replacements: HashMap<String, String> = HashMap::new();
+        let mut dead_fn_ops: HashSet<OpId> = HashSet::new();
+
+        for (_, mut candidates) in groups {
+            if candidates.len() <= 1 {
+                continue;
+            }
+            candidates.sort_by(|a, b| a.1.cmp(&b.1));
+            let (canon_id, canon_name, _) = candidates[0].clone();
+            let all_locs: Vec<Location> =
+                candidates.iter().map(|(_, _, loc)| loc.clone()).collect();
+            if let Some(canon_op) = module.ops.get_mut(canon_id) {
+                stamp_fused_provenance(canon_op, &all_locs);
+            }
+            for (dup_id, dup_name, _) in candidates.into_iter().skip(1) {
+                replacements.insert(dup_name, canon_name.clone());
+                dead_fn_ops.insert(dup_id);
+            }
+        }
+
+        if dead_fn_ops.is_empty() {
+            break;
+        }
+
+        // Rewrite all call and compiled_call references across the module.
+        for (_, op) in module.ops.iter_mut() {
+            let full = op.name.full_name();
+            let is_call = matches!(
+                full.as_str(),
+                "func.call"
+                    | "castforge.call"
+                    | "castforge.call.async"
+                    | "mogg.call"
+                    | "mogg.call.async"
+                    | "castforge.compiled_call"
+                    | "mogg.compiled_call"
+            );
+            if !is_call {
+                continue;
+            }
+            for attr_key in ["callee", "callee_symbol"] {
+                if let Some(callee) = op
+                    .attributes
+                    .get(attr_key)
+                    .and_then(|a| a.as_str())
+                    .map(str::to_string)
+                    && let Some(new_callee) = replacements.get(&callee)
+                {
+                    op.attributes.insert(
+                        attr_key.to_string(),
+                        Attribute::SymbolRef(new_callee.clone()),
+                    );
+                }
+            }
+        }
+
+        if let Some(root_reg) = module.regions.get(module.root_region)
+            && let Some(&root_blk) = root_reg.blocks.first()
+        {
+            module.blocks[root_blk]
+                .ops
+                .retain(|id| !dead_fn_ops.contains(id));
+        }
+        total_merged += dead_fn_ops.len();
+        for dead_id in dead_fn_ops {
+            module.ops.remove(dead_id);
+        }
+    }
+
+    total_merged
+}
