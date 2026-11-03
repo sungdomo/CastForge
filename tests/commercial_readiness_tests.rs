@@ -4582,3 +4582,51 @@ fn test_parallelize_and_fuse_mutable_loads_with_exclusive_chain_detachment() {
         );
     }
 }
+
+#[test]
+fn test_infer_and_propagate_tensor_layouts_and_conflict_detection() {
+    use castforge::passes::infer_and_propagate_tensor_layouts;
+
+    let mlir_ok = concat!(
+        "module @infer_layouts {\n",
+        "  func.func @main(%x: tensor<1x8x8x3xf32>, %b: tensor<1x8x8x3xf32>,",
+        " %w: tensor<16x3x3x3xf32>, %mw: tensor<3x16xf32>) -> tensor<1x8x8x16xf32> {\n",
+        "    %x_add = mo.add %x, %b",
+        " : (tensor<1x8x8x3xf32>, tensor<1x8x8x3xf32>) -> tensor<1x8x8x3xf32>\n",
+        "    %w_tr = mo.transfer %w : (tensor<16x3x3x3xf32>) -> tensor<16x3x3x3xf32>\n",
+        "    %y = mo.conv %x_add, %w_tr",
+        " : (tensor<1x8x8x3xf32>, tensor<16x3x3x3xf32>) -> tensor<1x8x8x16xf32>\n",
+        "    %mm = mo.matmul %x, %mw",
+        " : (tensor<1x8x8x3xf32>, tensor<3x16xf32>) -> tensor<1x8x8x16xf32>\n",
+        "    return %y : tensor<1x8x8x16xf32>\n",
+        "  }\n",
+        "}\n",
+    );
+
+    let mut m_ok = parse_mlir(mlir_ok).expect("valid MLIR");
+    let layouts = infer_and_propagate_tensor_layouts(&mut m_ok).expect("consistent layouts");
+    let func_id = m_ok.functions()[0];
+    let blk_id = m_ok.regions[m_ok.ops[func_id].regions[0]].blocks[0];
+    let args = &m_ok.blocks[blk_id].arguments;
+    assert_eq!(layouts.get(&args[0]).map(String::as_str), Some("NHWC"));
+    assert_eq!(layouts.get(&args[1]).map(String::as_str), Some("NHWC"));
+    assert_eq!(layouts.get(&args[2]).map(String::as_str), Some("FCRS"));
+    assert_eq!(layouts.get(&args[3]).map(String::as_str), Some("KN"));
+
+    // Conflict: same 4D tensor used as both conv filter ("FCRS") and conv_transpose ("RSFC"):
+    let mlir_conflict = concat!(
+        "module @layout_conflict {\n",
+        "  func.func @main(%x: tensor<1x8x8x3xf32>, %w: tensor<3x3x3x3xf32>)",
+        " -> tensor<1x8x8x3xf32> {\n",
+        "    %y0 = mo.conv %x, %w",
+        " : (tensor<1x8x8x3xf32>, tensor<3x3x3x3xf32>) -> tensor<1x8x8x3xf32>\n",
+        "    %y1 = mo.conv_transpose %y0, %w",
+        " : (tensor<1x8x8x3xf32>, tensor<3x3x3x3xf32>) -> tensor<1x8x8x3xf32>\n",
+        "    return %y1 : tensor<1x8x8x3xf32>\n",
+        "  }\n",
+        "}\n",
+    );
+    let mut m_conflict = parse_mlir(mlir_conflict).expect("valid MLIR");
+    let err = infer_and_propagate_tensor_layouts(&mut m_conflict).unwrap_err();
+    assert!(err.contains("already constrained 'FCRS'"));
+}

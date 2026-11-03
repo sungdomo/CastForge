@@ -14682,3 +14682,169 @@ pub fn fuse_mutable_loads_into_kernels(module: &mut Module) -> usize {
 
     fused_count
 }
+
+// ============================================================================
+// Batch 17 Step 4: Bidirectional Tensor Layout Inference & Conflict Detector
+// ============================================================================
+
+/// Returns the tensor rank of `ty` if it is a ranked `Type::Tensor`.
+fn tensor_rank_of_type(ty: &Type) -> Option<usize> {
+    match ty {
+        Type::Tensor(t) => Some(t.shape.len()),
+        _ => None,
+    }
+}
+
+/// Returns `(input_layout, filter_layout)` for `mo.conv` or `mo.conv_transpose` given `(input_rank,
+/// filter_rank)`. Only 2D (rank 4) and 3D (rank 5) convolutions are supported.
+pub fn conv_seed_layouts(
+    is_transpose: bool,
+    input_rank: usize,
+    filter_rank: usize,
+) -> Result<(&'static str, &'static str), String> {
+    if input_rank != filter_rank || (input_rank != 4 && input_rank != 5) {
+        return Err(format!(
+            "Only 2D/3D (rank 4/5) layouts supported for conv, got ({input_rank}, {filter_rank})"
+        ));
+    }
+    let in_layout = if input_rank == 4 { "NHWC" } else { "NDHWC" };
+    let flt_layout = match (is_transpose, filter_rank) {
+        (false, 4) => "FCRS",
+        (false, _) => "FCQRS",
+        (true, 4) => "RSFC",
+        (true, _) => "QRSFC",
+    };
+    Ok((in_layout, flt_layout))
+}
+
+/// Returns the list of `ValueId`s across which `op` propagates tensor layout constraints
+/// bidirectionally (`mo.guard` drops the leading predicate operand; `mo.transfer` and elementwise
+/// ops propagate across all tensor operands and results).
+fn layout_propagation_values_for_op(op: &Operation) -> Vec<ValueId> {
+    let name = op.name.full_name();
+    if name == "mo.guard" {
+        let mut vals: Vec<ValueId> = op.operands.iter().skip(1).copied().collect();
+        vals.extend(op.results.iter().copied());
+        vals
+    } else if matches!(
+        name.as_str(),
+        "mo.transfer"
+            | "mo.add"
+            | "mo.sub"
+            | "mo.mul"
+            | "mo.div"
+            | "mo.relu"
+            | "mo.exp"
+            | "mo.tanh"
+            | "stablehlo.add"
+            | "stablehlo.subtract"
+            | "stablehlo.multiply"
+            | "stablehlo.divide"
+            | "stablehlo.abs"
+            | "stablehlo.negate"
+    ) {
+        let mut vals: Vec<ValueId> = op.operands.iter().copied().collect();
+        vals.extend(op.results.iter().copied());
+        vals
+    } else {
+        Vec::new()
+    }
+}
+
+fn add_layout_constraint(
+    inferred: &mut IndexMap<ValueId, String>,
+    op_name: &str,
+    val: ValueId,
+    layout: &str,
+) -> Result<(), String> {
+    if let Some(existing) = inferred.get(&val) {
+        if existing != layout {
+            return Err(format!(
+                "{op_name}: layout '{layout}' conflicts with already constrained '{existing}'"
+            ));
+        }
+        return Ok(());
+    }
+    inferred.insert(val, layout.to_string());
+    Ok(())
+}
+
+/// Seeds layout constraints from `mo.conv`, `mo.conv_transpose`, and `mo.matmul` ops in `module`,
+/// propagates them bidirectionally through layout-preserving ops (`mo.guard`, `mo.transfer`, and
+/// elementwise ops), and detects conflicting layout constraints.
+pub fn infer_and_propagate_tensor_layouts(
+    module: &mut Module,
+) -> Result<IndexMap<ValueId, String>, String> {
+    let mut inferred: IndexMap<ValueId, String> = IndexMap::new();
+
+    let all_ops: Vec<OpId> = module
+        .blocks
+        .values()
+        .flat_map(|b| b.ops.iter().copied())
+        .collect();
+
+    // 1. Seed direct layout constraints from conv, conv_transpose, and matmul ops.
+    for &op_id in &all_ops {
+        let op = &module.ops[op_id];
+        let full = op.name.full_name();
+        if (full == "mo.conv" || full == "mo.conv_transpose") && op.operands.len() >= 2 {
+            let in_val = op.operands[0];
+            let flt_val = op.operands[1];
+            let in_rank = tensor_rank_of_type(&module.values[in_val].ty).unwrap_or(0);
+            let flt_rank = tensor_rank_of_type(&module.values[flt_val].ty).unwrap_or(0);
+            let (in_layout, flt_layout) =
+                conv_seed_layouts(full == "mo.conv_transpose", in_rank, flt_rank)?;
+            add_layout_constraint(&mut inferred, &full, in_val, in_layout)?;
+            add_layout_constraint(&mut inferred, &full, flt_val, flt_layout)?;
+        } else if full == "mo.matmul" && op.operands.len() >= 2 {
+            let weights = op.operands[1];
+            add_layout_constraint(&mut inferred, &full, weights, "KN")?;
+        }
+    }
+
+    // 2. Bidirectionally propagate layouts across users and defining ops.
+    let mut worklist: Vec<ValueId> = inferred.keys().copied().collect();
+    let mut history: IndexSet<ValueId> = worklist.iter().copied().collect();
+
+    while let Some(val) = worklist.pop() {
+        let layout = inferred[&val].clone();
+        let mut affected_ops: Vec<OpId> = Vec::new();
+        for &op_id in &all_ops {
+            if module.ops[op_id].operands.contains(&val) {
+                affected_ops.push(op_id);
+            }
+        }
+        if let ValueDef::OpResult { op: def_op, .. } = module.values[val].def {
+            affected_ops.push(def_op);
+        }
+
+        for op_id in affected_ops {
+            let op = &module.ops[op_id];
+            let full = op.name.full_name();
+            let prop_vals = layout_propagation_values_for_op(op);
+            for target_val in prop_vals {
+                if tensor_rank_of_type(&module.values[target_val].ty).is_none() {
+                    continue;
+                }
+                add_layout_constraint(&mut inferred, &full, target_val, &layout)?;
+                if history.insert(target_val) {
+                    worklist.push(target_val);
+                }
+            }
+        }
+    }
+
+    // 3. Annotate ops that touch inferred values with `"inferred_result_layout"` when applicable.
+    for &op_id in &all_ops {
+        if let Some(&res0) = module.ops[op_id].results.first()
+            && let Some(layout) = inferred.get(&res0)
+        {
+            module.ops[op_id].attributes.insert(
+                "inferred_result_layout".to_string(),
+                Attribute::String(layout.clone()),
+            );
+        }
+    }
+
+    Ok(inferred)
+}
