@@ -8436,3 +8436,61 @@ fn test_stage_device_graphs_and_raise_back_index_constants() {
         ]
     );
 }
+
+#[test]
+fn test_verify_model_arguments_and_fixup_overhanging_chains() {
+    use castforge::ir::Attribute;
+    use castforge::passes::{fixup_overhanging_chains, verify_model_arguments};
+
+    let src = concat!(
+        "module {\n",
+        "  func.func @model_entry(\n",
+        "    %ctx: !mo.chain,\n",
+        "    %x_mixed: tensor<?x16x32xf32>,\n",
+        "    %x_dyn: tensor<?x?xf32>\n",
+        "  ) -> !mo.chain {\n",
+        "    %u0, %u1 = \"mo.async_op_a\"(%x_mixed)",
+        " : (tensor<?x16x32xf32>) -> (tensor<16xf32>, !mo.chain)\n",
+        "    %v0 = \"mo.async_op_b\"(%x_dyn) : (tensor<?x?xf32>) -> tensor<8xf32>\n",
+        "    return %ctx : !mo.chain\n",
+        "  }\n",
+        "}\n"
+    );
+
+    let mut m = parse_mlir(src).unwrap();
+
+    // 1. `verify_model_arguments` with `implicit_arg_count = 1` skips `%ctx`, generates a shape
+    // assertion for `%x_mixed` (2 static dims -> `pop.and` + `mgp.assert` with `"any,16,32"`),
+    // and skips `%x_dyn` (all dynamic dims):
+    let asserts = verify_model_arguments(&mut m, 1);
+    assert_eq!(asserts, 1);
+
+    let fn_id = m.functions()[0];
+    let blk = m.regions[m.ops[fn_id].regions[0]].blocks[0];
+    let assert_op = m.blocks[blk]
+        .ops
+        .iter()
+        .copied()
+        .find(|&id| m.ops[id].name.full_name() == "mgp.assert")
+        .expect("mgp.assert must exist");
+    assert_eq!(
+        m.ops[assert_op].attributes.get("msg"),
+        Some(&Attribute::String(
+            "Tensor type mismatch for argument 0: Expected shape: [any,16,32]".to_string()
+        ))
+    );
+
+    // 2. `fixup_overhanging_chains` finds 2 non-terminator ops with unused results (`mo.async_op_a`
+    // and `mo.async_op_b`), picking at most 1 unused result per op (`%u0` and `%v0`), and joins
+    // them with the trailing `%ctx` return chain via `mo.chain.create`:
+    let synced = fixup_overhanging_chains(&mut m);
+    assert_eq!(synced, 2);
+
+    let ops = &m.blocks[blk].ops;
+    let chain_create_id = ops[ops.len() - 2];
+    let ret_id = ops[ops.len() - 1];
+    assert_eq!(m.ops[chain_create_id].name.full_name(), "mo.chain.create");
+    // `mo.chain.create` has 3 operands: 1 from `mo.async_op_a`, 1 from `mo.async_op_b`, and `%ctx`:
+    assert_eq!(m.ops[chain_create_id].operands.len(), 3);
+    assert_eq!(m.ops[ret_id].operands[0], m.ops[chain_create_id].results[0]);
+}

@@ -29093,3 +29093,285 @@ pub fn raise_back_index_constants(module: &mut Module) -> usize {
 
     raised
 }
+
+/// Inserts runtime shape-verification assertions (`mgp.tensor.extract_tensor_spec`,
+/// `mgp.tensor_spec.get_dim`, `index.constant`, `index.cmp`, `pop.and`, `mgp.assert`) at the
+/// start of each function's entry block for every tensor block argument (after skipping the first
+/// `implicit_arg_count` arguments) that has at least one static dimension.
+///
+/// Tensor arguments whose dimensions are all dynamic (`?` or symbolic) are skipped. Returns the
+/// number of `mgp.assert` operations inserted.
+pub fn verify_model_arguments(module: &mut Module, implicit_arg_count: usize) -> usize {
+    use crate::ir::mlir::{DType, Dim, Location, OpName, Operation, Value, ValueDef};
+
+    let mut inserted_asserts = 0usize;
+    let idx_ty = Type::Scalar(DType::Index);
+    let i1_ty = Type::Scalar(DType::I1);
+    let spec_ty = Type::Opaque("!mgp.tensor_spec".to_string());
+
+    let fn_ids = module.functions();
+    for fn_id in fn_ids {
+        let Some(&fn_reg) = module.ops[fn_id].regions.first() else {
+            continue;
+        };
+        let Some(&entry_blk) = module.regions[fn_reg].blocks.first() else {
+            continue;
+        };
+        let args = module.blocks[entry_blk].arguments.clone();
+        if args.len() <= implicit_arg_count {
+            continue;
+        }
+
+        let mut prologue_ops = Vec::new();
+        for (extra_idx, &arg_val) in args[implicit_arg_count..].iter().enumerate() {
+            let Type::Tensor(tt) = module.values[arg_val].ty.clone() else {
+                continue;
+            };
+            if tt.shape.is_empty() {
+                continue;
+            }
+            let static_dims: Vec<(usize, i64)> = tt
+                .shape
+                .iter()
+                .enumerate()
+                .filter_map(|(axis, d)| match d {
+                    Dim::Static(n) => Some((axis, *n)),
+                    _ => None,
+                })
+                .collect();
+            if static_dims.is_empty() {
+                continue;
+            }
+
+            let alloc_op_with_res = |m: &mut Module,
+                                     name: OpName,
+                                     operands: smallvec::SmallVec<[ValueId; 4]>,
+                                     attrs: indexmap::IndexMap<String, Attribute>,
+                                     res_ty: Option<Type>|
+             -> (OpId, Option<ValueId>) {
+                let mut results = smallvec::SmallVec::<[ValueId; 2]>::new();
+                let res_v = res_ty.map(|ty| {
+                    let v = m.values.insert(Value {
+                        id: ValueId::default(),
+                        ssa_name: None,
+                        ty,
+                        def: ValueDef::BlockArgument {
+                            block: entry_blk,
+                            index: 0,
+                        },
+                    });
+                    m.values[v].id = v;
+                    results.push(v);
+                    v
+                });
+                let oid = m.ops.insert(Operation {
+                    id: OpId::default(),
+                    name,
+                    operands,
+                    results,
+                    attributes: attrs,
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: Location::Unknown,
+                });
+                m.ops[oid].id = oid;
+                if let Some(v) = res_v {
+                    m.values[v].def = ValueDef::OpResult { op: oid, index: 0 };
+                }
+                (oid, res_v)
+            };
+
+            let (extract_op, Some(runtime_spec)) = alloc_op_with_res(
+                module,
+                OpName::new("mgp", "tensor.extract_tensor_spec"),
+                smallvec::smallvec![arg_val],
+                indexmap::IndexMap::new(),
+                Some(spec_ty.clone()),
+            ) else {
+                unreachable!()
+            };
+            prologue_ops.push(extract_op);
+
+            let mut are_equal: Option<ValueId> = None;
+            for (axis, expected_len) in static_dims {
+                let mut c_attrs = indexmap::IndexMap::new();
+                c_attrs.insert("value".to_string(), Attribute::Int(expected_len));
+                let (const_op, Some(expected_dim)) = alloc_op_with_res(
+                    module,
+                    OpName::new("index", "constant"),
+                    smallvec::SmallVec::new(),
+                    c_attrs,
+                    Some(idx_ty.clone()),
+                ) else {
+                    unreachable!()
+                };
+                prologue_ops.push(const_op);
+
+                let mut dim_attrs = indexmap::IndexMap::new();
+                dim_attrs.insert("axis".to_string(), Attribute::Int(axis as i64));
+                let (get_dim_op, Some(runtime_dim)) = alloc_op_with_res(
+                    module,
+                    OpName::new("mgp", "tensor_spec.get_dim"),
+                    smallvec::smallvec![runtime_spec],
+                    dim_attrs,
+                    Some(idx_ty.clone()),
+                ) else {
+                    unreachable!()
+                };
+                prologue_ops.push(get_dim_op);
+
+                let mut cmp_attrs = indexmap::IndexMap::new();
+                cmp_attrs.insert("predicate".to_string(), Attribute::String("eq".to_string()));
+                let (cmp_op, Some(dim_eq)) = alloc_op_with_res(
+                    module,
+                    OpName::new("index", "cmp"),
+                    smallvec::smallvec![runtime_dim, expected_dim],
+                    cmp_attrs,
+                    Some(i1_ty.clone()),
+                ) else {
+                    unreachable!()
+                };
+                prologue_ops.push(cmp_op);
+
+                are_equal = Some(match are_equal {
+                    None => dim_eq,
+                    Some(prev_eq) => {
+                        let (and_op, Some(conj)) = alloc_op_with_res(
+                            module,
+                            OpName::new("pop", "and"),
+                            smallvec::smallvec![prev_eq, dim_eq],
+                            indexmap::IndexMap::new(),
+                            Some(i1_ty.clone()),
+                        ) else {
+                            unreachable!()
+                        };
+                        prologue_ops.push(and_op);
+                        conj
+                    }
+                });
+            }
+
+            if let Some(cond_val) = are_equal {
+                let msg = format!(
+                    "Tensor type mismatch for argument {extra_idx}: Expected shape: [{}]",
+                    format_expected_tensor_shape(&tt.shape)
+                );
+                let mut assert_attrs = indexmap::IndexMap::new();
+                assert_attrs.insert("msg".to_string(), Attribute::String(msg));
+                let (assert_op, _) = alloc_op_with_res(
+                    module,
+                    OpName::new("mgp", "assert"),
+                    smallvec::smallvec![cond_val],
+                    assert_attrs,
+                    None,
+                );
+                prologue_ops.push(assert_op);
+                inserted_asserts += 1;
+            }
+        }
+
+        if !prologue_ops.is_empty() {
+            let mut new_block_ops = prologue_ops;
+            new_block_ops.append(&mut module.blocks[entry_blk].ops);
+            module.blocks[entry_blk].ops = new_block_ops;
+        }
+    }
+
+    inserted_asserts
+}
+
+/// Scans every block in `module` for non-terminator operations with unused results (selecting at
+/// most one unused result per operation, since a failing op sets all its results to error) and
+/// synchronizes them before the block's terminator by inserting `mo.chain.create` (or `mgp.sync`)
+/// and wiring the merged chain into the terminator's trailing chain operand.
+///
+/// Returns the total number of overhanging operations synchronized across all blocks.
+pub fn fixup_overhanging_chains(module: &mut Module) -> usize {
+    use crate::ir::mlir::{Location, OpName, Operation, Value, ValueDef};
+
+    let mut synchronized_ops = 0usize;
+    let chain_ty = Type::Opaque("!mo.chain".to_string());
+
+    let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+    for bid in block_ids {
+        let ops_snapshot = module.blocks[bid].ops.clone();
+        let Some(&term_id) = ops_snapshot.last() else {
+            continue;
+        };
+        let term_name = module.ops[term_id].name.full_name();
+        if !matches!(
+            term_name.as_str(),
+            "func.return" | "return" | "mo.output" | "mo.yield" | "mgp.output"
+        ) {
+            continue;
+        }
+
+        let mut hanging_results = smallvec::SmallVec::<[ValueId; 4]>::new();
+        for &op_id in &ops_snapshot[..ops_snapshot.len() - 1] {
+            let results = module.ops[op_id].results.clone();
+            for res_v in results {
+                let is_used = ops_snapshot.iter().any(|&other_id| {
+                    other_id != op_id && module.ops[other_id].operands.contains(&res_v)
+                });
+                if !is_used {
+                    hanging_results.push(res_v);
+                    break;
+                }
+            }
+        }
+        if hanging_results.is_empty() {
+            continue;
+        }
+        synchronized_ops += hanging_results.len();
+
+        // If the terminator's last operand is already a `!mo.chain`, include it in the join:
+        let term_operands = module.ops[term_id].operands.clone();
+        let trailing_chain_slot = term_operands.last().and_then(|&last_v| {
+            if matches!(&module.values[last_v].ty, Type::Opaque(s) if s == "!mo.chain") {
+                Some((term_operands.len() - 1, last_v))
+            } else {
+                None
+            }
+        });
+        if let Some((_, existing_ch)) = trailing_chain_slot {
+            hanging_results.push(existing_ch);
+        }
+
+        let merged_ch = module.values.insert(Value {
+            id: ValueId::default(),
+            ssa_name: None,
+            ty: chain_ty.clone(),
+            def: ValueDef::BlockArgument {
+                block: bid,
+                index: 0,
+            },
+        });
+        module.values[merged_ch].id = merged_ch;
+        let sync_op = module.ops.insert(Operation {
+            id: OpId::default(),
+            name: OpName::new("mo", "chain.create"),
+            operands: hanging_results,
+            results: smallvec::smallvec![merged_ch],
+            attributes: indexmap::IndexMap::new(),
+            regions: Vec::new(),
+            custom_syntax: false,
+            location: Location::Unknown,
+        });
+        module.ops[sync_op].id = sync_op;
+        module.values[merged_ch].def = ValueDef::OpResult {
+            op: sync_op,
+            index: 0,
+        };
+
+        let term_pos = module.blocks[bid].ops.len() - 1;
+        module.blocks[bid].ops.insert(term_pos, sync_op);
+
+        if let Some((slot, _)) = trailing_chain_slot {
+            module.ops[term_id].operands[slot] = merged_ch;
+        } else {
+            module.ops[term_id].operands.push(merged_ch);
+        }
+    }
+
+    synchronized_ops
+}
