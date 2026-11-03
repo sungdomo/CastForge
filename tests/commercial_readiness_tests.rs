@@ -5560,3 +5560,79 @@ fn test_stage_device_graph_regions_lowers_guards_and_isolates_body() {
         ]
     );
 }
+
+#[test]
+fn test_partition_device_graph_collective_across_multiple_accelerators() {
+    use castforge::ir::mlir::Attribute;
+    use castforge::passes::{partition_device_graph_collective, stage_device_graph_regions};
+
+    let mlir = concat!(
+        "module @partition_collective {\n",
+        "  func.func @main(%x: tensor<4xf32>) -> tensor<4xf32> {\n",
+        "    %r0 = mgp.routine.async %x {device_ref = \"gpu:0\"}",
+        " : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %st = mgp.device_graph.stable.create %r0 {device_ref = \"gpu:0\"}",
+        " : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %r1 = mgp.routine.async %st {device_ref = \"gpu:1\"}",
+        " : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %r1 : tensor<4xf32>\n",
+        "  }\n",
+        "}\n",
+    );
+
+    let mut m = parse_mlir(mlir).expect("valid MLIR");
+    assert_eq!(stage_device_graph_regions(&mut m), 3);
+    assert_eq!(
+        partition_device_graph_collective(&mut m).expect("valid partition"),
+        1
+    );
+
+    let func_id = m.functions()[0];
+    let blk_id = m.regions[m.ops[func_id].regions[0]].blocks[0];
+    let coll_op = m.blocks[blk_id].ops[0];
+    assert_eq!(
+        m.ops[coll_op].name.full_name(),
+        "mgp.device_graph.collective"
+    );
+    assert_eq!(m.ops[coll_op].regions.len(), 2);
+    assert_eq!(
+        m.ops[coll_op].attributes.get("num_stable_slots"),
+        Some(&Attribute::Int(1))
+    );
+
+    // Region 0 (`gpu:0`) publishes the stable slot via `stable.place`:
+    let reg0_blk = m.regions[m.ops[coll_op].regions[0]].blocks[0];
+    let reg0_names: Vec<String> = m.blocks[reg0_blk]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        reg0_names,
+        vec![
+            "mgp.routine.async",
+            "mgp.device_graph.stable.place",
+            "mgp.tensor.extract.tensor_spec",
+            "mgp.device_graph.stable.tensor",
+            "mgp.device_graph.collective.yield",
+        ]
+    );
+
+    // Region 1 (`gpu:1`) reads the stable slot via `stable.get` before running its routine:
+    let reg1_blk = m.regions[m.ops[coll_op].regions[1]].blocks[0];
+    let reg1_names: Vec<String> = m.blocks[reg1_blk]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        reg1_names,
+        vec![
+            "mgp.device_graph.stable.get",
+            "mgp.tensor_spec.create",
+            "mgp.device_graph.stable.tensor",
+            "mgp.routine.async",
+            "mgp.device_graph.collective.yield",
+        ]
+    );
+}

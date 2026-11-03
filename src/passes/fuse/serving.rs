@@ -18274,3 +18274,467 @@ pub fn stage_device_graph_regions(module: &mut Module) -> usize {
 
     total_staged
 }
+
+// ============================================================================
+// Batch 21 Step 4: Multi-Device Collective Graph Partitioner
+// ============================================================================
+
+/// Returns the device label (`device_ref` attribute, defaulting to `"cpu:0"`) of an operation.
+fn op_device_ref_str(op: &Operation) -> String {
+    match op.attributes.get("device_ref") {
+        Some(Attribute::String(s)) => s.clone(),
+        _ => "cpu:0".to_string(),
+    }
+}
+
+/// Returns `true` if `device_ref` represents a host CPU execution context.
+fn is_host_device_ref(device_ref: &str) -> bool {
+    device_ref == "cpu" || device_ref.starts_with("cpu:")
+}
+
+/// Partitions each `mgp.device_graph.staging` operation in `module` into an
+/// `mgp.device_graph.collective` operation with one region per sorted accelerator device:
+/// - Assigns sequential slot indices `0..K` to `mgp.device_graph.stable.create` operations.
+/// - Replays each non-terminator operation per device region:
+///   - `mgp.device_graph.stable.create` on its owning device lowers to
+///     `mgp.device_graph.stable.place` + `mgp.tensor.extract.tensor_spec` +
+///     `mgp.device_graph.stable.tensor`.
+///   - `mgp.routine.async` / `mogg.routine.async` on its matching accelerator device (or host CPU
+///     bookkeeping whose operands are available in the region) is cloned into the region; any
+///     operand produced by a `stable.create` on another device is materialized on demand via
+///     `mgp.device_graph.stable.get` + `mgp.tensor_spec.create` + `mgp.device_graph.stable.tensor`.
+/// - Emits `mgp.device_graph.collective.yield` per device region and rewires the staging
+///   operation's results to the collective operation's results.
+pub fn partition_device_graph_collective(module: &mut Module) -> Result<usize, String> {
+    let funcs = module.functions();
+    let mut partitioned_count = 0usize;
+
+    for func_id in funcs {
+        if module.ops[func_id].regions.is_empty() {
+            continue;
+        }
+        let reg_id = module.ops[func_id].regions[0];
+        if module.regions[reg_id].blocks.is_empty() {
+            continue;
+        }
+        let blk_id = module.regions[reg_id].blocks[0];
+        let orig_ops = module.blocks[blk_id].ops.clone();
+
+        for &staging_op in &orig_ops {
+            if !module.ops.contains_key(staging_op)
+                || module.ops[staging_op].name.full_name() != "mgp.device_graph.staging"
+                || module.ops[staging_op].regions.is_empty()
+            {
+                continue;
+            }
+            let staging_reg = module.ops[staging_op].regions[0];
+            if module.regions[staging_reg].blocks.is_empty() {
+                continue;
+            }
+            let staging_blk = module.regions[staging_reg].blocks[0];
+            let body_ops = module.blocks[staging_blk].ops.clone();
+            if body_ops.is_empty() {
+                continue;
+            }
+            let yield_op = *body_ops.last().unwrap();
+            let non_term_ops = &body_ops[..body_ops.len() - 1];
+
+            // Collect `stable.create` slot indices and sorted accelerator devices.
+            let mut stable_indices: IndexMap<OpId, usize> = IndexMap::new();
+            let mut stable_res_to_op: IndexMap<ValueId, OpId> = IndexMap::new();
+            let mut devices_set: IndexSet<String> = IndexSet::new();
+
+            for &op_id in non_term_ops {
+                let full = module.ops[op_id].name.full_name();
+                if full == "mgp.device_graph.stable.create" {
+                    let slot = stable_indices.len();
+                    stable_indices.insert(op_id, slot);
+                    if let Some(&res) = module.ops[op_id].results.first() {
+                        stable_res_to_op.insert(res, op_id);
+                    }
+                } else if matches!(full.as_str(), "mgp.routine.async" | "mogg.routine.async") {
+                    let dev = op_device_ref_str(&module.ops[op_id]);
+                    if !is_host_device_ref(&dev) {
+                        devices_set.insert(dev);
+                    }
+                } else {
+                    return Err(format!(
+                        "unexpected operation {full} inside device-graph staging body"
+                    ));
+                }
+            }
+
+            let mut device_order: Vec<String> = devices_set.into_iter().collect();
+            device_order.sort();
+            if device_order.is_empty() {
+                return Err("staging body has no accelerator regions to partition".to_string());
+            }
+
+            let loc = module.ops[staging_op].location.clone();
+            let i64_scalar_ty = Type::Tensor(crate::ir::mlir::TensorType {
+                shape: vec![Dim::Static(1)],
+                dtype: DType::I64,
+                encoding: None,
+            });
+
+            // Map staging block arguments back to outer staging operands.
+            let mut base_mapper: IndexMap<ValueId, ValueId> = IndexMap::new();
+            for (&blk_arg, &outer_in) in module.blocks[staging_blk]
+                .arguments
+                .iter()
+                .zip(module.ops[staging_op].operands.iter())
+            {
+                base_mapper.insert(blk_arg, outer_in);
+            }
+
+            let orig_yield_opds = module.ops[yield_op].operands.clone();
+            let mut collective_regions: Vec<crate::ir::RegionId> =
+                Vec::with_capacity(device_order.len());
+            let mut result_mapping: IndexMap<ValueId, usize> = IndexMap::new();
+            let mut collective_res_types: Vec<Type> = Vec::new();
+
+            for dev in &device_order {
+                let dev_blk = module.blocks.insert_with_key(|id| crate::ir::Block {
+                    id,
+                    label: None,
+                    arguments: Vec::new(),
+                    ops: Vec::new(),
+                });
+                let builder_arg = module.values.insert_with_key(|id| Value {
+                    id,
+                    ssa_name: None,
+                    ty: i64_scalar_ty.clone(),
+                    def: ValueDef::BlockArgument {
+                        block: dev_blk,
+                        index: 0,
+                    },
+                });
+                module.blocks[dev_blk].arguments.push(builder_arg);
+
+                let mut mapper = base_mapper.clone();
+                let mut stable_tensors: IndexMap<OpId, ValueId> = IndexMap::new();
+
+                for &op_id in non_term_ops {
+                    let full = module.ops[op_id].name.full_name();
+                    let op_dev = op_device_ref_str(&module.ops[op_id]);
+
+                    if full == "mgp.device_graph.stable.create" {
+                        if &op_dev != dev {
+                            continue;
+                        }
+                        let src_opd = module.ops[op_id].operands[0];
+                        let Some(&mapped_src) = mapper.get(&src_opd) else {
+                            return Err(
+                                "stable.create source was not materialized on its device".into()
+                            );
+                        };
+                        let slot_idx = stable_indices[&op_id] as i64;
+                        let tensor_ty = module.values[mapped_src].ty.clone();
+
+                        // 1. `mgp.device_graph.stable.place`
+                        let mut place_attrs = IndexMap::new();
+                        place_attrs.insert("slot_index".to_string(), Attribute::Int(slot_idx));
+                        let place_op = module.ops.insert_with_key(|id| Operation {
+                            id,
+                            name: OpName::new("mgp", "device_graph.stable.place"),
+                            operands: SmallVec::from_slice(&[builder_arg, mapped_src]),
+                            results: SmallVec::new(),
+                            attributes: place_attrs,
+                            regions: Vec::new(),
+                            custom_syntax: false,
+                            location: loc.clone(),
+                        });
+                        let placed_val = module.values.insert_with_key(|id| Value {
+                            id,
+                            ssa_name: None,
+                            ty: i64_scalar_ty.clone(),
+                            def: ValueDef::OpResult {
+                                op: place_op,
+                                index: 0,
+                            },
+                        });
+                        module.ops[place_op].results.push(placed_val);
+                        module.blocks[dev_blk].ops.push(place_op);
+
+                        // 2. `mgp.tensor.extract.tensor_spec`
+                        let spec_op = module.ops.insert_with_key(|id| Operation {
+                            id,
+                            name: OpName::new("mgp", "tensor.extract.tensor_spec"),
+                            operands: SmallVec::from_slice(&[mapped_src]),
+                            results: SmallVec::new(),
+                            attributes: IndexMap::new(),
+                            regions: Vec::new(),
+                            custom_syntax: false,
+                            location: loc.clone(),
+                        });
+                        let spec_val = module.values.insert_with_key(|id| Value {
+                            id,
+                            ssa_name: None,
+                            ty: i64_scalar_ty.clone(),
+                            def: ValueDef::OpResult {
+                                op: spec_op,
+                                index: 0,
+                            },
+                        });
+                        module.ops[spec_op].results.push(spec_val);
+                        module.blocks[dev_blk].ops.push(spec_op);
+
+                        // 3. `mgp.device_graph.stable.tensor`
+                        let st_op = module.ops.insert_with_key(|id| Operation {
+                            id,
+                            name: OpName::new("mgp", "device_graph.stable.tensor"),
+                            operands: SmallVec::from_slice(&[placed_val, spec_val]),
+                            results: SmallVec::new(),
+                            attributes: IndexMap::new(),
+                            regions: Vec::new(),
+                            custom_syntax: false,
+                            location: loc.clone(),
+                        });
+                        let st_val = module.values.insert_with_key(|id| Value {
+                            id,
+                            ssa_name: None,
+                            ty: tensor_ty,
+                            def: ValueDef::OpResult {
+                                op: st_op,
+                                index: 0,
+                            },
+                        });
+                        module.ops[st_op].results.push(st_val);
+                        module.blocks[dev_blk].ops.push(st_op);
+                        stable_tensors.insert(op_id, st_val);
+                        continue;
+                    }
+
+                    let is_host = is_host_device_ref(&op_dev);
+                    if &op_dev != dev && !is_host {
+                        continue;
+                    }
+
+                    // Check operand availability (or materialize from `stable.create`).
+                    let orig_opds = module.ops[op_id].operands.clone();
+                    let all_avail = orig_opds
+                        .iter()
+                        .all(|v| mapper.contains_key(v) || stable_res_to_op.contains_key(v));
+                    if !all_avail {
+                        if is_host {
+                            continue;
+                        }
+                        return Err(
+                            "operand is produced on another device without a stable slot".into(),
+                        );
+                    }
+
+                    let mut cloned_opds: SmallVec<[ValueId; 4]> = SmallVec::new();
+                    for &opd in &orig_opds {
+                        if let Some(&st_op_id) = stable_res_to_op.get(&opd) {
+                            let resolved = if let Some(&existing) = stable_tensors.get(&st_op_id) {
+                                existing
+                            } else {
+                                let slot_idx = stable_indices[&st_op_id] as i64;
+                                let tensor_ty = module.values[opd].ty.clone();
+                                let mut get_attrs = IndexMap::new();
+                                get_attrs
+                                    .insert("slot_index".to_string(), Attribute::Int(slot_idx));
+                                let get_op = module.ops.insert_with_key(|id| Operation {
+                                    id,
+                                    name: OpName::new("mgp", "device_graph.stable.get"),
+                                    operands: SmallVec::from_slice(&[builder_arg]),
+                                    results: SmallVec::new(),
+                                    attributes: get_attrs,
+                                    regions: Vec::new(),
+                                    custom_syntax: false,
+                                    location: loc.clone(),
+                                });
+                                let get_val = module.values.insert_with_key(|id| Value {
+                                    id,
+                                    ssa_name: None,
+                                    ty: i64_scalar_ty.clone(),
+                                    def: ValueDef::OpResult {
+                                        op: get_op,
+                                        index: 0,
+                                    },
+                                });
+                                module.ops[get_op].results.push(get_val);
+                                module.blocks[dev_blk].ops.push(get_op);
+
+                                let spec_op = module.ops.insert_with_key(|id| Operation {
+                                    id,
+                                    name: OpName::new("mgp", "tensor_spec.create"),
+                                    operands: SmallVec::new(),
+                                    results: SmallVec::new(),
+                                    attributes: IndexMap::new(),
+                                    regions: Vec::new(),
+                                    custom_syntax: false,
+                                    location: loc.clone(),
+                                });
+                                let spec_val = module.values.insert_with_key(|id| Value {
+                                    id,
+                                    ssa_name: None,
+                                    ty: i64_scalar_ty.clone(),
+                                    def: ValueDef::OpResult {
+                                        op: spec_op,
+                                        index: 0,
+                                    },
+                                });
+                                module.ops[spec_op].results.push(spec_val);
+                                module.blocks[dev_blk].ops.push(spec_op);
+
+                                let st_op = module.ops.insert_with_key(|id| Operation {
+                                    id,
+                                    name: OpName::new("mgp", "device_graph.stable.tensor"),
+                                    operands: SmallVec::from_slice(&[get_val, spec_val]),
+                                    results: SmallVec::new(),
+                                    attributes: IndexMap::new(),
+                                    regions: Vec::new(),
+                                    custom_syntax: false,
+                                    location: loc.clone(),
+                                });
+                                let st_val = module.values.insert_with_key(|id| Value {
+                                    id,
+                                    ssa_name: None,
+                                    ty: tensor_ty,
+                                    def: ValueDef::OpResult {
+                                        op: st_op,
+                                        index: 0,
+                                    },
+                                });
+                                module.ops[st_op].results.push(st_val);
+                                module.blocks[dev_blk].ops.push(st_op);
+                                stable_tensors.insert(st_op_id, st_val);
+                                st_val
+                            };
+                            mapper.insert(opd, resolved);
+                            cloned_opds.push(resolved);
+                        } else {
+                            cloned_opds.push(mapper[&opd]);
+                        }
+                    }
+
+                    let orig_name = module.ops[op_id].name.clone();
+                    let orig_attrs = module.ops[op_id].attributes.clone();
+                    let orig_res = module.ops[op_id].results.clone();
+                    let cloned_op = module.ops.insert_with_key(|id| Operation {
+                        id,
+                        name: orig_name,
+                        operands: cloned_opds,
+                        results: SmallVec::new(),
+                        attributes: orig_attrs,
+                        regions: Vec::new(),
+                        custom_syntax: false,
+                        location: loc.clone(),
+                    });
+                    for (r_idx, &old_r) in orig_res.iter().enumerate() {
+                        let r_ty = module.values[old_r].ty.clone();
+                        let new_r = module.values.insert_with_key(|id| Value {
+                            id,
+                            ssa_name: None,
+                            ty: r_ty,
+                            def: ValueDef::OpResult {
+                                op: cloned_op,
+                                index: r_idx as u32,
+                            },
+                        });
+                        module.ops[cloned_op].results.push(new_r);
+                        mapper.insert(old_r, new_r);
+                    }
+                    module.blocks[dev_blk].ops.push(cloned_op);
+                }
+
+                let mut reg_yields: SmallVec<[ValueId; 4]> = SmallVec::new();
+                for &orig_y in &orig_yield_opds {
+                    if let Some(&cloned_y) = mapper.get(&orig_y) {
+                        reg_yields.push(cloned_y);
+                        let res_idx = collective_res_types.len();
+                        collective_res_types.push(module.values[cloned_y].ty.clone());
+                        result_mapping.entry(orig_y).or_insert(res_idx);
+                    }
+                }
+                let cy_op = module.ops.insert_with_key(|id| Operation {
+                    id,
+                    name: OpName::new("mgp", "device_graph.collective.yield"),
+                    operands: reg_yields,
+                    results: SmallVec::new(),
+                    attributes: IndexMap::new(),
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: loc.clone(),
+                });
+                module.blocks[dev_blk].ops.push(cy_op);
+
+                let dev_reg = module.regions.insert_with_key(|id| crate::ir::Region {
+                    id,
+                    blocks: vec![dev_blk],
+                });
+                collective_regions.push(dev_reg);
+            }
+
+            let mut coll_attrs = IndexMap::new();
+            coll_attrs.insert(
+                "devices".to_string(),
+                Attribute::Array(
+                    device_order
+                        .iter()
+                        .map(|d| Attribute::String(d.clone()))
+                        .collect(),
+                ),
+            );
+            coll_attrs.insert(
+                "num_stable_slots".to_string(),
+                Attribute::Int(stable_indices.len() as i64),
+            );
+            let collective_op = module.ops.insert_with_key(|id| Operation {
+                id,
+                name: OpName::new("mgp", "device_graph.collective"),
+                operands: SmallVec::new(),
+                results: SmallVec::new(),
+                attributes: coll_attrs,
+                regions: collective_regions,
+                custom_syntax: false,
+                location: loc,
+            });
+            for (idx, ty) in collective_res_types.into_iter().enumerate() {
+                let v = module.values.insert_with_key(|id| Value {
+                    id,
+                    ssa_name: None,
+                    ty,
+                    def: ValueDef::OpResult {
+                        op: collective_op,
+                        index: idx as u32,
+                    },
+                });
+                module.ops[collective_op].results.push(v);
+            }
+
+            // Rewire uses of `staging_op` results to the mapped `collective_op` results.
+            let mut replace_map: IndexMap<ValueId, ValueId> = IndexMap::new();
+            for (&orig_y, &staging_res) in orig_yield_opds
+                .iter()
+                .zip(module.ops[staging_op].results.iter())
+            {
+                let idx = *result_mapping.get(&orig_y).ok_or_else(|| {
+                    "staging yield value not materialized in any region".to_string()
+                })?;
+                replace_map.insert(staging_res, module.ops[collective_op].results[idx]);
+            }
+
+            if let Some(pos) = module.blocks[blk_id]
+                .ops
+                .iter()
+                .position(|&id| id == staging_op)
+            {
+                module.blocks[blk_id].ops[pos] = collective_op;
+            }
+            for &ext_op in &module.blocks[blk_id].ops {
+                for opd in &mut module.ops[ext_op].operands {
+                    if let Some(&new_v) = replace_map.get(opd) {
+                        *opd = new_v;
+                    }
+                }
+            }
+            module.ops.remove(staging_op);
+            partitioned_count += 1;
+        }
+    }
+
+    Ok(partitioned_count)
+}
