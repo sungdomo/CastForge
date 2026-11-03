@@ -356,9 +356,17 @@ impl Pass for LowerPagedAttentionPass {
             }
         }
 
-        // Stamp homogeneous KV layer group IDs onto each attention op
+        // Stamp homogeneous KV layer group IDs and unified Jenga huge-block pool geometry
         let groups = analyze_kv_layer_groups(module);
-        for group in &groups {
+        let page_specs: Vec<KvPageSpec> = groups
+            .iter()
+            .map(|g| KvPageSpec {
+                data_bytes: g.bytes_per_page,
+                stride_alignment: Some(256),
+            })
+            .collect();
+        let jenga = plan_jenga_kv_geometry(&page_specs, 0.125, 128 * 1024 * 1024);
+        for (g_idx, group) in groups.iter().enumerate() {
             for &layer_idx in &group.layer_indices {
                 if let Some(&op_id) = attn_ops.get(layer_idx)
                     && let Some(op) = module.ops.get_mut(op_id)
@@ -367,6 +375,16 @@ impl Pass for LowerPagedAttentionPass {
                         "castforge.kv_layer_group".to_string(),
                         Attribute::Int(group.group_id as i64),
                     );
+                    if let Some(ref pool) = jenga {
+                        op.attributes.insert(
+                            "castforge.jenga_huge_block_bytes".to_string(),
+                            Attribute::Int(pool.huge_block_bytes as i64),
+                        );
+                        op.attributes.insert(
+                            "castforge.jenga_pages_per_huge_block".to_string(),
+                            Attribute::Int(pool.pages_per_huge_block[g_idx] as i64),
+                        );
+                    }
                 }
             }
         }
@@ -378,6 +396,210 @@ impl Pass for LowerPagedAttentionPass {
             ops_modified: modified,
             ops_created: 0,
         })
+    }
+}
+
+/// Physical page specification for a single KV-cache layer group in a unified Jenga block pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvPageSpec {
+    /// Non-zero payload size in bytes for one KV page in this layer group.
+    pub data_bytes: u64,
+    /// Optional hardware stride alignment in bytes (e.g., 256B for Tensor Core / TMA transfers).
+    pub stride_alignment: Option<u64>,
+}
+
+/// Unified "Jenga" huge-block pool geometry across heterogeneous KV-cache layer groups.
+///
+/// Every huge block of `huge_block_bytes` is an exact integer multiple of each group's
+/// `padded_page_bytes[i]`, allowing full-attention, sliding-window, MLA, and SSM layers to
+/// dynamically share a single physical memory pool without external fragmentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JengaPoolGeometry {
+    /// Size in bytes of one unified huge block (`lcm` of all `padded_page_bytes`).
+    pub huge_block_bytes: u64,
+    /// Padded byte stride of one page for each layer group.
+    pub padded_page_bytes: Vec<u64>,
+    /// Number of pages of group `i` that pack into one huge block.
+    pub pages_per_huge_block: Vec<u64>,
+}
+
+fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+fn checked_lcm_u64(a: u64, b: u64) -> Option<u64> {
+    if a == 0 || b == 0 {
+        return None;
+    }
+    (a / gcd_u64(a, b)).checked_mul(b)
+}
+
+/// Plans a unified "Jenga" huge-block pool geometry across heterogeneous [`KvPageSpec`]s.
+///
+/// Each page may be padded up to `1.0 + max_padding_fraction` (respecting `stride_alignment`)
+/// to minimize the least common multiple (`huge_block_bytes <= max_huge_block_bytes`).
+pub fn plan_jenga_kv_geometry(
+    pages: &[KvPageSpec],
+    max_padding_fraction: f64,
+    max_huge_block_bytes: u64,
+) -> Option<JengaPoolGeometry> {
+    if pages.is_empty() || !(0.0..1.0).contains(&max_padding_fraction) || max_huge_block_bytes == 0
+    {
+        return None;
+    }
+
+    let mut candidates_per_group: Vec<Vec<u64>> = Vec::with_capacity(pages.len());
+    for spec in pages {
+        if spec.data_bytes == 0 {
+            return None;
+        }
+        let align = spec.stride_alignment.unwrap_or(1).max(1);
+        let min_stride = spec.data_bytes.div_ceil(align) * align;
+        let max_allowed = ((spec.data_bytes as f64) * (1.0 + max_padding_fraction)).floor() as u64;
+        let max_stride = max_allowed.max(min_stride);
+
+        let mut strides = Vec::new();
+        let mut s = min_stride;
+        while s <= max_stride && strides.len() < 32 {
+            strides.push(s);
+            s = match s.checked_add(align) {
+                Some(next) => next,
+                None => break,
+            };
+        }
+        if strides.is_empty() {
+            return None;
+        }
+        candidates_per_group.push(strides);
+    }
+
+    let mut best_lcm: Option<u64> = None;
+    let mut best_strides: Vec<u64> = Vec::new();
+    let mut current = vec![0u64; pages.len()];
+
+    fn search(
+        group_idx: usize,
+        running_lcm: u64,
+        candidates: &[Vec<u64>],
+        max_huge: u64,
+        current: &mut [u64],
+        best_lcm: &mut Option<u64>,
+        best_strides: &mut Vec<u64>,
+    ) {
+        if let Some(best) = *best_lcm
+            && running_lcm >= best
+        {
+            return;
+        }
+        if group_idx == candidates.len() {
+            *best_lcm = Some(running_lcm);
+            *best_strides = current.to_vec();
+            return;
+        }
+        for &s in &candidates[group_idx] {
+            if let Some(next_lcm) = checked_lcm_u64(running_lcm, s)
+                && next_lcm <= max_huge
+            {
+                current[group_idx] = s;
+                search(
+                    group_idx + 1,
+                    next_lcm,
+                    candidates,
+                    max_huge,
+                    current,
+                    best_lcm,
+                    best_strides,
+                );
+            }
+        }
+    }
+
+    search(
+        0,
+        1,
+        &candidates_per_group,
+        max_huge_block_bytes,
+        &mut current,
+        &mut best_lcm,
+        &mut best_strides,
+    );
+
+    let huge_block_bytes = best_lcm?;
+    let pages_per_huge_block = best_strides.iter().map(|&s| huge_block_bytes / s).collect();
+    Some(JengaPoolGeometry {
+        huge_block_bytes,
+        padded_page_bytes: best_strides,
+        pages_per_huge_block,
+    })
+}
+
+/// Attention mask regime for a [`KvLayerGroup`] during prefix-cache hit planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvAttentionMaskKind {
+    /// Standard causal full attention: requires a contiguous cached prefix `[0..h)`.
+    FullAttention,
+    /// Sliding-window causal attention: requires at most `blocks_in_window` consecutive cached
+    /// blocks immediately preceding the stopping point `h`.
+    SlidingWindow { blocks_in_window: usize },
+}
+
+/// Computes the longest valid prefix-cache hit `h` (`0 <= h <= num_blocks`) for a full-attention
+/// layer group where `is_cached(block_idx)` reports whether block `block_idx` is resident.
+pub fn longest_full_attention_hit(num_blocks: usize, is_cached: impl Fn(usize) -> bool) -> usize {
+    (0..num_blocks).take_while(|&i| is_cached(i)).count()
+}
+
+/// Computes the longest valid prefix-cache hit `h` (`0 <= h <= num_blocks`) for a sliding-window
+/// attention layer group with window size `blocks_in_window` (`>= 1`).
+///
+/// A stopping point `h` is valid iff all blocks in `h.saturating_sub(blocks_in_window)..h` are
+/// cached (i.e. the `blocks_in_window` blocks immediately before `h`, or `0..h` when `h <= W`).
+pub fn longest_sliding_window_hit(
+    num_blocks: usize,
+    blocks_in_window: usize,
+    is_cached: impl Fn(usize) -> bool,
+) -> usize {
+    let w = blocks_in_window.max(1);
+    for h in (1..=num_blocks).rev() {
+        let start = h.saturating_sub(w);
+        if (start..h).all(&is_cached) {
+            return h;
+        }
+    }
+    0
+}
+
+/// Computes the longest joint prefix-cache hit across hybrid full-attention and sliding-window
+/// [`KvLayerGroup`]s by iteratively narrowing the candidate stopping point until convergence.
+pub fn longest_joint_prefix_hit(
+    num_blocks: usize,
+    groups: &[(KvAttentionMaskKind, &dyn Fn(usize) -> bool)],
+) -> usize {
+    if groups.is_empty() || num_blocks == 0 {
+        return 0;
+    }
+    let mut upper = num_blocks;
+    loop {
+        let prev = upper;
+        for &(mask_kind, is_cached) in groups {
+            upper = match mask_kind {
+                KvAttentionMaskKind::FullAttention => longest_full_attention_hit(upper, is_cached),
+                KvAttentionMaskKind::SlidingWindow { blocks_in_window } => {
+                    longest_sliding_window_hit(upper, blocks_in_window, is_cached)
+                }
+            };
+            if upper == 0 {
+                return 0;
+            }
+        }
+        if upper == prev {
+            return upper;
+        }
     }
 }
 

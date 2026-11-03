@@ -8,7 +8,11 @@ use castforge::ffi::{
 };
 use castforge::ir::formats::{import_gguf_bytes, import_onnx_json};
 use castforge::ir::{DType, Dim, TensorBacking, TensorEntry, TensorStore, TensorType, parse_mlir};
-use castforge::passes::{EngineKvFormat, PassManager, PassRegistry, analyze_kv_layer_groups};
+use castforge::passes::{
+    EngineKvFormat, KvAttentionMaskKind, KvPageSpec, PassManager, PassRegistry,
+    analyze_kv_layer_groups, longest_full_attention_hit, longest_joint_prefix_hit,
+    longest_sliding_window_hit, plan_jenga_kv_geometry,
+};
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
 
@@ -328,4 +332,81 @@ module @paged_kv_test {
     assert!(printed.contains("castforge.kv_format = \"cross_layer\""));
     assert!(printed.contains("32, 2, 2, 16, 1, 4"));
     assert!(printed.contains("castforge.kv_layer_group = 0"));
+    assert!(printed.contains("castforge.jenga_huge_block_bytes = 256"));
+    assert!(printed.contains("castforge.jenga_pages_per_huge_block = 1"));
+}
+
+#[test]
+fn test_jenga_kv_pool_geometry_and_hybrid_prefix_hit_planner() {
+    // 1. Jenga Block-Pool Geometry:
+    // Group 0 (e.g. MLA latent page): 3584 bytes (7 * 512), aligned to 256 -> can pad to 4096
+    // Group 1 (e.g. GQA KV page): 4096 bytes, aligned to 256
+    // Without padding, lcm(3584, 4096) = 28672. With <= 15% padding, 3584 pads to 4096.
+    let specs = vec![
+        KvPageSpec {
+            data_bytes: 3584,
+            stride_alignment: Some(256),
+        },
+        KvPageSpec {
+            data_bytes: 4096,
+            stride_alignment: Some(256),
+        },
+    ];
+    let exact = plan_jenga_kv_geometry(&specs, 0.0, 1024 * 1024).unwrap();
+    assert_eq!(exact.huge_block_bytes, 28672);
+    assert_eq!(exact.pages_per_huge_block, vec![8, 7]);
+
+    let padded = plan_jenga_kv_geometry(&specs, 0.15, 1024 * 1024).unwrap();
+    assert_eq!(padded.huge_block_bytes, 4096);
+    assert_eq!(padded.padded_page_bytes, vec![4096, 4096]);
+    assert_eq!(padded.pages_per_huge_block, vec![1, 1]);
+
+    // 2. Hybrid Full-Attention + Sliding-Window Prefix-Hit Planner:
+    // Suppose we have 6 prompt blocks [0..6):
+    // - Full-attention group has cached blocks: [true, true, true, true, true, false] -> max hit 5
+    // - Sliding-window group (window = 2 blocks) evicted early blocks [0, 1] and kept [2, 3, 4]:
+    //   cached = [false, false, true, true, true, false]
+    //   Stopping at h = 5 requires blocks [3, 4] cached -> true!
+    //   Stopping at h = 4 requires blocks [2, 3] cached -> true!
+    //   Stopping at h = 3 requires blocks [1, 2] cached -> false (block 1 evicted)!
+    let full_cached = [true, true, true, true, true, false];
+    let sw_cached = [false, false, true, true, true, false];
+
+    assert_eq!(longest_full_attention_hit(6, |i| full_cached[i]), 5);
+    assert_eq!(longest_sliding_window_hit(6, 2, |i| sw_cached[i]), 5);
+
+    let f_full = |i: usize| full_cached[i];
+    let f_sw = |i: usize| sw_cached[i];
+    let joint = longest_joint_prefix_hit(
+        6,
+        &[
+            (KvAttentionMaskKind::FullAttention, &f_full),
+            (
+                KvAttentionMaskKind::SlidingWindow {
+                    blocks_in_window: 2,
+                },
+                &f_sw,
+            ),
+        ],
+    );
+    assert_eq!(joint, 5);
+
+    // Now suppose full-attention only cached [0, 1, 2] (hit = 3), while sliding-window cached
+    // [false, false, true, true, true, false]. At upper = 3, sliding-window needs [1, 2] cached,
+    // which fails, narrowing to h = 0!
+    let full_short = [true, true, true, false, false, false];
+    let f_full_short = |i: usize| full_short[i];
+    let joint_narrowed = longest_joint_prefix_hit(
+        6,
+        &[
+            (KvAttentionMaskKind::FullAttention, &f_full_short),
+            (
+                KvAttentionMaskKind::SlidingWindow {
+                    blocks_in_window: 2,
+                },
+                &f_sw,
+            ),
+        ],
+    );
+    assert_eq!(joint_narrowed, 0);
 }
