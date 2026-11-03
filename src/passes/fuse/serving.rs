@@ -3533,6 +3533,42 @@ impl IsolatedLruEvictionPolicy {
         }
         victims
     }
+
+    /// Returns all `cache_salt` identifiers that currently hold at least one tracked key.
+    pub fn tracked_salts(&self) -> Vec<String> {
+        self.buckets
+            .iter()
+            .filter_map(|(salt, b)| (!b.is_empty()).then_some(salt.clone()))
+            .collect()
+    }
+
+    /// Selects up to `ceil(len * expected_ratio)` LRU keys from `cache_salt` that satisfy
+    /// `is_eligible` without mutating the LRU bucket (used by asynchronous fleet eviction where
+    /// keys leave the LRU only after the `DELETE` event is confirmed).
+    pub fn select_eviction_candidates_filtered<F>(
+        &self,
+        cache_salt: &str,
+        expected_ratio: f64,
+        is_eligible: F,
+    ) -> Vec<u64>
+    where
+        F: Fn(u64) -> bool,
+    {
+        let ratio = expected_ratio.clamp(0.0, 1.0);
+        if ratio <= 0.0 {
+            return Vec::new();
+        }
+        let Some(bucket) = self.buckets.get(cache_salt) else {
+            return Vec::new();
+        };
+        let target = ((bucket.len() as f64) * ratio).ceil() as usize;
+        bucket
+            .keys()
+            .copied()
+            .filter(|&k| is_eligible(k))
+            .take(target)
+            .collect()
+    }
 }
 
 /// Default GPUDirect Storage (`cuFile` / `O_DIRECT`) filesystem block alignment (`4096` bytes).
@@ -6590,7 +6626,7 @@ pub fn plan_cacheblend_token_reorder(
 
 /// Storage tier reported by a cache event batch (inspired by LMCache
 /// `lmcache/v1/distributed/api.py` `Tier`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CacheEventTier {
     /// Volatile host/device L1 cache tier (tied to emitter incarnation).
     L1,
@@ -10686,4 +10722,326 @@ pub fn recover_contiguous_or_dim0_padded_view(
         padding_per_block_elems,
         block_stride_elems,
     })
+}
+
+/// Multi-tier fleet cache byte-usage view rolled up per key, per `cache_salt`, and per
+/// `(instance_id, backend)` with $O(\text{instance placements})$ `L1` fencing.
+#[derive(Debug, Clone, Default)]
+pub struct FleetCacheUsageView {
+    /// `(tier, key, cache_salt, owner, backend) -> size_bytes`
+    placement_sizes: IndexMap<(CacheEventTier, u64, String, String, String), u64>,
+    /// `(tier, key) -> total_bytes`
+    key_bytes: IndexMap<(CacheEventTier, u64), u64>,
+    /// `(tier, cache_salt) -> total_bytes`
+    salt_bytes: IndexMap<(CacheEventTier, String), u64>,
+    /// `(tier, owner, backend) -> total_bytes`
+    instance_bytes: IndexMap<(CacheEventTier, String, String), u64>,
+    /// Reverse index `owner -> set of (key, cache_salt, backend)` for `L1` placements.
+    l1_by_instance: IndexMap<String, IndexSet<(u64, String, String)>>,
+}
+
+impl FleetCacheUsageView {
+    /// Creates an empty [`FleetCacheUsageView`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn adjust_rollups(
+        &mut self,
+        tier: CacheEventTier,
+        key: u64,
+        cache_salt: &str,
+        owner: &str,
+        backend: &str,
+        delta: i64,
+    ) {
+        let update_map = |val: Option<&u64>, d: i64| -> Option<u64> {
+            let cur = val.copied().unwrap_or(0) as i64 + d;
+            (cur > 0).then_some(cur as u64)
+        };
+        let k_id = (tier, key);
+        if let Some(next) = update_map(self.key_bytes.get(&k_id), delta) {
+            self.key_bytes.insert(k_id, next);
+        } else {
+            self.key_bytes.shift_remove(&k_id);
+        }
+
+        let s_id = (tier, cache_salt.to_string());
+        if let Some(next) = update_map(self.salt_bytes.get(&s_id), delta) {
+            self.salt_bytes.insert(s_id, next);
+        } else {
+            self.salt_bytes.shift_remove(&s_id);
+        }
+
+        let i_id = (tier, owner.to_string(), backend.to_string());
+        if let Some(next) = update_map(self.instance_bytes.get(&i_id), delta) {
+            self.instance_bytes.insert(i_id, next);
+        } else {
+            self.instance_bytes.shift_remove(&i_id);
+        }
+    }
+
+    /// Consumes a gate-admitted cache-event batch for `cache_salt`.
+    ///
+    /// Shared pools (`shared == true`) are indexed under `owner = ""` so single-instance fencing
+    /// never drops fleet-shared storage bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn consume_batch(
+        &mut self,
+        instance_id: &str,
+        tier: CacheEventTier,
+        backend: &str,
+        shared: bool,
+        op: CacheEventOpKind,
+        cache_salt: &str,
+        entries: &[CacheEventEntrySpec],
+    ) {
+        if op == CacheEventOpKind::Access {
+            return;
+        }
+        let owner = if shared { "" } else { instance_id };
+        for entry in entries {
+            let pid = (
+                tier,
+                entry.key,
+                cache_salt.to_string(),
+                owner.to_string(),
+                backend.to_string(),
+            );
+            match op {
+                CacheEventOpKind::Store => {
+                    let old = self
+                        .placement_sizes
+                        .insert(pid, entry.size_bytes)
+                        .unwrap_or(0);
+                    if tier == CacheEventTier::L1 && !owner.is_empty() {
+                        self.l1_by_instance
+                            .entry(owner.to_string())
+                            .or_default()
+                            .insert((entry.key, cache_salt.to_string(), backend.to_string()));
+                    }
+                    let delta = (entry.size_bytes as i64) - (old as i64);
+                    if delta != 0 {
+                        self.adjust_rollups(tier, entry.key, cache_salt, owner, backend, delta);
+                    }
+                }
+                CacheEventOpKind::Delete => {
+                    if let Some(old) = self.placement_sizes.shift_remove(&pid) {
+                        if tier == CacheEventTier::L1
+                            && !owner.is_empty()
+                            && let Some(set) = self.l1_by_instance.get_mut(owner)
+                        {
+                            set.shift_remove(&(
+                                entry.key,
+                                cache_salt.to_string(),
+                                backend.to_string(),
+                            ));
+                            if set.is_empty() {
+                                self.l1_by_instance.shift_remove(owner);
+                            }
+                        }
+                        self.adjust_rollups(
+                            tier,
+                            entry.key,
+                            cache_salt,
+                            owner,
+                            backend,
+                            -(old as i64),
+                        );
+                    }
+                }
+                CacheEventOpKind::Access => {}
+            }
+        }
+    }
+
+    /// Drops all `L1` bytes reported by `instance_id` while preserving `L2` and shared-pool bytes.
+    /// Returns the total `L1` bytes removed.
+    pub fn fence_instance(&mut self, instance_id: &str) -> u64 {
+        let Some(items) = self.l1_by_instance.shift_remove(instance_id) else {
+            return 0;
+        };
+        let mut removed_bytes = 0u64;
+        for (key, salt, backend) in items {
+            let pid = (
+                CacheEventTier::L1,
+                key,
+                salt.clone(),
+                instance_id.to_string(),
+                backend.clone(),
+            );
+            if let Some(old) = self.placement_sizes.shift_remove(&pid) {
+                removed_bytes += old;
+                self.adjust_rollups(
+                    CacheEventTier::L1,
+                    key,
+                    &salt,
+                    instance_id,
+                    &backend,
+                    -(old as i64),
+                );
+            }
+        }
+        removed_bytes
+    }
+
+    /// Returns total bytes held for `key` in `tier` across all active placements.
+    pub fn get_key_bytes(&self, tier: CacheEventTier, key: u64) -> u64 {
+        self.key_bytes.get(&(tier, key)).copied().unwrap_or(0)
+    }
+
+    /// Returns total bytes held under `cache_salt` in `tier`.
+    pub fn get_salt_bytes(&self, tier: CacheEventTier, cache_salt: &str) -> u64 {
+        self.salt_bytes
+            .get(&(tier, cache_salt.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Returns total bytes held across all tenants in `tier`.
+    pub fn get_total_bytes(&self, tier: CacheEventTier) -> u64 {
+        self.salt_bytes
+            .iter()
+            .filter_map(|((t, _), &b)| (*t == tier).then_some(b))
+            .sum()
+    }
+}
+
+/// Fleet-wide per-`cache_salt` `L2` watermark eviction controller with reference-counted key
+/// pinning and last-copy-aware LRU accounting.
+#[derive(Debug, Clone)]
+pub struct FleetWatermarkEvictionController {
+    /// Per-tenant byte quota registry.
+    pub quota: KvSaltQuotaRegistry,
+    /// Per-tenant isolated LRU eviction policy.
+    pub policy: IsolatedLruEvictionPolicy,
+    pin_counts: IndexMap<u64, usize>,
+    eviction_ratio: f64,
+    trigger_watermark: f64,
+    max_delete_batch: usize,
+}
+
+impl FleetWatermarkEvictionController {
+    /// Creates a new [`FleetWatermarkEvictionController`].
+    pub fn new(eviction_ratio: f64, trigger_watermark: f64, max_delete_batch: usize) -> Self {
+        Self {
+            quota: KvSaltQuotaRegistry::new(),
+            policy: IsolatedLruEvictionPolicy::new(),
+            pin_counts: IndexMap::new(),
+            eviction_ratio: eviction_ratio.clamp(0.0, 1.0),
+            trigger_watermark: trigger_watermark.max(0.0),
+            max_delete_batch: max_delete_batch.max(1),
+        }
+    }
+
+    /// Applies an admitted `L2` batch to the controller's LRU after `usage` has already processed
+    /// the same batch.
+    ///
+    /// A `Delete` event removes a key from the LRU only when its last `L2` placement is gone
+    /// (`usage.get_key_bytes(L2, key) == 0`).
+    pub fn consume_l2_batch(
+        &mut self,
+        usage: &FleetCacheUsageView,
+        op: CacheEventOpKind,
+        cache_salt: &str,
+        keys: &[u64],
+    ) {
+        match op {
+            CacheEventOpKind::Store => self.policy.on_keys_created(cache_salt, keys),
+            CacheEventOpKind::Access => self.policy.on_keys_touched(cache_salt, keys),
+            CacheEventOpKind::Delete => {
+                for &k in keys {
+                    if usage.get_key_bytes(CacheEventTier::L2, k) == 0 {
+                        self.policy.on_keys_removed(cache_salt, &[k]);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Increments the active `L2` pin count for each key in `keys`, excluding it from eviction.
+    pub fn pin(&mut self, keys: &[u64]) {
+        for &k in keys {
+            *self.pin_counts.entry(k).or_insert(0) += 1;
+        }
+    }
+
+    /// Decrements the active `L2` pin count for each key in `keys`, removing the entry at `0`.
+    pub fn unpin(&mut self, keys: &[u64]) {
+        for &k in keys {
+            if let Some(c) = self.pin_counts.get_mut(&k) {
+                if *c <= 1 {
+                    self.pin_counts.shift_remove(&k);
+                } else {
+                    *c -= 1;
+                }
+            }
+        }
+    }
+
+    /// Removes all pins for `keys` (used by force-delete).
+    pub fn drop_pins(&mut self, keys: &[u64]) {
+        for &k in keys {
+            self.pin_counts.shift_remove(&k);
+        }
+    }
+
+    /// Returns the active pin count for `key`.
+    pub fn pin_count(&self, key: u64) -> usize {
+        self.pin_counts.get(&key).copied().unwrap_or(0)
+    }
+
+    /// Filters `keys` to those with no active `L2` pin, preserving input order.
+    pub fn filter_unpinned(&self, keys: &[u64]) -> Vec<u64> {
+        keys.iter()
+            .copied()
+            .filter(|k| !self.pin_counts.contains_key(k))
+            .collect()
+    }
+
+    /// Computes the per-`cache_salt` `L2` eviction plan against `usage`.
+    ///
+    /// Salts without an effective quota (`effective_limit_bytes == None`) are exempt; salts with
+    /// `current_bytes >= trigger_watermark * limit` select `ceil(len * effective_ratio)` unpinned
+    /// LRU keys (`effective_ratio = 1.0` when `limit == 0`).
+    pub fn compute_eviction_plan(&self, usage: &FleetCacheUsageView) -> IndexMap<String, Vec<u64>> {
+        let mut plan = IndexMap::new();
+        for salt in self.policy.tracked_salts() {
+            let current_bytes = usage.get_salt_bytes(CacheEventTier::L2, &salt);
+            if current_bytes == 0 {
+                continue;
+            }
+            let Some(limit) = self.quota.effective_limit_bytes(&salt) else {
+                continue;
+            };
+            if (current_bytes as f64) < self.trigger_watermark * (limit as f64) {
+                continue;
+            }
+            let effective_ratio = if limit == 0 { 1.0 } else { self.eviction_ratio };
+            let victims =
+                self.policy
+                    .select_eviction_candidates_filtered(&salt, effective_ratio, |k| {
+                        !self.pin_counts.contains_key(&k)
+                    });
+            if !victims.is_empty() {
+                plan.insert(salt, victims);
+            }
+        }
+        plan
+    }
+
+    /// Splits a computed eviction plan into outbound delete request batches of at most
+    /// `max_delete_batch` keys each.
+    pub fn chunk_delete_batches(
+        &self,
+        plan: &IndexMap<String, Vec<u64>>,
+    ) -> Vec<(String, Vec<u64>)> {
+        let mut batches = Vec::new();
+        for (salt, keys) in plan {
+            for chunk in keys.chunks(self.max_delete_batch) {
+                batches.push((salt.clone(), chunk.to_vec()));
+            }
+        }
+        batches
+    }
 }

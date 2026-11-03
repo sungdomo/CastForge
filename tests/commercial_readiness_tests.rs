@@ -21,18 +21,18 @@ use castforge::passes::{
     ChainedBlockHashConfig, CollectiveGraphNodeSpec, ContiguousViewPlan, CoordinatorEventGate,
     CoordinatorKeyDirectory, DEFAULT_MAX_KERNELS_IN_FUSION_SET, DaxGenerationSlotArena,
     DaxPutOutcome, DeviceGraphStage, DeviceTargetArch, DynamicAllocRequest, EngineKvFormat,
-    EventIngestOutcome, FULL_ATTENTION_WINDOW, FdpRawBlockSlotManager, GDS_DEFAULT_ALIGN_BYTES,
-    GdsSlabAddressManager, IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind,
-    KvBlockPool, KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry,
-    KvScaleScope, KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy,
-    LayerGroupPayloadSharder, P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable, P2PPeerSpec,
-    PassManager, PassRegistry, PlacementRecord, RAW_BLOCK_META_MAGIC, RAW_BLOCK_SLOT_MAGIC,
-    ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST, RawBlockMetaCheckpointHeader,
-    ReshapeDimMapping, TOKEN_WIRE_STRIDE, TurboQuantPreset, TurboQuantSerdeConfig,
-    WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
-    analyze_static_reshape_dim_mapping, annotate_squeeze_unsqueeze_reshapes,
-    anonymize_symbolic_dims, await_hanging_effect_chains, build_orthonormal_hadamard,
-    classify_blend_read_groups, coalesce_exhaustive_gathers_to_split,
+    EventIngestOutcome, FULL_ATTENTION_WINDOW, FdpRawBlockSlotManager, FleetCacheUsageView,
+    FleetWatermarkEvictionController, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
+    IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
+    KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope,
+    KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy, LayerGroupPayloadSharder,
+    P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable, P2PPeerSpec, PassManager, PassRegistry,
+    PlacementRecord, RAW_BLOCK_META_MAGIC, RAW_BLOCK_SLOT_MAGIC, ROWWISE_CHEAP_OP_COST,
+    ROWWISE_EXPENSIVE_OP_COST, RawBlockMetaCheckpointHeader, ReshapeDimMapping, TOKEN_WIRE_STRIDE,
+    TurboQuantPreset, TurboQuantSerdeConfig, WarmPrefetchJobTable, WarmPrefetchStatus,
+    analyze_kv_layer_groups, analyze_static_reshape_dim_mapping,
+    annotate_squeeze_unsqueeze_reshapes, anonymize_symbolic_dims, await_hanging_effect_chains,
+    build_orthonormal_hadamard, classify_blend_read_groups, coalesce_exhaustive_gathers_to_split,
     coalesce_partitioning_slices_to_split, compress_splat_constants,
     compute_cb_group_rope_geometry, compute_ieee_crc32, decode_kv_fs_filename,
     decode_kv_storage_key, decode_raw_block_slot_header, defer_allocs_to_first_use,
@@ -3622,4 +3622,125 @@ fn test_recover_contiguous_or_dim0_padded_view_and_stride_ties() {
     //    overlapping outer blocks (`strides = [512, 64, 1]`):
     assert!(recover_contiguous_or_dim0_padded_view(&[4, 16, 64], &[2048, 128, 1]).is_none());
     assert!(recover_contiguous_or_dim0_padded_view(&[4, 16, 64], &[512, 64, 1]).is_none());
+}
+
+#[test]
+fn test_fleet_cache_usage_view_and_watermark_eviction_controller() {
+    let mut usage = FleetCacheUsageView::new();
+    let mut ctrl = FleetWatermarkEvictionController::new(0.5, 0.8, 2);
+
+    // 1. Store 4 keys under `tenant-a` in L2 (each 1000 bytes -> 4000 bytes total), plus key 10
+    //    replicated on a second non-shared L2 backend (`nvme`) and in `worker-1` L1:
+    let entries_a = vec![
+        CacheEventEntrySpec {
+            key: 10,
+            size_bytes: 1000,
+        },
+        CacheEventEntrySpec {
+            key: 20,
+            size_bytes: 1000,
+        },
+        CacheEventEntrySpec {
+            key: 30,
+            size_bytes: 1000,
+        },
+        CacheEventEntrySpec {
+            key: 40,
+            size_bytes: 1000,
+        },
+    ];
+    usage.consume_batch(
+        "worker-1",
+        CacheEventTier::L2,
+        "redis",
+        true,
+        CacheEventOpKind::Store,
+        "tenant-a",
+        &entries_a,
+    );
+    ctrl.consume_l2_batch(
+        &usage,
+        CacheEventOpKind::Store,
+        "tenant-a",
+        &[10, 20, 30, 40],
+    );
+
+    usage.consume_batch(
+        "worker-2",
+        CacheEventTier::L2,
+        "nvme",
+        false,
+        CacheEventOpKind::Store,
+        "tenant-a",
+        &[CacheEventEntrySpec {
+            key: 10,
+            size_bytes: 1000,
+        }],
+    );
+    usage.consume_batch(
+        "worker-1",
+        CacheEventTier::L1,
+        "dram",
+        false,
+        CacheEventOpKind::Store,
+        "tenant-a",
+        &[CacheEventEntrySpec {
+            key: 10,
+            size_bytes: 1000,
+        }],
+    );
+
+    assert_eq!(usage.get_key_bytes(CacheEventTier::L2, 10), 2000);
+    assert_eq!(usage.get_salt_bytes(CacheEventTier::L2, "tenant-a"), 5000);
+    assert_eq!(usage.get_total_bytes(CacheEventTier::L1), 1000);
+
+    // Fencing `worker-1` drops its L1 bytes (`1000`) while leaving L2 (`5000`) untouched:
+    assert_eq!(usage.fence_instance("worker-1"), 1000);
+    assert_eq!(usage.get_total_bytes(CacheEventTier::L1), 0);
+    assert_eq!(usage.get_salt_bytes(CacheEventTier::L2, "tenant-a"), 5000);
+
+    // Deleting key 10 from `nvme` still leaves its `redis` L2 copy (`1000` bytes), so key 10
+    // stays in the LRU!
+    usage.consume_batch(
+        "worker-2",
+        CacheEventTier::L2,
+        "nvme",
+        false,
+        CacheEventOpKind::Delete,
+        "tenant-a",
+        &[CacheEventEntrySpec {
+            key: 10,
+            size_bytes: 0,
+        }],
+    );
+    ctrl.consume_l2_batch(&usage, CacheEventOpKind::Delete, "tenant-a", &[10]);
+    assert_eq!(ctrl.policy.resident_len_for_salt("tenant-a"), 4);
+
+    // 2. Pin key 40 (the LRU head, since `on_keys_created` inserts in reverse request order
+    //    `[40, 30, 20, 10]`) and set quota for `tenant-a` to `5000` (`watermark = 4000`):
+    ctrl.pin(&[40]);
+    assert_eq!(ctrl.pin_count(40), 1);
+    assert_eq!(ctrl.filter_unpinned(&[40, 30, 20]), vec![30, 20]);
+
+    // Without quota configured, `tenant-a` is exempt:
+    assert!(ctrl.compute_eviction_plan(&usage).is_empty());
+
+    // Arm quota `5000` -> `current_bytes = 4000 >= 0.8 * 5000` triggers eviction of 2
+    // unpinned keys (`[30, 20]`, skipping pinned key `40`):
+    ctrl.quota.set_quota("tenant-a", 5000);
+    let plan = ctrl.compute_eviction_plan(&usage);
+    assert_eq!(plan.get("tenant-a"), Some(&vec![30, 20]));
+
+    // With quota `0`, `effective_ratio = 1.0` selects all 3 unpinned keys (`[30, 20, 10]`) and
+    // chunks them into batches of `max_delete_batch = 2`:
+    ctrl.quota.set_quota("tenant-a", 0);
+    let full_plan = ctrl.compute_eviction_plan(&usage);
+    assert_eq!(full_plan.get("tenant-a"), Some(&vec![30, 20, 10]));
+    assert_eq!(
+        ctrl.chunk_delete_batches(&full_plan),
+        vec![
+            ("tenant-a".to_string(), vec![30, 20]),
+            ("tenant-a".to_string(), vec![10]),
+        ]
+    );
 }
