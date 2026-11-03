@@ -18,11 +18,11 @@ use castforge::passes::{
     CacheGenCdfCodec, ChainedBlockHashConfig, DEFAULT_MAX_KERNELS_IN_FUSION_SET, DeviceTargetArch,
     EngineKvFormat, FULL_ATTENTION_WINDOW, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
     IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
-    KvDmaTransferMode, KvPageSpec, KvSaltQuotaRegistry, KvScaleScope, PassManager, PassRegistry,
-    analyze_kv_layer_groups, anonymize_symbolic_dims, compress_splat_constants,
-    defer_allocs_to_first_use, direct_copy_format_supported, elide_redundant_state_transfers,
-    flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
-    fuse_reshape_epilogue, fuse_sole_use_prologues, hash_prefix_token_blocks,
+    KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope,
+    PassManager, PassRegistry, analyze_kv_layer_groups, anonymize_symbolic_dims,
+    compress_splat_constants, defer_allocs_to_first_use, direct_copy_format_supported,
+    elide_redundant_state_transfers, flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps,
+    fuse_locations, fuse_reshape_epilogue, fuse_sole_use_prologues, hash_prefix_token_blocks,
     is_supported_arch_dtype, longest_full_attention_hit, longest_joint_prefix_hit,
     longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_duplicate_shape_ops,
     merge_identical_functions, plan_cacheblend_retrieve, plan_jenga_kv_geometry,
@@ -1570,4 +1570,27 @@ module @shape_dedup {
     let printed = castforge::ir::print_mlir(&module);
     assert_eq!(printed.matches("stablehlo.reshape").count(), 1);
     assert_eq!(printed.matches("stablehlo.iota").count(), 1);
+}
+
+#[test]
+fn test_kv_prefix_bloom_filter_optimal_sizing_and_batch_dedup() {
+    let mut bf = KvPrefixBloomFilter::new(1_000, 0.01);
+    // m = floor(-(1000 * ln(0.01)) / (ln(2)^2)) = 9585, k = floor((9585/1000) * ln(2)) = 6
+    assert_eq!(bf.bit_size(), 9_585);
+    assert_eq!(bf.hash_count(), 6);
+    assert_eq!(bf.bits_set(), 0);
+
+    // Batch with duplicates [101, 202, 101, 303, 202] -> exactly 3 newly observed unique keys!
+    let new_count = bf.add_batch_and_count_new(&[101, 202, 101, 303, 202]);
+    assert_eq!(new_count, 3);
+    assert_eq!(bf.item_count(), 3);
+    assert!(bf.contains(101));
+    assert!(bf.contains(202));
+    assert!(bf.contains(303));
+    assert!(!bf.contains(999_999));
+    assert!(bf.fill_rate() > 0.0);
+
+    bf.clear();
+    assert_eq!(bf.item_count(), 0);
+    assert_eq!(bf.bits_set(), 0);
 }

@@ -3824,3 +3824,132 @@ pub fn merge_duplicate_shape_ops(module: &mut Module) -> usize {
 
     merged_count
 }
+
+/// Memory-efficient optimal-parameter Bloom filter for fast KV prefix-chunk membership testing
+/// and unique-chunk counting (inspired by LMCache `lmcache/v1/utils/bloom_filter.py`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct KvPrefixBloomFilter {
+    bit_size: usize,
+    hash_count: usize,
+    words: Vec<u32>,
+    item_count: usize,
+    expected_elements: usize,
+    false_positive_rate: f64,
+}
+
+impl KvPrefixBloomFilter {
+    /// Optimal bit-array size `m = floor(-(n * ln(p)) / (ln(2)^2))`.
+    pub fn optimal_bit_size(expected_elements: usize, false_positive_rate: f64) -> usize {
+        let n = expected_elements.max(1) as f64;
+        let p = false_positive_rate.clamp(1e-9, 0.999_999);
+        let ln2 = std::f64::consts::LN_2;
+        ((-(n * p.ln()) / (ln2 * ln2)).floor() as usize).max(32)
+    }
+
+    /// Optimal hash function count `k = max(1, floor((m / n) * ln(2)))`.
+    pub fn optimal_hash_count(bit_size: usize, expected_elements: usize) -> usize {
+        let n = expected_elements.max(1) as f64;
+        let m = bit_size.max(1) as f64;
+        (((m / n) * std::f64::consts::LN_2).floor() as usize).max(1)
+    }
+
+    /// Creates a new Bloom filter sized for `expected_elements` and `false_positive_rate`.
+    pub fn new(expected_elements: usize, false_positive_rate: f64) -> Self {
+        let bit_size = Self::optimal_bit_size(expected_elements, false_positive_rate);
+        let hash_count = Self::optimal_hash_count(bit_size, expected_elements);
+        let word_count = bit_size.div_ceil(32);
+        Self {
+            bit_size,
+            hash_count,
+            words: vec![0u32; word_count],
+            item_count: 0,
+            expected_elements: expected_elements.max(1),
+            false_positive_rate: false_positive_rate.clamp(1e-9, 0.999_999),
+        }
+    }
+
+    /// Bit capacity `m` of the filter.
+    pub fn bit_size(&self) -> usize {
+        self.bit_size
+    }
+
+    /// Number of independent hash probes `k` per key.
+    pub fn hash_count(&self) -> usize {
+        self.hash_count
+    }
+
+    /// Number of unique/inserted items recorded.
+    pub fn item_count(&self) -> usize {
+        self.item_count
+    }
+
+    fn hash_positions(&self, key: u64) -> Vec<usize> {
+        let mut out = Vec::with_capacity(self.hash_count);
+        for i in 0..self.hash_count {
+            // SplitMix64-style double hashing seeded by `(key, probe_index)`
+            let mut z = key
+                .wrapping_add((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                .wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            out.push((z as usize) % self.bit_size);
+        }
+        out
+    }
+
+    /// Inserts `key` into the Bloom filter.
+    pub fn add(&mut self, key: u64) {
+        for pos in self.hash_positions(key) {
+            self.words[pos >> 5] |= 1u32 << (pos & 31);
+        }
+        self.item_count += 1;
+    }
+
+    /// Inserts a batch of `keys` and returns the count of newly observed unique keys (keys for
+    /// which at least one bit position was previously unset).
+    pub fn add_batch_and_count_new(&mut self, keys: &[u64]) -> usize {
+        let mut unique_new = 0usize;
+        for &key in keys {
+            let positions = self.hash_positions(key);
+            let is_new = positions
+                .iter()
+                .any(|&pos| (self.words[pos >> 5] & (1u32 << (pos & 31))) == 0);
+            if is_new {
+                for pos in positions {
+                    self.words[pos >> 5] |= 1u32 << (pos & 31);
+                }
+                unique_new += 1;
+            }
+        }
+        self.item_count += unique_new;
+        unique_new
+    }
+
+    /// Returns `true` if all probe bits for `key` are set.
+    pub fn contains(&self, key: u64) -> bool {
+        self.hash_positions(key)
+            .into_iter()
+            .all(|pos| (self.words[pos >> 5] & (1u32 << (pos & 31))) != 0)
+    }
+
+    /// Total number of set bits across the bit array.
+    pub fn bits_set(&self) -> usize {
+        self.words.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    /// Fraction of bits currently set in `[0.0, 1.0]`.
+    pub fn fill_rate(&self) -> f64 {
+        if self.bit_size == 0 {
+            0.0
+        } else {
+            (self.bits_set() as f64) / (self.bit_size as f64)
+        }
+    }
+
+    /// Resets all bits and item counters to zero.
+    pub fn clear(&mut self) {
+        self.words.fill(0);
+        self.item_count = 0;
+    }
+}
