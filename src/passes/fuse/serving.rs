@@ -13756,3 +13756,346 @@ pub fn predicate_assert_dependencies(module: &mut Module) -> usize {
 
     predicated_ops
 }
+
+// ============================================================================
+// Polynomial Rolling-Hash Window Matcher & Coordinator Blend Content Index
+// (inspired by LMCache `lmcache/v1/mp_coordinator/blend_index.py` and
+//  `lmcache/v1/multiprocess/token_hasher.py`)
+// ============================================================================
+
+/// Fleet-constant 64-bit odd polynomial base for CacheBlend rolling-hash content indexing.
+pub const BLEND_POLY_BASE: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Occupancy filter growth factor (`16` slots per live distinct content).
+pub const BLEND_INDEX_TABLE_GROWTH: usize = 16;
+
+/// Minimum power-of-two slot count (`1024`) for the occupancy filter.
+pub const BLEND_INDEX_MIN_TABLE_SIZE: usize = 1 << 10;
+
+/// Computes sliding-window 64-bit polynomial rolling hashes across `tokens` for window size
+/// `window_k` in $O(n)$ time using natural $\bmod 2^{64}$ arithmetic:
+/// $$H([x_0, \dots, x_{k-1}]) = \sum_{i=0}^{k-1} x_i \cdot \text{base}^{k - 1 - i} \pmod{2^{64}}$$
+#[must_use]
+pub fn rolling_hash_windows_u64(tokens: &[u64], window_k: usize, base: u64) -> Vec<u64> {
+    if window_k == 0 || tokens.len() < window_k {
+        return Vec::new();
+    }
+    let n = tokens.len();
+    let mut out = Vec::with_capacity(n - window_k + 1);
+
+    let mut power = 1u64;
+    for _ in 0..(window_k - 1) {
+        power = power.wrapping_mul(base);
+    }
+
+    let mut h = 0u64;
+    for &tok in &tokens[..window_k] {
+        h = h.wrapping_mul(base).wrapping_add(tok);
+    }
+    out.push(h);
+
+    for i in window_k..n {
+        let old = tokens[i - window_k];
+        let new = tokens[i];
+        h = h.wrapping_sub(old.wrapping_mul(power));
+        h = h.wrapping_mul(base).wrapping_add(new);
+        out.push(h);
+    }
+    out
+}
+
+/// Computes non-overlapping chunk polynomial hashes of length `tokens.len() / window_k`.
+#[must_use]
+pub fn chunk_hash_windows_u64(tokens: &[u64], window_k: usize, base: u64) -> Vec<u64> {
+    if window_k == 0 || tokens.len() < window_k {
+        return Vec::new();
+    }
+    let num_windows = tokens.len() / window_k;
+    let mut out = Vec::with_capacity(num_windows);
+    for w in 0..num_windows {
+        let start = w * window_k;
+        let mut h = 0u64;
+        for &tok in &tokens[start..start + window_k] {
+            h = h.wrapping_mul(base).wrapping_add(tok);
+        }
+        out.push(h);
+    }
+    out
+}
+
+/// Point-in-time O(1) summary of [`BlendContentFingerprintIndex`] contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlendIndexStats {
+    /// Distinct chunk token contents indexed.
+    pub num_contents: usize,
+    /// Total chunk hashes indexed across those contents.
+    pub num_chunks: usize,
+    /// Total `(chunk_hash, namespace)` claims across those chunks.
+    pub num_claims: usize,
+    /// Distinct namespaces currently holding indexed content.
+    pub num_namespaces: usize,
+    /// Number of slots in the power-of-two occupancy filter.
+    pub table_size: usize,
+}
+
+/// Verified token-exact fragment match returned by [`BlendContentFingerprintIndex::match_tokens`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlendFragmentMatch {
+    /// Matched chunk's 32-byte `chunk_hash`.
+    pub chunk_hash: [u8; 32],
+    /// Token offset of the chunk in its originally stored sequence.
+    pub old_st: usize,
+    /// Starting token index of the matched window in the query sequence.
+    pub cur_st: usize,
+}
+
+#[derive(Debug, Clone)]
+struct BlendOccupant {
+    token_offset: usize,
+    namespaces: IndexSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BlendFingerprintEntry {
+    token_ids: Vec<u64>,
+    occupants: IndexMap<[u8; 32], BlendOccupant>,
+}
+
+/// Content fingerprint index over the coordinator key directory's token bindings for CacheBlend
+/// fragment lookup.
+#[derive(Debug, Clone)]
+pub struct BlendContentFingerprintIndex {
+    chunk_size: usize,
+    probe_stride: usize,
+    fingerprint_table: IndexMap<u64, BlendFingerprintEntry>,
+    slots: Vec<u8>,
+    mask: usize,
+    bits_set: usize,
+    num_chunks: usize,
+    claims_by_namespace: IndexMap<String, usize>,
+}
+
+impl BlendContentFingerprintIndex {
+    /// Creates an empty [`BlendContentFingerprintIndex`].
+    ///
+    /// Returns `None` if `chunk_size == 0` or `probe_stride == 0`.
+    #[must_use]
+    pub fn new(chunk_size: usize, probe_stride: usize) -> Option<Self> {
+        if chunk_size == 0 || probe_stride == 0 {
+            return None;
+        }
+        Some(Self {
+            chunk_size,
+            probe_stride,
+            fingerprint_table: IndexMap::new(),
+            slots: vec![0u8; BLEND_INDEX_MIN_TABLE_SIZE],
+            mask: BLEND_INDEX_MIN_TABLE_SIZE - 1,
+            bits_set: 0,
+            num_chunks: 0,
+            claims_by_namespace: IndexMap::new(),
+        })
+    }
+
+    fn fingerprint(&self, token_ids: &[u64]) -> u64 {
+        chunk_hash_windows_u64(token_ids, self.chunk_size, BLEND_POLY_BASE)[0]
+    }
+
+    fn adjust_claim_count(&mut self, namespace: &str, delta: isize) {
+        let current = self
+            .claims_by_namespace
+            .get(namespace)
+            .copied()
+            .unwrap_or(0) as isize;
+        let next = current + delta;
+        if next > 0 {
+            self.claims_by_namespace
+                .insert(namespace.to_string(), next as usize);
+        } else {
+            self.claims_by_namespace.shift_remove(namespace);
+        }
+    }
+
+    fn rebuild_table(&mut self) {
+        let mut size = BLEND_INDEX_MIN_TABLE_SIZE;
+        while size < BLEND_INDEX_TABLE_GROWTH.saturating_mul(self.fingerprint_table.len()) {
+            size <<= 1;
+        }
+        self.slots = vec![0u8; size];
+        self.mask = size - 1;
+        let mut bits = 0usize;
+        for &poly in self.fingerprint_table.keys() {
+            let slot = (poly as usize) & self.mask;
+            if self.slots[slot] == 0 {
+                self.slots[slot] = 1;
+                bits += 1;
+            }
+        }
+        self.bits_set = bits;
+    }
+
+    /// Records that `namespace` stores `chunk_hash` with `token_ids` at `token_offset`.
+    ///
+    /// Ignores content whose length does not equal `chunk_size`.
+    pub fn add(
+        &mut self,
+        token_ids: &[u64],
+        chunk_hash: [u8; 32],
+        token_offset: usize,
+        namespace: &str,
+    ) {
+        if token_ids.len() != self.chunk_size {
+            return;
+        }
+        let poly = self.fingerprint(token_ids);
+        let is_new_fp = !self.fingerprint_table.contains_key(&poly);
+        if is_new_fp {
+            self.fingerprint_table.insert(
+                poly,
+                BlendFingerprintEntry {
+                    token_ids: token_ids.to_vec(),
+                    occupants: IndexMap::new(),
+                },
+            );
+            let slot = (poly as usize) & self.mask;
+            if self.slots[slot] == 0 {
+                self.slots[slot] = 1;
+                self.bits_set += 1;
+            }
+            if BLEND_INDEX_TABLE_GROWTH.saturating_mul(self.fingerprint_table.len())
+                > self.slots.len()
+            {
+                self.rebuild_table();
+            }
+        }
+
+        let entry = self.fingerprint_table.get_mut(&poly).unwrap();
+        if let Some(occ) = entry.occupants.get_mut(&chunk_hash) {
+            occ.token_offset = token_offset;
+            if occ.namespaces.insert(namespace.to_string()) {
+                self.adjust_claim_count(namespace, 1);
+            }
+        } else {
+            let mut namespaces = IndexSet::new();
+            namespaces.insert(namespace.to_string());
+            entry.occupants.insert(
+                chunk_hash,
+                BlendOccupant {
+                    token_offset,
+                    namespaces,
+                },
+            );
+            self.num_chunks += 1;
+            self.adjust_claim_count(namespace, 1);
+        }
+    }
+
+    /// Drops `namespace`'s claim on `chunk_hash` under `token_ids`.
+    pub fn remove_claim(&mut self, token_ids: &[u64], chunk_hash: &[u8; 32], namespace: &str) {
+        if token_ids.len() != self.chunk_size {
+            return;
+        }
+        let poly = self.fingerprint(token_ids);
+        let Some(entry) = self.fingerprint_table.get_mut(&poly) else {
+            return;
+        };
+        let Some(occ) = entry.occupants.get_mut(chunk_hash) else {
+            return;
+        };
+        if !occ.namespaces.shift_remove(namespace) {
+            return;
+        }
+        let occ_empty = occ.namespaces.is_empty();
+        if occ_empty {
+            entry.occupants.shift_remove(chunk_hash);
+        }
+        let entry_empty = entry.occupants.is_empty();
+        self.adjust_claim_count(namespace, -1);
+        if !occ_empty {
+            return;
+        }
+        self.num_chunks -= 1;
+        if !entry_empty {
+            return;
+        }
+        self.fingerprint_table.shift_remove(&poly);
+        if self.bits_set > 2 * self.fingerprint_table.len() {
+            self.rebuild_table();
+        }
+    }
+
+    /// Drops `chunk_hash` and every namespace's claim on it under `token_ids`.
+    pub fn remove_chunk(&mut self, token_ids: &[u64], chunk_hash: &[u8; 32]) {
+        if token_ids.len() != self.chunk_size {
+            return;
+        }
+        let poly = self.fingerprint(token_ids);
+        let Some(entry) = self.fingerprint_table.get_mut(&poly) else {
+            return;
+        };
+        let Some(occ) = entry.occupants.shift_remove(chunk_hash) else {
+            return;
+        };
+        self.num_chunks -= 1;
+        let namespaces: Vec<String> = occ.namespaces.into_iter().collect();
+        for ns in namespaces {
+            self.adjust_claim_count(&ns, -1);
+        }
+        if self.fingerprint_table[&poly].occupants.is_empty() {
+            self.fingerprint_table.shift_remove(&poly);
+            if self.bits_set > 2 * self.fingerprint_table.len() {
+                self.rebuild_table();
+            }
+        }
+    }
+
+    /// Finds chunks `namespace` can retrieve that are contained in `tokens`, verified token-exact,
+    /// returned in ascending `cur_st` order (at most one match per `chunk_hash`).
+    #[must_use]
+    pub fn match_tokens(&self, tokens: &[u64], namespace: &str) -> Vec<BlendFragmentMatch> {
+        if tokens.len() < self.chunk_size {
+            return Vec::new();
+        }
+        let rolling = rolling_hash_windows_u64(tokens, self.chunk_size, BLEND_POLY_BASE);
+        let mut matches = Vec::new();
+        let mut seen: IndexSet<[u8; 32]> = IndexSet::new();
+
+        for (pos, &fp) in rolling.iter().step_by(self.probe_stride).enumerate() {
+            let slot = (fp as usize) & self.mask;
+            if self.slots[slot] == 0 {
+                continue;
+            }
+            let Some(entry) = self.fingerprint_table.get(&fp) else {
+                continue;
+            };
+            let cur_st = pos * self.probe_stride;
+            for (&chunk_hash, occ) in &entry.occupants {
+                if seen.contains(&chunk_hash) || !occ.namespaces.contains(namespace) {
+                    continue;
+                }
+                if tokens[cur_st..cur_st + self.chunk_size] != entry.token_ids[..] {
+                    break;
+                }
+                seen.insert(chunk_hash);
+                matches.push(BlendFragmentMatch {
+                    chunk_hash,
+                    old_st: occ.token_offset,
+                    cur_st,
+                });
+                break;
+            }
+        }
+        matches
+    }
+
+    /// Returns a point-in-time O(1) summary of index contents.
+    #[must_use]
+    pub fn stats(&self) -> BlendIndexStats {
+        BlendIndexStats {
+            num_contents: self.fingerprint_table.len(),
+            num_chunks: self.num_chunks,
+            num_claims: self.claims_by_namespace.values().sum(),
+            num_namespaces: self.claims_by_namespace.len(),
+            table_size: self.slots.len(),
+        }
+    }
+}

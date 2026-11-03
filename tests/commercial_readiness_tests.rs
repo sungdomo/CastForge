@@ -14,35 +14,36 @@ use castforge::ir::{
     DType, Dim, Location, TensorBacking, TensorEntry, TensorStore, TensorType, parse_mlir,
 };
 use castforge::passes::{
-    AffinitySlotRouter, ArcKvEvictionPolicy, AsymK16V8Codec, BLEND_REORDER_LMIN, Bitmap2D,
-    BlendMatchSpan, BlendObjectGroupKind, BlendReadGroupSet, BlendTokenRangeMatcher,
-    BucketHistogram, BufferDependencyTree, CBChunkMatch, CBGroupRopeGeometry, CBGroupSpec,
-    CHUNK_COUNT_HISTOGRAM_BOUNDS, COORDINATOR_CHECKPOINT_MAGIC, CacheBlendRopeSpec,
-    CacheEventBatchSpec, CacheEventEntrySpec, CacheEventOpKind, CacheEventTier, CacheGenCdfCodec,
-    ChainedBlockHashConfig, CollectiveGraphNodeSpec, ContiguousViewPlan, CoordinatorEventGate,
-    CoordinatorKeyDirectory, DEFAULT_MAX_KERNELS_IN_FUSION_SET, DaxGenerationSlotArena,
-    DaxPutOutcome, DeviceGraphStage, DeviceTargetArch, DynamicAllocRequest, EXCLUDED_ENGINE_GROUP,
-    EngineGroupInfoSpec, EngineKvFormat, EventIngestOutcome, FULL_ATTENTION_WINDOW,
-    FdpRawBlockSlotManager, FleetCacheUsageView, FleetInstanceRegistry, FleetMembershipCounters,
-    FleetWatermarkEvictionController, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
-    IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KafkaStreamPositionTable,
-    KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter,
-    KvSaltQuotaRegistry, KvScaleScope, KvStorageKeySpec, L2_AEAD_FRAME_OVERHEAD, L2_AEAD_IV_LEN,
-    L2_HKDF_INFO_PREFIX, L2FaultInjectConfig, L2FaultInjectPolicy, LayerGroupPayloadSharder,
-    MemoryTagSpec, MpInstanceSpec, MultiTierPrefetchPlan, P2P_DEFAULT_MAX_MISSES,
-    P2PPeerDiscoveryTable, P2PPeerSpec, PassManager, PassRegistry, PlacementRecord,
-    PrefetchFetchingPolicy, QuiesceStateMachine, RAW_BLOCK_META_MAGIC, RAW_BLOCK_SLOT_MAGIC,
-    ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST, RawBlockMetaCheckpointHeader,
-    ReshapeDimMapping, SaltKeyProvider, TOKEN_WIRE_STRIDE, TierMapState, TurboQuantPreset,
-    TurboQuantSerdeConfig, WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
-    analyze_static_reshape_dim_mapping, annotate_squeeze_unsqueeze_reshapes,
-    anonymize_symbolic_dims, await_hanging_effect_chains, build_orthonormal_hadamard,
-    classify_blend_read_groups, coalesce_exhaustive_gathers_to_split,
-    coalesce_partitioning_slices_to_split, coalesce_unbundle_consumers_to_parallel,
-    collect_alloc_uses_in_block, compress_splat_constants, compute_cb_group_rope_geometry,
-    compute_ieee_crc32, decode_coordinator_checkpoint_envelope, decode_kv_fs_filename,
-    decode_kv_storage_key, decode_raw_block_slot_header, defer_allocs_to_first_use,
-    direct_copy_format_supported, downsample_subchunk_swa_block_ids,
+    AffinitySlotRouter, ArcKvEvictionPolicy, AsymK16V8Codec, BLEND_INDEX_MIN_TABLE_SIZE,
+    BLEND_POLY_BASE, BLEND_REORDER_LMIN, Bitmap2D, BlendContentFingerprintIndex,
+    BlendFragmentMatch, BlendIndexStats, BlendMatchSpan, BlendObjectGroupKind, BlendReadGroupSet,
+    BlendTokenRangeMatcher, BucketHistogram, BufferDependencyTree, CBChunkMatch,
+    CBGroupRopeGeometry, CBGroupSpec, CHUNK_COUNT_HISTOGRAM_BOUNDS, COORDINATOR_CHECKPOINT_MAGIC,
+    CacheBlendRopeSpec, CacheEventBatchSpec, CacheEventEntrySpec, CacheEventOpKind, CacheEventTier,
+    CacheGenCdfCodec, ChainedBlockHashConfig, CollectiveGraphNodeSpec, ContiguousViewPlan,
+    CoordinatorEventGate, CoordinatorKeyDirectory, DEFAULT_MAX_KERNELS_IN_FUSION_SET,
+    DaxGenerationSlotArena, DaxPutOutcome, DeviceGraphStage, DeviceTargetArch, DynamicAllocRequest,
+    EXCLUDED_ENGINE_GROUP, EngineGroupInfoSpec, EngineKvFormat, EventIngestOutcome,
+    FULL_ATTENTION_WINDOW, FdpRawBlockSlotManager, FleetCacheUsageView, FleetInstanceRegistry,
+    FleetMembershipCounters, FleetWatermarkEvictionController, GDS_DEFAULT_ALIGN_BYTES,
+    GdsSlabAddressManager, IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL,
+    KafkaStreamPositionTable, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode, KvPageSpec,
+    KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope, KvStorageKeySpec,
+    L2_AEAD_FRAME_OVERHEAD, L2_AEAD_IV_LEN, L2_HKDF_INFO_PREFIX, L2FaultInjectConfig,
+    L2FaultInjectPolicy, LayerGroupPayloadSharder, MemoryTagSpec, MpInstanceSpec,
+    MultiTierPrefetchPlan, P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable, P2PPeerSpec, PassManager,
+    PassRegistry, PlacementRecord, PrefetchFetchingPolicy, QuiesceStateMachine,
+    RAW_BLOCK_META_MAGIC, RAW_BLOCK_SLOT_MAGIC, ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST,
+    RawBlockMetaCheckpointHeader, ReshapeDimMapping, SaltKeyProvider, TOKEN_WIRE_STRIDE,
+    TierMapState, TurboQuantPreset, TurboQuantSerdeConfig, WarmPrefetchJobTable,
+    WarmPrefetchStatus, analyze_kv_layer_groups, analyze_static_reshape_dim_mapping,
+    annotate_squeeze_unsqueeze_reshapes, anonymize_symbolic_dims, await_hanging_effect_chains,
+    build_orthonormal_hadamard, chunk_hash_windows_u64, classify_blend_read_groups,
+    coalesce_exhaustive_gathers_to_split, coalesce_partitioning_slices_to_split,
+    coalesce_unbundle_consumers_to_parallel, collect_alloc_uses_in_block, compress_splat_constants,
+    compute_cb_group_rope_geometry, compute_ieee_crc32, decode_coordinator_checkpoint_envelope,
+    decode_kv_fs_filename, decode_kv_storage_key, decode_raw_block_slot_header,
+    defer_allocs_to_first_use, direct_copy_format_supported, downsample_subchunk_swa_block_ids,
     elide_redundant_mutable_buffer_ops, elide_redundant_state_transfers,
     eliminate_implied_dependencies, encode_coordinator_checkpoint_envelope, encode_kv_fs_filename,
     encode_kv_storage_key, encode_raw_block_meta_checkpoint, encode_raw_block_slot_header,
@@ -65,8 +66,8 @@ use castforge::passes::{
     plan_multi_tier_prefetch_load, predicate_assert_dependencies, promote_narrow_accumulators,
     re_rope_key_in_place, recalculate_subchunk_blocks_to_skip, recognize_composite_activations,
     recover_contiguous_or_dim0_padded_view, relax_non_aliasing_mutable_chain_sequences,
-    resolve_l1_memory_affinity, reuse_dead_loop_buffers, seal_l2_kv_frame,
-    select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
+    resolve_l1_memory_affinity, reuse_dead_loop_buffers, rolling_hash_windows_u64,
+    seal_l2_kv_frame, select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
     sink_split_through_reshape, sink_transpose_through_elementwise_and_broadcast,
     slice_block_ids_per_group, solve_lloyd_max_gaussian, stamp_fused_provenance,
     swim_reshape_through_slice, unfold_chunk_range, unique_blend_token_coverage,
@@ -4394,4 +4395,73 @@ fn test_predicate_assert_dependencies_stops_at_first_chain_consumer() {
     );
     assert_eq!(m.ops[ops[4]].operands[0], m.ops[ops[3]].results[0]);
     assert_eq!(m.ops[ops[5]].operands[0], m.ops[ops[4]].results[1]);
+}
+
+#[test]
+fn test_blend_content_fingerprint_index_and_rolling_hash_windows() {
+    let seq = [10u64, 20, 30, 40, 50, 60, 70, 80];
+    let rolling = rolling_hash_windows_u64(&seq, 4, BLEND_POLY_BASE);
+    let chunked = chunk_hash_windows_u64(&seq, 4, BLEND_POLY_BASE);
+    assert_eq!(rolling.len(), 5);
+    assert_eq!(chunked.len(), 2);
+    // Non-overlapping chunk hashes at offsets 0 and 4 equal rolling hashes at 0 and 4!
+    assert_eq!(chunked[0], rolling[0]);
+    assert_eq!(chunked[1], rolling[4]);
+
+    let mut idx = BlendContentFingerprintIndex::new(4, 1).expect("valid index");
+    let ch1 = [0x11u8; 32];
+    let ch2 = [0x22u8; 32];
+    idx.add(&[10, 20, 30, 40], ch1, 64, "ns-alpha");
+    idx.add(&[10, 20, 30, 40], ch1, 64, "ns-beta");
+    idx.add(&[50, 60, 70, 80], ch2, 128, "ns-alpha");
+
+    assert_eq!(
+        idx.stats(),
+        BlendIndexStats {
+            num_contents: 2,
+            num_chunks: 2,
+            num_claims: 3,
+            num_namespaces: 2,
+            table_size: BLEND_INDEX_MIN_TABLE_SIZE,
+        }
+    );
+
+    // Query `[99, 10, 20, 30, 40, 88, 50, 60, 70, 80]` contains `ch1` at `cur_st = 1` and
+    // `ch2` at `cur_st = 6`:
+    let query = [99u64, 10, 20, 30, 40, 88, 50, 60, 70, 80];
+    let matches_alpha = idx.match_tokens(&query, "ns-alpha");
+    assert_eq!(
+        matches_alpha,
+        vec![
+            BlendFragmentMatch {
+                chunk_hash: ch1,
+                old_st: 64,
+                cur_st: 1,
+            },
+            BlendFragmentMatch {
+                chunk_hash: ch2,
+                old_st: 128,
+                cur_st: 6,
+            },
+        ]
+    );
+    // `ns-beta` only claimed `ch1`:
+    let matches_beta = idx.match_tokens(&query, "ns-beta");
+    assert_eq!(
+        matches_beta,
+        vec![BlendFragmentMatch {
+            chunk_hash: ch1,
+            old_st: 64,
+            cur_st: 1,
+        }]
+    );
+
+    // Removing `ns-alpha`'s claim on `ch1` keeps `ch1` alive for `ns-beta`, while `remove_chunk`
+    // drops `ch2` completely:
+    idx.remove_claim(&[10, 20, 30, 40], &ch1, "ns-alpha");
+    idx.remove_chunk(&[50, 60, 70, 80], &ch2);
+    assert_eq!(idx.stats().num_contents, 1);
+    assert_eq!(idx.stats().num_chunks, 1);
+    assert_eq!(idx.stats().num_claims, 1);
+    assert_eq!(idx.stats().num_namespaces, 1);
 }
