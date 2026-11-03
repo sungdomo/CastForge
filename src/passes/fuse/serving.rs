@@ -19798,3 +19798,394 @@ pub fn add_profile_scope_tracing(module: &mut Module, trace_unlabelled: bool) ->
 
     inserted_ranges
 }
+
+// ============================================================================
+// Batch 22 Step 3: Device-Graph Recording Stub Generator & Builder Pool Alloc
+// Lowering
+// ============================================================================
+
+#[derive(Debug, Clone)]
+struct RecordingStubInfo {
+    stub_name: String,
+    context_arg_index: usize,
+}
+
+fn is_producer_dispatch_op(op: &Operation) -> bool {
+    matches!(
+        op.name.full_name().as_str(),
+        "mogg.call_opaque" | "mogg.call.foreach" | "mogg.call.foreach_tile" | "mogg.call.view_copy"
+    )
+}
+
+fn create_recording_stub_function(
+    module: &mut Module,
+    orig_func_id: OpId,
+    orig_sym_name: &str,
+) -> Result<RecordingStubInfo, String> {
+    let Some(&orig_reg) = module.ops[orig_func_id].regions.first() else {
+        return Err(format!("kernel stub '{orig_sym_name}' has no region"));
+    };
+    let Some(&orig_blk) = module.regions[orig_reg].blocks.first() else {
+        return Err(format!("kernel stub '{orig_sym_name}' has no entry block"));
+    };
+    let orig_args = module.blocks[orig_blk].arguments.clone();
+    let orig_ops = module.blocks[orig_blk].ops.clone();
+
+    let mut producer_op_opt: Option<OpId> = None;
+    for &op_id in &orig_ops {
+        if is_producer_dispatch_op(&module.ops[op_id]) {
+            producer_op_opt = Some(op_id);
+            break;
+        }
+    }
+    let Some(producer_op) = producer_op_opt else {
+        return Err(format!(
+            "device-graph recording stub: '{orig_sym_name}' has no producer dispatch"
+        ));
+    };
+
+    // Determine which block argument of `orig_blk` acts as the launch context.
+    let mut context_arg_index: Option<usize> = None;
+    if let Some(Attribute::Int(idx)) = module.ops[producer_op].attributes.get("context_arg_index")
+        && *idx >= 0
+        && (*idx as usize) < orig_args.len()
+    {
+        context_arg_index = Some(*idx as usize);
+    } else {
+        for &opd in module.ops[producer_op].operands.iter().rev() {
+            if let Some(pos) = orig_args.iter().position(|&a| a == opd) {
+                context_arg_index = Some(pos);
+                break;
+            }
+        }
+    }
+    let Some(ctx_arg_idx) = context_arg_index else {
+        return Err(format!(
+            "device-graph recording stub: launch context in '{orig_sym_name}' is not a block arg"
+        ));
+    };
+
+    let use_build_graph = module.ops[producer_op].name.full_name() == "mogg.call_opaque"
+        && matches!(
+            module.ops[producer_op].attributes.get("has_build_graph"),
+            Some(Attribute::Bool(true))
+        );
+
+    let loc = module.ops[orig_func_id].location.clone();
+    let new_blk = module.blocks.insert_with_key(|id| crate::ir::Block {
+        id,
+        label: None,
+        arguments: Vec::new(),
+        ops: Vec::new(),
+    });
+    let mut val_map: IndexMap<ValueId, ValueId> = IndexMap::new();
+    for (arg_i, &old_arg) in orig_args.iter().enumerate() {
+        let arg_ty = module.values[old_arg].ty.clone();
+        let new_arg = module.values.insert_with_key(|id| Value {
+            id,
+            ssa_name: None,
+            ty: arg_ty,
+            def: ValueDef::BlockArgument {
+                block: new_blk,
+                index: arg_i as u32,
+            },
+        });
+        module.blocks[new_blk].arguments.push(new_arg);
+        val_map.insert(old_arg, new_arg);
+    }
+
+    let launch_arg = module.blocks[new_blk].arguments[ctx_arg_idx];
+
+    // If not `use_build_graph`, emit `mgp.device_graph.recording_context` at block start.
+    let recording_ctx_val = if !use_build_graph {
+        let rec_ty = module.values[launch_arg].ty.clone();
+        let rec_op = module.ops.insert_with_key(|id| Operation {
+            id,
+            name: OpName::new("mgp", "device_graph.recording_context"),
+            operands: smallvec::smallvec![launch_arg],
+            results: SmallVec::new(),
+            attributes: IndexMap::new(),
+            regions: Vec::new(),
+            custom_syntax: false,
+            location: loc.clone(),
+        });
+        let rec_val = module.values.insert_with_key(|id| Value {
+            id,
+            ssa_name: None,
+            ty: rec_ty,
+            def: ValueDef::OpResult {
+                op: rec_op,
+                index: 0,
+            },
+        });
+        module.ops[rec_op].results.push(rec_val);
+        module.blocks[new_blk].ops.push(rec_op);
+        Some(rec_val)
+    } else {
+        None
+    };
+
+    for &op_id in &orig_ops {
+        let full_name = module.ops[op_id].name.full_name();
+        if use_build_graph && full_name == "mogg.with_trace" {
+            continue;
+        }
+        if op_id == producer_op {
+            let mut mapped_opds: SmallVec<[ValueId; 4]> = module.ops[op_id]
+                .operands
+                .iter()
+                .map(|&v| val_map.get(&v).copied().unwrap_or(v))
+                .collect();
+
+            if use_build_graph {
+                // Stamp any `mogg.tuple.create` feeding the build_graph dispatch with
+                // `variadic_abi = "stable"` when marked `is_stable_variadic = true`.
+                for &in_val in &mapped_opds {
+                    if let ValueDef::OpResult { op: def_op, .. } = module.values[in_val].def
+                        && module.ops[def_op].name.full_name() == "mogg.tuple.create"
+                        && matches!(
+                            module.ops[def_op].attributes.get("is_stable_variadic"),
+                            Some(Attribute::Bool(true))
+                        )
+                    {
+                        module.ops[def_op].attributes.insert(
+                            "variadic_abi".to_string(),
+                            Attribute::String("stable".to_string()),
+                        );
+                    }
+                }
+                let mut bg_attrs = module.ops[op_id].attributes.clone();
+                bg_attrs.shift_remove("has_build_graph");
+                if !bg_attrs.contains_key("has_epilogue_fusion") {
+                    bg_attrs.insert("has_epilogue_fusion".to_string(), Attribute::Bool(false));
+                }
+                let bg_op = module.ops.insert_with_key(|id| Operation {
+                    id,
+                    name: OpName::new("mogg", "call.build_graph"),
+                    operands: mapped_opds,
+                    results: SmallVec::new(),
+                    attributes: bg_attrs,
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: loc.clone(),
+                });
+                module.blocks[new_blk].ops.push(bg_op);
+            } else {
+                if let Some(rec_v) = recording_ctx_val {
+                    for opd in &mut mapped_opds {
+                        if *opd == launch_arg {
+                            *opd = rec_v;
+                        }
+                    }
+                }
+                let orig_name = module.ops[op_id].name.clone();
+                let orig_attrs = module.ops[op_id].attributes.clone();
+                let orig_res = module.ops[op_id].results.clone();
+                let cloned_op = module.ops.insert_with_key(|id| Operation {
+                    id,
+                    name: orig_name,
+                    operands: mapped_opds,
+                    results: SmallVec::new(),
+                    attributes: orig_attrs,
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: loc.clone(),
+                });
+                for (r_idx, &old_r) in orig_res.iter().enumerate() {
+                    let r_ty = module.values[old_r].ty.clone();
+                    let new_r = module.values.insert_with_key(|id| Value {
+                        id,
+                        ssa_name: None,
+                        ty: r_ty,
+                        def: ValueDef::OpResult {
+                            op: cloned_op,
+                            index: r_idx as u32,
+                        },
+                    });
+                    module.ops[cloned_op].results.push(new_r);
+                    val_map.insert(old_r, new_r);
+                }
+                module.blocks[new_blk].ops.push(cloned_op);
+            }
+            continue;
+        }
+
+        if full_name == "func.return" || full_name == "mogg.output" {
+            let ret_name = module.ops[op_id].name.clone();
+            let ret_op = module.ops.insert_with_key(|id| Operation {
+                id,
+                name: ret_name,
+                operands: SmallVec::new(),
+                results: SmallVec::new(),
+                attributes: IndexMap::new(),
+                regions: Vec::new(),
+                custom_syntax: false,
+                location: loc.clone(),
+            });
+            module.blocks[new_blk].ops.push(ret_op);
+            continue;
+        }
+
+        let mapped_opds: SmallVec<[ValueId; 4]> = module.ops[op_id]
+            .operands
+            .iter()
+            .map(|&v| val_map.get(&v).copied().unwrap_or(v))
+            .collect();
+        let orig_name = module.ops[op_id].name.clone();
+        let orig_attrs = module.ops[op_id].attributes.clone();
+        let orig_res = module.ops[op_id].results.clone();
+        let cloned_op = module.ops.insert_with_key(|id| Operation {
+            id,
+            name: orig_name,
+            operands: mapped_opds,
+            results: SmallVec::new(),
+            attributes: orig_attrs,
+            regions: Vec::new(),
+            custom_syntax: false,
+            location: loc.clone(),
+        });
+        for (r_idx, &old_r) in orig_res.iter().enumerate() {
+            let r_ty = module.values[old_r].ty.clone();
+            let new_r = module.values.insert_with_key(|id| Value {
+                id,
+                ssa_name: None,
+                ty: r_ty,
+                def: ValueDef::OpResult {
+                    op: cloned_op,
+                    index: r_idx as u32,
+                },
+            });
+            module.ops[cloned_op].results.push(new_r);
+            val_map.insert(old_r, new_r);
+        }
+        module.blocks[new_blk].ops.push(cloned_op);
+    }
+
+    let new_reg = module.regions.insert_with_key(|id| crate::ir::Region {
+        id,
+        blocks: vec![new_blk],
+    });
+    let stub_name = format!("{orig_sym_name}_build_graph");
+    let mut func_attrs = module.ops[orig_func_id].attributes.clone();
+    func_attrs.insert("sym_name".to_string(), Attribute::String(stub_name.clone()));
+    let new_func_id = module.ops.insert_with_key(|id| Operation {
+        id,
+        name: OpName::new("func", "func"),
+        operands: SmallVec::new(),
+        results: SmallVec::new(),
+        attributes: func_attrs,
+        regions: vec![new_reg],
+        custom_syntax: false,
+        location: loc,
+    });
+
+    // Insert the generated stub right after `orig_func_id` in its parent block.
+    let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+    for b_id in block_ids {
+        if let Some(pos) = module.blocks[b_id]
+            .ops
+            .iter()
+            .position(|&id| id == orig_func_id)
+        {
+            module.blocks[b_id].ops.insert(pos + 1, new_func_id);
+            break;
+        }
+    }
+
+    Ok(RecordingStubInfo {
+        stub_name,
+        context_arg_index: ctx_arg_idx,
+    })
+}
+
+/// Generates `@<callee>_build_graph` recording sibling stubs for `mogg.call`
+/// sites inside device-graph regions (or functions marked `is_device_graph = true`),
+/// retargets the calls to pass the enclosing graph builder in the launch-context
+/// slot, and rewrites `mgp.buffer.alloc` inside those regions into
+/// `mgp.device_graph.alloc` bound to the enclosing graph builder.
+pub fn generate_device_graph_build_stubs(module: &mut Module) -> Result<usize, String> {
+    let mut sym_to_func: IndexMap<String, OpId> = IndexMap::new();
+    for f_id in module.functions() {
+        if let Some(Attribute::String(name)) = module.ops[f_id].attributes.get("sym_name") {
+            sym_to_func.insert(name.clone(), f_id);
+        }
+    }
+
+    // Collect `(block_id, builder_value)` pairs for all device-graph blocks.
+    let mut graph_blocks: Vec<(BlockId, ValueId)> = Vec::new();
+    for f_id in module.functions() {
+        let is_dg_func = matches!(
+            module.ops[f_id].attributes.get("is_device_graph"),
+            Some(Attribute::Bool(true))
+        );
+        for &reg_id in &module.ops[f_id].regions {
+            for &blk_id in &module.regions[reg_id].blocks {
+                if is_dg_func && let Some(&b_arg) = module.blocks[blk_id].arguments.first() {
+                    graph_blocks.push((blk_id, b_arg));
+                }
+                for &op_id in &module.blocks[blk_id].ops {
+                    let op_name = module.ops[op_id].name.full_name();
+                    if op_name == "mgp.device_graph.collective"
+                        || op_name == "mgp.device_graph.staging"
+                        || op_name == "mgp.device_graph.dependencies"
+                    {
+                        for &inner_reg in &module.ops[op_id].regions {
+                            for &inner_blk in &module.regions[inner_reg].blocks {
+                                if let Some(&b_arg) = module.blocks[inner_blk].arguments.first() {
+                                    graph_blocks.push((inner_blk, b_arg));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut callee_to_stub: IndexMap<String, RecordingStubInfo> = IndexMap::new();
+    let mut rewritten_count = 0usize;
+
+    for (blk_id, builder_val) in graph_blocks {
+        let ops = module.blocks[blk_id].ops.clone();
+        for op_id in ops {
+            let full_name = module.ops[op_id].name.full_name();
+            if full_name == "mogg.call" {
+                let callee = module.ops[op_id]
+                    .attributes
+                    .get("callee")
+                    .and_then(Attribute::as_str)
+                    .map(|s| s.trim_start_matches('@').to_string())
+                    .ok_or_else(|| "mogg.call missing 'callee' attribute".to_string())?;
+
+                let stub_info = if let Some(existing) = callee_to_stub.get(&callee) {
+                    existing.clone()
+                } else {
+                    let orig_f = *sym_to_func.get(&callee).ok_or_else(|| {
+                        format!("recording stub call: '{callee}' does not name a kernel stub")
+                    })?;
+                    let info = create_recording_stub_function(module, orig_f, &callee)?;
+                    callee_to_stub.insert(callee.clone(), info.clone());
+                    info
+                };
+
+                if stub_info.context_arg_index >= module.ops[op_id].operands.len() {
+                    return Err(format!(
+                        "recording stub call: expected operand {} to be the launch context",
+                        stub_info.context_arg_index
+                    ));
+                }
+                module.ops[op_id].operands[stub_info.context_arg_index] = builder_val;
+                module.ops[op_id]
+                    .attributes
+                    .insert("callee".to_string(), Attribute::String(stub_info.stub_name));
+                rewritten_count += 1;
+            } else if full_name == "mgp.buffer.alloc" {
+                module.ops[op_id].name = OpName::new("mgp", "device_graph.alloc");
+                module.ops[op_id].operands.push(builder_val);
+                rewritten_count += 1;
+            }
+        }
+    }
+
+    Ok(rewritten_count)
+}

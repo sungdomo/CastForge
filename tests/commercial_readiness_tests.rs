@@ -5907,3 +5907,106 @@ fn test_prepare_device_primitives_and_hierarchical_profile_scope_tracing() {
     );
     assert!(!m.ops[gpu_op].attributes.contains_key("device_ref"));
 }
+
+#[test]
+fn test_generate_device_graph_build_stubs_and_builder_alloc_lowering() {
+    use castforge::ir::Attribute;
+    use castforge::passes::generate_device_graph_build_stubs;
+
+    let ir = concat!(
+        "module @device_graph_stubs {\n",
+        "  func.func @matmul_stub(%in: tensor<4xf32>, %ctx: tensor<1xi64>)",
+        " -> tensor<4xf32> {\n",
+        "    %pack = mogg.tuple.create %in {is_stable_variadic = true}",
+        " : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %trace = mogg.with_trace %pack : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %res = mogg.call_opaque %pack, %ctx {has_build_graph = true}",
+        " : (tensor<4xf32>, tensor<1xi64>) -> tensor<4xf32>\n",
+        "    return %res : tensor<4xf32>\n",
+        "  }\n",
+        "  func.func @copy_stub(%in: tensor<4xf32>, %ctx: tensor<1xi64>)",
+        " -> tensor<4xf32> {\n",
+        "    %res = mogg.call.view_copy %in, %ctx",
+        " : (tensor<4xf32>, tensor<1xi64>) -> tensor<4xf32>\n",
+        "    return %res : tensor<4xf32>\n",
+        "  }\n",
+        "  func.func @graph_body(%builder: tensor<1xi64>, %x: tensor<4xf32>,",
+        " %eager_ctx: tensor<1xi64>) -> tensor<4xf32> {\n",
+        "    %buf = mgp.buffer.alloc %x : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %c1 = mogg.call %buf, %eager_ctx {callee = \"matmul_stub\"}",
+        " : (tensor<4xf32>, tensor<1xi64>) -> tensor<4xf32>\n",
+        "    %c2 = mogg.call %c1, %eager_ctx {callee = \"copy_stub\"}",
+        " : (tensor<4xf32>, tensor<1xi64>) -> tensor<4xf32>\n",
+        "    return %c2 : tensor<4xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(ir).expect("valid MLIR");
+    let graph_func = m.functions()[2];
+    m.ops[graph_func]
+        .attributes
+        .insert("is_device_graph".to_string(), Attribute::Bool(true));
+
+    let rewritten =
+        generate_device_graph_build_stubs(&mut m).expect("stub generation should succeed");
+    assert_eq!(rewritten, 3);
+
+    // Module now has 5 functions: matmul_stub, matmul_stub_build_graph, copy_stub,
+    // copy_stub_build_graph, and graph_body.
+    let funcs = m.functions();
+    assert_eq!(funcs.len(), 5);
+
+    // Verify `matmul_stub_build_graph` has `mogg.tuple.create` with `variadic_abi = "stable"`
+    // and `mogg.call.build_graph` (with `mogg.with_trace` dropped):
+    let matmul_bg = funcs[1];
+    assert_eq!(
+        m.ops[matmul_bg].attributes.get("sym_name"),
+        Some(&Attribute::String("matmul_stub_build_graph".to_string()))
+    );
+    let matmul_bg_blk = m.regions[m.ops[matmul_bg].regions[0]].blocks[0];
+    let matmul_bg_ops: Vec<String> = m.blocks[matmul_bg_blk]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        matmul_bg_ops,
+        vec!["mogg.tuple.create", "mogg.call.build_graph", "func.return"]
+    );
+    let tuple_op = m.blocks[matmul_bg_blk].ops[0];
+    assert_eq!(
+        m.ops[tuple_op].attributes.get("variadic_abi"),
+        Some(&Attribute::String("stable".to_string()))
+    );
+
+    // Verify `copy_stub_build_graph` inserts `mgp.device_graph.recording_context` at block start:
+    let copy_bg = funcs[3];
+    let copy_bg_blk = m.regions[m.ops[copy_bg].regions[0]].blocks[0];
+    let copy_bg_ops: Vec<String> = m.blocks[copy_bg_blk]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        copy_bg_ops,
+        vec![
+            "mgp.device_graph.recording_context",
+            "mogg.call.view_copy",
+            "func.return"
+        ]
+    );
+
+    // Verify `graph_body` rewrote `mgp.buffer.alloc` -> `mgp.device_graph.alloc` and calls:
+    let gb_blk = m.regions[m.ops[graph_func].regions[0]].blocks[0];
+    let builder_arg = m.blocks[gb_blk].arguments[0];
+    let alloc_op = m.blocks[gb_blk].ops[0];
+    assert_eq!(m.ops[alloc_op].name.full_name(), "mgp.device_graph.alloc");
+    assert_eq!(m.ops[alloc_op].operands.last(), Some(&builder_arg));
+
+    let call1_op = m.blocks[gb_blk].ops[1];
+    assert_eq!(
+        m.ops[call1_op].attributes.get("callee"),
+        Some(&Attribute::String("matmul_stub_build_graph".to_string()))
+    );
+    assert_eq!(m.ops[call1_op].operands[1], builder_arg);
+}
