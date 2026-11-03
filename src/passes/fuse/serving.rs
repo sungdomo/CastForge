@@ -11747,3 +11747,132 @@ impl FleetInstanceRegistry {
         self.counters
     }
 }
+
+/// 8-byte ASCII magic header (`LMCKPT\0\0`) for coordinator checkpoint files.
+pub const COORDINATOR_CHECKPOINT_MAGIC: &[u8; 8] = b"LMCKPT\0\0";
+
+/// Encodes a coordinator checkpoint binary envelope (`8-byte magic + little-endian u32 version +
+/// payload`).
+pub fn encode_coordinator_checkpoint_envelope(version: u32, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + payload.len());
+    out.extend_from_slice(COORDINATOR_CHECKPOINT_MAGIC);
+    out.extend_from_slice(&version.to_le_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Validates and strips the 12-byte coordinator checkpoint header (`LMCKPT\0\0` and
+/// `expected_version`), returning the non-empty payload slice.
+pub fn decode_coordinator_checkpoint_envelope(buf: &[u8], expected_version: u32) -> Option<&[u8]> {
+    if buf.len() <= 12 || &buf[0..8] != COORDINATOR_CHECKPOINT_MAGIC {
+        return None;
+    }
+    let version = u32::from_le_bytes(buf[8..12].try_into().ok()?);
+    if version != expected_version {
+        return None;
+    }
+    Some(&buf[12..])
+}
+
+/// Per-`(topic, partition)` stream offset cursor captured atomically inside coordinator
+/// checkpoints.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KafkaStreamPositionTable {
+    offsets: IndexMap<(String, u32), u64>,
+}
+
+impl KafkaStreamPositionTable {
+    /// Creates an empty [`KafkaStreamPositionTable`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records the offset of a batch that the coordinator gate has just admitted.
+    pub fn record(&mut self, topic: &str, partition: u32, offset: u64) {
+        self.offsets.insert((topic.to_string(), partition), offset);
+    }
+
+    /// Returns `Some(last_offset + 1)` to resume `(topic, partition)` from, or `None` if no
+    /// offset has been recorded for that partition.
+    pub fn next_offset(&self, topic: &str, partition: u32) -> Option<u64> {
+        self.offsets
+            .get(&(topic.to_string(), partition))
+            .map(|&off| off + 1)
+    }
+
+    /// Captures all recorded `(topic, partition, offset)` triples for checkpoint serialization.
+    pub fn capture_offsets(&self) -> Vec<(String, u32, u64)> {
+        self.offsets
+            .iter()
+            .map(|((t, p), &off)| (t.clone(), *p, off))
+            .collect()
+    }
+
+    /// Replaces the table with a checkpointed snapshot of `(topic, partition, offset)` triples.
+    pub fn restore_offsets(&mut self, entries: &[(String, u32, u64)]) {
+        self.offsets.clear();
+        for (topic, partition, offset) in entries {
+            self.offsets.insert((topic.clone(), *partition), *offset);
+        }
+    }
+}
+
+/// Coordinator ingest quiesce state machine that parks new cache-event batches while waiting for
+/// in-flight batches to drain before capturing a consistent multi-view checkpoint.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuiesceStateMachine {
+    quiesce_requested: bool,
+    in_flight: usize,
+}
+
+impl QuiesceStateMachine {
+    /// Creates a new idle [`QuiesceStateMachine`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Attempts to start applying an ingest batch. Returns `false` (parking the caller) when a
+    /// checkpoint quiesce is currently requested.
+    pub fn try_begin_apply(&mut self) -> bool {
+        if self.quiesce_requested {
+            return false;
+        }
+        self.in_flight += 1;
+        true
+    }
+
+    /// Completes one in-flight ingest batch and returns `true` if a pending quiesce has now
+    /// reached `in_flight == 0` (ready for consistent capture).
+    pub fn finish_apply(&mut self) -> bool {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        self.quiesce_requested && self.in_flight == 0
+    }
+
+    /// Requests ingest quiescence and returns `true` if `in_flight` is already `0`.
+    pub fn request_quiesce(&mut self) -> bool {
+        self.quiesce_requested = true;
+        self.in_flight == 0
+    }
+
+    /// Returns `true` when `quiesce_requested` is active and `in_flight == 0`.
+    pub fn is_quiesced(&self) -> bool {
+        self.quiesce_requested && self.in_flight == 0
+    }
+
+    /// Releases a completed quiesce so parked ingest batches can resume.
+    pub fn release_quiesce(&mut self) {
+        self.quiesce_requested = false;
+    }
+
+    /// Aborts a pending quiesce on timeout without stalling ingest further, returning the number
+    /// of batches that were still in flight.
+    pub fn abort_quiesce_on_timeout(&mut self) -> usize {
+        self.quiesce_requested = false;
+        self.in_flight
+    }
+
+    /// Returns `(quiesce_requested, in_flight)`.
+    pub fn state(&self) -> (bool, usize) {
+        (self.quiesce_requested, self.in_flight)
+    }
+}

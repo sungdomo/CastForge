@@ -16,49 +16,49 @@ use castforge::ir::{
 use castforge::passes::{
     AffinitySlotRouter, ArcKvEvictionPolicy, AsymK16V8Codec, BLEND_REORDER_LMIN, BlendMatchSpan,
     BlendObjectGroupKind, BlendReadGroupSet, BlendTokenRangeMatcher, BucketHistogram, CBChunkMatch,
-    CBGroupRopeGeometry, CBGroupSpec, CHUNK_COUNT_HISTOGRAM_BOUNDS, CacheBlendRopeSpec,
-    CacheEventBatchSpec, CacheEventEntrySpec, CacheEventOpKind, CacheEventTier, CacheGenCdfCodec,
-    ChainedBlockHashConfig, CollectiveGraphNodeSpec, ContiguousViewPlan, CoordinatorEventGate,
-    CoordinatorKeyDirectory, DEFAULT_MAX_KERNELS_IN_FUSION_SET, DaxGenerationSlotArena,
-    DaxPutOutcome, DeviceGraphStage, DeviceTargetArch, DynamicAllocRequest, EXCLUDED_ENGINE_GROUP,
-    EngineGroupInfoSpec, EngineKvFormat, EventIngestOutcome, FULL_ATTENTION_WINDOW,
-    FdpRawBlockSlotManager, FleetCacheUsageView, FleetInstanceRegistry, FleetMembershipCounters,
-    FleetWatermarkEvictionController, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
-    IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
-    KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope,
-    KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy, LayerGroupPayloadSharder,
-    MpInstanceSpec, P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable, P2PPeerSpec, PassManager,
-    PassRegistry, PlacementRecord, RAW_BLOCK_META_MAGIC, RAW_BLOCK_SLOT_MAGIC,
-    ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST, RawBlockMetaCheckpointHeader,
-    ReshapeDimMapping, TOKEN_WIRE_STRIDE, TurboQuantPreset, TurboQuantSerdeConfig,
-    WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
-    analyze_static_reshape_dim_mapping, annotate_squeeze_unsqueeze_reshapes,
-    anonymize_symbolic_dims, await_hanging_effect_chains, build_orthonormal_hadamard,
-    classify_blend_read_groups, coalesce_exhaustive_gathers_to_split,
+    CBGroupRopeGeometry, CBGroupSpec, CHUNK_COUNT_HISTOGRAM_BOUNDS, COORDINATOR_CHECKPOINT_MAGIC,
+    CacheBlendRopeSpec, CacheEventBatchSpec, CacheEventEntrySpec, CacheEventOpKind, CacheEventTier,
+    CacheGenCdfCodec, ChainedBlockHashConfig, CollectiveGraphNodeSpec, ContiguousViewPlan,
+    CoordinatorEventGate, CoordinatorKeyDirectory, DEFAULT_MAX_KERNELS_IN_FUSION_SET,
+    DaxGenerationSlotArena, DaxPutOutcome, DeviceGraphStage, DeviceTargetArch, DynamicAllocRequest,
+    EXCLUDED_ENGINE_GROUP, EngineGroupInfoSpec, EngineKvFormat, EventIngestOutcome,
+    FULL_ATTENTION_WINDOW, FdpRawBlockSlotManager, FleetCacheUsageView, FleetInstanceRegistry,
+    FleetMembershipCounters, FleetWatermarkEvictionController, GDS_DEFAULT_ALIGN_BYTES,
+    GdsSlabAddressManager, IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL,
+    KafkaStreamPositionTable, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode, KvPageSpec,
+    KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope, KvStorageKeySpec, L2FaultInjectConfig,
+    L2FaultInjectPolicy, LayerGroupPayloadSharder, MpInstanceSpec, P2P_DEFAULT_MAX_MISSES,
+    P2PPeerDiscoveryTable, P2PPeerSpec, PassManager, PassRegistry, PlacementRecord,
+    QuiesceStateMachine, RAW_BLOCK_META_MAGIC, RAW_BLOCK_SLOT_MAGIC, ROWWISE_CHEAP_OP_COST,
+    ROWWISE_EXPENSIVE_OP_COST, RawBlockMetaCheckpointHeader, ReshapeDimMapping, TOKEN_WIRE_STRIDE,
+    TurboQuantPreset, TurboQuantSerdeConfig, WarmPrefetchJobTable, WarmPrefetchStatus,
+    analyze_kv_layer_groups, analyze_static_reshape_dim_mapping,
+    annotate_squeeze_unsqueeze_reshapes, anonymize_symbolic_dims, await_hanging_effect_chains,
+    build_orthonormal_hadamard, classify_blend_read_groups, coalesce_exhaustive_gathers_to_split,
     coalesce_partitioning_slices_to_split, compress_splat_constants,
-    compute_cb_group_rope_geometry, compute_ieee_crc32, decode_kv_fs_filename,
-    decode_kv_storage_key, decode_raw_block_slot_header, defer_allocs_to_first_use,
-    direct_copy_format_supported, downsample_subchunk_swa_block_ids,
-    elide_redundant_state_transfers, eliminate_implied_dependencies, encode_kv_fs_filename,
-    encode_kv_storage_key, encode_raw_block_meta_checkpoint, encode_raw_block_slot_header,
-    encode_wide_column_row_key, engine_group_layer_indices, expand_engine_block_ids,
-    expected_contiguous_shape_from_strides, find_squeeze_axis, find_unsqueeze_axis,
-    flatten_elementwise_chains, fold_extend_lifetimes_into_async_kernels,
-    fold_unfold_hybrid_prefix_bitmaps, fuse_horizontal_shared_input_ops, fuse_locations,
-    fuse_reshape_epilogue, fuse_sole_use_prologues, get_engine_group_indices,
-    group_p2p_lookup_keys, hash_packed_token_blocks_be, hash_prefix_token_blocks,
-    hoist_callsite_invariant_subgraph_ops, hoist_exec_invariant_ops,
-    hoist_symbolic_dim_expressions, interleave_chunk_major_object_keys, is_supported_arch_dtype,
-    legalize_rowwise_reduction_launch, longest_full_attention_hit, longest_joint_prefix_hit,
-    longest_sliding_window_hit, map_axis_through_static_reshape, mark_cuda_graph_stable_tensors,
-    merge_adjacent_parallel_loops, merge_duplicate_shape_ops, merge_identical_functions,
-    merge_parallel_matmuls, num_engine_groups, num_packed_tokens, pack_token_ids_be,
-    plan_cacheblend_retrieve, plan_cacheblend_token_reorder, plan_concat_in_place,
-    plan_device_graph_collective_partition, plan_dynamic_memory_pool, plan_jenga_kv_geometry,
-    plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
-    re_rope_key_in_place, recalculate_subchunk_blocks_to_skip, recognize_composite_activations,
-    recover_contiguous_or_dim0_padded_view, reuse_dead_loop_buffers,
-    select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
+    compute_cb_group_rope_geometry, compute_ieee_crc32, decode_coordinator_checkpoint_envelope,
+    decode_kv_fs_filename, decode_kv_storage_key, decode_raw_block_slot_header,
+    defer_allocs_to_first_use, direct_copy_format_supported, downsample_subchunk_swa_block_ids,
+    elide_redundant_state_transfers, eliminate_implied_dependencies,
+    encode_coordinator_checkpoint_envelope, encode_kv_fs_filename, encode_kv_storage_key,
+    encode_raw_block_meta_checkpoint, encode_raw_block_slot_header, encode_wide_column_row_key,
+    engine_group_layer_indices, expand_engine_block_ids, expected_contiguous_shape_from_strides,
+    find_squeeze_axis, find_unsqueeze_axis, flatten_elementwise_chains,
+    fold_extend_lifetimes_into_async_kernels, fold_unfold_hybrid_prefix_bitmaps,
+    fuse_horizontal_shared_input_ops, fuse_locations, fuse_reshape_epilogue,
+    fuse_sole_use_prologues, get_engine_group_indices, group_p2p_lookup_keys,
+    hash_packed_token_blocks_be, hash_prefix_token_blocks, hoist_callsite_invariant_subgraph_ops,
+    hoist_exec_invariant_ops, hoist_symbolic_dim_expressions, interleave_chunk_major_object_keys,
+    is_supported_arch_dtype, legalize_rowwise_reduction_launch, longest_full_attention_hit,
+    longest_joint_prefix_hit, longest_sliding_window_hit, map_axis_through_static_reshape,
+    mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops, merge_duplicate_shape_ops,
+    merge_identical_functions, merge_parallel_matmuls, num_engine_groups, num_packed_tokens,
+    pack_token_ids_be, plan_cacheblend_retrieve, plan_cacheblend_token_reorder,
+    plan_concat_in_place, plan_device_graph_collective_partition, plan_dynamic_memory_pool,
+    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
+    promote_narrow_accumulators, re_rope_key_in_place, recalculate_subchunk_blocks_to_skip,
+    recognize_composite_activations, recover_contiguous_or_dim0_padded_view,
+    reuse_dead_loop_buffers, select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
     sink_split_through_reshape, sink_transpose_through_elementwise_and_broadcast,
     slice_block_ids_per_group, solve_lloyd_max_gaussian, stamp_fused_provenance,
     swim_reshape_through_slice, unfold_chunk_range, unique_blend_token_coverage,
@@ -3954,4 +3954,51 @@ fn test_affinity_slot_router_and_fleet_instance_registry() {
             unknown_heartbeat: 1,
         }
     );
+}
+
+#[test]
+fn test_quiesce_state_machine_stream_position_and_checkpoint_envelope() {
+    // 1. Verify `QuiesceStateMachine`:
+    let mut q = QuiesceStateMachine::new();
+    assert!(q.try_begin_apply());
+    assert!(q.try_begin_apply());
+    assert_eq!(q.state(), (false, 2));
+
+    // Requesting quiesce while 2 batches are in flight sets `quiesce_requested = true` and parks
+    // any new arriving batches:
+    assert!(!q.request_quiesce());
+    assert!(!q.is_quiesced());
+    assert!(!q.try_begin_apply());
+
+    // First in-flight batch finishes -> still 1 in flight:
+    assert!(!q.finish_apply());
+    // Second in-flight batch finishes -> `in_flight == 0` wakes the capturer!
+    assert!(q.finish_apply());
+    assert!(q.is_quiesced());
+
+    // Releasing quiesce resumes normal batch ingestion:
+    q.release_quiesce();
+    assert!(q.try_begin_apply());
+    assert!(!q.request_quiesce());
+    assert_eq!(q.abort_quiesce_on_timeout(), 1);
+    assert!(!q.finish_apply());
+
+    // 2. Verify `KafkaStreamPositionTable` and `encode/decode_coordinator_checkpoint_envelope`:
+    let mut pos = KafkaStreamPositionTable::new();
+    assert_eq!(pos.next_offset("cache-events", 0), None);
+    pos.record("cache-events", 0, 41);
+    pos.record("cache-events", 1, 99);
+    assert_eq!(pos.next_offset("cache-events", 0), Some(42));
+    let snapshot = pos.capture_offsets();
+    let mut restored = KafkaStreamPositionTable::new();
+    restored.restore_offsets(&snapshot);
+    assert_eq!(restored, pos);
+
+    assert_eq!(COORDINATOR_CHECKPOINT_MAGIC, b"LMCKPT\0\0");
+    let env = encode_coordinator_checkpoint_envelope(1, b"checkpoint-payload");
+    assert_eq!(
+        decode_coordinator_checkpoint_envelope(&env, 1),
+        Some(&b"checkpoint-payload"[..])
+    );
+    assert!(decode_coordinator_checkpoint_envelope(&env, 2).is_none());
 }
