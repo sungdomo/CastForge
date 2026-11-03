@@ -5085,3 +5085,41 @@ fn test_simplify_extend_lifetimes_absorbs_into_async_routine() {
         ]))
     );
 }
+
+#[test]
+fn test_defer_buffer_allocations_to_mutators_and_join_chains() {
+    use castforge::passes::defer_buffer_allocations_to_mutators;
+
+    let mlir = concat!(
+        "module @defer_alloc {\n",
+        "  func.func @main(%ch0: tensor<1xi64>, %x: tensor<4xf32>) -> tensor<1xi64> {\n",
+        "    %buf = mgp.buffer.alloc %ch0 : (tensor<1xi64>) -> tensor<4xf32>\n",
+        "    %ch1 = mgp.async_compute %ch0, %x : (tensor<1xi64>, tensor<4xf32>) -> tensor<1xi64>\n",
+        "    %ch2 = mo.mutable.store %ch1, %buf, %x",
+        " : (tensor<1xi64>, tensor<4xf32>, tensor<4xf32>) -> tensor<1xi64>\n",
+        "    return %ch2 : tensor<1xi64>\n",
+        "  }\n",
+        "}\n",
+    );
+
+    let mut m = parse_mlir(mlir).expect("valid MLIR");
+    assert_eq!(defer_buffer_allocations_to_mutators(&mut m), 1);
+
+    let func_id = m.functions()[0];
+    let blk_id = m.regions[m.ops[func_id].regions[0]].blocks[0];
+    let op_names: Vec<String> = m.blocks[blk_id]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        op_names,
+        vec![
+            "mgp.async_compute",
+            "mo.chain.create",
+            "mgp.buffer.alloc",
+            "mo.mutable.store",
+            "func.return"
+        ]
+    );
+}

@@ -16324,3 +16324,149 @@ pub fn simplify_extend_lifetimes(module: &mut Module) -> usize {
 
     absorbed
 }
+
+// ============================================================================
+// Batch 19 Step 4: Unique-Mutator Buffer Allocation Deferrer
+// ============================================================================
+
+/// Returns `true` if `op` mutates buffer operand `buf_val`.
+fn op_mutates_buffer(op: &Operation, buf_val: ValueId) -> bool {
+    if !op.operands.contains(&buf_val) {
+        return false;
+    }
+    let full = op.name.full_name();
+    matches!(
+        full.as_str(),
+        "mo.mutable.store" | "mgp.buffer.write" | "mgp.kernel"
+    ) || matches!(
+        op.attributes.get("mutates_buffer"),
+        Some(Attribute::Bool(true))
+    )
+}
+
+/// Defers `mgp.buffer.alloc` / `mo.buffer.alloc` operations until immediately before their unique
+/// buffer mutator in the block and joins the mutator's input chains into the allocation's input
+/// chain (`alsoWaitForChains`) so memory is not reserved while upstream chain work is still
+/// running. Returns the number of deferred buffer allocations.
+pub fn defer_buffer_allocations_to_mutators(module: &mut Module) -> usize {
+    let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+    let mut deferred_count = 0usize;
+
+    for blk_id in block_ids {
+        let orig_ops = module.blocks[blk_id].ops.clone();
+        let mut moved_allocs: IndexSet<OpId> = IndexSet::new();
+
+        for &alloc_op in &orig_ops {
+            if moved_allocs.contains(&alloc_op) {
+                continue;
+            }
+            let full = module.ops[alloc_op].name.full_name();
+            if full != "mgp.buffer.alloc" && full != "mo.buffer.alloc" {
+                continue;
+            }
+            if module.ops[alloc_op].operands.is_empty() || module.ops[alloc_op].results.is_empty() {
+                continue;
+            }
+            let alloc_in_chain = module.ops[alloc_op].operands[0];
+            let out_buf = module.ops[alloc_op].results[0];
+
+            // Locate unique mutator and verify no user of `out_buf` precedes that mutator.
+            let cur_ops = &module.blocks[blk_id].ops;
+            let mut mutators: Vec<(usize, OpId)> = Vec::new();
+            let mut first_use_pos: Option<usize> = None;
+
+            for (pos, &cand_op) in cur_ops.iter().enumerate() {
+                if cand_op == alloc_op {
+                    continue;
+                }
+                let cand = &module.ops[cand_op];
+                if cand.operands.contains(&out_buf) {
+                    if first_use_pos.is_none() {
+                        first_use_pos = Some(pos);
+                    }
+                    if op_mutates_buffer(cand, out_buf) {
+                        mutators.push((pos, cand_op));
+                    }
+                }
+            }
+
+            if mutators.len() != 1 {
+                continue;
+            }
+            let (mut_pos, mutator_op) = mutators[0];
+            if first_use_pos != Some(mut_pos) {
+                continue;
+            }
+            let Some(alloc_pos) = cur_ops.iter().position(|&id| id == alloc_op) else {
+                continue;
+            };
+            if alloc_pos >= mut_pos {
+                continue;
+            }
+
+            // Collect chain-typed operands (`tensor<1xi64>`) on `mutator_op` that differ from
+            // `alloc_in_chain` and any chain result of `alloc_op`.
+            let chain_ty = module.values[alloc_in_chain].ty.clone();
+            let alloc_results: IndexSet<ValueId> =
+                module.ops[alloc_op].results.iter().copied().collect();
+            let mut extra_chains: Vec<ValueId> = Vec::new();
+            for &opd in &module.ops[mutator_op].operands {
+                if opd != out_buf
+                    && opd != alloc_in_chain
+                    && !alloc_results.contains(&opd)
+                    && module.values[opd].ty == chain_ty
+                    && !extra_chains.contains(&opd)
+                {
+                    extra_chains.push(opd);
+                }
+            }
+
+            // Move `alloc_op` right before `mutator_op`.
+            module.blocks[blk_id].ops.remove(alloc_pos);
+            let new_mut_pos = module.blocks[blk_id]
+                .ops
+                .iter()
+                .position(|&id| id == mutator_op)
+                .unwrap();
+
+            if !extra_chains.is_empty() {
+                let mut join_opds = SmallVec::new();
+                join_opds.push(alloc_in_chain);
+                for ch in extra_chains {
+                    join_opds.push(ch);
+                }
+                let loc = module.ops[alloc_op].location.clone();
+                let join_op = module.ops.insert_with_key(|id| Operation {
+                    id,
+                    name: OpName::new("mo", "chain.create"),
+                    operands: join_opds,
+                    results: SmallVec::new(),
+                    attributes: IndexMap::new(),
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: loc,
+                });
+                let joined_ch = module.values.insert_with_key(|id| Value {
+                    id,
+                    ssa_name: None,
+                    ty: chain_ty,
+                    def: ValueDef::OpResult {
+                        op: join_op,
+                        index: 0,
+                    },
+                });
+                module.ops[join_op].results.push(joined_ch);
+                module.ops[alloc_op].operands[0] = joined_ch;
+                module.blocks[blk_id].ops.insert(new_mut_pos, join_op);
+                module.blocks[blk_id].ops.insert(new_mut_pos + 1, alloc_op);
+            } else {
+                module.blocks[blk_id].ops.insert(new_mut_pos, alloc_op);
+            }
+
+            moved_allocs.insert(alloc_op);
+            deferred_count += 1;
+        }
+    }
+
+    deferred_count
+}
