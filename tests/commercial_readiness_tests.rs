@@ -8973,3 +8973,99 @@ fn test_fuse_rowwise_reductions_fuses_producer_and_per_row_consumer() {
         vec!["map.load", "rmo.exp", "map.load", "rmo.add", "map.store"]
     );
 }
+
+#[test]
+fn test_add_fallback_shape_functions_inserts_host_transfer_and_maps_params() {
+    use castforge::ir::Attribute;
+    use castforge::ir::mlir::{Dim, TensorType};
+    use castforge::passes::add_fallback_shape_functions;
+
+    let src = concat!(
+        "module {\n",
+        "  func.func @fallback_shapes(\n",
+        "    %x: tensor<512xf32>,\n",
+        "    %shape_gpu: tensor<3xi64>\n",
+        "  ) -> tensor<16x?x32xf32> {\n",
+        "    %y = \"mo.reshape\"(%x, %shape_gpu)",
+        " {device = \"gpu:0\", output_param_decls = [\"D_out\"]}",
+        " : (tensor<512xf32>, tensor<3xi64>) -> tensor<16x?x32xf32>\n",
+        "    return %y : tensor<16x?x32xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(src).unwrap();
+    let fn_id = m.functions()[0];
+    let fn_blk = m.regions[m.ops[fn_id].regions[0]].blocks[0];
+    let reshape_id = m.blocks[fn_blk].ops[0];
+    let y_val = m.ops[reshape_id].results[0];
+
+    // Give `%y` a symbolic dimension `Dim::Symbolic("D_out")` at axis 1:
+    m.values[y_val].ty = castforge::ir::Type::Tensor(TensorType {
+        shape: vec![
+            Dim::Static(16),
+            Dim::Symbolic("D_out".to_string()),
+            Dim::Static(32),
+        ],
+        dtype: DType::F32,
+        encoding: Some("gpu:0".to_string()),
+    });
+
+    let (emitted, transfers) =
+        add_fallback_shape_functions(&mut m).expect("fallback shape function pass succeeds");
+    assert_eq!(emitted, 1);
+    assert_eq!(transfers, 1);
+
+    let op_names: Vec<String> = m.blocks[fn_blk]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        op_names,
+        vec![
+            "mo.chain.create",
+            "mo.transfer",
+            "mo.invoke_shape_func",
+            "mo.reshape",
+            "func.return"
+        ]
+    );
+
+    let xfer_id = m.blocks[fn_blk].ops[1];
+    let inv_id = m.blocks[fn_blk].ops[2];
+    // `mo.invoke_shape_func` consumes the host-transferred shape operand at index 1:
+    assert_eq!(m.ops[inv_id].operands[1], m.ops[xfer_id].results[0]);
+    assert_eq!(
+        m.ops[inv_id].attributes.get("func_name"),
+        Some(&Attribute::String("mo.reshape".to_string()))
+    );
+    assert_eq!(
+        m.ops[inv_id].attributes.get("output_param_decls"),
+        Some(&Attribute::Array(vec![
+            Attribute::String("F0".to_string()),
+            Attribute::String("D_out".to_string()),
+            Attribute::String("F1".to_string()),
+        ]))
+    );
+    // `output_param_decls` on `mo.reshape` is cleared:
+    assert_eq!(
+        m.ops[reshape_id].attributes.get("output_param_decls"),
+        Some(&Attribute::Array(vec![]))
+    );
+
+    // Verify `mo.custom` without a registered shape function reports a clear error:
+    let bad_custom_src = concat!(
+        "module {\n",
+        "  func.func @unregistered_custom(%x: tensor<4xf32>) -> tensor<?xf32>",
+        " attributes {registered_shape_funcs = [\"other_op\"]} {\n",
+        "    %y = \"mo.custom\"(%x)",
+        " {symbol = \"my_unregistered_op\", output_param_decls = [\"N\"]}",
+        " : (tensor<4xf32>) -> tensor<?xf32>\n",
+        "    return %y : tensor<?xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut bad_m = parse_mlir(bad_custom_src).unwrap();
+    let err = add_fallback_shape_functions(&mut bad_m).unwrap_err();
+    assert!(err.contains("@extensibility.register_shape_function(\"my_unregistered_op\")"));
+}

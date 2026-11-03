@@ -30641,3 +30641,343 @@ pub fn fuse_rowwise_reductions(module: &mut Module) -> (usize, usize) {
 
     (producers_fused, consumers_fused)
 }
+
+/// Parses a list of declared output parameter names from an operation's `"output_param_decls"`
+/// attribute.
+fn parse_output_param_decls(op: &Operation) -> Vec<String> {
+    match op.attributes.get("output_param_decls") {
+        Some(Attribute::Array(items)) => items
+            .iter()
+            .filter_map(|a| match a {
+                Attribute::String(s) if !s.is_empty() => Some(s.clone()),
+                Attribute::Opaque(s) if !s.is_empty() => Some(s.trim().trim_matches('"').into()),
+                _ => None,
+            })
+            .collect(),
+        Some(Attribute::String(s)) if !s.is_empty() => s
+            .split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Infers the data-dependent input operand indices for a shape-function fallback on `op`.
+fn infer_data_dep_input_indices(op: &Operation) -> Vec<i64> {
+    if let Some(Attribute::Array(arr)) = op.attributes.get("data_dep_input_idxs") {
+        let parsed: Vec<i64> = arr
+            .iter()
+            .filter_map(|a| match a {
+                Attribute::Int(v) => Some(*v),
+                _ => None,
+            })
+            .collect();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    match op.name.full_name().as_str() {
+        "mo.arg_nonzero" => vec![0],
+        "mo.broadcast_to" | "mo.reshape" | "mo.arg_max" | "mo.arg_min" | "mo.reduce_mul"
+        | "mo.tile" => vec![1],
+        "mo.bottom_k" | "mo.top_k" => vec![1, 2],
+        "mo.range" => vec![0, 1, 2],
+        "mo.split" | "mo.slice" => vec![1, 2, 3],
+        "mo.scatter_add" | "mo.scatter_max" | "mo.scatter_min" | "mo.scatter_mul" => vec![3],
+        "mo.non_maximum_suppression" => vec![0, 1, 2, 3, 4],
+        _ => Vec::new(),
+    }
+}
+
+/// Checks whether `val_id` resides on a non-host device (`!= "cpu:0"`).
+fn is_off_host_tensor_value(module: &Module, val_id: ValueId, consumer_op: &Operation) -> bool {
+    let Type::Tensor(tt) = &module.values[val_id].ty else {
+        return false;
+    };
+    if let Some(enc) = &tt.encoding
+        && !enc.is_empty()
+    {
+        return enc != "cpu:0" && enc != "cpu";
+    }
+    if let crate::ir::mlir::ValueDef::OpResult { op: def_op, .. } = module.values[val_id].def
+        && let Some(Attribute::String(dev)) = module.ops[def_op].attributes.get("device")
+        && !dev.is_empty()
+    {
+        return dev != "cpu:0" && dev != "cpu";
+    }
+    if let Some(Attribute::String(dev)) = consumer_op.attributes.get("device")
+        && !dev.is_empty()
+    {
+        return dev != "cpu:0" && dev != "cpu";
+    }
+    false
+}
+
+/// Computes the positional parameter mapping for a fallback shape function over `res_ty`, keeping
+/// declared symbolic dims in `declared_set` and assigning fresh `"F<n>"` fallback names to static
+/// or externally declared dimensions.
+fn build_fallback_shape_param_mapping(
+    res_ty: &Type,
+    declared_set: &std::collections::HashSet<String>,
+    fallback_counter: &mut usize,
+) -> Vec<Attribute> {
+    let Type::Tensor(tt) = res_ty else {
+        return Vec::new();
+    };
+    let mut params = Vec::with_capacity(tt.shape.len());
+    for dim in &tt.shape {
+        match dim {
+            Dim::Symbolic(sym) if declared_set.contains(sym) => {
+                params.push(Attribute::String(sym.clone()));
+            }
+            _ => {
+                let fb = format!("F{}", *fallback_counter);
+                *fallback_counter += 1;
+                params.push(Attribute::String(fb));
+            }
+        }
+    }
+    params
+}
+
+/// Materializes `mo.invoke_shape_func` fallback shape computations for operations with non-empty
+/// `"output_param_decls"`, inserting host transfers (`mo.chain.create` + `mo.transfer` to
+/// `"cpu:0"`) for off-host data-dependent tensor operands and clearing `"output_param_decls"` on
+/// each processed operation.
+///
+/// For `mo.custom` operations, validates that `"symbol"` is present in any
+/// `"registered_shape_funcs"` list on the enclosing function (returning an `Err` with
+/// `@extensibility.register_shape_function` guidance if missing).
+///
+/// Returns `Ok((shape_funcs_emitted, host_transfers_inserted))`.
+pub fn add_fallback_shape_functions(module: &mut Module) -> Result<(usize, usize), String> {
+    let mut shape_funcs_emitted = 0usize;
+    let mut host_transfers_inserted = 0usize;
+
+    for func_id in module.functions() {
+        let mut fallback_counter = 0usize;
+        let registered_custom: Option<std::collections::HashSet<String>> =
+            match module.ops[func_id].attributes.get("registered_shape_funcs") {
+                Some(Attribute::Array(items)) => Some(
+                    items
+                        .iter()
+                        .filter_map(|a| match a {
+                            Attribute::String(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            };
+
+        let regions = module.ops[func_id].regions.clone();
+        for reg_id in regions {
+            let blocks = module.regions[reg_id].blocks.clone();
+            for blk_id in blocks {
+                let op_ids = module.blocks[blk_id].ops.clone();
+                for op_id in op_ids {
+                    let decls = parse_output_param_decls(&module.ops[op_id]);
+                    if decls.is_empty() {
+                        continue;
+                    }
+                    let declared_set: std::collections::HashSet<String> =
+                        decls.iter().cloned().collect();
+                    let full_name = module.ops[op_id].name.full_name();
+                    let loc = module.ops[op_id].location.clone();
+
+                    if full_name == "mo.custom" {
+                        let sym = match module.ops[op_id].attributes.get("symbol") {
+                            Some(Attribute::String(s)) if !s.is_empty() => s.clone(),
+                            _ => {
+                                return Err(
+                                    "mo.custom with output_param_decls requires a 'symbol' attr"
+                                        .to_string(),
+                                );
+                            }
+                        };
+                        if let Some(reg_set) = &registered_custom
+                            && !reg_set.contains(&sym)
+                        {
+                            return Err(format!(
+                                "custom op '{sym}' with data-dependent output dimensions requires \
+                                 a registered shape function; add \
+                                 '@extensibility.register_shape_function(\"{sym}\")' to the kernel"
+                            ));
+                        }
+                    }
+
+                    let data_dep_idxs = infer_data_dep_input_indices(&module.ops[op_id]);
+                    let mut invoke_operands = module.ops[op_id].operands.clone();
+                    let mut pre_ops = Vec::<OpId>::new();
+                    let mut chain_val: Option<ValueId> = None;
+
+                    // Copy any off-host data-dependent tensor operands to `"cpu:0"`:
+                    for &dep_idx in &data_dep_idxs {
+                        if dep_idx < 0 || (dep_idx as usize) >= invoke_operands.len() {
+                            continue;
+                        }
+                        let idx_usize = dep_idx as usize;
+                        let opd_val = invoke_operands[idx_usize];
+                        if !is_off_host_tensor_value(module, opd_val, &module.ops[op_id]) {
+                            continue;
+                        }
+                        let ch_ty = Type::Opaque("!mo.chain".to_string());
+                        let cur_chain = match chain_val {
+                            Some(c) => c,
+                            None => {
+                                let ch_op = module.ops.insert(Operation {
+                                    id: OpId::default(),
+                                    name: OpName::new("mo", "chain.create"),
+                                    operands: smallvec::SmallVec::new(),
+                                    results: smallvec::SmallVec::new(),
+                                    attributes: indexmap::IndexMap::new(),
+                                    regions: Vec::new(),
+                                    custom_syntax: false,
+                                    location: loc.clone(),
+                                });
+                                module.ops[ch_op].id = ch_op;
+                                let cv = module.values.insert(crate::ir::mlir::Value {
+                                    id: ValueId::default(),
+                                    ssa_name: None,
+                                    ty: ch_ty.clone(),
+                                    def: crate::ir::mlir::ValueDef::OpResult {
+                                        op: ch_op,
+                                        index: 0,
+                                    },
+                                });
+                                module.values[cv].id = cv;
+                                module.ops[ch_op].results.push(cv);
+                                pre_ops.push(ch_op);
+                                cv
+                            }
+                        };
+
+                        let mut host_tt = match &module.values[opd_val].ty {
+                            Type::Tensor(tt) => tt.clone(),
+                            _ => unreachable!(),
+                        };
+                        host_tt.encoding = Some("cpu:0".to_string());
+                        let host_tensor_ty = Type::Tensor(host_tt);
+
+                        let mut xfer_attrs = indexmap::IndexMap::new();
+                        xfer_attrs
+                            .insert("device".to_string(), Attribute::String("cpu:0".to_string()));
+                        let xfer_op = module.ops.insert(Operation {
+                            id: OpId::default(),
+                            name: OpName::new("mo", "transfer"),
+                            operands: smallvec::smallvec![opd_val, cur_chain],
+                            results: smallvec::SmallVec::new(),
+                            attributes: xfer_attrs,
+                            regions: Vec::new(),
+                            custom_syntax: false,
+                            location: loc.clone(),
+                        });
+                        module.ops[xfer_op].id = xfer_op;
+                        let host_v = module.values.insert(crate::ir::mlir::Value {
+                            id: ValueId::default(),
+                            ssa_name: None,
+                            ty: host_tensor_ty,
+                            def: crate::ir::mlir::ValueDef::OpResult {
+                                op: xfer_op,
+                                index: 0,
+                            },
+                        });
+                        module.values[host_v].id = host_v;
+                        let out_ch = module.values.insert(crate::ir::mlir::Value {
+                            id: ValueId::default(),
+                            ssa_name: None,
+                            ty: ch_ty,
+                            def: crate::ir::mlir::ValueDef::OpResult {
+                                op: xfer_op,
+                                index: 1,
+                            },
+                        });
+                        module.values[out_ch].id = out_ch;
+                        module.ops[xfer_op].results.push(host_v);
+                        module.ops[xfer_op].results.push(out_ch);
+                        pre_ops.push(xfer_op);
+
+                        invoke_operands[idx_usize] = host_v;
+                        chain_val = Some(out_ch);
+                        host_transfers_inserted += 1;
+                    }
+
+                    let results = module.ops[op_id].results.clone();
+                    let target_results: Vec<(usize, ValueId)> =
+                        if full_name == "mo.split" || full_name == "mo.custom" {
+                            results.iter().copied().enumerate().collect()
+                        } else {
+                            results.first().copied().into_iter().enumerate().collect()
+                        };
+
+                    for (res_idx, res_val) in target_results {
+                        let res_ty = module.values[res_val].ty.clone();
+                        if !matches!(res_ty, Type::Tensor(_)) {
+                            continue;
+                        }
+                        let shape_params = build_fallback_shape_param_mapping(
+                            &res_ty,
+                            &declared_set,
+                            &mut fallback_counter,
+                        );
+                        let func_name_str = if full_name == "mo.split" {
+                            "split_ith_output_shape".to_string()
+                        } else if full_name == "mo.custom" {
+                            match module.ops[op_id].attributes.get("symbol") {
+                                Some(Attribute::String(s)) => s.clone(),
+                                _ => full_name.clone(),
+                            }
+                        } else {
+                            full_name.clone()
+                        };
+
+                        let mut inv_attrs = indexmap::IndexMap::new();
+                        inv_attrs.insert("func_name".to_string(), Attribute::String(func_name_str));
+                        inv_attrs.insert(
+                            "output_param_decls".to_string(),
+                            Attribute::Array(shape_params),
+                        );
+                        inv_attrs.insert(
+                            "data_dep_input_idxs".to_string(),
+                            Attribute::Array(
+                                data_dep_idxs.iter().map(|&i| Attribute::Int(i)).collect(),
+                            ),
+                        );
+                        if let Some(axis_attr) = module.ops[op_id].attributes.get("axis").cloned() {
+                            inv_attrs.insert("axis".to_string(), axis_attr);
+                        }
+                        if full_name == "mo.split" || full_name == "mo.custom" {
+                            inv_attrs
+                                .insert("output_idx".to_string(), Attribute::Int(res_idx as i64));
+                        }
+
+                        let inv_op = module.ops.insert(Operation {
+                            id: OpId::default(),
+                            name: OpName::new("mo", "invoke_shape_func"),
+                            operands: invoke_operands.clone(),
+                            results: smallvec::SmallVec::new(),
+                            attributes: inv_attrs,
+                            regions: Vec::new(),
+                            custom_syntax: false,
+                            location: loc.clone(),
+                        });
+                        module.ops[inv_op].id = inv_op;
+                        pre_ops.push(inv_op);
+                        shape_funcs_emitted += 1;
+                    }
+
+                    // Clear `output_param_decls` on `op_id` and splice `pre_ops` right before it:
+                    module.ops[op_id]
+                        .attributes
+                        .insert("output_param_decls".to_string(), Attribute::Array(vec![]));
+                    if let Some(pos) = module.blocks[blk_id].ops.iter().position(|&x| x == op_id) {
+                        module.blocks[blk_id].ops.splice(pos..pos, pre_ops);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((shape_funcs_emitted, host_transfers_inserted))
+}
