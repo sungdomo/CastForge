@@ -14,15 +14,16 @@ use castforge::ir::{
     DType, Dim, Location, TensorBacking, TensorEntry, TensorStore, TensorType, parse_mlir,
 };
 use castforge::passes::{
-    AsymK16V8Codec, CacheBlendRopeSpec, CacheGenCdfCodec, ChainedBlockHashConfig,
-    DEFAULT_MAX_KERNELS_IN_FUSION_SET, EngineKvFormat, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind,
-    KvBlockPool, KvDmaTransferMode, KvPageSpec, KvScaleScope, PassManager, PassRegistry,
-    analyze_kv_layer_groups, anonymize_symbolic_dims, compress_splat_constants,
-    direct_copy_format_supported, fuse_locations, fuse_reshape_epilogue, fuse_sole_use_prologues,
-    hash_prefix_token_blocks, longest_full_attention_hit, longest_joint_prefix_hit,
-    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_identical_functions,
-    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
-    re_rope_key_in_place, stamp_fused_provenance,
+    AsymK16V8Codec, CBChunkMatch, CBGroupSpec, CacheBlendRopeSpec, CacheGenCdfCodec,
+    ChainedBlockHashConfig, DEFAULT_MAX_KERNELS_IN_FUSION_SET, EngineKvFormat,
+    KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode, KvPageSpec,
+    KvScaleScope, PassManager, PassRegistry, analyze_kv_layer_groups, anonymize_symbolic_dims,
+    compress_splat_constants, direct_copy_format_supported, fuse_locations, fuse_reshape_epilogue,
+    fuse_sole_use_prologues, hash_prefix_token_blocks, longest_full_attention_hit,
+    longest_joint_prefix_hit, longest_sliding_window_hit, mark_cuda_graph_stable_tensors,
+    merge_identical_functions, plan_cacheblend_retrieve, plan_jenga_kv_geometry,
+    plan_kernel_sequence_fusion, plan_kv_dma_transfer, re_rope_key_in_place,
+    stamp_fused_provenance,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -1096,4 +1097,61 @@ fn test_cachegen_16bit_monotonic_cdf_and_arithmetic_coding_roundtrip() {
 
     let decoded = codec.decode_channel(&cdf, &bitstream, symbols.len());
     assert_eq!(decoded, symbols);
+}
+
+#[test]
+fn test_cacheblend_batched_retrieve_plan_waves_and_staging() {
+    let groups = vec![CBGroupSpec {
+        group_idx: 0,
+        num_layers: 2,
+        slot_tokens: 16,
+        num_temp_slots: 2, // double-buffered temporary staging slots
+        bytes_per_token_per_layer: 128,
+        rope_enabled: true,
+    }];
+
+    // 3 non-block-aligned RAG chunks -> must partition into 2 waves (`[chunk0, chunk1]` and
+    // `[chunk2]`) because `num_temp_slots = 2`!
+    let chunks = vec![
+        CBChunkMatch {
+            host_offset: 0,
+            num_tokens: 8, // 2 * 8 * 128 = 2048B (aligned within [0..4096))
+            old_start_pos: 0,
+            cur_start_pos: 0, // no position shift -> no re-RoPE needed!
+            slot_mapping_offset: 0,
+        },
+        CBChunkMatch {
+            host_offset: 3072,
+            num_tokens: 8, // 2048B starting at 3072 -> straddles 4096 pin boundary!
+            old_start_pos: 10,
+            cur_start_pos: 42, // position shifted -> emits CBRopeVar(old=10, cur=42)
+            slot_mapping_offset: 8,
+        },
+        CBChunkMatch {
+            host_offset: 8192,
+            num_tokens: 6,
+            old_start_pos: 5,
+            cur_start_pos: 20,
+            slot_mapping_offset: 16,
+        },
+    ];
+
+    let steps = plan_cacheblend_retrieve(&groups, &chunks, 4096);
+    assert_eq!(steps.len(), 2);
+
+    // Wave 0: 2 chunks -> chunk 0 has 1 aligned staging copy, chunk 1 splits into 2 copies
+    assert_eq!(steps[0].staging_copies.len(), 3);
+    assert_eq!(steps[0].ropes.len(), 1); // only chunk 1 (slot_idx = 1) needed re-RoPE
+    assert_eq!(steps[0].ropes[0].slot_idx, 1);
+    assert_eq!(steps[0].ropes[0].old_st, 10);
+    assert_eq!(steps[0].ropes[0].cur_st, 42);
+    assert_eq!(steps[0].scatters.len(), 2);
+
+    // Wave 1: chunk 2 reuses `slot_idx = 0`!
+    assert_eq!(steps[1].staging_copies.len(), 1);
+    assert_eq!(steps[1].ropes.len(), 1);
+    assert_eq!(steps[1].ropes[0].slot_idx, 0);
+    assert_eq!(steps[1].scatters.len(), 1);
+    assert_eq!(steps[1].scatters[0].slot_idx, 0);
+    assert_eq!(steps[1].scatters[0].n_tok, 6);
 }

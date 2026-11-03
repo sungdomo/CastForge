@@ -2469,3 +2469,145 @@ impl CacheGenCdfCodec {
         decoded
     }
 }
+
+/// Per-layer-group invariants for CacheBlend non-block-aligned KV retrieval
+/// (inspired by LMCache `csrc/cuda/blend_kernels.cuh` `CBGroupSpec`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CBGroupSpec {
+    pub group_idx: usize,
+    pub num_layers: usize,
+    pub slot_tokens: usize,
+    pub num_temp_slots: usize,
+    pub bytes_per_token_per_layer: usize,
+    pub rope_enabled: bool,
+}
+
+/// Descriptor for a single non-block-aligned RAG chunk hit in host KV memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CBChunkMatch {
+    pub host_offset: usize,
+    pub num_tokens: usize,
+    pub old_start_pos: i64,
+    pub cur_start_pos: i64,
+    pub slot_mapping_offset: usize,
+}
+
+/// K-only in-place delta re-RoPE launch descriptor for one temporary staging slot
+/// (inspired by LMCache `csrc/cuda/blend_kernels.cuh` `CBRopeVar`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CBRopeVar {
+    pub group_idx: usize,
+    pub slot_idx: usize,
+    pub old_st: i64,
+    pub cur_st: i64,
+}
+
+/// Per-token scatter launch descriptor writing `n_tok` tokens from temporary staging slot
+/// `slot_idx` into paged KV slots starting at `slot_mapping_offset`
+/// (inspired by LMCache `csrc/cuda/blend_kernels.cuh` `CBScatterVar`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CBScatterVar {
+    pub group_idx: usize,
+    pub slot_idx: usize,
+    pub slot_mapping_offset: usize,
+    pub n_tok: usize,
+}
+
+/// One batched wave of CacheBlend temporary staging slots: H2D staging copies, then K-only
+/// delta re-RoPE launches, then per-token paged KV scatters
+/// (inspired by LMCache `csrc/cuda/blend_kernels.cuh` `CBRetrieveStep`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CBRetrieveStep {
+    pub step_idx: usize,
+    pub staging_copies: Vec<KvDmaCopyEntry>,
+    pub ropes: Vec<CBRopeVar>,
+    pub scatters: Vec<CBScatterVar>,
+}
+
+/// Builds a batched plan-then-execute CacheBlend retrieve schedule (`Vec<CBRetrieveStep>`)
+/// over `groups` and `chunks`, partitioning chunks into waves sized by the available temporary
+/// GPU staging slots (`num_temp_slots`) and splitting H2D staging copies at `host_buffer_alignment`
+/// pin-chunk boundaries (inspired by LMCache `blend_kernels.cuh` `execute_cb_retrieve_plan`).
+pub fn plan_cacheblend_retrieve(
+    groups: &[CBGroupSpec],
+    chunks: &[CBChunkMatch],
+    host_buffer_alignment: usize,
+) -> Vec<CBRetrieveStep> {
+    if groups.is_empty() || chunks.is_empty() {
+        return Vec::new();
+    }
+    let wave_cap = groups
+        .iter()
+        .map(|g| g.num_temp_slots.max(1))
+        .min()
+        .unwrap_or(1);
+    let align = host_buffer_alignment.max(1);
+    let mut steps = Vec::new();
+
+    for (step_idx, wave) in chunks.chunks(wave_cap).enumerate() {
+        let mut staging_copies = Vec::new();
+        let mut ropes = Vec::new();
+        let mut scatters = Vec::new();
+
+        for (slot_idx, chunk) in wave.iter().enumerate() {
+            let n_tok = chunk.num_tokens;
+            if n_tok == 0 {
+                continue;
+            }
+            let mut group_host_cursor = chunk.host_offset;
+            for grp in groups {
+                let total_bytes = grp
+                    .num_layers
+                    .saturating_mul(n_tok)
+                    .saturating_mul(grp.bytes_per_token_per_layer);
+                let slot_cap_bytes = grp
+                    .num_layers
+                    .saturating_mul(grp.slot_tokens.max(n_tok))
+                    .saturating_mul(grp.bytes_per_token_per_layer);
+                let dev_base = slot_idx.saturating_mul(slot_cap_bytes);
+
+                let mut rem = total_bytes;
+                let mut h_cur = group_host_cursor;
+                let mut d_cur = dev_base;
+                while rem > 0 {
+                    let next_boundary = ((h_cur / align) + 1) * align;
+                    let step_bytes = rem.min(next_boundary - h_cur);
+                    staging_copies.push(KvDmaCopyEntry {
+                        block_id: slot_idx,
+                        host_offset: h_cur as u64,
+                        device_offset: d_cur as u64,
+                        width_bytes: step_bytes as u64,
+                        height_layers: grp.num_layers,
+                    });
+                    h_cur += step_bytes;
+                    d_cur += step_bytes;
+                    rem -= step_bytes;
+                }
+                group_host_cursor += total_bytes;
+
+                if grp.rope_enabled && chunk.old_start_pos != chunk.cur_start_pos {
+                    ropes.push(CBRopeVar {
+                        group_idx: grp.group_idx,
+                        slot_idx,
+                        old_st: chunk.old_start_pos,
+                        cur_st: chunk.cur_start_pos,
+                    });
+                }
+                scatters.push(CBScatterVar {
+                    group_idx: grp.group_idx,
+                    slot_idx,
+                    slot_mapping_offset: chunk.slot_mapping_offset,
+                    n_tok,
+                });
+            }
+        }
+
+        steps.push(CBRetrieveStep {
+            step_idx,
+            staging_copies,
+            ropes,
+            scatters,
+        });
+    }
+    steps
+}
