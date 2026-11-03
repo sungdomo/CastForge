@@ -20653,3 +20653,306 @@ pub fn globalize_and_inline_model_subgraphs(
 
     Ok(processed_calls)
 }
+
+// ============================================================================
+// Batch 22 Step 5: Rowwise Kernel Legalizer (Primary Input Selection, Monoid
+// Binding, Row Store Grouping, and Launch Parameter Synthesis)
+// ============================================================================
+
+const CHEAP_ROWWISE_ELEMENT_COST: u32 = 1;
+const EXPENSIVE_ROWWISE_ELEMENT_COST: u32 = 16;
+
+fn dtype_bitwidth(ty: &Type) -> u32 {
+    match ty {
+        Type::Tensor(t) => t.dtype.bit_width() as u32,
+        _ => 32,
+    }
+}
+
+fn rowwise_call_elementwise_cost(op: &Operation) -> u32 {
+    if matches!(
+        op.attributes.get("is_expensive"),
+        Some(Attribute::Bool(true))
+    ) {
+        return EXPENSIVE_ROWWISE_ELEMENT_COST;
+    }
+    let mo_name = op
+        .attributes
+        .get("mo_op_name")
+        .and_then(Attribute::as_str)
+        .unwrap_or("");
+    if matches!(
+        mo_name,
+        "mo.div" | "mo.exp" | "mo.log" | "mo.tanh" | "mo.erf" | "mo.rsqrt" | "mo.sin" | "mo.cos"
+    ) {
+        EXPENSIVE_ROWWISE_ELEMENT_COST
+    } else {
+        CHEAP_ROWWISE_ELEMENT_COST
+    }
+}
+
+/// Legalizes `mogg.call.rowwise` operations across `module` in four stages:
+/// 1. Selects the primary input capture from the first `mogg.rowwise.reduce`
+///    fold's element-index `mogg.tensor.load`, rewriting matching loads into
+///    `mogg.rowwise.primary` and setting `primary` and `is_cached`.
+/// 2. Binds monoid reduction metadata (`fields` and widest `accum_bitwidth`).
+/// 3. Groups row-indexed `mogg.tensor.store` operations into a trailing
+///    `mogg.rowwise.emit` region.
+/// 4. Validates that no stray stores remain outside `mogg.rowwise.emit` and
+///    computes launch attributes (`num_phases`, `dtype_size`,
+///    `computationally_expensive`, `simd_monoid`, and optional `cols`).
+pub fn legalize_rowwise_kernels(
+    module: &mut Module,
+    expensive_cost_threshold: u32,
+) -> Result<usize, String> {
+    let mut legalized_count = 0usize;
+    let all_ops: Vec<OpId> = module.ops.keys().collect();
+    let rowwise_ops: Vec<OpId> = all_ops
+        .into_iter()
+        .filter(|&id| {
+            module
+                .ops
+                .get(id)
+                .is_some_and(|op| op.name.full_name() == "mogg.call.rowwise")
+        })
+        .collect();
+
+    for rw_op in rowwise_ops {
+        let Some(&rw_reg) = module.ops[rw_op].regions.first() else {
+            return Err("mogg.call.rowwise has no body region".to_string());
+        };
+        let Some(&rw_blk) = module.regions[rw_reg].blocks.first() else {
+            return Err("mogg.call.rowwise has no entry block".to_string());
+        };
+        let rw_args = module.blocks[rw_blk].arguments.clone();
+        if rw_args.len() < 2 {
+            return Err(
+                "mogg.call.rowwise body must have at least 1 capture arg and 1 row index arg"
+                    .to_string(),
+            );
+        }
+        let capture_args = &rw_args[..rw_args.len() - 1];
+        let row_arg = *rw_args.last().unwrap();
+
+        let fold_ops: Vec<OpId> = module.blocks[rw_blk]
+            .ops
+            .iter()
+            .copied()
+            .filter(|&id| module.ops[id].name.full_name() == "mogg.rowwise.reduce")
+            .collect();
+        if fold_ops.is_empty() {
+            return Err("mogg.call.rowwise has no fold".to_string());
+        }
+
+        // Stage 1: Select primary input capture if not already set.
+        if !module.ops[rw_op].attributes.contains_key("primary") {
+            let first_fold = fold_ops[0];
+            let Some(&first_fold_reg) = module.ops[first_fold].regions.first() else {
+                return Err("mogg.rowwise.reduce has no body region".to_string());
+            };
+            let first_fold_blk = module.regions[first_fold_reg].blocks[0];
+            let Some(&first_elem_idx) = module.blocks[first_fold_blk].arguments.first() else {
+                return Err("mogg.rowwise.reduce body missing element index argument".to_string());
+            };
+
+            let mut primary_idx_opt: Option<usize> = None;
+            for &f_op in &module.blocks[first_fold_blk].ops {
+                if module.ops[f_op].name.full_name() == "mogg.tensor.load"
+                    && module.ops[f_op].operands.len() >= 2
+                    && module.ops[f_op].operands[1] == first_elem_idx
+                {
+                    let tensor_opd = module.ops[f_op].operands[0];
+                    if let Some(pos) = capture_args.iter().position(|&c| c == tensor_opd) {
+                        primary_idx_opt = Some(pos);
+                        break;
+                    }
+                }
+            }
+            let Some(primary_idx) = primary_idx_opt else {
+                return Err(
+                    "mogg.call.rowwise has no input its first fold loads at the element index"
+                        .to_string(),
+                );
+            };
+
+            let primary_tensor = capture_args[primary_idx];
+            let mut folds_reading_primary = 0usize;
+            for &fold_op in &fold_ops {
+                let fold_reg = module.ops[fold_op].regions[0];
+                let fold_blk = module.regions[fold_reg].blocks[0];
+                let Some(&elem_idx) = module.blocks[fold_blk].arguments.first() else {
+                    continue;
+                };
+                let mut matched_loads = Vec::new();
+                for &f_op in &module.blocks[fold_blk].ops {
+                    if module.ops[f_op].name.full_name() == "mogg.tensor.load"
+                        && module.ops[f_op].operands.len() >= 2
+                        && module.ops[f_op].operands[0] == primary_tensor
+                        && module.ops[f_op].operands[1] == elem_idx
+                    {
+                        matched_loads.push(f_op);
+                    }
+                }
+                if !matched_loads.is_empty() {
+                    folds_reading_primary += 1;
+                    for load_op in matched_loads {
+                        module.ops[load_op].name = OpName::new("mogg.rowwise", "primary");
+                        module.ops[load_op].operands.clear();
+                    }
+                }
+            }
+
+            module.ops[rw_op]
+                .attributes
+                .insert("primary".to_string(), Attribute::Int(primary_idx as i64));
+            module.ops[rw_op].attributes.insert(
+                "is_cached".to_string(),
+                Attribute::Bool(folds_reading_primary > 1),
+            );
+        }
+
+        // Stage 2: Bind monoids and compute widest accumulator bitwidth.
+        let mut widest_accum_bits = 0u32;
+        let mut widest_monoid = String::new();
+        let mut widest_state_bits = 0u32;
+        let mut total_element_cost = 0u32;
+
+        for &fold_op in &fold_ops {
+            let monoid_name = module.ops[fold_op]
+                .attributes
+                .get("monoid")
+                .and_then(Attribute::as_str)
+                .ok_or_else(|| "mogg.rowwise.reduce missing 'monoid' attribute".to_string())?
+                .to_string();
+
+            let num_res = module.ops[fold_op].results.len();
+            if let Some(Attribute::Array(expected_fields)) =
+                module.ops[fold_op].attributes.get("monoid_fields").cloned()
+            {
+                if expected_fields.len() != num_res {
+                    return Err(format!(
+                        "rowwise.reduce has {num_res} results, but monoid has {} output fields",
+                        expected_fields.len()
+                    ));
+                }
+                module.ops[fold_op]
+                    .attributes
+                    .insert("fields".to_string(), Attribute::Array(expected_fields));
+            } else {
+                let default_fields: Vec<Attribute> = (0..num_res)
+                    .map(|i| Attribute::String(format!("val_{i}")))
+                    .collect();
+                module.ops[fold_op]
+                    .attributes
+                    .insert("fields".to_string(), Attribute::Array(default_fields));
+            }
+
+            let mut fold_state_bits = 0u32;
+            let res_ids = module.ops[fold_op].results.clone();
+            for r_id in res_ids {
+                let bits = dtype_bitwidth(&module.values[r_id].ty);
+                fold_state_bits += bits;
+                widest_accum_bits = widest_accum_bits.max(bits);
+            }
+            if widest_monoid.is_empty() || fold_state_bits > widest_state_bits {
+                widest_state_bits = fold_state_bits;
+                widest_monoid = monoid_name;
+            }
+
+            let fold_reg = module.ops[fold_op].regions[0];
+            let fold_blk = module.regions[fold_reg].blocks[0];
+            for &f_op in &module.blocks[fold_blk].ops {
+                if module.ops[f_op].name.full_name() == "mogg.call.elementwise" {
+                    total_element_cost += rowwise_call_elementwise_cost(&module.ops[f_op]);
+                }
+            }
+        }
+
+        if widest_accum_bits > 0 {
+            module.ops[rw_op].attributes.insert(
+                "accum_bitwidth".to_string(),
+                Attribute::Int(i64::from(widest_accum_bits)),
+            );
+        }
+
+        // Stage 3: Group row-indexed `mogg.tensor.store` ops into a trailing `mogg.rowwise.emit`.
+        let mut row_stores: Vec<OpId> = Vec::new();
+        let mut stray_store = false;
+        for &op_id in &module.blocks[rw_blk].ops {
+            if module.ops[op_id].name.full_name() == "mogg.tensor.store" {
+                if module.ops[op_id].operands.get(1).copied() == Some(row_arg) {
+                    row_stores.push(op_id);
+                } else {
+                    stray_store = true;
+                }
+            }
+        }
+        if stray_store {
+            return Err(
+                "mogg.call.rowwise stores outside its emit; only reduce-shaped bodies are supported"
+                    .to_string(),
+            );
+        }
+
+        if !row_stores.is_empty() {
+            let rw_loc = module.ops[rw_op].location.clone();
+            module.blocks[rw_blk]
+                .ops
+                .retain(|id| !row_stores.contains(id));
+            let emit_blk = module.blocks.insert_with_key(|id| crate::ir::Block {
+                id,
+                label: None,
+                arguments: Vec::new(),
+                ops: row_stores,
+            });
+            let emit_reg = module.regions.insert_with_key(|id| crate::ir::Region {
+                id,
+                blocks: vec![emit_blk],
+            });
+            let emit_op = module.ops.insert_with_key(|id| Operation {
+                id,
+                name: OpName::new("mogg.rowwise", "emit"),
+                operands: SmallVec::new(),
+                results: SmallVec::new(),
+                attributes: IndexMap::new(),
+                regions: vec![emit_reg],
+                custom_syntax: false,
+                location: rw_loc,
+            });
+            let insert_pos = module.blocks[rw_blk]
+                .ops
+                .iter()
+                .position(|&id| {
+                    let n = module.ops[id].name.full_name();
+                    n == "mogg.yield" || n == "func.return"
+                })
+                .unwrap_or(module.blocks[rw_blk].ops.len());
+            module.blocks[rw_blk].ops.insert(insert_pos, emit_op);
+        }
+
+        // Stage 4: Set launch parameters.
+        module.ops[rw_op]
+            .attributes
+            .insert("num_phases".to_string(), Attribute::Int(1));
+        module.ops[rw_op]
+            .attributes
+            .insert("dtype_size".to_string(), Attribute::Int(0));
+        module.ops[rw_op].attributes.insert(
+            "computationally_expensive".to_string(),
+            Attribute::Bool(total_element_cost >= expensive_cost_threshold),
+        );
+        module.ops[rw_op]
+            .attributes
+            .insert("simd_monoid".to_string(), Attribute::String(widest_monoid));
+        if let Some(Attribute::Int(cols)) = module.ops[rw_op].attributes.get("static_cols").cloned()
+        {
+            module.ops[rw_op]
+                .attributes
+                .insert("cols".to_string(), Attribute::Int(cols));
+        }
+
+        legalized_count += 1;
+    }
+
+    Ok(legalized_count)
+}

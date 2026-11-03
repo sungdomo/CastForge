@@ -6119,3 +6119,224 @@ fn test_globalize_and_inline_model_subgraphs_offsets_slots_and_prefixes_weights(
         Some(&Attribute::Int(7))
     );
 }
+
+#[test]
+fn test_legalize_rowwise_kernels_primary_selection_monoid_binding_and_launch_params() {
+    use castforge::ir::{
+        Attribute, Block, DType, Dim, OpName, Operation, Region, TensorType, Type, Value, ValueDef,
+    };
+    use castforge::passes::legalize_rowwise_kernels;
+    use indexmap::IndexMap;
+    use smallvec::SmallVec;
+
+    let ir = concat!(
+        "module @rowwise_mod {\n",
+        "  func.func @row_reduce(%in0: tensor<4xf32>, %out0: tensor<4xf32>) -> tensor<4xf32> {\n",
+        "    %rw = mogg.call.rowwise %in0, %out0 {static_cols = 128}",
+        " : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %rw : tensor<4xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(ir).expect("valid MLIR");
+    let func_id = m.functions()[0];
+    let func_blk = m.regions[m.ops[func_id].regions[0]].blocks[0];
+    let rw_op = m.blocks[func_blk].ops[0];
+    let loc = m.ops[rw_op].location.clone();
+    let f32_ty = Type::Tensor(TensorType::new(vec![Dim::Static(4)], DType::F32));
+    let idx_ty = Type::Tensor(TensorType::new(vec![Dim::Static(1)], DType::I64));
+
+    // Attach the rowwise body region with `[%cap_in, %cap_out, %row_idx]`, a `mogg.rowwise.reduce`
+    // fold region with `[%elem_idx, %acc]`, an element-index `mogg.tensor.load`, an expensive
+    // `mogg.call.elementwise` (`mo.exp`), and a row-indexed `mogg.tensor.store`:
+    let rw_blk = m.blocks.insert_with_key(|id| Block {
+        id,
+        label: None,
+        arguments: Vec::new(),
+        ops: Vec::new(),
+    });
+    let cap_in = m.values.insert_with_key(|id| Value {
+        id,
+        ssa_name: None,
+        ty: f32_ty.clone(),
+        def: ValueDef::BlockArgument {
+            block: rw_blk,
+            index: 0,
+        },
+    });
+    let cap_out = m.values.insert_with_key(|id| Value {
+        id,
+        ssa_name: None,
+        ty: f32_ty.clone(),
+        def: ValueDef::BlockArgument {
+            block: rw_blk,
+            index: 1,
+        },
+    });
+    let row_idx = m.values.insert_with_key(|id| Value {
+        id,
+        ssa_name: None,
+        ty: idx_ty.clone(),
+        def: ValueDef::BlockArgument {
+            block: rw_blk,
+            index: 2,
+        },
+    });
+    m.blocks[rw_blk].arguments = vec![cap_in, cap_out, row_idx];
+
+    let fold_blk = m.blocks.insert_with_key(|id| Block {
+        id,
+        label: None,
+        arguments: Vec::new(),
+        ops: Vec::new(),
+    });
+    let elem_idx = m.values.insert_with_key(|id| Value {
+        id,
+        ssa_name: None,
+        ty: idx_ty,
+        def: ValueDef::BlockArgument {
+            block: fold_blk,
+            index: 0,
+        },
+    });
+    m.blocks[fold_blk].arguments = vec![elem_idx];
+
+    let load_op = m.ops.insert_with_key(|id| Operation {
+        id,
+        name: OpName::new("mogg.tensor", "load"),
+        operands: smallvec::smallvec![cap_in, elem_idx],
+        results: SmallVec::new(),
+        attributes: IndexMap::new(),
+        regions: Vec::new(),
+        custom_syntax: false,
+        location: loc.clone(),
+    });
+    let loaded_val = m.values.insert_with_key(|id| Value {
+        id,
+        ssa_name: None,
+        ty: f32_ty.clone(),
+        def: ValueDef::OpResult {
+            op: load_op,
+            index: 0,
+        },
+    });
+    m.ops[load_op].results.push(loaded_val);
+
+    let elem_op = m.ops.insert_with_key(|id| Operation {
+        id,
+        name: OpName::new("mogg.call", "elementwise"),
+        operands: smallvec::smallvec![loaded_val],
+        results: SmallVec::new(),
+        attributes: {
+            let mut a = IndexMap::new();
+            a.insert(
+                "mo_op_name".to_string(),
+                Attribute::String("mo.exp".to_string()),
+            );
+            a
+        },
+        regions: Vec::new(),
+        custom_syntax: false,
+        location: loc.clone(),
+    });
+    let elem_val = m.values.insert_with_key(|id| Value {
+        id,
+        ssa_name: None,
+        ty: f32_ty.clone(),
+        def: ValueDef::OpResult {
+            op: elem_op,
+            index: 0,
+        },
+    });
+    m.ops[elem_op].results.push(elem_val);
+    m.blocks[fold_blk].ops = vec![load_op, elem_op];
+
+    let fold_reg = m.regions.insert_with_key(|id| Region {
+        id,
+        blocks: vec![fold_blk],
+    });
+    let fold_op = m.ops.insert_with_key(|id| Operation {
+        id,
+        name: OpName::new("mogg.rowwise", "reduce"),
+        operands: SmallVec::new(),
+        results: SmallVec::new(),
+        attributes: {
+            let mut a = IndexMap::new();
+            a.insert(
+                "monoid".to_string(),
+                Attribute::String("online_softmax".to_string()),
+            );
+            a
+        },
+        regions: vec![fold_reg],
+        custom_syntax: false,
+        location: loc.clone(),
+    });
+    let fold_res = m.values.insert_with_key(|id| Value {
+        id,
+        ssa_name: None,
+        ty: f32_ty,
+        def: ValueDef::OpResult {
+            op: fold_op,
+            index: 0,
+        },
+    });
+    m.ops[fold_op].results.push(fold_res);
+
+    let store_op = m.ops.insert_with_key(|id| Operation {
+        id,
+        name: OpName::new("mogg.tensor", "store"),
+        operands: smallvec::smallvec![cap_out, row_idx, fold_res],
+        results: SmallVec::new(),
+        attributes: IndexMap::new(),
+        regions: Vec::new(),
+        custom_syntax: false,
+        location: loc,
+    });
+    m.blocks[rw_blk].ops = vec![fold_op, store_op];
+    let rw_reg = m.regions.insert_with_key(|id| Region {
+        id,
+        blocks: vec![rw_blk],
+    });
+    m.ops[rw_op].regions.push(rw_reg);
+
+    let count = legalize_rowwise_kernels(&mut m, 16).expect("rowwise legalization succeeds");
+    assert_eq!(count, 1);
+
+    assert_eq!(
+        m.ops[rw_op].attributes.get("primary"),
+        Some(&Attribute::Int(0))
+    );
+    assert_eq!(
+        m.ops[rw_op].attributes.get("is_cached"),
+        Some(&Attribute::Bool(false))
+    );
+    assert_eq!(
+        m.ops[rw_op].attributes.get("accum_bitwidth"),
+        Some(&Attribute::Int(32))
+    );
+    assert_eq!(
+        m.ops[rw_op].attributes.get("computationally_expensive"),
+        Some(&Attribute::Bool(true))
+    );
+    assert_eq!(
+        m.ops[rw_op].attributes.get("simd_monoid"),
+        Some(&Attribute::String("online_softmax".to_string()))
+    );
+    assert_eq!(
+        m.ops[rw_op].attributes.get("cols"),
+        Some(&Attribute::Int(128))
+    );
+
+    // Load inside fold became `mogg.rowwise.primary`, and store moved into `mogg.rowwise.emit`:
+    assert_eq!(m.ops[load_op].name.full_name(), "mogg.rowwise.primary");
+    let rw_body_ops: Vec<String> = m.blocks[rw_blk]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        rw_body_ops,
+        vec!["mogg.rowwise.reduce", "mogg.rowwise.emit"]
+    );
+}
