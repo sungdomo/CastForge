@@ -20189,3 +20189,467 @@ pub fn generate_device_graph_build_stubs(module: &mut Module) -> Result<usize, S
 
     Ok(rewritten_count)
 }
+
+// ============================================================================
+// Batch 22 Step 4: Bottom-Up Model Call-Graph Slot Globalization & Subgraph
+// Inlining
+// ============================================================================
+
+/// Offsets the runtime slot attribute (`b_buffer_slot` on `mgp.buffer.cache`,
+/// or `a_runtime_slot` on `mgp.runtime.create`, `mgp.module.load`, and
+/// `mgp.execute.generic`) of `op` by `slot_offset`.
+pub fn offset_runtime_slots_in_op(op: &mut Operation, slot_offset: i64) {
+    let attr_key = match op.name.full_name().as_str() {
+        "mgp.buffer.cache" => Some("b_buffer_slot"),
+        "mgp.runtime.create" | "mgp.module.load" | "mgp.execute.generic" => Some("a_runtime_slot"),
+        _ => None,
+    };
+    if let Some(key) = attr_key
+        && let Some(Attribute::Int(old_slot)) = op.attributes.get(key).cloned()
+    {
+        op.attributes
+            .insert(key.to_string(), Attribute::Int(old_slot + slot_offset));
+    }
+}
+
+fn find_model_context_create(module: &Module, func_id: OpId) -> Option<(OpId, i64)> {
+    for &reg_id in &module.ops[func_id].regions {
+        for &blk_id in &module.regions[reg_id].blocks {
+            for &op_id in &module.blocks[blk_id].ops {
+                if module.ops[op_id].name.full_name() == "mgp.context.create" {
+                    let slots = match module.ops[op_id].attributes.get("num_slots") {
+                        Some(Attribute::Int(n)) => *n,
+                        _ => 0,
+                    };
+                    return Some((op_id, slots));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn topo_sort_model_call_graph(
+    models: &[String],
+    edges: &IndexMap<String, Vec<String>>,
+) -> Result<Vec<String>, String> {
+    // 0 = unvisited, 1 = visiting (on stack), 2 = visited
+    let mut state: IndexMap<String, u8> = IndexMap::new();
+    let mut post_order: Vec<String> = Vec::new();
+    let mut stack_path: Vec<String> = Vec::new();
+
+    fn dfs(
+        node: &str,
+        edges: &IndexMap<String, Vec<String>>,
+        state: &mut IndexMap<String, u8>,
+        post_order: &mut Vec<String>,
+        stack_path: &mut Vec<String>,
+    ) -> Result<(), String> {
+        state.insert(node.to_string(), 1);
+        stack_path.push(node.to_string());
+        if let Some(callees) = edges.get(node) {
+            for callee in callees {
+                match state.get(callee).copied().unwrap_or(0) {
+                    1 => {
+                        return Err(format!(
+                            "cycle detected in model call graph, cannot inline: {} -> {}",
+                            stack_path.join(" -> "),
+                            callee
+                        ));
+                    }
+                    0 => dfs(callee, edges, state, post_order, stack_path)?,
+                    _ => {}
+                }
+            }
+        }
+        stack_path.pop();
+        state.insert(node.to_string(), 2);
+        post_order.push(node.to_string());
+        Ok(())
+    }
+
+    for m in models {
+        if state.get(m).copied().unwrap_or(0) == 0 {
+            dfs(m, edges, &mut state, &mut post_order, &mut stack_path)?;
+        }
+    }
+    Ok(post_order)
+}
+
+/// Performs bottom-up model call-graph analysis across `mgp.call` sites in
+/// `module`, rejecting call-graph cycles and either:
+/// - (`inline_subgraphs == false`): globalizing subgraph slot indices by
+///   emitting an `index.constant` slot offset operand for each `mgp.call` and
+///   marking `is_globalized_index = true`; or
+/// - (`inline_subgraphs == true`): inlining subgraph bodies at each `mgp.call`
+///   site with runtime slot attributes offset by the accumulated parent slot
+///   usage, prefixing placeholder `mgp.buffer.constant_external` weight names
+///   via `mgp.string.create` + `mgp.string.concat`, updating the parent
+///   `mgp.context.create`'s `num_slots`, and erasing unused subgraph models.
+pub fn globalize_and_inline_model_subgraphs(
+    module: &mut Module,
+    inline_subgraphs: bool,
+) -> Result<usize, String> {
+    let func_ids = module.functions();
+    if func_ids.len() <= 1 {
+        return Ok(0);
+    }
+
+    let mut sym_to_func: IndexMap<String, OpId> = IndexMap::new();
+    let mut model_names: Vec<String> = Vec::new();
+    for &f_id in &func_ids {
+        if let Some(Attribute::String(sym)) = module.ops[f_id].attributes.get("sym_name") {
+            sym_to_func.insert(sym.clone(), f_id);
+            model_names.push(sym.clone());
+        }
+    }
+
+    let mut call_edges: IndexMap<String, Vec<String>> = IndexMap::new();
+    let mut has_any_mgp_call = false;
+    for (sym, &f_id) in &sym_to_func {
+        let mut callees: Vec<String> = Vec::new();
+        for &reg_id in &module.ops[f_id].regions {
+            for &blk_id in &module.regions[reg_id].blocks {
+                for &op_id in &module.blocks[blk_id].ops {
+                    if module.ops[op_id].name.full_name() == "mgp.call" {
+                        has_any_mgp_call = true;
+                        let callee = module.ops[op_id]
+                            .attributes
+                            .get("callee")
+                            .and_then(Attribute::as_str)
+                            .map(|s| s.trim_start_matches('@').to_string())
+                            .ok_or_else(|| "mgp.call missing 'callee' attribute".to_string())?;
+                        if !sym_to_func.contains_key(&callee) {
+                            return Err(format!("failed to find symbol @{callee}"));
+                        }
+                        if !callees.contains(&callee) {
+                            callees.push(callee);
+                        }
+                    }
+                }
+            }
+        }
+        call_edges.insert(sym.clone(), callees);
+    }
+
+    if !has_any_mgp_call {
+        return Ok(0);
+    }
+
+    // Bottom-up order (callees before callers) and cycle check.
+    let bottom_up_models = topo_sort_model_call_graph(&model_names, &call_edges)?;
+
+    // Verify every model in the call graph has an `mgp.context.create` op.
+    let mut model_ctx_info: IndexMap<String, (OpId, i64)> = IndexMap::new();
+    for sym in &bottom_up_models {
+        let f_id = sym_to_func[sym];
+        let Some(info) = find_model_context_create(module, f_id) else {
+            return Err(format!("unable to find context in model @{sym}"));
+        };
+        model_ctx_info.insert(sym.clone(), info);
+    }
+
+    let mut processed_calls = 0usize;
+    let mut inlined_counts: IndexMap<String, usize> = IndexMap::new();
+
+    for caller_sym in &bottom_up_models {
+        let caller_f = sym_to_func[caller_sym];
+        let (caller_ctx_op, mut model_slot_usage) = model_ctx_info[caller_sym];
+        let caller_ctx_val = module.ops[caller_ctx_op].results.first().copied();
+        let Some(&caller_reg) = module.ops[caller_f].regions.first() else {
+            continue;
+        };
+        let Some(&caller_blk) = module.regions[caller_reg].blocks.first() else {
+            continue;
+        };
+
+        let call_ops: Vec<OpId> = module.blocks[caller_blk]
+            .ops
+            .iter()
+            .copied()
+            .filter(|&id| module.ops[id].name.full_name() == "mgp.call")
+            .collect();
+        if call_ops.is_empty() {
+            continue;
+        }
+
+        for call_op in call_ops {
+            let callee_sym = module.ops[call_op]
+                .attributes
+                .get("callee")
+                .and_then(Attribute::as_str)
+                .unwrap_or("")
+                .trim_start_matches('@')
+                .to_string();
+            let (_, callee_slots_used) = model_ctx_info[&callee_sym];
+            let slot_offset = model_slot_usage;
+            let call_loc = module.ops[call_op].location.clone();
+
+            if !inline_subgraphs {
+                let const_op = module.ops.insert_with_key(|id| Operation {
+                    id,
+                    name: OpName::new("index", "constant"),
+                    operands: SmallVec::new(),
+                    results: SmallVec::new(),
+                    attributes: {
+                        let mut attrs = IndexMap::new();
+                        attrs.insert("value".to_string(), Attribute::Int(slot_offset));
+                        attrs
+                    },
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: call_loc,
+                });
+                let idx_val = module.values.insert_with_key(|id| Value {
+                    id,
+                    ssa_name: None,
+                    ty: Type::Tensor(TensorType::new(vec![Dim::Static(1)], DType::I64)),
+                    def: ValueDef::OpResult {
+                        op: const_op,
+                        index: 0,
+                    },
+                });
+                module.ops[const_op].results.push(idx_val);
+                if let Some(pos) = module.blocks[caller_blk]
+                    .ops
+                    .iter()
+                    .position(|&id| id == call_op)
+                {
+                    module.blocks[caller_blk].ops.insert(pos, const_op);
+                }
+                module.ops[call_op].operands.push(idx_val);
+                module.ops[call_op]
+                    .attributes
+                    .insert("is_globalized_index".to_string(), Attribute::Bool(true));
+                model_slot_usage += callee_slots_used;
+                processed_calls += 1;
+                continue;
+            }
+
+            // Full subgraph inlining mode:
+            let callee_f = sym_to_func[&callee_sym];
+            let (callee_ctx_op, _) = model_ctx_info[&callee_sym];
+            let callee_reg = module.ops[callee_f].regions[0];
+            let callee_blk = module.regions[callee_reg].blocks[0];
+            let callee_args = module.blocks[callee_blk].arguments.clone();
+            let callee_ops = module.blocks[callee_blk].ops.clone();
+            let call_operands = module.ops[call_op].operands.clone();
+
+            let mut val_map: IndexMap<ValueId, ValueId> = IndexMap::new();
+            for (&c_arg, &c_opd) in callee_args.iter().zip(call_operands.iter()) {
+                val_map.insert(c_arg, c_opd);
+            }
+            if let (Some(parent_ctx_v), Some(&sub_ctx_v)) =
+                (caller_ctx_val, module.ops[callee_ctx_op].results.first())
+            {
+                val_map.insert(sub_ctx_v, parent_ctx_v);
+            }
+
+            let prefix_opt = module.ops[call_op]
+                .attributes
+                .get("prefix")
+                .and_then(Attribute::as_str)
+                .map(ToString::to_string);
+
+            let mut inserted_ops: Vec<OpId> = Vec::new();
+            let mut prefix_val_opt: Option<ValueId> = None;
+            if let Some(ref prefix_str) = prefix_opt {
+                let str_op = module.ops.insert_with_key(|id| Operation {
+                    id,
+                    name: OpName::new("mgp", "string.create"),
+                    operands: SmallVec::new(),
+                    results: SmallVec::new(),
+                    attributes: {
+                        let mut attrs = IndexMap::new();
+                        attrs.insert("value".to_string(), Attribute::String(prefix_str.clone()));
+                        attrs
+                    },
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: call_loc.clone(),
+                });
+                let p_val = module.values.insert_with_key(|id| Value {
+                    id,
+                    ssa_name: None,
+                    ty: Type::Tensor(TensorType::new(vec![Dim::Static(1)], DType::I64)),
+                    def: ValueDef::OpResult {
+                        op: str_op,
+                        index: 0,
+                    },
+                });
+                module.ops[str_op].results.push(p_val);
+                inserted_ops.push(str_op);
+                prefix_val_opt = Some(p_val);
+            }
+
+            let mut term_mapped_results: Vec<ValueId> = Vec::new();
+            for &sub_op in &callee_ops {
+                if sub_op == callee_ctx_op {
+                    continue;
+                }
+                let sub_name = module.ops[sub_op].name.full_name();
+                if sub_name == "func.return" || sub_name == "mef.output" {
+                    term_mapped_results = module.ops[sub_op]
+                        .operands
+                        .iter()
+                        .map(|&v| val_map.get(&v).copied().unwrap_or(v))
+                        .collect();
+                    continue;
+                }
+
+                let mut mapped_opds: SmallVec<[ValueId; 4]> = module.ops[sub_op]
+                    .operands
+                    .iter()
+                    .map(|&v| val_map.get(&v).copied().unwrap_or(v))
+                    .collect();
+
+                if sub_name == "mgp.buffer.constant_external"
+                    && matches!(
+                        module.ops[sub_op].attributes.get("e_is_placeholder"),
+                        Some(Attribute::Bool(true))
+                    )
+                    && let Some(p_val) = prefix_val_opt
+                    && let Some(name_opd) = mapped_opds.first_mut()
+                {
+                    let raw_name = *name_opd;
+                    let raw_ty = module.values[raw_name].ty.clone();
+                    let concat_op = module.ops.insert_with_key(|id| Operation {
+                        id,
+                        name: OpName::new("mgp", "string.concat"),
+                        operands: smallvec::smallvec![p_val, raw_name],
+                        results: SmallVec::new(),
+                        attributes: IndexMap::new(),
+                        regions: Vec::new(),
+                        custom_syntax: false,
+                        location: call_loc.clone(),
+                    });
+                    let concat_val = module.values.insert_with_key(|id| Value {
+                        id,
+                        ssa_name: None,
+                        ty: raw_ty,
+                        def: ValueDef::OpResult {
+                            op: concat_op,
+                            index: 0,
+                        },
+                    });
+                    module.ops[concat_op].results.push(concat_val);
+                    inserted_ops.push(concat_op);
+                    *name_opd = concat_val;
+                }
+
+                let orig_name = module.ops[sub_op].name.clone();
+                let orig_attrs = module.ops[sub_op].attributes.clone();
+                let orig_res = module.ops[sub_op].results.clone();
+                let cloned_op = module.ops.insert_with_key(|id| Operation {
+                    id,
+                    name: orig_name,
+                    operands: mapped_opds,
+                    results: SmallVec::new(),
+                    attributes: orig_attrs,
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: call_loc.clone(),
+                });
+                offset_runtime_slots_in_op(&mut module.ops[cloned_op], slot_offset);
+                for (r_idx, &old_r) in orig_res.iter().enumerate() {
+                    let r_ty = module.values[old_r].ty.clone();
+                    let new_r = module.values.insert_with_key(|id| Value {
+                        id,
+                        ssa_name: None,
+                        ty: r_ty,
+                        def: ValueDef::OpResult {
+                            op: cloned_op,
+                            index: r_idx as u32,
+                        },
+                    });
+                    module.ops[cloned_op].results.push(new_r);
+                    val_map.insert(old_r, new_r);
+                }
+                inserted_ops.push(cloned_op);
+            }
+
+            let call_results = module.ops[call_op].results.clone();
+            let mut result_replacements: IndexMap<ValueId, ValueId> = IndexMap::new();
+            for (&old_res, &new_res) in call_results.iter().zip(term_mapped_results.iter()) {
+                result_replacements.insert(old_res, new_res);
+            }
+
+            if let Some(pos) = module.blocks[caller_blk]
+                .ops
+                .iter()
+                .position(|&id| id == call_op)
+            {
+                module.blocks[caller_blk]
+                    .ops
+                    .splice(pos..=pos, inserted_ops);
+            }
+            for &op_id in &module.blocks[caller_blk].ops {
+                for opd in &mut module.ops[op_id].operands {
+                    if let Some(&rep) = result_replacements.get(opd) {
+                        *opd = rep;
+                    }
+                }
+            }
+            module.ops.remove(call_op);
+
+            model_slot_usage += callee_slots_used;
+            *inlined_counts.entry(callee_sym).or_insert(0) += 1;
+            processed_calls += 1;
+        }
+
+        if inline_subgraphs {
+            module.ops[caller_ctx_op]
+                .attributes
+                .insert("num_slots".to_string(), Attribute::Int(model_slot_usage));
+            if let Some(entry) = model_ctx_info.get_mut(caller_sym) {
+                entry.1 = model_slot_usage;
+            }
+        }
+    }
+
+    if inline_subgraphs {
+        for (sym, count) in inlined_counts {
+            if count == 0 {
+                continue;
+            }
+            let f_id = sym_to_func[&sym];
+            let is_subgraph = matches!(
+                module.ops[f_id].attributes.get("is_subgraph"),
+                Some(Attribute::Bool(true))
+            );
+            if !is_subgraph {
+                continue;
+            }
+            let mut still_used = false;
+            for &other_f in &module.functions() {
+                if other_f == f_id {
+                    continue;
+                }
+                for &r_id in &module.ops[other_f].regions {
+                    for &b_id in &module.regions[r_id].blocks {
+                        for &op_id in &module.blocks[b_id].ops {
+                            if module.ops[op_id].name.full_name() == "mgp.call"
+                                && module.ops[op_id]
+                                    .attributes
+                                    .get("callee")
+                                    .and_then(Attribute::as_str)
+                                    .is_some_and(|s| s.trim_start_matches('@') == sym)
+                            {
+                                still_used = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !still_used {
+                let all_blks: Vec<BlockId> = module.blocks.keys().collect();
+                for b_id in all_blks {
+                    module.blocks[b_id].ops.retain(|&id| id != f_id);
+                }
+                module.ops.remove(f_id);
+            }
+        }
+    }
+
+    Ok(processed_calls)
+}

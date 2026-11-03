@@ -6010,3 +6010,112 @@ fn test_generate_device_graph_build_stubs_and_builder_alloc_lowering() {
     );
     assert_eq!(m.ops[call1_op].operands[1], builder_arg);
 }
+
+#[test]
+fn test_globalize_and_inline_model_subgraphs_offsets_slots_and_prefixes_weights() {
+    use castforge::ir::Attribute;
+    use castforge::passes::globalize_and_inline_model_subgraphs;
+
+    let ir = concat!(
+        "module @subgraph_inlining {\n",
+        "  func.func @sub_mlp(%x: tensor<4xf32>, %w_name: tensor<1xi64>) -> tensor<4xf32> {\n",
+        "    %ctx = mgp.context.create %x {num_slots = 3} : (tensor<4xf32>) -> tensor<1xi64>\n",
+        "    %w = mgp.buffer.constant_external %w_name {e_is_placeholder = true}",
+        " : (tensor<1xi64>) -> tensor<4xf32>\n",
+        "    %cached = mgp.buffer.cache %w, %ctx {b_buffer_slot = 1}",
+        " : (tensor<4xf32>, tensor<1xi64>) -> tensor<4xf32>\n",
+        "    %out = mgp.execute.generic %x, %cached {a_runtime_slot = 2}",
+        " : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %out : tensor<4xf32>\n",
+        "  }\n",
+        "  func.func @main_model(%in: tensor<4xf32>, %w_name: tensor<1xi64>) -> tensor<4xf32> {\n",
+        "    %ctx = mgp.context.create %in {num_slots = 5} : (tensor<4xf32>) -> tensor<1xi64>\n",
+        "    %res = mgp.call %in, %w_name {callee = \"sub_mlp\", prefix = \"layers.0.\"}",
+        " : (tensor<4xf32>, tensor<1xi64>) -> tensor<4xf32>\n",
+        "    return %res : tensor<4xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+
+    // 1. Test globalize-only mode (`inline_subgraphs = false`):
+    let mut m_glob = parse_mlir(ir).expect("valid MLIR");
+    let count_glob =
+        globalize_and_inline_model_subgraphs(&mut m_glob, false).expect("globalize succeeds");
+    assert_eq!(count_glob, 1);
+    let main_glob = m_glob.functions()[1];
+    let main_glob_blk = m_glob.regions[m_glob.ops[main_glob].regions[0]].blocks[0];
+    let glob_ops: Vec<String> = m_glob.blocks[main_glob_blk]
+        .ops
+        .iter()
+        .map(|&id| m_glob.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        glob_ops,
+        vec![
+            "mgp.context.create",
+            "index.constant",
+            "mgp.call",
+            "func.return"
+        ]
+    );
+    let const_op = m_glob.blocks[main_glob_blk].ops[1];
+    assert_eq!(
+        m_glob.ops[const_op].attributes.get("value"),
+        Some(&Attribute::Int(5))
+    );
+    let call_op = m_glob.blocks[main_glob_blk].ops[2];
+    assert_eq!(
+        m_glob.ops[call_op].attributes.get("is_globalized_index"),
+        Some(&Attribute::Bool(true))
+    );
+
+    // 2. Test full subgraph inlining mode (`inline_subgraphs = true`):
+    let mut m_inl = parse_mlir(ir).expect("valid MLIR");
+    let sub_func = m_inl.functions()[0];
+    m_inl.ops[sub_func]
+        .attributes
+        .insert("is_subgraph".to_string(), Attribute::Bool(true));
+
+    let count_inl =
+        globalize_and_inline_model_subgraphs(&mut m_inl, true).expect("inlining succeeds");
+    assert_eq!(count_inl, 1);
+    // `sub_mlp` was erased because it was marked `is_subgraph = true` and had no remaining uses:
+    assert_eq!(m_inl.functions().len(), 1);
+
+    let main_inl = m_inl.functions()[0];
+    let main_inl_blk = m_inl.regions[m_inl.ops[main_inl].regions[0]].blocks[0];
+    let inl_ops: Vec<String> = m_inl.blocks[main_inl_blk]
+        .ops
+        .iter()
+        .map(|&id| m_inl.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        inl_ops,
+        vec![
+            "mgp.context.create",
+            "mgp.string.create",
+            "mgp.string.concat",
+            "mgp.buffer.constant_external",
+            "mgp.buffer.cache",
+            "mgp.execute.generic",
+            "func.return",
+        ]
+    );
+    // Parent context `num_slots` updated to 5 + 3 = 8:
+    let ctx_op = m_inl.blocks[main_inl_blk].ops[0];
+    assert_eq!(
+        m_inl.ops[ctx_op].attributes.get("num_slots"),
+        Some(&Attribute::Int(8))
+    );
+    // `b_buffer_slot` offset from 1 -> 1 + 5 = 6, `a_runtime_slot` offset from 2 -> 2 + 5 = 7:
+    let cache_op = m_inl.blocks[main_inl_blk].ops[4];
+    assert_eq!(
+        m_inl.ops[cache_op].attributes.get("b_buffer_slot"),
+        Some(&Attribute::Int(6))
+    );
+    let exec_op = m_inl.blocks[main_inl_blk].ops[5];
+    assert_eq!(
+        m_inl.ops[exec_op].attributes.get("a_runtime_slot"),
+        Some(&Attribute::Int(7))
+    );
+}
