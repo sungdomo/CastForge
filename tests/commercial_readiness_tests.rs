@@ -2,7 +2,10 @@
 //! hardening & resource quotas, lazy `.safetensors` indexing, structured pass telemetry, and
 //! extended ONNX operators (`Einsum`, `Tile`, `TopK`, negative-axis ops).
 
-use castforge::codegen::evaluate_module;
+use castforge::codegen::{
+    BackendRegistry, CompilationCache, TargetConfig, compute_function_structural_hashes,
+    compute_module_structural_hash, evaluate_module,
+};
 use castforge::ffi::{
     castforge_compile_mlir, castforge_free_string, castforge_optimize_mlir, castforge_version,
 };
@@ -409,4 +412,86 @@ fn test_jenga_kv_pool_geometry_and_hybrid_prefix_hit_planner() {
         ],
     );
     assert_eq!(joint_narrowed, 0);
+}
+
+#[test]
+fn test_subgraph_structural_hash_and_compilation_cache() {
+    let mlir_layer_0 = r#"
+module @decoder_block_0 {
+  func.func @layer_0(%x0: tensor<2x4xf32>, %w0: tensor<2x4xf32>) -> tensor<2x4xf32> {
+    %sum0 = stablehlo.add %x0, %w0 : tensor<2x4xf32>
+    %act0 = stablehlo.tanh %sum0 : tensor<2x4xf32>
+    func.return %act0 : tensor<2x4xf32>
+  }
+}
+"#;
+    let mlir_layer_31 = r#"
+module @decoder_block_31 {
+  func.func @layer_31(%hidden: tensor<2x4xf32>, %weight: tensor<2x4xf32>) -> tensor<2x4xf32> {
+    %added = stablehlo.add %hidden, %weight : tensor<2x4xf32>
+    %out = stablehlo.tanh %added : tensor<2x4xf32>
+    func.return %out : tensor<2x4xf32>
+  }
+}
+"#;
+    let mod_0 = parse_mlir(mlir_layer_0).unwrap();
+    let mod_31 = parse_mlir(mlir_layer_31).unwrap();
+
+    // Despite different module, function, and SSA variable names, structural hashes match!
+    assert_eq!(
+        compute_module_structural_hash(&mod_0),
+        compute_module_structural_hash(&mod_31)
+    );
+
+    let registry = BackendRegistry::with_builtin_backends();
+    let config = TargetConfig::default();
+    let mut cache = CompilationCache::new();
+
+    // First compilation: cold miss
+    let (code_0, hit_0) = registry
+        .generate_cached("c", &mod_0, &config, &mut cache)
+        .unwrap();
+    assert!(!hit_0);
+    assert_eq!(cache.misses(), 1);
+    assert_eq!(cache.hits(), 0);
+    assert_eq!(cache.len(), 1);
+
+    // Second compilation of structurally identical decoder block 31: warm hit in O(1)
+    let (code_31, hit_31) = registry
+        .generate_cached("c", &mod_31, &config, &mut cache)
+        .unwrap();
+    assert!(hit_31);
+    assert_eq!(cache.misses(), 1);
+    assert_eq!(cache.hits(), 1);
+    assert_eq!(cache.len(), 1);
+    assert_eq!(code_0, code_31);
+
+    // Multi-function module with 3 identical decoder layers and 1 main function:
+    let multi_layer_mlir = r#"
+module @transformer_3_layers {
+  func.func @layer_0(%x: tensor<2x4xf32>, %w: tensor<2x4xf32>) -> tensor<2x4xf32> {
+    %0 = stablehlo.add %x, %w : tensor<2x4xf32>
+    func.return %0 : tensor<2x4xf32>
+  }
+  func.func @layer_1(%a: tensor<2x4xf32>, %b: tensor<2x4xf32>) -> tensor<2x4xf32> {
+    %0 = stablehlo.add %a, %b : tensor<2x4xf32>
+    func.return %0 : tensor<2x4xf32>
+  }
+  func.func @layer_2(%p: tensor<2x4xf32>, %q: tensor<2x4xf32>) -> tensor<2x4xf32> {
+    %0 = stablehlo.add %p, %q : tensor<2x4xf32>
+    func.return %0 : tensor<2x4xf32>
+  }
+  func.func @main(%in: tensor<2x4xf32>, %w: tensor<2x4xf32>) -> tensor<2x4xf32> {
+    %0 = stablehlo.multiply %in, %w : tensor<2x4xf32>
+    func.return %0 : tensor<2x4xf32>
+  }
+}
+"#;
+    let multi_mod = parse_mlir(multi_layer_mlir).unwrap();
+    let fn_hashes = compute_function_structural_hashes(&multi_mod);
+    assert_eq!(fn_hashes.len(), 4);
+    assert_eq!(fn_hashes[0].1, fn_hashes[1].1);
+    assert_eq!(fn_hashes[1].1, fn_hashes[2].1);
+    assert_ne!(fn_hashes[0].1, fn_hashes[3].1);
+    assert_eq!(CompilationCache::analyze_layer_reuse(&multi_mod), (2, 4));
 }

@@ -21,8 +21,10 @@ pub use autotune::{
     apply_schedule_to_module, autotune_module, autotune_module_jit, jit_execute_and_benchmark,
 };
 pub use backend::{
-    BackendRegistry, C99Backend, CodegenBackend, CudaBackend, CustomBackendTranslator, HipBackend,
-    MslBackend, OpenClBackend, RustBackend, WgslBackend, emit_c_like_loop_stmt,
+    BackendRegistry, C99Backend, CodegenBackend, CompilationCache, CudaBackend,
+    CustomBackendTranslator, HipBackend, MslBackend, OpenClBackend, RustBackend, WgslBackend,
+    compute_function_structural_hashes, compute_module_structural_hash,
+    compute_region_structural_hash, emit_c_like_loop_stmt,
 };
 pub use config::*;
 pub use cost_model::{
