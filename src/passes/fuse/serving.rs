@@ -27052,3 +27052,471 @@ pub fn hoist_constant_subgraphs_into_parent(module: &mut Module) -> usize {
 
     total_hoisted_ops
 }
+
+fn is_complex_param_expr(sym: &str) -> bool {
+    let trimmed = sym.trim();
+    !trimmed.is_empty()
+        && trimmed != "?"
+        && (trimmed.contains('(')
+            || trimmed.contains('+')
+            || trimmed.contains('-')
+            || trimmed.contains('*')
+            || trimmed.contains('/'))
+}
+
+fn type_has_complex_param_expr(ty: &Type) -> bool {
+    if let Type::Tensor(t) = ty {
+        t.shape
+            .iter()
+            .any(|d| matches!(d, crate::ir::mlir::Dim::Symbolic(s) if is_complex_param_expr(s)))
+    } else {
+        false
+    }
+}
+
+fn replace_complex_dims_in_type(
+    ty: &Type,
+    expr_to_param: &std::collections::HashMap<String, String>,
+) -> Type {
+    if let Type::Tensor(t) = ty {
+        let mut new_t = t.clone();
+        for d in &mut new_t.shape {
+            if let crate::ir::mlir::Dim::Symbolic(s) = d
+                && let Some(alias) = expr_to_param.get(s)
+            {
+                *s = alias.clone();
+            }
+        }
+        Type::Tensor(new_t)
+    } else {
+        ty.clone()
+    }
+}
+
+/// Hoists complex symbolic parameter expressions (`Dim::Symbolic` containing operators or
+/// function applications) out of tensor types into `kgen.param.declare` alias declarations,
+/// inserting `mo.rebind` operations on rewritten inputs/outputs and folding consecutive or
+/// identity `mo.rebind`s.
+///
+/// Returns the number of `kgen.param.declare` parameter alias declarations created.
+pub fn hoist_parameter_expressions(module: &mut Module) -> usize {
+    use crate::ir::mlir::{Dim, Location, OpName, Operation, Value, ValueDef};
+
+    let mut created_decls = 0usize;
+    let mut next_param_idx = 0usize;
+
+    let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+    for bid in block_ids {
+        let mut expr_to_param: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for &oid in &module.blocks[bid].ops {
+            let op = &module.ops[oid];
+            if op.name.full_name() == "kgen.param.declare"
+                && let (Some(name), Some(expr)) = (
+                    op.attributes
+                        .get("name")
+                        .or_else(|| op.attributes.get("sym_name"))
+                        .and_then(Attribute::as_str),
+                    op.attributes.get("expr").and_then(Attribute::as_str),
+                )
+            {
+                expr_to_param.insert(expr.to_string(), name.to_string());
+            }
+        }
+
+        let ops_snapshot = module.blocks[bid].ops.clone();
+        for op_id in ops_snapshot {
+            let Some(op) = module.ops.get(op_id).cloned() else {
+                continue;
+            };
+            let full = op.name.full_name();
+            if full == "kgen.param.declare" || full == "mo.rebind" || is_terminator_op_name(&full) {
+                continue;
+            }
+
+            let mut op_exprs = Vec::new();
+            for &opnd in &op.operands {
+                if let Some(Type::Tensor(t)) = module.values.get(opnd).map(|v| &v.ty) {
+                    for d in &t.shape {
+                        if let Dim::Symbolic(s) = d
+                            && is_complex_param_expr(s)
+                            && !op_exprs.contains(s)
+                        {
+                            op_exprs.push(s.clone());
+                        }
+                    }
+                }
+            }
+            for &res in &op.results {
+                if let Some(Type::Tensor(t)) = module.values.get(res).map(|v| &v.ty) {
+                    for d in &t.shape {
+                        if let Dim::Symbolic(s) = d
+                            && is_complex_param_expr(s)
+                            && !op_exprs.contains(s)
+                        {
+                            op_exprs.push(s.clone());
+                        }
+                    }
+                }
+            }
+            if op_exprs.is_empty() {
+                continue;
+            }
+
+            let mut pre_ops = Vec::new();
+            for expr in op_exprs {
+                if !expr_to_param.contains_key(&expr) {
+                    let alias = format!("param_expr_{next_param_idx}");
+                    next_param_idx += 1;
+                    expr_to_param.insert(expr.clone(), alias.clone());
+                    let mut attrs = indexmap::IndexMap::new();
+                    attrs.insert("name".to_string(), Attribute::String(alias));
+                    attrs.insert("expr".to_string(), Attribute::String(expr));
+                    let decl_op = module.ops.insert(Operation {
+                        id: OpId::default(),
+                        name: OpName::new("kgen", "param.declare"),
+                        operands: smallvec::SmallVec::new(),
+                        results: smallvec::SmallVec::new(),
+                        attributes: attrs,
+                        regions: Vec::new(),
+                        custom_syntax: false,
+                        location: Location::Unknown,
+                    });
+                    module.ops[decl_op].id = decl_op;
+                    pre_ops.push(decl_op);
+                    created_decls += 1;
+                }
+            }
+
+            // Rebind complex tensor inputs:
+            let mut input_remap: std::collections::HashMap<ValueId, ValueId> =
+                std::collections::HashMap::new();
+            for &opnd in &op.operands {
+                if input_remap.contains_key(&opnd) {
+                    continue;
+                }
+                let Some(orig_ty) = module.values.get(opnd).map(|v| v.ty.clone()) else {
+                    continue;
+                };
+                if type_has_complex_param_expr(&orig_ty) {
+                    let rebound_ty = replace_complex_dims_in_type(&orig_ty, &expr_to_param);
+                    let rebound_val = module.values.insert(Value {
+                        id: ValueId::default(),
+                        ssa_name: None,
+                        ty: rebound_ty,
+                        def: ValueDef::BlockArgument {
+                            block: bid,
+                            index: 0,
+                        },
+                    });
+                    module.values[rebound_val].id = rebound_val;
+                    let rebind_op = module.ops.insert(Operation {
+                        id: OpId::default(),
+                        name: OpName::new("mo", "rebind"),
+                        operands: smallvec::smallvec![opnd],
+                        results: smallvec::smallvec![rebound_val],
+                        attributes: indexmap::IndexMap::new(),
+                        regions: Vec::new(),
+                        custom_syntax: false,
+                        location: Location::Unknown,
+                    });
+                    module.ops[rebind_op].id = rebind_op;
+                    module.values[rebound_val].def = ValueDef::OpResult {
+                        op: rebind_op,
+                        index: 0,
+                    };
+                    pre_ops.push(rebind_op);
+                    input_remap.insert(opnd, rebound_val);
+                }
+            }
+
+            for opnd_slot in &mut module.ops[op_id].operands {
+                if let Some(&mapped) = input_remap.get(opnd_slot) {
+                    *opnd_slot = mapped;
+                }
+            }
+
+            // Rewrite op result types in-place and emit output rebinds to original types:
+            let mut post_ops = Vec::new();
+            let results_snapshot = module.ops[op_id].results.clone();
+            for res_v in results_snapshot {
+                let orig_ty = module.values[res_v].ty.clone();
+                if type_has_complex_param_expr(&orig_ty) {
+                    let aliased_ty = replace_complex_dims_in_type(&orig_ty, &expr_to_param);
+                    module.values[res_v].ty = aliased_ty;
+
+                    let out_rebound_val = module.values.insert(Value {
+                        id: ValueId::default(),
+                        ssa_name: None,
+                        ty: orig_ty,
+                        def: ValueDef::BlockArgument {
+                            block: bid,
+                            index: 0,
+                        },
+                    });
+                    module.values[out_rebound_val].id = out_rebound_val;
+                    let out_rebind_op = module.ops.insert(Operation {
+                        id: OpId::default(),
+                        name: OpName::new("mo", "rebind"),
+                        operands: smallvec::smallvec![res_v],
+                        results: smallvec::smallvec![out_rebound_val],
+                        attributes: indexmap::IndexMap::new(),
+                        regions: Vec::new(),
+                        custom_syntax: false,
+                        location: Location::Unknown,
+                    });
+                    module.ops[out_rebind_op].id = out_rebind_op;
+                    module.values[out_rebound_val].def = ValueDef::OpResult {
+                        op: out_rebind_op,
+                        index: 0,
+                    };
+
+                    let all_ops: Vec<OpId> = module.ops.keys().collect();
+                    for oid in all_ops {
+                        if oid == out_rebind_op {
+                            continue;
+                        }
+                        for opnd in &mut module.ops[oid].operands {
+                            if *opnd == res_v {
+                                *opnd = out_rebound_val;
+                            }
+                        }
+                    }
+                    post_ops.push(out_rebind_op);
+                }
+            }
+
+            if let Some(pos) = module.blocks[bid].ops.iter().position(|&id| id == op_id) {
+                for (off, pid) in pre_ops.iter().copied().enumerate() {
+                    module.blocks[bid].ops.insert(pos + off, pid);
+                }
+                let after_op_pos = pos + pre_ops.len() + 1;
+                for (off, qid) in post_ops.into_iter().enumerate() {
+                    module.blocks[bid].ops.insert(after_op_pos + off, qid);
+                }
+            }
+        }
+
+        // Fold consecutive `mo.rebind(mo.rebind(x))` and identity `mo.rebind`s in the block:
+        let mut idx = 0usize;
+        while idx < module.blocks[bid].ops.len() {
+            let oid = module.blocks[bid].ops[idx];
+            if module.ops[oid].name.full_name() != "mo.rebind"
+                || module.ops[oid].operands.len() != 1
+                || module.ops[oid].results.len() != 1
+            {
+                idx += 1;
+                continue;
+            }
+            let mut src_v = module.ops[oid].operands[0];
+            let dst_v = module.ops[oid].results[0];
+            if let Some(ValueDef::OpResult { op: prev_op, .. }) =
+                module.values.get(src_v).map(|v| v.def)
+                && module
+                    .ops
+                    .get(prev_op)
+                    .is_some_and(|p| p.name.full_name() == "mo.rebind" && p.operands.len() == 1)
+            {
+                src_v = module.ops[prev_op].operands[0];
+                module.ops[oid].operands[0] = src_v;
+            }
+            if module.values[src_v].ty == module.values[dst_v].ty {
+                let all_ops: Vec<OpId> = module.ops.keys().collect();
+                for other_id in all_ops {
+                    for opnd in &mut module.ops[other_id].operands {
+                        if *opnd == dst_v {
+                            *opnd = src_v;
+                        }
+                    }
+                }
+                module.blocks[bid].ops.remove(idx);
+                module.ops.remove(oid);
+                continue;
+            }
+            idx += 1;
+        }
+    }
+
+    created_decls
+}
+
+/// Evaluates `mo.invoke_shape_func` packing shape queries (`pack_matmul_b_shape_func`,
+/// `pack_conv_filter_shape`, `pack_conv_transpose_filter_shape`) against target tile widths,
+/// materializing `kgen.param.declare` constants for each output parameter.
+///
+/// When `sanity_check_shape_funcs` is `true`, retains `mo.invoke_shape_func` with renamed
+/// output parameters and emits `kgen.param.assert_eq` checks; otherwise erases the resolved
+/// `mo.invoke_shape_func` operations.
+pub fn invoke_shape_packing_functions(
+    module: &mut Module,
+    sanity_check_shape_funcs: bool,
+) -> Result<usize, String> {
+    use crate::ir::mlir::{Dim, Location, OpName, Operation};
+
+    let mut resolved_count = 0usize;
+    let func_ids = module.functions();
+    for fn_id in func_ids {
+        let tile_width = match module.ops[fn_id].attributes.get("target_tile_width") {
+            Some(Attribute::Int(v)) => (*v).max(1),
+            _ => 16,
+        };
+
+        let regions = module.ops[fn_id].regions.clone();
+        for reg_id in regions {
+            let blocks = module.regions[reg_id].blocks.clone();
+            for bid in blocks {
+                let ops_snapshot = module.blocks[bid].ops.clone();
+                for op_id in ops_snapshot {
+                    let Some(op) = module.ops.get(op_id).cloned() else {
+                        continue;
+                    };
+                    if op.name.full_name() != "mo.invoke_shape_func" {
+                        continue;
+                    }
+                    let Some(func_name) = op
+                        .attributes
+                        .get("shape_func_name")
+                        .and_then(Attribute::as_str)
+                    else {
+                        continue;
+                    };
+
+                    let in_dims: Vec<i64> = if let Some(Attribute::Array(items)) =
+                        op.attributes.get("input_shape")
+                    {
+                        items
+                            .iter()
+                            .filter_map(|a| match a {
+                                Attribute::Int(v) => Some(*v),
+                                _ => None,
+                            })
+                            .collect()
+                    } else if let Some(&first_opnd) = op.operands.first()
+                        && let Some(Type::Tensor(t)) = module.values.get(first_opnd).map(|v| &v.ty)
+                    {
+                        t.shape
+                            .iter()
+                            .filter_map(|d| match d {
+                                Dim::Static(n) => Some(*n),
+                                _ => None,
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+
+                    let inferred_shapes: Vec<i64> = match (func_name, in_dims.as_slice()) {
+                        ("pack_matmul_b_shape_func", &[k, n]) if k > 0 && n > 0 => {
+                            vec![(n + tile_width - 1) / tile_width, k, tile_width]
+                        }
+                        ("pack_conv_filter_shape", &[f, c, r, s])
+                            if f > 0 && c > 0 && r > 0 && s > 0 =>
+                        {
+                            vec![(f + tile_width - 1) / tile_width, c, r, s, tile_width]
+                        }
+                        ("pack_conv_transpose_filter_shape", &[r, s, f, c])
+                            if r > 0 && s > 0 && f > 0 && c > 0 =>
+                        {
+                            vec![(c + tile_width - 1) / tile_width, r, s, f, tile_width]
+                        }
+                        _ => continue,
+                    };
+
+                    let output_decls: Vec<String> = match op.attributes.get("output_param_decls") {
+                        Some(Attribute::Array(items)) => items
+                            .iter()
+                            .filter_map(Attribute::as_str)
+                            .map(str::to_string)
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    if output_decls.len() != inferred_shapes.len() {
+                        return Err(format!(
+                            "number of inferred parameters ({}) does not match number of \
+                             output parameters ({})",
+                            inferred_shapes.len(),
+                            output_decls.len()
+                        ));
+                    }
+
+                    let mut pre_decls = Vec::with_capacity(output_decls.len());
+                    for (decl_name, val) in output_decls.iter().zip(inferred_shapes.iter()) {
+                        let mut attrs = indexmap::IndexMap::new();
+                        attrs.insert("name".to_string(), Attribute::String(decl_name.clone()));
+                        attrs.insert("value".to_string(), Attribute::Int(*val));
+                        let decl_op = module.ops.insert(Operation {
+                            id: OpId::default(),
+                            name: OpName::new("kgen", "param.declare"),
+                            operands: smallvec::SmallVec::new(),
+                            results: smallvec::SmallVec::new(),
+                            attributes: attrs,
+                            regions: Vec::new(),
+                            custom_syntax: false,
+                            location: Location::Unknown,
+                        });
+                        module.ops[decl_op].id = decl_op;
+                        pre_decls.push(decl_op);
+                    }
+
+                    let mut post_asserts = Vec::new();
+                    if sanity_check_shape_funcs {
+                        let mut renamed_decls = Vec::with_capacity(output_decls.len());
+                        for decl_name in &output_decls {
+                            let check_name = format!("{decl_name}_check");
+                            renamed_decls.push(Attribute::String(check_name.clone()));
+                            let mut attrs = indexmap::IndexMap::new();
+                            attrs.insert(
+                                "lhs_param".to_string(),
+                                Attribute::String(decl_name.clone()),
+                            );
+                            attrs.insert("rhs_param".to_string(), Attribute::String(check_name));
+                            attrs.insert(
+                                "message".to_string(),
+                                Attribute::String(
+                                    "shape generated by C++ shape function does not match \
+                                     the kernel implementation"
+                                        .to_string(),
+                                ),
+                            );
+                            let assert_op = module.ops.insert(Operation {
+                                id: OpId::default(),
+                                name: OpName::new("kgen", "param.assert_eq"),
+                                operands: smallvec::SmallVec::new(),
+                                results: smallvec::SmallVec::new(),
+                                attributes: attrs,
+                                regions: Vec::new(),
+                                custom_syntax: false,
+                                location: Location::Unknown,
+                            });
+                            module.ops[assert_op].id = assert_op;
+                            post_asserts.push(assert_op);
+                        }
+                        module.ops[op_id].attributes.insert(
+                            "output_param_decls".to_string(),
+                            Attribute::Array(renamed_decls),
+                        );
+                    }
+
+                    if let Some(pos) = module.blocks[bid].ops.iter().position(|&id| id == op_id) {
+                        for (off, did) in pre_decls.iter().copied().enumerate() {
+                            module.blocks[bid].ops.insert(pos + off, did);
+                        }
+                        let invoke_pos = pos + pre_decls.len();
+                        if sanity_check_shape_funcs {
+                            for (off, aid) in post_asserts.into_iter().enumerate() {
+                                module.blocks[bid].ops.insert(invoke_pos + 1 + off, aid);
+                            }
+                        } else {
+                            module.blocks[bid].ops.remove(invoke_pos);
+                            module.ops.remove(op_id);
+                        }
+                    }
+
+                    resolved_count += 1;
+                }
+            }
+        }
+    }
+
+    Ok(resolved_count)
+}

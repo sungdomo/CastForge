@@ -7891,3 +7891,72 @@ fn test_hoist_constant_subgraphs_into_parent_hoists_invariant_ops_and_moves_chai
         ]
     );
 }
+
+#[test]
+fn test_hoist_parameter_expressions_and_invoke_shape_packing_functions() {
+    use castforge::ir::{Attribute, DType, Dim, TensorType, Type};
+    use castforge::passes::{hoist_parameter_expressions, invoke_shape_packing_functions};
+
+    let src = concat!(
+        "module {\n",
+        "  func.func @param_and_packing(%x: tensor<4xf32>, %w: tensor<64x36xf32>) ",
+        "-> tensor<4xf32> attributes {target_tile_width = 16} {\n",
+        "    \"mo.invoke_shape_func\"(%w) {shape_func_name = \"pack_matmul_b_shape_func\"} : ",
+        "(tensor<64x36xf32>) -> ()\n",
+        "    %y = \"mo.relu\"(%x) : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %z = \"mo.abs\"(%y) : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %z : tensor<4xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(src).unwrap();
+    let fn_id = m.functions()[0];
+    let blk = m.regions[m.ops[fn_id].regions[0]].blocks[0];
+    let invoke_op = m.blocks[blk].ops[0];
+    m.ops[invoke_op].attributes.insert(
+        "output_param_decls".to_string(),
+        Attribute::Array(vec![
+            Attribute::String("P0".to_string()),
+            Attribute::String("P1".to_string()),
+            Attribute::String("P2".to_string()),
+        ]),
+    );
+
+    // Give `%x`, `%y`, and `%z` a complex symbolic dimension `mul(B, 2)` so
+    // `hoist_parameter_expressions` hoists `param_expr_0 = mul(B, 2)` and folds consecutive
+    // `mo.rebind`s between `mo.relu` and `mo.abs`:
+    let complex_ty = Type::Tensor(TensorType::new(
+        vec![Dim::Symbolic("mul(B, 2)".to_string())],
+        DType::F32,
+    ));
+    let x_arg = m.blocks[blk].arguments[0];
+    let relu_op = m.blocks[blk].ops[1];
+    let abs_op = m.blocks[blk].ops[2];
+    m.values[x_arg].ty = complex_ty.clone();
+    m.values[m.ops[relu_op].results[0]].ty = complex_ty.clone();
+    m.values[m.ops[abs_op].results[0]].ty = complex_ty;
+
+    let decls = hoist_parameter_expressions(&mut m);
+    assert_eq!(decls, 1);
+
+    let resolved = invoke_shape_packing_functions(&mut m, true)
+        .expect("invoke_shape_packing_functions succeeds");
+    assert_eq!(resolved, 1);
+
+    // Check that 3 packing `kgen.param.declare` ops (`[ceil(36/16)=3, 64, 16]`) and 3
+    // `kgen.param.assert_eq` sanity-check ops were materialized:
+    let mut pack_vals = Vec::new();
+    let mut assert_count = 0usize;
+    for &oid in &m.blocks[blk].ops {
+        let full = m.ops[oid].name.full_name();
+        if full == "kgen.param.declare"
+            && let Some(Attribute::Int(v)) = m.ops[oid].attributes.get("value")
+        {
+            pack_vals.push(*v);
+        } else if full == "kgen.param.assert_eq" {
+            assert_count += 1;
+        }
+    }
+    assert_eq!(pack_vals, vec![3, 64, 16]);
+    assert_eq!(assert_count, 3);
+}
