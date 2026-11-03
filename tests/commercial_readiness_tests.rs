@@ -5636,3 +5636,76 @@ fn test_partition_device_graph_collective_across_multiple_accelerators() {
         ]
     );
 }
+
+#[test]
+fn test_reconcile_and_resolve_device_graph_builder_casts_and_shape_only_check() {
+    use castforge::passes::{
+        is_shape_only_in_region, reconcile_and_resolve_device_graph_builder_casts,
+    };
+
+    let ir = concat!(
+        "module @finalize_graph_mod {\n",
+        "  func.func @finalize_graph(%builder: tensor<1xi64>, %buf: tensor<8xf32>)",
+        " -> tensor<4xf32> {\n",
+        "    %dev_ctx_tmp = builtin.unrealized_conversion_cast %builder",
+        " : (tensor<1xi64>) -> tensor<2xi64>\n",
+        "    %builder_roundtrip = builtin.unrealized_conversion_cast %dev_ctx_tmp",
+        " : (tensor<2xi64>) -> tensor<1xi64>\n",
+        "    %bridge_ctx = builtin.unrealized_conversion_cast %builder_roundtrip",
+        " {bridge_kind = \"builder_to_device_context\"}",
+        " : (tensor<1xi64>) -> tensor<2xi64>\n",
+        "    %sliced = mgp.buffer.slice %buf, %bridge_ctx",
+        " : (tensor<8xf32>, tensor<2xi64>) -> tensor<4xf32>\n",
+        "    %spec = mgp.tensor.extract.tensor_spec %sliced",
+        " : (tensor<4xf32>) -> tensor<1xi64>\n",
+        "    return %sliced : tensor<4xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(ir).expect("valid MLIR");
+    let func_op = m.functions()[0];
+    let func_reg = m.ops[func_op].regions[0];
+    let func_blk = m.regions[func_reg].blocks[0];
+
+    // Check `is_shape_only_in_region`: `%buf` is used by `mgp.buffer.slice` (not shape-only),
+    // while `%sliced` is used by `extract.tensor_spec` and `func.return` (not shape-only).
+    let buf_val = m.blocks[func_blk].arguments[1];
+    assert!(!is_shape_only_in_region(&m, func_reg, buf_val));
+
+    let resolved =
+        reconcile_and_resolve_device_graph_builder_casts(&mut m).expect("cast resolution succeeds");
+    assert_eq!(resolved, 3);
+
+    let op_names: Vec<String> = m.blocks[func_blk]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        op_names,
+        vec![
+            "mgp.device_graph.device_context",
+            "mgp.buffer.slice",
+            "mgp.tensor.extract.tensor_spec",
+            "func.return",
+        ]
+    );
+
+    // Verify that an unaudited user of a builder_to_device_context cast returns an error:
+    let bad_ir = concat!(
+        "module @unaudited_mod {\n",
+        "  func.func @unaudited(%builder: tensor<1xi64>, %x: tensor<4xf32>) -> tensor<4xf32> {\n",
+        "    %bridge = builtin.unrealized_conversion_cast %builder",
+        " {bridge_kind = \"builder_to_device_context\"}",
+        " : (tensor<1xi64>) -> tensor<2xi64>\n",
+        "    %bad = mgp.routine.async %x, %bridge",
+        " : (tensor<4xf32>, tensor<2xi64>) -> tensor<4xf32>\n",
+        "    return %bad : tensor<4xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut bad_m = parse_mlir(bad_ir).expect("valid MLIR");
+    let err = reconcile_and_resolve_device_graph_builder_casts(&mut bad_m)
+        .expect_err("unaudited op should fail");
+    assert!(err.contains("unaudited op 'mgp.routine.async'"));
+}

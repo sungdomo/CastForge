@@ -18738,3 +18738,184 @@ pub fn partition_device_graph_collective(module: &mut Module) -> Result<usize, S
 
     Ok(partitioned_count)
 }
+
+/// Checks whether `val` is used inside `reg_id` exclusively by
+/// `mgp.tensor.extract.tensor_spec` operations (and has at least one use inside
+/// `reg_id`), enabling shape-only values to cross device-graph region boundaries
+/// without materializing device buffer transfers.
+pub fn is_shape_only_in_region(module: &Module, reg_id: crate::ir::RegionId, val: ValueId) -> bool {
+    let Some(reg) = module.regions.get(reg_id) else {
+        return false;
+    };
+    let mut found_use = false;
+    for &blk_id in &reg.blocks {
+        let Some(blk) = module.blocks.get(blk_id) else {
+            continue;
+        };
+        for &op_id in &blk.ops {
+            let Some(op) = module.ops.get(op_id) else {
+                continue;
+            };
+            if op.operands.contains(&val) {
+                found_use = true;
+                if op.name.full_name() != "mgp.tensor.extract.tensor_spec" {
+                    return false;
+                }
+            }
+        }
+    }
+    found_use
+}
+
+/// Reconciles inverse `builtin.unrealized_conversion_cast` chains across all
+/// blocks in `module` and lowers remaining builder-to-device-context bridge
+/// casts (`bridge_kind = "builder_to_device_context"`) into explicit
+/// `mgp.device_graph.device_context` operations after auditing that every
+/// downstream user is a host-side zero-kernel slice operation
+/// (`mgp.buffer.slice`, `mgp.buffer.bulk_slice`, or `mgp.tensor.slice`).
+pub fn reconcile_and_resolve_device_graph_builder_casts(
+    module: &mut Module,
+) -> Result<usize, String> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut resolved_count = 0usize;
+    let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+
+    // Phase 1: Reconcile inverse `builtin.unrealized_conversion_cast` pairs
+    // where `cast_b(cast_a(x))` restores the exact type of `x`.
+    for &blk_id in &block_ids {
+        let Some(blk) = module.blocks.get(blk_id) else {
+            continue;
+        };
+        let ops: Vec<OpId> = blk.ops.clone();
+        let mut forward_replacements: HashMap<ValueId, ValueId> = HashMap::new();
+        let mut dead_casts: HashSet<OpId> = HashSet::new();
+
+        for &op_id in &ops {
+            let Some(op) = module.ops.get(op_id) else {
+                continue;
+            };
+            if op.name.full_name() != "builtin.unrealized_conversion_cast"
+                || op.operands.len() != 1
+                || op.results.len() != 1
+            {
+                continue;
+            }
+            let mut src_val = op.operands[0];
+            while let Some(&mapped) = forward_replacements.get(&src_val) {
+                src_val = mapped;
+            }
+            let dst_val = op.results[0];
+            if let ValueDef::OpResult { op: def_op, .. } = module.values[src_val].def
+                && let Some(prod_op) = module.ops.get(def_op)
+                && prod_op.name.full_name() == "builtin.unrealized_conversion_cast"
+                && prod_op.operands.len() == 1
+                && prod_op.results.len() == 1
+            {
+                let orig_val = prod_op.operands[0];
+                if module.values[orig_val].ty == module.values[dst_val].ty {
+                    forward_replacements.insert(dst_val, orig_val);
+                    dead_casts.insert(op_id);
+                }
+            }
+        }
+
+        if !forward_replacements.is_empty() {
+            for &op_id in &ops {
+                if let Some(op) = module.ops.get_mut(op_id) {
+                    for opd in &mut op.operands {
+                        while let Some(&mapped) = forward_replacements.get(opd) {
+                            *opd = mapped;
+                        }
+                    }
+                }
+            }
+            // Remove dead inverse casts and any intermediate casts that became unused.
+            let mut used_vals: HashSet<ValueId> = HashSet::new();
+            for &op_id in &module.blocks[blk_id].ops {
+                if !dead_casts.contains(&op_id)
+                    && let Some(op) = module.ops.get(op_id)
+                {
+                    for &opd in &op.operands {
+                        used_vals.insert(opd);
+                    }
+                }
+            }
+            for &op_id in ops.iter().rev() {
+                if dead_casts.contains(&op_id) {
+                    module.ops.remove(op_id);
+                    resolved_count += 1;
+                } else if let Some(op) = module.ops.get(op_id)
+                    && op.name.full_name() == "builtin.unrealized_conversion_cast"
+                    && op.results.len() == 1
+                    && !used_vals.contains(&op.results[0])
+                {
+                    let prod_operands = op.operands.clone();
+                    dead_casts.insert(op_id);
+                    module.ops.remove(op_id);
+                    resolved_count += 1;
+                    let _ = prod_operands;
+                }
+            }
+            module.blocks[blk_id]
+                .ops
+                .retain(|op_id| !dead_casts.contains(op_id));
+        }
+    }
+
+    // Phase 2: Audit and rewrite remaining `bridge_kind = "builder_to_device_context"`
+    // `builtin.unrealized_conversion_cast` operations into `mgp.device_graph.device_context`.
+    for &blk_id in &block_ids {
+        let Some(blk) = module.blocks.get(blk_id) else {
+            continue;
+        };
+        let ops: Vec<OpId> = blk.ops.clone();
+        for &op_id in &ops {
+            let Some(op) = module.ops.get(op_id) else {
+                continue;
+            };
+            if op.name.full_name() != "builtin.unrealized_conversion_cast" || op.results.len() != 1
+            {
+                continue;
+            }
+            let is_builder_bridge = matches!(
+                op.attributes.get("bridge_kind"),
+                Some(Attribute::String(s)) if s == "builder_to_device_context"
+            );
+            if !is_builder_bridge {
+                continue;
+            }
+            let cast_res = op.results[0];
+            for &user_id in &ops {
+                if user_id == op_id {
+                    continue;
+                }
+                let Some(user_op) = module.ops.get(user_id) else {
+                    continue;
+                };
+                if user_op.operands.contains(&cast_res) {
+                    let uname = user_op.name.full_name();
+                    if uname != "mgp.buffer.slice"
+                        && uname != "mgp.buffer.bulk_slice"
+                        && uname != "mgp.tensor.slice"
+                    {
+                        return Err(format!(
+                            "unaudited op '{}' uses backing device context of device_graph_builder",
+                            uname
+                        ));
+                    }
+                }
+            }
+            if let Some(op_mut) = module.ops.get_mut(op_id) {
+                op_mut.name = OpName {
+                    dialect: "mgp".to_string(),
+                    name: "device_graph.device_context".to_string(),
+                };
+                op_mut.attributes.shift_remove("bridge_kind");
+                resolved_count += 1;
+            }
+        }
+    }
+
+    Ok(resolved_count)
+}
