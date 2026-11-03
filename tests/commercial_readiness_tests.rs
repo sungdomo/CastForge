@@ -19,12 +19,13 @@ use castforge::passes::{
     EngineKvFormat, FULL_ATTENTION_WINDOW, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
     IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
     KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope,
-    LayerGroupPayloadSharder, PassManager, PassRegistry, WarmPrefetchJobTable, WarmPrefetchStatus,
-    analyze_kv_layer_groups, anonymize_symbolic_dims, compress_splat_constants,
-    defer_allocs_to_first_use, direct_copy_format_supported, elide_redundant_state_transfers,
-    flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
-    fuse_reshape_epilogue, fuse_sole_use_prologues, hash_prefix_token_blocks,
-    is_supported_arch_dtype, longest_full_attention_hit, longest_joint_prefix_hit,
+    LayerGroupPayloadSharder, PassManager, PassRegistry, ROWWISE_CHEAP_OP_COST,
+    ROWWISE_EXPENSIVE_OP_COST, WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
+    anonymize_symbolic_dims, compress_splat_constants, defer_allocs_to_first_use,
+    direct_copy_format_supported, elide_redundant_state_transfers, flatten_elementwise_chains,
+    fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
+    fuse_sole_use_prologues, hash_prefix_token_blocks, is_supported_arch_dtype,
+    legalize_rowwise_reduction_launch, longest_full_attention_hit, longest_joint_prefix_hit,
     longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_duplicate_shape_ops,
     merge_identical_functions, plan_cacheblend_retrieve, plan_concat_in_place,
     plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
@@ -1699,5 +1700,56 @@ module @concat_inplace {
         !c_unaligned_op
             .attributes
             .contains_key("castforge.concat_in_place")
+    );
+}
+
+#[test]
+fn test_legalize_rowwise_reduction_launch_cost_model_and_attributes() {
+    use castforge::ir::Attribute;
+
+    assert_eq!(ROWWISE_CHEAP_OP_COST, 1);
+    assert_eq!(ROWWISE_EXPENSIVE_OP_COST, 16);
+
+    let mlir = r#"
+module @rowwise_cost {
+  func.func @main(%x: tensor<4x128xf16>, %i: tensor<f16>) -> tensor<4x128xf16> {
+    %a = stablehlo.add %x, %x : tensor<4x128xf16>
+    %r = stablehlo.reduce %a, %i : (tensor<4x128xf16>, tensor<f16>) -> tensor<4xf16>
+    %sm = "castforge.softmax"(%x) {axis = 1 : i64} : (tensor<4x128xf16>) -> tensor<4x128xf16>
+    return %sm : tensor<4x128xf16>
+  }
+}
+"#;
+    let mut module = parse_mlir(mlir).expect("valid MLIR");
+    // Threshold = 16:
+    // - `%r` (`stablehlo.reduce` fed by cheap `stablehlo.add`): cost = 1 + 1 = 2 (< 16),
+    //   `num_phases = 1`, `accum_bits = 32` (promoted from `f16`), `cols = Some(128)`
+    // - `%sm` (`castforge.softmax`): cost = 2*16 + 3 = 35 (>= 16 -> expensive!),
+    //   `num_phases = 2`, `cols = Some(128)`
+    let plans = legalize_rowwise_reduction_launch(&mut module, 16);
+    assert_eq!(plans.len(), 2);
+
+    assert_eq!(plans[0].op_name, "stablehlo.reduce");
+    assert_eq!(plans[0].element_cost, 2);
+    assert!(!plans[0].computationally_expensive);
+    assert_eq!(plans[0].num_phases, 1);
+    assert_eq!(plans[0].accum_bits, 32);
+    assert_eq!(plans[0].cols, Some(128));
+
+    assert_eq!(plans[1].op_name, "castforge.softmax");
+    assert_eq!(plans[1].element_cost, 35);
+    assert!(plans[1].computationally_expensive);
+    assert_eq!(plans[1].num_phases, 2);
+    assert_eq!(plans[1].accum_bits, 32);
+    assert_eq!(plans[1].cols, Some(128));
+
+    let sm_op = &module.ops[plans[1].op_id];
+    assert_eq!(
+        sm_op.attributes.get("castforge.rowwise_expensive"),
+        Some(&Attribute::Bool(true))
+    );
+    assert_eq!(
+        sm_op.attributes.get("castforge.rowwise_cols"),
+        Some(&Attribute::Int(128))
     );
 }

@@ -4306,3 +4306,154 @@ pub fn plan_concat_in_place(module: &mut Module, alignment_bytes: u64) -> usize 
 
     planned
 }
+
+/// Cost weight of a cheap arithmetic/comparison op in a rowwise reduction body (`1`).
+pub const ROWWISE_CHEAP_OP_COST: u32 = 1;
+
+/// Cost weight of a division or transcendental op in a rowwise reduction body (`16`)
+/// (matching Modular `LegalizeRowwiseKernels.cpp`: `kExpensiveOpCost = 16`).
+pub const ROWWISE_EXPENSIVE_OP_COST: u32 = 16;
+
+/// Legalized launch parameters for a rowwise reduction or normalization kernel
+/// (inspired by Modular `GraphCompiler/lib/MOGGDialect/Transforms/LegalizeRowwiseKernels.cpp`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowwiseLaunchPlan {
+    /// Operation arena ID in the [`Module`].
+    pub op_id: OpId,
+    /// Full operation name (e.g., `"castforge.softmax"`, `"stablehlo.reduce"`).
+    pub op_name: String,
+    /// Per-element weighted instruction cost across the rowwise fold body and prologue.
+    pub element_cost: u32,
+    /// Whether `element_cost >= expensive_cost_threshold`.
+    pub computationally_expensive: bool,
+    /// Number of row passes (`1` for pure reductions, `2` for normalize-shaped bodies).
+    pub num_phases: u32,
+    /// Reduction accumulator bit-width (`max(32, element_dtype_bits)`).
+    pub accum_bits: u32,
+    /// Static reduction axis extent (`cols`) when statically known.
+    pub cols: Option<i64>,
+}
+
+fn elementwise_op_cost(op: &Operation) -> Option<u32> {
+    if op.name.dialect != "stablehlo" {
+        return None;
+    }
+    match op.name.name.as_str() {
+        "exponential" | "tanh" | "rsqrt" | "sqrt" | "log" | "logistic" | "divide" | "sine"
+        | "cosine" => Some(ROWWISE_EXPENSIVE_OP_COST),
+        "add" | "subtract" | "multiply" | "maximum" | "minimum" | "abs" | "negate" | "clamp"
+        | "select" => Some(ROWWISE_CHEAP_OP_COST),
+        _ => None,
+    }
+}
+
+/// Scores per-element arithmetic vs. transcendental cost for rowwise reduction and normalization
+/// kernels (`castforge.softmax`, `castforge.log_softmax`, `castforge.rmsnorm`,
+/// `castforge.layernorm`, `stablehlo.reduce`) and stamps launch parameters onto each op
+/// (inspired by Modular `GraphCompiler/lib/MOGGDialect/Transforms/LegalizeRowwiseKernels.cpp`
+/// `setLaunchParams` and `bindMonoids`).
+pub fn legalize_rowwise_reduction_launch(
+    module: &mut Module,
+    expensive_cost_threshold: u32,
+) -> Vec<RowwiseLaunchPlan> {
+    let mut plans = Vec::new();
+    let block_ids: Vec<_> = module.blocks.keys().collect();
+
+    for block_id in block_ids {
+        let op_ids = module.blocks[block_id].ops.clone();
+        for op_id in op_ids {
+            let Some(op) = module.ops.get(op_id).cloned() else {
+                continue;
+            };
+            let op_name = op.name.to_string();
+            let (base_cost, num_phases) = match op_name.as_str() {
+                "castforge.softmax" | "castforge.log_softmax" => {
+                    (2 * ROWWISE_EXPENSIVE_OP_COST + 3 * ROWWISE_CHEAP_OP_COST, 2)
+                }
+                "castforge.rmsnorm" => (ROWWISE_EXPENSIVE_OP_COST + 3 * ROWWISE_CHEAP_OP_COST, 2),
+                "castforge.layernorm" => (ROWWISE_EXPENSIVE_OP_COST + 6 * ROWWISE_CHEAP_OP_COST, 2),
+                "stablehlo.reduce" => (ROWWISE_CHEAP_OP_COST, 1),
+                _ => continue,
+            };
+
+            if op.operands.is_empty() {
+                continue;
+            }
+            let primary_in = op.operands[0];
+
+            // Walk backward up sole-use elementwise producers feeding `primary_in` to accumulate
+            // fused per-element prologue cost.
+            let mut prologue_cost = 0u32;
+            let mut cur_val = primary_in;
+            while let Some(v_info) = module.values.get(cur_val) {
+                let ValueDef::OpResult { op: prod_id, .. } = v_info.def else {
+                    break;
+                };
+                let Some(prod_op) = module.ops.get(prod_id) else {
+                    break;
+                };
+                let Some(c) = elementwise_op_cost(prod_op) else {
+                    break;
+                };
+                prologue_cost += c;
+                if let Some(&first_arg) = prod_op.operands.first() {
+                    cur_val = first_arg;
+                } else {
+                    break;
+                }
+            }
+
+            let element_cost = base_cost + prologue_cost;
+            let computationally_expensive = element_cost >= expensive_cost_threshold;
+
+            let (accum_bits, cols) = if let Some(v_info) = module.values.get(primary_in)
+                && let Type::Tensor(ref tt) = v_info.ty
+            {
+                let bits = (tt.dtype.bit_width() as u32).max(32);
+                let last_col = match tt.shape.last() {
+                    Some(Dim::Static(d)) if *d > 0 => Some(*d),
+                    _ => None,
+                };
+                (bits, last_col)
+            } else {
+                (32, None)
+            };
+
+            if let Some(op_mut) = module.ops.get_mut(op_id) {
+                op_mut.attributes.insert(
+                    "castforge.rowwise_element_cost".to_string(),
+                    Attribute::Int(element_cost as i64),
+                );
+                op_mut.attributes.insert(
+                    "castforge.rowwise_expensive".to_string(),
+                    Attribute::Bool(computationally_expensive),
+                );
+                op_mut.attributes.insert(
+                    "castforge.rowwise_num_phases".to_string(),
+                    Attribute::Int(num_phases as i64),
+                );
+                op_mut.attributes.insert(
+                    "castforge.rowwise_accum_bits".to_string(),
+                    Attribute::Int(accum_bits as i64),
+                );
+                if let Some(c) = cols {
+                    op_mut
+                        .attributes
+                        .insert("castforge.rowwise_cols".to_string(), Attribute::Int(c));
+                }
+            }
+
+            plans.push(RowwiseLaunchPlan {
+                op_id,
+                op_name,
+                element_cost,
+                computationally_expensive,
+                num_phases,
+                accum_bits,
+                cols,
+            });
+        }
+    }
+
+    plans
+}
