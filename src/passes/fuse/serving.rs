@@ -15950,3 +15950,197 @@ pub fn compute_device_graph_dependencies(module: &mut Module) -> usize {
 
     converted_count
 }
+
+// ============================================================================
+// Batch 19 Step 1: Optimal Bloom Filter & Sub-Chunk Sliding-Window Block Downsampler
+// ============================================================================
+
+/// Downsamples `block_ids` for a kernel group when `keep_blocks_per_chunk < total_blocks_per_chunk`
+/// (such as sub-chunk sliding-window attention), retaining the trailing `keep_blocks_per_chunk`
+/// blocks of each `total_blocks_per_chunk` chunk.
+pub fn downsample_sliding_window_block_ids(
+    block_ids: &[u64],
+    total_blocks_per_chunk: usize,
+    keep_blocks_per_chunk: usize,
+) -> Result<Vec<u64>, String> {
+    if total_blocks_per_chunk == 0 || keep_blocks_per_chunk == 0 {
+        return Err("blocks per chunk must be non-zero".to_string());
+    }
+    if keep_blocks_per_chunk > total_blocks_per_chunk {
+        return Err("keep_blocks_per_chunk cannot exceed total_blocks_per_chunk".to_string());
+    }
+    if !block_ids.len().is_multiple_of(total_blocks_per_chunk) {
+        return Err(format!(
+            "block_ids len {} not a multiple of {total_blocks_per_chunk}",
+            block_ids.len()
+        ));
+    }
+    let mut out =
+        Vec::with_capacity((block_ids.len() / total_blocks_per_chunk) * keep_blocks_per_chunk);
+    for chunk in block_ids.chunks_exact(total_blocks_per_chunk) {
+        out.extend_from_slice(&chunk[total_blocks_per_chunk - keep_blocks_per_chunk..]);
+    }
+    Ok(out)
+}
+
+/// Recalculates the number of blocks to skip for a batch of chunks when the sliding-window size
+/// (`blocks_per_window`) is smaller than or equal to `blocks_per_chunk`.
+#[must_use]
+pub fn recalculate_sliding_window_blocks_to_skip(
+    blocks_per_chunk: usize,
+    blocks_per_window: usize,
+    blocks_to_skip: usize,
+) -> usize {
+    if blocks_per_chunk == 0 || blocks_per_chunk == blocks_per_window {
+        return blocks_to_skip;
+    }
+    let full_windows_to_skip = blocks_to_skip / blocks_per_chunk;
+    let tail_blocks = blocks_to_skip % blocks_per_chunk;
+    let dropped_prefix = blocks_per_chunk.saturating_sub(blocks_per_window);
+    let tail_blocks_to_skip = tail_blocks.saturating_sub(dropped_prefix);
+    full_windows_to_skip
+        .saturating_mul(blocks_per_window)
+        .saturating_add(tail_blocks_to_skip)
+}
+
+/// Returns `(batch_start_idx, batch_len)` ranges over `0..total_items` in batches of `batch_size`
+/// after skipping the first `skip_count` items.
+pub fn batched_ranges_with_skip(
+    total_items: usize,
+    batch_size: usize,
+    skip_count: usize,
+) -> Result<Vec<(usize, usize)>, String> {
+    if batch_size == 0 {
+        return Err("batch_size must be at least 1".to_string());
+    }
+    let mut ranges = Vec::new();
+    let mut start = skip_count;
+    while start < total_items {
+        let len = (total_items - start).min(batch_size);
+        ranges.push((start, len));
+        start += len;
+    }
+    Ok(ranges)
+}
+
+/// Memory-efficient Bloom filter sized from `(expected_elements, false_positive_rate)` using
+/// $m = \lfloor -(n \ln p) / (\ln 2)^2 \rfloor$ and $k = \max(1, \lfloor (m / n) \ln 2 \rfloor)$.
+#[derive(Debug, Clone)]
+pub struct OptimalBloomFilter {
+    size_bits: usize,
+    hash_count: usize,
+    words: Vec<u32>,
+    item_count: usize,
+}
+
+impl OptimalBloomFilter {
+    /// Constructs a new [`OptimalBloomFilter`] for `expected_elements` and `false_positive_rate`.
+    #[must_use]
+    pub fn new(expected_elements: usize, false_positive_rate: f64) -> Self {
+        let n = expected_elements.max(1) as f64;
+        let p = false_positive_rate.clamp(1e-9, 0.999);
+        let ln2 = std::f64::consts::LN_2;
+        let size_bits = (-(n * p.ln()) / (ln2 * ln2)).floor().max(32.0) as usize;
+        let hash_count = (((size_bits as f64) / n) * ln2).floor().max(1.0) as usize;
+        let num_words = size_bits.div_ceil(32);
+        Self {
+            size_bits,
+            hash_count,
+            words: vec![0u32; num_words],
+            item_count: 0,
+        }
+    }
+
+    /// Optimal bit-array size $m$ in bits.
+    #[must_use]
+    pub fn size_bits(&self) -> usize {
+        self.size_bits
+    }
+
+    /// Optimal number of hash functions $k$.
+    #[must_use]
+    pub fn hash_count(&self) -> usize {
+        self.hash_count
+    }
+
+    /// Number of unique items inserted.
+    #[must_use]
+    pub fn item_count(&self) -> usize {
+        self.item_count
+    }
+
+    /// Computes the $k$ bit positions in `0..self.size_bits` for `key`.
+    #[must_use]
+    pub fn hash_positions(&self, key: &[u8]) -> Vec<usize> {
+        (0..self.hash_count)
+            .map(|i| {
+                let mut h =
+                    0x9E37_79B9_7F4A_7C15u64 ^ ((i as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+                for &b in key {
+                    h = (h ^ u64::from(b)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                }
+                h ^= h >> 31;
+                (h as usize) % self.size_bits
+            })
+            .collect()
+    }
+
+    /// Inserts `key` into the Bloom filter.
+    pub fn add(&mut self, key: &[u8]) {
+        for pos in self.hash_positions(key) {
+            self.words[pos >> 5] |= 1u32 << (pos & 31);
+        }
+        self.item_count += 1;
+    }
+
+    /// Inserts a batch of precomputed hash-position lists and returns how many items had at least
+    /// one previously unset bit.
+    pub fn add_batch_with_positions_and_check(&mut self, positions_list: &[Vec<usize>]) -> usize {
+        let mut unique_count = 0usize;
+        for positions in positions_list {
+            let is_new = positions.iter().any(|&pos| {
+                let p = pos % self.size_bits;
+                (self.words[p >> 5] & (1u32 << (p & 31))) == 0
+            });
+            if is_new {
+                for &pos in positions {
+                    let p = pos % self.size_bits;
+                    self.words[p >> 5] |= 1u32 << (p & 31);
+                }
+                unique_count += 1;
+            }
+        }
+        self.item_count += unique_count;
+        unique_count
+    }
+
+    /// Returns `true` if all $k$ bit positions for `key` are set.
+    #[must_use]
+    pub fn contains(&self, key: &[u8]) -> bool {
+        self.hash_positions(key)
+            .into_iter()
+            .all(|pos| (self.words[pos >> 5] & (1u32 << (pos & 31))) != 0)
+    }
+
+    /// Number of bits currently set to `1`.
+    #[must_use]
+    pub fn bits_set(&self) -> usize {
+        self.words.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    /// Fraction of bits currently set (`bits_set / size_bits`).
+    #[must_use]
+    pub fn fill_rate(&self) -> f64 {
+        if self.size_bits == 0 {
+            0.0
+        } else {
+            self.bits_set() as f64 / self.size_bits as f64
+        }
+    }
+
+    /// Resets all bits and item count to zero.
+    pub fn clear(&mut self) {
+        self.words.fill(0);
+        self.item_count = 0;
+    }
+}

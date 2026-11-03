@@ -4968,3 +4968,42 @@ fn test_compute_device_graph_dependencies_and_stable_place_ordering() {
         ]))
     );
 }
+
+#[test]
+fn test_optimal_bloom_filter_and_sliding_window_block_downsampler() {
+    use castforge::passes::{
+        OptimalBloomFilter, batched_ranges_with_skip, downsample_sliding_window_block_ids,
+        recalculate_sliding_window_blocks_to_skip,
+    };
+
+    // 1. Sub-chunk sliding-window block downsampler (e.g. 2 chunks of 4 blocks each, SWA keeps 2):
+    let swa_blocks = vec![11u64, 12, 13, 14, 15, 16, 17, 18];
+    let downsampled = downsample_sliding_window_block_ids(&swa_blocks, 4, 2).unwrap();
+    assert_eq!(downsampled, vec![13, 14, 17, 18]);
+
+    // 2. Sliding-window block skip recalculation:
+    assert_eq!(recalculate_sliding_window_blocks_to_skip(4, 4, 5), 5);
+    // 1 full chunk (2 window blocks) + 3 tail blocks where first 2 are outside window -> 2 + 1 = 3:
+    assert_eq!(recalculate_sliding_window_blocks_to_skip(4, 2, 7), 3);
+    // Batched iteration with skip:
+    assert_eq!(
+        batched_ranges_with_skip(10, 3, 2).unwrap(),
+        vec![(2, 3), (5, 3), (8, 2)]
+    );
+
+    // 3. Optimal Bloom filter:
+    let mut bf = OptimalBloomFilter::new(1000, 0.01);
+    assert!(bf.size_bits() > 9000);
+    assert!(bf.hash_count() >= 6);
+    bf.add(b"chunk-alpha");
+    bf.add(b"chunk-beta");
+    assert!(bf.contains(b"chunk-alpha"));
+    assert!(bf.contains(b"chunk-beta"));
+    assert!(!bf.contains(b"chunk-never-inserted"));
+    let p_alpha = bf.hash_positions(b"chunk-alpha");
+    let p_gamma = bf.hash_positions(b"chunk-gamma");
+    let added = bf.add_batch_with_positions_and_check(&[p_alpha, p_gamma]);
+    assert_eq!(added, 1);
+    assert_eq!(bf.item_count(), 3);
+    assert!(bf.fill_rate() > 0.0);
+}
