@@ -17090,3 +17090,103 @@ pub fn lower_buffer_concat_in_place(module: &mut Module, preferred_alignment: u6
 
     lowered_count
 }
+
+// ============================================================================
+// Batch 20 Step 3: Hanging Chain Overhang Terminator Joiner
+// ============================================================================
+
+/// Returns `true` if `ty` represents a 1-D `i64` execution chain (`tensor<1xi64>`).
+fn is_chain_tensor_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Tensor(t)
+            if t.dtype == DType::I64 && t.shape.as_slice() == [Dim::Static(1)]
+    )
+}
+
+/// Scans every block in `module` for operations that produce unused chain results
+/// (`tensor<1xi64>`), collects at most one hanging chain result per operation, and joins them into
+/// the block terminator's (`func.return`) chain operand via `mo.chain.create` so asynchronous
+/// chain work is awaited before block exit. Returns the number of hanging chains joined.
+pub fn fixup_hanging_chain_overhangs(module: &mut Module) -> usize {
+    let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+    let mut joined_chains = 0usize;
+
+    for blk_id in block_ids {
+        let ops = &module.blocks[blk_id].ops;
+        if ops.is_empty() {
+            continue;
+        }
+        let term_op = *ops.last().unwrap();
+        if module.ops[term_op].name.full_name() != "func.return" {
+            continue;
+        }
+        let Some(term_chain_idx) = module.ops[term_op]
+            .operands
+            .iter()
+            .position(|&v| is_chain_tensor_type(&module.values[v].ty))
+        else {
+            continue;
+        };
+
+        // Collect all used values in the block.
+        let mut used_vals: IndexSet<ValueId> = IndexSet::new();
+        for &op_id in ops {
+            for &opd in &module.ops[op_id].operands {
+                used_vals.insert(opd);
+            }
+        }
+
+        // Collect at most one unused chain result per non-terminator op.
+        let mut hanging_chains: Vec<ValueId> = Vec::new();
+        for &op_id in &ops[..ops.len() - 1] {
+            for &res in &module.ops[op_id].results {
+                if is_chain_tensor_type(&module.values[res].ty) && !used_vals.contains(&res) {
+                    hanging_chains.push(res);
+                    break;
+                }
+            }
+        }
+
+        if hanging_chains.is_empty() {
+            continue;
+        }
+
+        let orig_term_chain = module.ops[term_op].operands[term_chain_idx];
+        let chain_ty = module.values[orig_term_chain].ty.clone();
+        let loc = module.ops[term_op].location.clone();
+        let mut join_opds = SmallVec::new();
+        join_opds.push(orig_term_chain);
+        for &hc in &hanging_chains {
+            join_opds.push(hc);
+        }
+
+        let join_op = module.ops.insert_with_key(|id| Operation {
+            id,
+            name: OpName::new("mo", "chain.create"),
+            operands: join_opds,
+            results: SmallVec::new(),
+            attributes: IndexMap::new(),
+            regions: Vec::new(),
+            custom_syntax: false,
+            location: loc,
+        });
+        let joined_val = module.values.insert_with_key(|id| Value {
+            id,
+            ssa_name: None,
+            ty: chain_ty,
+            def: ValueDef::OpResult {
+                op: join_op,
+                index: 0,
+            },
+        });
+        module.ops[join_op].results.push(joined_val);
+        module.ops[term_op].operands[term_chain_idx] = joined_val;
+
+        let term_pos = module.blocks[blk_id].ops.len() - 1;
+        module.blocks[blk_id].ops.insert(term_pos, join_op);
+        joined_chains += hanging_chains.len();
+    }
+
+    joined_chains
+}

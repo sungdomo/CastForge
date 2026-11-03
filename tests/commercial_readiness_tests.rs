@@ -5287,3 +5287,32 @@ fn test_lower_buffer_concat_in_place_with_alignment_check() {
     assert_eq!(slice_count, 2);
     assert_eq!(alloc_count, 1);
 }
+
+#[test]
+fn test_fixup_hanging_chain_overhangs_awaits_unused_chains() {
+    use castforge::passes::fixup_hanging_chain_overhangs;
+
+    let mlir = concat!(
+        "module @overhangs {\n",
+        "  func.func @main(%ch0: tensor<1xi64>, %x: tensor<4xf32>) -> tensor<1xi64> {\n",
+        "    %ch_main = mgp.async_compute %ch0, %x",
+        " : (tensor<1xi64>, tensor<4xf32>) -> tensor<1xi64>\n",
+        "    %ch_hang1 = mgp.side_effect %ch0, %x",
+        " : (tensor<1xi64>, tensor<4xf32>) -> tensor<1xi64>\n",
+        "    %ch_hang2 = mgp.telemetry %ch0 : (tensor<1xi64>) -> tensor<1xi64>\n",
+        "    return %ch_main : tensor<1xi64>\n",
+        "  }\n",
+        "}\n",
+    );
+
+    let mut m = parse_mlir(mlir).expect("valid MLIR");
+    assert_eq!(fixup_hanging_chain_overhangs(&mut m), 2);
+
+    let func_id = m.functions()[0];
+    let blk_id = m.regions[m.ops[func_id].regions[0]].blocks[0];
+    let ops = &m.blocks[blk_id].ops;
+    assert_eq!(ops.len(), 5);
+    let join_op = ops[3];
+    assert_eq!(m.ops[join_op].name.full_name(), "mo.chain.create");
+    assert_eq!(m.ops[join_op].operands.len(), 3);
+}
