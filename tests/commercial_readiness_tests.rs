@@ -13,10 +13,11 @@ use castforge::ir::formats::{import_gguf_bytes, import_onnx_json};
 use castforge::ir::{DType, Dim, TensorBacking, TensorEntry, TensorStore, TensorType, parse_mlir};
 use castforge::passes::{
     AsymK16V8Codec, CacheBlendRopeSpec, ChainedBlockHashConfig, EngineKvFormat,
-    KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvPageSpec, KvScaleScope, PassManager,
-    PassRegistry, analyze_kv_layer_groups, compress_splat_constants, hash_prefix_token_blocks,
-    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
-    mark_cuda_graph_stable_tensors, plan_jenga_kv_geometry, re_rope_key_in_place,
+    KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool, KvPageSpec, KvScaleScope,
+    PassManager, PassRegistry, analyze_kv_layer_groups, compress_splat_constants,
+    hash_prefix_token_blocks, longest_full_attention_hit, longest_joint_prefix_hit,
+    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, plan_jenga_kv_geometry,
+    re_rope_key_in_place,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -777,4 +778,40 @@ module @splat_and_cuda_graph {
     assert!(printed.contains("stablehlo.broadcast_in_dim"));
     assert!(printed.contains("castforge.cuda_graph_capturable = true"));
     assert!(printed.contains("castforge.cuda_graph_stable = true"));
+}
+
+#[test]
+fn test_intrusive_lru_kv_block_pool_revival_and_reverse_chain_eviction() {
+    let mut pool = KvBlockPool::new(3);
+    assert_eq!(pool.free_count(), 3);
+
+    // Allocate 3 blocks: commit b0 (root prefix) and b1 (child prefix), leave b2 uncommitted
+    let b0 = pool.allocate().unwrap();
+    let b1 = pool.allocate().unwrap();
+    let b2 = pool.allocate().unwrap();
+    assert_eq!((b0, b1, b2), (0, 1, 2));
+    assert_eq!(pool.free_count(), 0);
+
+    pool.commit(b0, 0xAAAA);
+    pool.commit(b1, 0xBBBB);
+
+    // Release chain [b0, b1] in reverse order -> b1 goes to free list first, then b0 at MRU tail.
+    // Release uncommitted b2 -> goes to the FRONT (LRU head) so it is reused before evicting b1/b0!
+    pool.release_request_chain(&[b0, b1]);
+    pool.release_block(b2);
+    assert_eq!(pool.free_count(), 3);
+
+    // Next allocation MUST recycle uncommitted b2 (front of free list) without evicting b0 or b1!
+    let recycled = pool.allocate().unwrap();
+    assert_eq!(recycled, b2);
+
+    // Revive b0 from the free list via prefix hit in O(1):
+    let revived_b0 = pool.touch_or_revive_prefix(0xAAAA).unwrap();
+    assert_eq!(revived_b0, b0);
+    assert_eq!(pool.free_count(), 1); // Only b1 remains on the free list
+
+    // Next allocation must evict b1 (the tail of the chain, which was freed before b0)
+    let evicted = pool.allocate().unwrap();
+    assert_eq!(evicted, b1);
+    assert!(pool.touch_or_revive_prefix(0xBBBB).is_none());
 }

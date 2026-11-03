@@ -1354,3 +1354,191 @@ pub fn mark_cuda_graph_stable_tensors(module: &mut Module) -> CudaGraphCaptureRe
         blocking_ops,
     }
 }
+
+/// Intrusive doubly-linked LRU free-list links stored inline inside each [`KvPoolBlock`]
+/// (inspired by Modular `rust_kv/kv-core/src/pool/free_list.rs`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvFreeLinks {
+    pub prev: Option<usize>,
+    pub next: Option<usize>,
+    pub in_free_list: bool,
+}
+
+/// Metadata for a single physical block in [`KvBlockPool`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvPoolBlock {
+    pub block_id: usize,
+    pub ref_count: usize,
+    pub prefix_hash: Option<u64>,
+    pub links: KvFreeLinks,
+}
+
+/// $O(1)$ Intrusive LRU KV-Cache Block Pool with prefix-hit revival, uncommitted front-recycle,
+/// and reverse-chain eviction ordering (inspired by Modular `rust_kv/kv-core/src/pool`).
+#[derive(Debug, Clone)]
+pub struct KvBlockPool {
+    blocks: Vec<KvPoolBlock>,
+    free_head: Option<usize>,
+    free_tail: Option<usize>,
+    free_len: usize,
+    hash_to_block: std::collections::HashMap<u64, usize>,
+}
+
+impl KvBlockPool {
+    /// Creates a new [`KvBlockPool`] with `num_blocks` physical blocks (`0..num_blocks`), all
+    /// initially on the free list in ascending ID order.
+    pub fn new(num_blocks: usize) -> Self {
+        let mut pool = Self {
+            blocks: (0..num_blocks)
+                .map(|id| KvPoolBlock {
+                    block_id: id,
+                    ref_count: 0,
+                    prefix_hash: None,
+                    links: KvFreeLinks::default(),
+                })
+                .collect(),
+            free_head: None,
+            free_tail: None,
+            free_len: 0,
+            hash_to_block: std::collections::HashMap::new(),
+        };
+        for id in 0..num_blocks {
+            pool.push_free_back(id);
+        }
+        pool
+    }
+
+    /// Number of currently unreferenced blocks on the LRU free list.
+    pub fn free_count(&self) -> usize {
+        self.free_len
+    }
+
+    /// Total capacity in blocks.
+    pub fn capacity(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Inspects metadata for `block_id`.
+    pub fn block(&self, block_id: usize) -> Option<&KvPoolBlock> {
+        self.blocks.get(block_id)
+    }
+
+    fn push_free_back(&mut self, id: usize) {
+        debug_assert!(!self.blocks[id].links.in_free_list);
+        if let Some(tail) = self.free_tail {
+            self.blocks[tail].links.next = Some(id);
+        } else {
+            self.free_head = Some(id);
+        }
+        self.blocks[id].links = KvFreeLinks {
+            prev: self.free_tail,
+            next: None,
+            in_free_list: true,
+        };
+        self.free_tail = Some(id);
+        self.free_len += 1;
+    }
+
+    fn push_free_front(&mut self, id: usize) {
+        debug_assert!(!self.blocks[id].links.in_free_list);
+        if let Some(head) = self.free_head {
+            self.blocks[head].links.prev = Some(id);
+        } else {
+            self.free_tail = Some(id);
+        }
+        self.blocks[id].links = KvFreeLinks {
+            prev: None,
+            next: self.free_head,
+            in_free_list: true,
+        };
+        self.free_head = Some(id);
+        self.free_len += 1;
+    }
+
+    fn unlink_free(&mut self, id: usize) {
+        let links = self.blocks[id].links;
+        debug_assert!(links.in_free_list);
+        if let Some(prev) = links.prev {
+            self.blocks[prev].links.next = links.next;
+        } else {
+            self.free_head = links.next;
+        }
+        if let Some(next) = links.next {
+            self.blocks[next].links.prev = links.prev;
+        } else {
+            self.free_tail = links.prev;
+        }
+        self.blocks[id].links = KvFreeLinks::default();
+        self.free_len -= 1;
+    }
+
+    /// Allocates a block from the front of the LRU free list in $O(1)$, evicting its old
+    /// `prefix_hash` mapping if it was previously committed.
+    pub fn allocate(&mut self) -> Option<usize> {
+        let id = self.free_head?;
+        self.unlink_free(id);
+        if let Some(old_hash) = self.blocks[id].prefix_hash.take()
+            && self.hash_to_block.get(&old_hash) == Some(&id)
+        {
+            self.hash_to_block.remove(&old_hash);
+        }
+        self.blocks[id].ref_count = 1;
+        Some(id)
+    }
+
+    /// Commits a full block `block_id` under `prefix_hash` so future requests can match it.
+    pub fn commit(&mut self, block_id: usize, prefix_hash: u64) {
+        if let Some(blk) = self.blocks.get_mut(block_id) {
+            blk.prefix_hash = Some(prefix_hash);
+            self.hash_to_block.insert(prefix_hash, block_id);
+        }
+    }
+
+    /// Looks up `prefix_hash` in the pool; if the block is currently sitting on the free list
+    /// awaiting eviction, revives it in $O(1)$ by unlinking it from the middle of the free list!
+    pub fn touch_or_revive_prefix(&mut self, prefix_hash: u64) -> Option<usize> {
+        let &id = self.hash_to_block.get(&prefix_hash)?;
+        if self.blocks[id].prefix_hash != Some(prefix_hash) {
+            return None;
+        }
+        if self.blocks[id].links.in_free_list {
+            self.unlink_free(id);
+        }
+        self.blocks[id].ref_count += 1;
+        Some(id)
+    }
+
+    /// Releases a single block:
+    /// - If `ref_count` drops to `0` and the block was **committed** (`prefix_hash.is_some()`),
+    ///   appends it to the **back** (MRU tail) of the free list so its cached prefix stays alive
+    ///   as long as possible.
+    /// - If `ref_count` drops to `0` and the block was **uncommitted** (`prefix_hash.is_none()`),
+    ///   prepends it to the **front** (LRU head) of the free list so it is recycled immediately
+    ///   before evicting any committed prefix block!
+    pub fn release_block(&mut self, block_id: usize) {
+        let Some(blk) = self.blocks.get_mut(block_id) else {
+            return;
+        };
+        if blk.ref_count == 0 {
+            return;
+        }
+        blk.ref_count -= 1;
+        if blk.ref_count == 0 {
+            let committed = blk.prefix_hash.is_some();
+            if committed {
+                self.push_free_back(block_id);
+            } else {
+                self.push_free_front(block_id);
+            }
+        }
+    }
+
+    /// Releases a request's chain of blocks `[b_0, b_1, ..., b_{k-1}]` in **reverse order**
+    /// (`b_{k-1}` first, `b_0` last) so the tail of the chain sits closer to the LRU eviction
+    /// head than the root prefix block `b_0`.
+    pub fn release_request_chain(&mut self, chain: &[usize]) {
+        for &block_id in chain.iter().rev() {
+            self.release_block(block_id);
+        }
+    }
+}
