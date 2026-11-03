@@ -17425,3 +17425,195 @@ pub fn outline_structured_kernel_bodies(module: &mut Module) -> usize {
 
     outlined_count
 }
+
+// ============================================================================
+// Batch 20 Step 5: Parametric Dependency Topological Sorter & Rooted Components
+// ============================================================================
+
+/// Tracks combined SSA def-use and symbolic parameter (`decl_param` / `use_params`) dependencies
+/// between operations in a block.
+#[derive(Debug, Clone, Default)]
+pub struct ParametricTopologyGraph {
+    /// For each operation, the ordered set of provider operations it depends on.
+    pub providers_of: IndexMap<OpId, IndexSet<OpId>>,
+    /// For each operation, the ordered set of user operations that depend on it.
+    pub users_of: IndexMap<OpId, IndexSet<OpId>>,
+}
+
+impl ParametricTopologyGraph {
+    /// Builds the combined SSA and parametric dependency graph for `blk_id`.
+    #[must_use]
+    pub fn from_block(module: &Module, blk_id: BlockId) -> Self {
+        let ops = &module.blocks[blk_id].ops;
+        let block_set: IndexSet<OpId> = ops.iter().copied().collect();
+        let mut graph = Self::default();
+        for &op_id in ops {
+            graph.providers_of.entry(op_id).or_default();
+            graph.users_of.entry(op_id).or_default();
+        }
+
+        // Map parameter names declared via `decl_param = "..."` to their declaring OpId.
+        let mut param_decls: IndexMap<String, OpId> = IndexMap::new();
+        for &op_id in ops {
+            if let Some(Attribute::String(name)) = module.ops[op_id].attributes.get("decl_param") {
+                param_decls.insert(name.clone(), op_id);
+            }
+        }
+
+        for &op_id in ops {
+            let op = &module.ops[op_id];
+            // 1. SSA dependencies within the block.
+            for &opd in &op.operands {
+                if let ValueDef::OpResult { op: def_op, .. } = module.values[opd].def
+                    && def_op != op_id
+                    && block_set.contains(&def_op)
+                {
+                    graph.providers_of.entry(op_id).or_default().insert(def_op);
+                    graph.users_of.entry(def_op).or_default().insert(op_id);
+                }
+            }
+            // 2. Parametric dependencies (`use_params = ["..."]`).
+            if let Some(Attribute::Array(items)) = op.attributes.get("use_params") {
+                for item in items {
+                    if let Attribute::String(param_name) = item
+                        && let Some(&decl_op) = param_decls.get(param_name)
+                        && decl_op != op_id
+                    {
+                        graph.providers_of.entry(op_id).or_default().insert(decl_op);
+                        graph.users_of.entry(decl_op).or_default().insert(op_id);
+                    }
+                }
+            }
+        }
+
+        graph
+    }
+
+    /// Topologically sorts `ops` in-place using the repeated-scan Kahn blocker-decrement swap
+    /// algorithm. Returns `Err(stuck_ops)` in deterministic order if a dependency cycle prevents
+    /// progress.
+    pub fn sort_op_slice(&self, ops: &mut [OpId]) -> Result<(), Vec<OpId>> {
+        let n = ops.len();
+        if n <= 1 {
+            return Ok(());
+        }
+        let mut id_of: IndexMap<OpId, usize> = IndexMap::with_capacity(n);
+        for (idx, &op_id) in ops.iter().enumerate() {
+            id_of.insert(op_id, idx);
+        }
+
+        let mut num_blockers = vec![0usize; n];
+        let mut waiters_of: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (idx, &op_id) in ops.iter().enumerate() {
+            let mut blockers: IndexSet<usize> = IndexSet::new();
+            if let Some(provs) = self.providers_of.get(&op_id) {
+                for &prov in provs {
+                    if let Some(&prov_idx) = id_of.get(&prov)
+                        && prov_idx != idx
+                    {
+                        blockers.insert(prov_idx);
+                    }
+                }
+            }
+            num_blockers[idx] = blockers.len();
+            for blocker_idx in blockers {
+                waiters_of[blocker_idx].push(idx);
+            }
+        }
+
+        let mut ids: Vec<usize> = (0..n).collect();
+        let mut next_scheduled = 0usize;
+
+        while next_scheduled < n {
+            let mut scheduled_any = false;
+            let sweep_start = next_scheduled;
+            for i in sweep_start..n {
+                let orig_id = ids[i];
+                if num_blockers[orig_id] != 0 {
+                    continue;
+                }
+                for &waiter in &waiters_of[orig_id] {
+                    num_blockers[waiter] -= 1;
+                }
+                ops.swap(i, next_scheduled);
+                ids.swap(i, next_scheduled);
+                scheduled_any = true;
+                next_scheduled += 1;
+            }
+            if !scheduled_any {
+                return Err(ops[next_scheduled..].to_vec());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Topologically sorts all non-terminator operations in `blk_id` using combined SSA and parametric
+/// dependencies while keeping any trailing `func.return` terminator at the end of the block.
+/// Returns the number of operations whose position changed, or `Err(stuck_ops)` on a cycle.
+pub fn topologically_sort_parametric_block(
+    module: &mut Module,
+    blk_id: BlockId,
+) -> Result<usize, Vec<OpId>> {
+    let graph = ParametricTopologyGraph::from_block(module, blk_id);
+    let orig_ops = module.blocks[blk_id].ops.clone();
+    if orig_ops.len() <= 1 {
+        return Ok(0);
+    }
+    let has_terminator = module.ops[*orig_ops.last().unwrap()].name.full_name() == "func.return";
+    let body_len = if has_terminator {
+        orig_ops.len() - 1
+    } else {
+        orig_ops.len()
+    };
+
+    let mut sorted = orig_ops.clone();
+    graph.sort_op_slice(&mut sorted[..body_len])?;
+
+    let moved = orig_ops
+        .iter()
+        .zip(sorted.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    module.blocks[blk_id].ops = sorted;
+    Ok(moved)
+}
+
+/// Extracts `root_op` and its connected component of transitive users (plus non-root providers of
+/// those users) within `blk_id`, returned in topological order.
+pub fn extract_rooted_parametric_components(
+    module: &Module,
+    blk_id: BlockId,
+    root_op: OpId,
+) -> Result<Vec<OpId>, Vec<OpId>> {
+    let graph = ParametricTopologyGraph::from_block(module, blk_id);
+    let mut fringe = vec![root_op];
+    let mut enqueued: IndexSet<OpId> = IndexSet::new();
+    enqueued.insert(root_op);
+    let mut component = Vec::new();
+
+    while let Some(cur) = fringe.pop() {
+        component.push(cur);
+        if let Some(users) = graph.users_of.get(&cur) {
+            for &u in users {
+                if enqueued.insert(u) {
+                    fringe.push(u);
+                }
+            }
+        }
+        if cur == root_op {
+            continue;
+        }
+        if let Some(provs) = graph.providers_of.get(&cur) {
+            for &p in provs {
+                if enqueued.insert(p) {
+                    fringe.push(p);
+                }
+            }
+        }
+    }
+
+    graph.sort_op_slice(&mut component)?;
+    Ok(component)
+}

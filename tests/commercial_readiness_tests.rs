@@ -5359,3 +5359,57 @@ fn test_outline_structured_kernel_bodies_into_opaque_closure() {
     let closure_blk = m.regions[m.ops[closure_op].regions[0]].blocks[0];
     assert_eq!(m.blocks[closure_blk].arguments.len(), 3);
 }
+
+#[test]
+fn test_parametric_topology_sort_and_rooted_components() {
+    use castforge::passes::{
+        extract_rooted_parametric_components, topologically_sort_parametric_block,
+    };
+
+    // Graph region where `%user` appears before `%decl` in textual order, but `%user` references
+    // parameter `"tile_k"` declared by `%decl`, and `%comb` consumes both `%user` and `%aux`.
+    let mlir = concat!(
+        "module @param_topo {\n",
+        "  func.func @main(%x: tensor<4xf32>) -> tensor<4xf32> {\n",
+        "    %user = mo.param.consumer %x {use_params = [\"tile_k\"]}",
+        " : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %decl = mo.param.producer %x {decl_param = \"tile_k\"}",
+        " : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %aux = mo.aux %x : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %comb = mo.combine %user, %aux",
+        " : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %comb : tensor<4xf32>\n",
+        "  }\n",
+        "}\n",
+    );
+
+    let mut m = parse_mlir(mlir).expect("valid MLIR");
+    let func_id = m.functions()[0];
+    let blk_id = m.regions[m.ops[func_id].regions[0]].blocks[0];
+
+    let moved = topologically_sort_parametric_block(&mut m, blk_id).expect("acyclic");
+    assert!(moved >= 2);
+
+    let op_names: Vec<String> = m.blocks[blk_id]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    // `mo.param.producer` (`decl_param = "tile_k"`) is scheduled before `mo.param.consumer`:
+    let prod_pos = op_names
+        .iter()
+        .position(|n| n == "mo.param.producer")
+        .unwrap();
+    let cons_pos = op_names
+        .iter()
+        .position(|n| n == "mo.param.consumer")
+        .unwrap();
+    assert!(prod_pos < cons_pos);
+    assert_eq!(op_names.last().unwrap(), "func.return");
+
+    // Rooted component starting from `mo.param.producer` pulls in `mo.param.consumer`,
+    // `mo.combine`, `func.return`, and `mo.combine`'s provider `mo.aux`, all topologically sorted:
+    let prod_op = m.blocks[blk_id].ops[prod_pos];
+    let comp = extract_rooted_parametric_components(&m, blk_id, prod_op).expect("acyclic");
+    assert_eq!(comp.len(), 5);
+}
