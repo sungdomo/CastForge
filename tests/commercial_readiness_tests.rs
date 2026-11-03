@@ -13,11 +13,11 @@ use castforge::ir::formats::{import_gguf_bytes, import_onnx_json};
 use castforge::ir::{DType, Dim, TensorBacking, TensorEntry, TensorStore, TensorType, parse_mlir};
 use castforge::passes::{
     AsymK16V8Codec, CacheBlendRopeSpec, ChainedBlockHashConfig, EngineKvFormat,
-    KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool, KvPageSpec, KvScaleScope,
-    PassManager, PassRegistry, analyze_kv_layer_groups, compress_splat_constants,
-    hash_prefix_token_blocks, longest_full_attention_hit, longest_joint_prefix_hit,
-    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, plan_jenga_kv_geometry,
-    re_rope_key_in_place,
+    KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode, KvPageSpec,
+    KvScaleScope, PassManager, PassRegistry, analyze_kv_layer_groups, compress_splat_constants,
+    direct_copy_format_supported, hash_prefix_token_blocks, longest_full_attention_hit,
+    longest_joint_prefix_hit, longest_sliding_window_hit, mark_cuda_graph_stable_tensors,
+    plan_jenga_kv_geometry, plan_kv_dma_transfer, re_rope_key_in_place,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -814,4 +814,36 @@ fn test_intrusive_lru_kv_block_pool_revival_and_reverse_chain_eviction() {
     let evicted = pool.allocate().unwrap();
     assert_eq!(evicted, b1);
     assert!(pool.touch_or_revive_prefix(0xBBBB).is_none());
+}
+
+#[test]
+fn test_kv_dma_transfer_planner_and_pin_chunk_boundary_splitting() {
+    assert!(direct_copy_format_supported(EngineKvFormat::Nhd));
+    assert!(direct_copy_format_supported(EngineKvFormat::CrossLayer));
+    assert!(direct_copy_format_supported(EngineKvFormat::MlaLatent));
+    assert!(!direct_copy_format_supported(EngineKvFormat::Hnd));
+
+    // 1. Hnd format must select StagedSmKernel
+    let hnd_plan = plan_kv_dma_transfer(EngineKvFormat::Hnd, 4, 1024, &[0], 0, 4096);
+    assert_eq!(hnd_plan.mode, KvDmaTransferMode::StagedSmKernel);
+    assert_eq!(hnd_plan.entries.len(), 4);
+
+    // 2. CrossLayer collapses all 4 layers (4 * 1024 = 4096B) into a single DirectCopy2DPitched
+    // entry when aligned, or splits across pin-chunk boundaries when straddling `align = 4096`!
+    let cross_aligned = plan_kv_dma_transfer(EngineKvFormat::CrossLayer, 4, 1024, &[2], 0, 4096);
+    assert_eq!(cross_aligned.mode, KvDmaTransferMode::DirectCopy2DPitched);
+    assert_eq!(cross_aligned.entries.len(), 1);
+    assert_eq!(cross_aligned.pin_boundary_splits, 0);
+    assert_eq!(cross_aligned.entries[0].width_bytes, 4096);
+
+    // Start at host_offset = 3072 with pin-chunk alignment = 4096 -> 4096B transfer straddles
+    // boundary 4096 and must split into [3072..4096) (1024B) + [4096..7168) (3072B)!
+    let cross_split = plan_kv_dma_transfer(EngineKvFormat::CrossLayer, 4, 1024, &[2], 3072, 4096);
+    assert_eq!(cross_split.mode, KvDmaTransferMode::DirectCopy2DPitched);
+    assert_eq!(cross_split.pin_boundary_splits, 1);
+    assert_eq!(cross_split.entries.len(), 2);
+    assert_eq!(cross_split.entries[0].host_offset, 3072);
+    assert_eq!(cross_split.entries[0].width_bytes, 1024);
+    assert_eq!(cross_split.entries[1].host_offset, 4096);
+    assert_eq!(cross_split.entries[1].width_bytes, 3072);
 }

@@ -1542,3 +1542,124 @@ impl KvBlockPool {
         }
     }
 }
+
+/// Hardware transfer execution path for moving KV-cache pages between host memory and GPU VRAM
+/// (inspired by LMCache `csrc/cuda/mp_mem_kernels.cuh` and `transfer_plan_types.cuh`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvDmaTransferMode {
+    /// Direct 1D Copy-Engine batch DMA (`cudaMemcpyBatchAsync`), bypassing SM kernels.
+    DirectCopy1D,
+    /// Direct 2D Pitched Copy-Engine DMA (`cudaMemcpy3DBatchAsync`) collapsing all `num_layers`
+    /// of a block into a single pitched transfer (`EngineKvFormat::CrossLayer`).
+    DirectCopy2DPitched,
+    /// Staged H2D/D2H copy + SM scatter/gather kernel for non-contiguous layouts (`Hnd`).
+    StagedSmKernel,
+}
+
+/// Returns `true` if `format` stores each page block as a contiguous `[block_size, nh, hs]` run
+/// eligible for direct Copy-Engine DMA without SM gather/scatter kernels.
+pub fn direct_copy_format_supported(format: EngineKvFormat) -> bool {
+    matches!(
+        format,
+        EngineKvFormat::Nhd | EngineKvFormat::CrossLayer | EngineKvFormat::MlaLatent
+    )
+}
+
+/// A single DMA copy descriptor, guaranteed not to straddle a `host_buffer_alignment` pin-chunk
+/// boundary (`cudaHostRegister` region boundary).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvDmaCopyEntry {
+    pub block_id: usize,
+    pub host_offset: u64,
+    pub device_offset: u64,
+    pub width_bytes: u64,
+    pub height_layers: usize,
+}
+
+/// Planned KV-cache transfer batch across a sequence of page blocks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvDmaTransferPlan {
+    pub mode: KvDmaTransferMode,
+    pub entries: Vec<KvDmaCopyEntry>,
+    pub pin_boundary_splits: usize,
+}
+
+/// Plans a KV-cache H2D/D2H transfer for `block_ids` starting at `initial_host_offset`,
+/// selecting Direct 1D/2D Copy-Engine DMA vs. Staged SM kernels and splitting any copy that
+/// crosses a `host_buffer_alignment` (`cudaHostRegister`) boundary.
+pub fn plan_kv_dma_transfer(
+    format: EngineKvFormat,
+    num_layers: usize,
+    bytes_per_layer_block: u64,
+    block_ids: &[usize],
+    initial_host_offset: u64,
+    host_buffer_alignment: u64,
+) -> KvDmaTransferPlan {
+    let layers = num_layers.max(1);
+    let align = host_buffer_alignment.max(1);
+    let mode = if !direct_copy_format_supported(format) {
+        KvDmaTransferMode::StagedSmKernel
+    } else if format == EngineKvFormat::CrossLayer && layers > 1 {
+        KvDmaTransferMode::DirectCopy2DPitched
+    } else {
+        KvDmaTransferMode::DirectCopy1D
+    };
+
+    let mut entries = Vec::new();
+    let mut pin_boundary_splits = 0usize;
+    let mut cur_host = initial_host_offset;
+
+    for &blk_id in block_ids {
+        if mode == KvDmaTransferMode::DirectCopy2DPitched {
+            let total_block_bytes = bytes_per_layer_block * (layers as u64);
+            let mut rem = total_block_bytes;
+            let mut dev_off = (blk_id as u64) * total_block_bytes;
+            while rem > 0 {
+                let chunk_rem = align - (cur_host % align);
+                let step = rem.min(chunk_rem);
+                if step < rem {
+                    pin_boundary_splits += 1;
+                }
+                entries.push(KvDmaCopyEntry {
+                    block_id: blk_id,
+                    host_offset: cur_host,
+                    device_offset: dev_off,
+                    width_bytes: step,
+                    height_layers: 1,
+                });
+                cur_host += step;
+                dev_off += step;
+                rem -= step;
+            }
+        } else {
+            for layer_idx in 0..layers {
+                let mut rem = bytes_per_layer_block;
+                let mut dev_off =
+                    ((layer_idx * 1024 + blk_id) as u64).saturating_mul(bytes_per_layer_block);
+                while rem > 0 {
+                    let chunk_rem = align - (cur_host % align);
+                    let step = rem.min(chunk_rem);
+                    if step < rem {
+                        pin_boundary_splits += 1;
+                    }
+                    entries.push(KvDmaCopyEntry {
+                        block_id: blk_id,
+                        host_offset: cur_host,
+                        device_offset: dev_off,
+                        width_bytes: step,
+                        height_layers: 1,
+                    });
+                    cur_host += step;
+                    dev_off += step;
+                    rem -= step;
+                }
+            }
+        }
+    }
+
+    KvDmaTransferPlan {
+        mode,
+        entries,
+        pin_boundary_splits,
+    }
+}
