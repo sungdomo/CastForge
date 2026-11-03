@@ -26,9 +26,9 @@ use castforge::passes::{
     fuse_reshape_epilogue, fuse_sole_use_prologues, hash_prefix_token_blocks,
     is_supported_arch_dtype, longest_full_attention_hit, longest_joint_prefix_hit,
     longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_duplicate_shape_ops,
-    merge_identical_functions, plan_cacheblend_retrieve, plan_jenga_kv_geometry,
-    plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
-    re_rope_key_in_place, stamp_fused_provenance, unfold_chunk_range,
+    merge_identical_functions, plan_cacheblend_retrieve, plan_concat_in_place,
+    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
+    promote_narrow_accumulators, re_rope_key_in_place, stamp_fused_provenance, unfold_chunk_range,
     validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
@@ -1648,4 +1648,56 @@ fn test_layer_group_payload_sharder_qualifiers_and_roundtrip() {
     // Removing a required group shard causes reassembly to fail cleanly
     shards.shift_remove("layers_2_3");
     assert!(sharder.reassemble(&shards).is_none());
+}
+
+#[test]
+fn test_plan_concat_in_place_alignment_and_offset_computation() {
+    use castforge::ir::Attribute;
+
+    // Case 1: Two distinct op-produced `tensor<4x16xf32>` slices (256 bytes each) concatenated
+    // along dimension 0 -> aligned to 64 bytes, uniform stride = true, offsets = [0, 256]
+    // Case 2: Unaligned `tensor<3xf32>` (12 bytes) preceding `tensor<4xf32>` -> rejected for 64B!
+    let mlir = r#"
+module @concat_inplace {
+  func.func @main(%x: tensor<4x16xf32>, %u: tensor<3xf32>, %v: tensor<4xf32>) -> tensor<8x16xf32> {
+    %a = stablehlo.abs %x : tensor<4x16xf32>
+    %b = stablehlo.negate %x : tensor<4x16xf32>
+    %c_ok = stablehlo.concatenate %a, %b : (tensor<4x16xf32>, tensor<4x16xf32>) -> tensor<8x16xf32>
+    %u1 = stablehlo.abs %u : tensor<3xf32>
+    %v1 = stablehlo.abs %v : tensor<4xf32>
+    %c_bad = stablehlo.concatenate %u1, %v1 : (tensor<3xf32>, tensor<4xf32>) -> tensor<7xf32>
+    return %c_ok : tensor<8x16xf32>
+  }
+}
+"#;
+    let mut module = parse_mlir(mlir).expect("valid MLIR");
+    let planned = plan_concat_in_place(&mut module, 64);
+    assert_eq!(planned, 1);
+
+    let func_id = module.functions()[0];
+    let func_block = module.regions[module.ops[func_id].regions[0]].blocks[0];
+    let ops = &module.blocks[func_block].ops;
+    let c_ok_op = &module.ops[ops[2]];
+    assert_eq!(
+        c_ok_op.attributes.get("castforge.concat_in_place"),
+        Some(&Attribute::Bool(true))
+    );
+    assert_eq!(
+        c_ok_op.attributes.get("castforge.concat_uniform_stride"),
+        Some(&Attribute::Bool(true))
+    );
+    assert_eq!(
+        c_ok_op
+            .attributes
+            .get("castforge.concat_slice_byte_offsets"),
+        Some(&Attribute::DenseIntArray(vec![0, 256]))
+    );
+
+    // Unaligned concat (`%u1` is 12 bytes, not a multiple of 64) must NOT be marked in-place!
+    let c_unaligned_op = &module.ops[ops[5]];
+    assert!(
+        !c_unaligned_op
+            .attributes
+            .contains_key("castforge.concat_in_place")
+    );
 }

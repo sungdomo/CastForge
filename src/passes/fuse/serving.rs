@@ -4159,3 +4159,150 @@ impl LayerGroupPayloadSharder {
         Some(out)
     }
 }
+
+/// Returns `(provable_factor_bytes, static_total_bytes)` for a tensor type `ty`:
+/// - `provable_factor_bytes` is the product of all static dimension extents times the element byte
+///   width (matching Modular `isProvableMultipleOf`: a dynamic extent times a static row byte
+///   stride is provably a multiple of `alignment` whenever the static factor is a multiple of
+///   `alignment`),
+/// - `static_total_bytes` is `Some(total_bytes)` when all dimensions are static.
+fn tensor_provable_byte_factor(ty: &Type) -> Option<(u64, Option<u64>)> {
+    let Type::Tensor(tt) = ty else {
+        return None;
+    };
+    let elem_bytes = (tt.dtype.bit_width() as u64).div_ceil(8).max(1);
+    let mut static_factor = elem_bytes;
+    let mut all_static = true;
+    for dim in &tt.shape {
+        match dim {
+            Dim::Static(d) if *d >= 0 => {
+                static_factor = static_factor.saturating_mul(*d as u64);
+            }
+            _ => {
+                all_static = false;
+            }
+        }
+    }
+    let total = if all_static {
+        Some(static_factor)
+    } else {
+        None
+    };
+    Some((static_factor, total))
+}
+
+/// Plans alignment-aware in-place buffer concatenation (`stablehlo.concatenate`)
+/// (inspired by Modular `GraphCompiler/lib/MGPDialect/Transforms/ConcatInPlacePass.cpp`).
+///
+/// A `stablehlo.concatenate` along outer dimension `0` can alias its distinct producer input
+/// buffers directly into subviews of the output buffer iff:
+/// 1. Every input operand is a distinct `ValueDef::OpResult` (not a block argument or duplicate
+///    operand), and
+/// 2. Every preceding input slice (`inputs[..inputs.len() - 1]`) has a byte size provably divisible
+///    by `alignment_bytes` (either via static total bytes or via a dynamic extent multiplied by an
+///    aligned static row byte stride).
+///
+/// Stamps `castforge.concat_in_place = true`, `castforge.concat_uniform_stride`, and (when slice
+/// byte sizes are statically known) `castforge.concat_slice_byte_offsets` onto eligible
+/// `stablehlo.concatenate` ops. Returns the number of concatenations planned in-place.
+pub fn plan_concat_in_place(module: &mut Module, alignment_bytes: u64) -> usize {
+    let align = alignment_bytes.max(1);
+    let mut planned = 0usize;
+    let block_ids: Vec<_> = module.blocks.keys().collect();
+
+    for block_id in block_ids {
+        let op_ids = module.blocks[block_id].ops.clone();
+        for op_id in op_ids {
+            let Some(op) = module.ops.get(op_id).cloned() else {
+                continue;
+            };
+            if !op.is_op("stablehlo", "concatenate") || op.operands.len() < 2 {
+                continue;
+            }
+            let axis = match op.attributes.get("dimension") {
+                Some(Attribute::Int(d)) => *d,
+                _ => 0,
+            };
+            if axis != 0 {
+                continue;
+            }
+
+            // Inputs must be distinct and produced by explicit ops (`ValueDef::OpResult`).
+            let mut seen_inputs = std::collections::HashSet::with_capacity(op.operands.len());
+            let mut all_distinct_allocs = true;
+            let mut factors_and_totals = Vec::with_capacity(op.operands.len());
+
+            for &in_val in &op.operands {
+                if !seen_inputs.insert(in_val) {
+                    all_distinct_allocs = false;
+                    break;
+                }
+                let Some(val_info) = module.values.get(in_val) else {
+                    all_distinct_allocs = false;
+                    break;
+                };
+                if !matches!(val_info.def, ValueDef::OpResult { .. }) {
+                    all_distinct_allocs = false;
+                    break;
+                }
+                let Some(ft) = tensor_provable_byte_factor(&val_info.ty) else {
+                    all_distinct_allocs = false;
+                    break;
+                };
+                factors_and_totals.push(ft);
+            }
+            if !all_distinct_allocs {
+                continue;
+            }
+
+            // Every slice except the last feeds a subsequent slice's base address and must be a
+            // provable multiple of `align`.
+            let preceding_aligned = factors_and_totals[..factors_and_totals.len() - 1]
+                .iter()
+                .all(|&(factor, _)| align <= 1 || factor.is_multiple_of(align));
+            if !preceding_aligned {
+                continue;
+            }
+
+            let static_sizes: Option<Vec<u64>> =
+                factors_and_totals.iter().map(|&(_, tot)| tot).collect();
+            let uniform_stride = static_sizes
+                .as_ref()
+                .is_some_and(|sizes| sizes.windows(2).all(|w| w[0] == w[1]));
+
+            if let Some(op_mut) = module.ops.get_mut(op_id) {
+                op_mut.attributes.insert(
+                    "castforge.concat_in_place".to_string(),
+                    Attribute::Bool(true),
+                );
+                op_mut.attributes.insert(
+                    "castforge.concat_uniform_stride".to_string(),
+                    Attribute::Bool(uniform_stride),
+                );
+                if let Some(sizes) = static_sizes {
+                    let offsets: Vec<i64> = if uniform_stride {
+                        let slice_sz = sizes[0] as i64;
+                        (0..sizes.len()).map(|i| (i as i64) * slice_sz).collect()
+                    } else {
+                        let mut acc = 0i64;
+                        sizes
+                            .iter()
+                            .map(|&sz| {
+                                let cur = acc;
+                                acc += sz as i64;
+                                cur
+                            })
+                            .collect()
+                    };
+                    op_mut.attributes.insert(
+                        "castforge.concat_slice_byte_offsets".to_string(),
+                        Attribute::DenseIntArray(offsets),
+                    );
+                }
+                planned += 1;
+            }
+        }
+    }
+
+    planned
+}
