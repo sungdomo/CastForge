@@ -28462,3 +28462,261 @@ pub fn allocate_accumulating_buffers(module: &mut Module) -> (usize, usize) {
 
     (assigned_epilogues, allocated_scratch)
 }
+
+fn is_closure_index_transform_op(full_name: &str) -> bool {
+    full_name.starts_with("map.index.") && !full_name.ends_with(".stride")
+}
+
+fn is_capturing_fusion_closure(full_name: &str) -> bool {
+    matches!(
+        full_name,
+        "map.iter.elementwise.body" | "map.iter.prologue" | "map.iter.epilogue"
+    )
+}
+
+/// Walks backward from `idx_val` through a chain of `map.index.*` transform ops inside `block_id`,
+/// returning the chain closest-to-load first.
+fn collect_closure_index_transform_chain(module: &Module, idx_val: ValueId) -> Vec<OpId> {
+    use crate::ir::mlir::ValueDef;
+
+    let mut chain = Vec::new();
+    let mut current = idx_val;
+    while let Some(ValueDef::OpResult { op, .. }) = module.values.get(current).map(|v| v.def) {
+        let Some(def_op) = module.ops.get(op) else {
+            break;
+        };
+        if !is_closure_index_transform_op(&def_op.name.full_name()) || def_op.operands.is_empty() {
+            break;
+        }
+        chain.push(op);
+        current = def_op.operands[0];
+    }
+    chain
+}
+
+/// Checks whether `transform_op`'s index result transitively reaches the index operand of a
+/// `map.store` within `closure_block` through index-space transforms.
+fn closure_transform_feeds_store(
+    module: &Module,
+    closure_block: BlockId,
+    transform_op: OpId,
+) -> bool {
+    let Some(&start_res) = module.ops[transform_op].results.first() else {
+        return false;
+    };
+    let mut worklist = vec![start_res];
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(start_res);
+
+    while let Some(val) = worklist.pop() {
+        for &op_id in &module.blocks[closure_block].ops {
+            let op = &module.ops[op_id];
+            let full = op.name.full_name();
+            if full == "map.store" {
+                // In `map.store(%val, %tensor, %idx)`, the last operand is the index:
+                if op.operands.last().copied() == Some(val) {
+                    return true;
+                }
+            } else if is_closure_index_transform_op(&full)
+                && op.operands.first().copied() == Some(val)
+                && let Some(&res) = op.results.first()
+                && visited.insert(res)
+            {
+                worklist.push(res);
+            }
+        }
+    }
+    false
+}
+
+/// Hoists load-side `map.index.*` transform chains (`map.index.slice`, `map.index.broadcast`,
+/// `map.index.reshape`, `map.index.transpose`) that do not transitively feed a `map.store` index
+/// out of capturing fusion closures (`map.iter.elementwise.body`, `map.iter.prologue`,
+/// `map.iter.epilogue`) into `<op>.stride` view operations placed immediately before the closure.
+///
+/// Also rewires `map.call_elementwise` index operands through hoistable index-transform prefixes
+/// and erases dead index-transform ops from the closure body. Returns
+/// `(hoisted_stride_ops, erased_index_transforms)`.
+pub fn loop_invariant_view_motion(module: &mut Module) -> (usize, usize) {
+    use crate::ir::mlir::{Location, OpName, Operation, RegionId, Value, ValueDef};
+
+    let mut hoisted_stride_ops = 0usize;
+    let mut erased_transforms = 0usize;
+
+    let region_ids: Vec<RegionId> = module.regions.iter().map(|(r, _)| r).collect();
+    for rid in region_ids {
+        let block_ids = module.regions[rid].blocks.clone();
+        for outer_bid in block_ids {
+            let outer_ops = module.blocks[outer_bid].ops.clone();
+            for closure_id in outer_ops {
+                let Some(closure_op) = module.ops.get(closure_id).cloned() else {
+                    continue;
+                };
+                let closure_name = closure_op.name.full_name();
+                if !is_capturing_fusion_closure(&closure_name) {
+                    continue;
+                }
+                let Some(&c_rid) = closure_op.regions.first() else {
+                    continue;
+                };
+                let Some(&c_bid) = module.regions[c_rid].blocks.first() else {
+                    continue;
+                };
+
+                // Map capture block arguments to outer capture operands.
+                // `map.iter.epilogue` has 2 leading non-capture args `(%val, %idx)`;
+                // `map.iter.elementwise.body` and `map.iter.prologue` have 1 leading `%idx` arg.
+                let num_captures = closure_op.operands.len();
+                let c_args = module.blocks[c_bid].arguments.clone();
+                if c_args.len() < num_captures {
+                    continue;
+                }
+                let capture_arg_offset = c_args.len() - num_captures;
+                let mut outer_map = std::collections::HashMap::new();
+                for (i, &outer_val) in closure_op.operands.iter().enumerate() {
+                    outer_map.insert(c_args[capture_arg_offset + i], outer_val);
+                }
+
+                let inner_ops = module.blocks[c_bid].ops.clone();
+                let mut inserted_before_closure = Vec::new();
+
+                // 1. Hoist load-side index-transform prefixes into `.stride` ops before `closure`:
+                for &inner_id in &inner_ops {
+                    let Some(load_op) = module.ops.get(inner_id).cloned() else {
+                        continue;
+                    };
+                    if load_op.name.full_name() != "map.load" || load_op.operands.len() < 2 {
+                        continue;
+                    }
+                    let load_tensor_arg = load_op.operands[0];
+                    let load_idx_val = load_op.operands[1];
+                    let chain = collect_closure_index_transform_chain(module, load_idx_val);
+                    let mut prefix_len = 0usize;
+                    while prefix_len < chain.len()
+                        && !closure_transform_feeds_store(module, c_bid, chain[prefix_len])
+                    {
+                        prefix_len += 1;
+                    }
+                    if prefix_len == 0 {
+                        continue;
+                    }
+                    let hoist_slice = &chain[..prefix_len];
+                    let outermost_transform = hoist_slice[hoist_slice.len() - 1];
+                    let outermost_idx = module.ops[outermost_transform].operands[0];
+
+                    let mut current_outer_tensor = outer_map
+                        .get(&load_tensor_arg)
+                        .copied()
+                        .unwrap_or(load_tensor_arg);
+                    let tensor_ty = module.values[current_outer_tensor].ty.clone();
+
+                    for &t_id in hoist_slice {
+                        let t_op = module.ops[t_id].clone();
+                        let stride_op_name = format!("{}.stride", t_op.name.name);
+                        let mut stride_operands = smallvec::smallvec![current_outer_tensor];
+                        for &extra_opnd in t_op.operands.iter().skip(1) {
+                            let mapped = outer_map.get(&extra_opnd).copied().unwrap_or(extra_opnd);
+                            stride_operands.push(mapped);
+                        }
+                        let stride_res = module.values.insert(Value {
+                            id: ValueId::default(),
+                            ssa_name: None,
+                            ty: tensor_ty.clone(),
+                            def: ValueDef::BlockArgument {
+                                block: outer_bid,
+                                index: 0,
+                            },
+                        });
+                        module.values[stride_res].id = stride_res;
+                        let stride_op = module.ops.insert(Operation {
+                            id: OpId::default(),
+                            name: OpName::new(&t_op.name.dialect, &stride_op_name),
+                            operands: stride_operands,
+                            results: smallvec::smallvec![stride_res],
+                            attributes: t_op.attributes.clone(),
+                            regions: Vec::new(),
+                            custom_syntax: false,
+                            location: Location::Unknown,
+                        });
+                        module.ops[stride_op].id = stride_op;
+                        module.values[stride_res].def = ValueDef::OpResult {
+                            op: stride_op,
+                            index: 0,
+                        };
+                        inserted_before_closure.push(stride_op);
+                        current_outer_tensor = stride_res;
+                        hoisted_stride_ops += 1;
+                    }
+
+                    // Add new capture operand on `closure_id` and matching block arg on `c_bid`:
+                    module.ops[closure_id].operands.push(current_outer_tensor);
+                    let new_cap_arg = module.add_block_argument(c_bid, None, tensor_ty.clone());
+                    outer_map.insert(new_cap_arg, current_outer_tensor);
+
+                    module.ops[inner_id].operands[0] = new_cap_arg;
+                    module.ops[inner_id].operands[1] = outermost_idx;
+                }
+
+                if !inserted_before_closure.is_empty()
+                    && let Some(pos) = module.blocks[outer_bid]
+                        .ops
+                        .iter()
+                        .position(|&id| id == closure_id)
+                {
+                    for (off, sid) in inserted_before_closure.into_iter().enumerate() {
+                        module.blocks[outer_bid].ops.insert(pos + off, sid);
+                    }
+                }
+
+                // 2. Rewire `map.call_elementwise` index operands through hoistable prefixes:
+                for &inner_id in &inner_ops {
+                    let Some(call_op) = module.ops.get(inner_id).cloned() else {
+                        continue;
+                    };
+                    if call_op.name.full_name() != "map.call_elementwise"
+                        || call_op.operands.is_empty()
+                    {
+                        continue;
+                    }
+                    let idx_pos = call_op.operands.len() - 1;
+                    let chain =
+                        collect_closure_index_transform_chain(module, call_op.operands[idx_pos]);
+                    let mut prefix_len = 0usize;
+                    while prefix_len < chain.len()
+                        && !closure_transform_feeds_store(module, c_bid, chain[prefix_len])
+                    {
+                        prefix_len += 1;
+                    }
+                    if prefix_len > 0 {
+                        let outermost = chain[prefix_len - 1];
+                        let new_idx = module.ops[outermost].operands[0];
+                        module.ops[inner_id].operands[idx_pos] = new_idx;
+                    }
+                }
+
+                // 3. Erase dead `map.index.*` transforms inside `c_bid` in reverse order:
+                let rev_ops: Vec<OpId> = module.blocks[c_bid].ops.iter().copied().rev().collect();
+                for tid in rev_ops {
+                    let Some(top) = module.ops.get(tid).cloned() else {
+                        continue;
+                    };
+                    if !is_closure_index_transform_op(&top.name.full_name()) {
+                        continue;
+                    }
+                    let used = top.results.iter().any(|&r| {
+                        module.blocks[c_bid]
+                            .ops
+                            .iter()
+                            .any(|&oid| oid != tid && module.ops[oid].operands.contains(&r))
+                    });
+                    if !used {
+                        module.remove_op(c_bid, tid);
+                        erased_transforms += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    (hoisted_stride_ops, erased_transforms)
+}

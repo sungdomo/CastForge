@@ -8229,3 +8229,123 @@ fn test_allocate_accumulating_buffers_mixed_precision_vs_same_dtype() {
     assert_eq!(module.ops[k1].results.len(), 3);
     assert_eq!(module.ops[k2].results.len(), 2);
 }
+
+#[test]
+fn test_loop_invariant_view_motion_hoists_load_views_and_preserves_store_transforms() {
+    use castforge::ir::mlir::OpName;
+    use castforge::passes::loop_invariant_view_motion;
+
+    let src = concat!(
+        "module {\n",
+        "  func.func @view_motion(\n",
+        "    %in_t: tensor<8xf32>,\n",
+        "    %out_t: tensor<8xf32>\n",
+        "  ) -> tensor<8xf32> {\n",
+        "    return %out_t : tensor<8xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+
+    let mut m = parse_mlir(src).unwrap();
+    let fn_id = m.functions()[0];
+    let fn_blk = m.regions[m.ops[fn_id].regions[0]].blocks[0];
+    let args = m.blocks[fn_blk].arguments.clone();
+    let (in_t, out_t) = (args[0], args[1]);
+    let t_ty = m.values[in_t].ty.clone();
+    let idx_ty = castforge::ir::Type::Scalar(DType::Index);
+    let f32_ty = castforge::ir::Type::Scalar(DType::F32);
+
+    // Build `map.iter.elementwise.body(%in_t, %out_t)` before `func.return`:
+    let c_blk = m.create_block(None);
+    let loop_idx = m.add_block_argument(c_blk, None, idx_ty.clone());
+    let cap_in = m.add_block_argument(c_blk, None, t_ty.clone());
+    let cap_out = m.add_block_argument(c_blk, None, t_ty.clone());
+
+    // Store-feeding transform `map.index.reshape(%loop_idx)` -> must stay in closure:
+    let reshape_op = m.add_operation(
+        c_blk,
+        OpName::new("map", "index.reshape"),
+        smallvec::smallvec![loop_idx],
+        vec![(None, idx_ty.clone())],
+        indexmap::IndexMap::new(),
+        vec![],
+        false,
+        Location::Unknown,
+    );
+    let reshaped_idx = m.ops[reshape_op].results[0];
+
+    // Load-only transform composed on `reshaped_idx`: `map.index.broadcast(%reshaped_idx)` ->
+    // must hoist into `map.index.broadcast.stride` before the closure!
+    let bcast_op = m.add_operation(
+        c_blk,
+        OpName::new("map", "index.broadcast"),
+        smallvec::smallvec![reshaped_idx],
+        vec![(None, idx_ty.clone())],
+        indexmap::IndexMap::new(),
+        vec![],
+        false,
+        Location::Unknown,
+    );
+    let bcast_idx = m.ops[bcast_op].results[0];
+
+    let load_op = m.add_operation(
+        c_blk,
+        OpName::new("map", "load"),
+        smallvec::smallvec![cap_in, bcast_idx],
+        vec![(None, f32_ty.clone())],
+        indexmap::IndexMap::new(),
+        vec![],
+        false,
+        Location::Unknown,
+    );
+    let loaded_val = m.ops[load_op].results[0];
+
+    m.add_operation(
+        c_blk,
+        OpName::new("map", "store"),
+        smallvec::smallvec![loaded_val, cap_out, reshaped_idx],
+        vec![],
+        indexmap::IndexMap::new(),
+        vec![],
+        false,
+        Location::Unknown,
+    );
+
+    let c_reg = m.create_region(vec![c_blk]);
+    let closure_op = m.add_operation(
+        fn_blk,
+        OpName::new("map", "iter.elementwise.body"),
+        smallvec::smallvec![in_t, out_t],
+        vec![],
+        indexmap::IndexMap::new(),
+        vec![c_reg],
+        false,
+        Location::Unknown,
+    );
+
+    let (hoisted, erased) = loop_invariant_view_motion(&mut m);
+    assert_eq!(hoisted, 1);
+    assert_eq!(erased, 1);
+
+    // Verify `map.index.broadcast.stride` was inserted before `map.iter.elementwise.body`
+    // and `map.index.reshape` remained inside the closure:
+    let outer_names: Vec<String> = m.blocks[fn_blk]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert!(outer_names.contains(&"map.index.broadcast.stride".to_string()));
+    assert_eq!(m.ops[closure_op].operands.len(), 3);
+
+    let inner_names: Vec<String> = m.blocks[c_blk]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        inner_names,
+        vec!["map.index.reshape", "map.load", "map.store"]
+    );
+    // `map.load` now indexes at `reshaped_idx` directly:
+    assert_eq!(m.ops[load_op].operands[1], reshaped_idx);
+}
