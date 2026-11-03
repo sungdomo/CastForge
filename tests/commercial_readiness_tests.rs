@@ -18,10 +18,10 @@ use castforge::passes::{
     BlendReadGroupSet, BlendTokenRangeMatcher, BucketHistogram, CBChunkMatch, CBGroupRopeGeometry,
     CBGroupSpec, CHUNK_COUNT_HISTOGRAM_BOUNDS, CacheBlendRopeSpec, CacheEventBatchSpec,
     CacheEventEntrySpec, CacheEventOpKind, CacheEventTier, CacheGenCdfCodec,
-    ChainedBlockHashConfig, CoordinatorEventGate, CoordinatorKeyDirectory,
-    DEFAULT_MAX_KERNELS_IN_FUSION_SET, DaxGenerationSlotArena, DaxPutOutcome, DeviceTargetArch,
-    DynamicAllocRequest, EngineKvFormat, EventIngestOutcome, FULL_ATTENTION_WINDOW,
-    FdpRawBlockSlotManager, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
+    ChainedBlockHashConfig, CollectiveGraphNodeSpec, CoordinatorEventGate, CoordinatorKeyDirectory,
+    DEFAULT_MAX_KERNELS_IN_FUSION_SET, DaxGenerationSlotArena, DaxPutOutcome, DeviceGraphStage,
+    DeviceTargetArch, DynamicAllocRequest, EngineKvFormat, EventIngestOutcome,
+    FULL_ATTENTION_WINDOW, FdpRawBlockSlotManager, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
     IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
     KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope,
     KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy, LayerGroupPayloadSharder,
@@ -38,18 +38,19 @@ use castforge::passes::{
     elide_redundant_state_transfers, eliminate_implied_dependencies, encode_kv_fs_filename,
     encode_kv_storage_key, encode_raw_block_meta_checkpoint, encode_raw_block_slot_header,
     encode_wide_column_row_key, find_squeeze_axis, find_unsqueeze_axis, flatten_elementwise_chains,
-    fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
-    fuse_sole_use_prologues, group_p2p_lookup_keys, hash_packed_token_blocks_be,
-    hash_prefix_token_blocks, hoist_exec_invariant_ops, hoist_symbolic_dim_expressions,
-    interleave_chunk_major_object_keys, is_supported_arch_dtype, legalize_rowwise_reduction_launch,
-    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
-    map_axis_through_static_reshape, mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops,
-    merge_duplicate_shape_ops, merge_identical_functions, merge_parallel_matmuls,
-    num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve, plan_cacheblend_token_reorder,
-    plan_concat_in_place, plan_dynamic_memory_pool, plan_jenga_kv_geometry,
-    plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
-    re_rope_key_in_place, recalculate_subchunk_blocks_to_skip, recognize_composite_activations,
-    reuse_dead_loop_buffers, select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
+    fold_extend_lifetimes_into_async_kernels, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
+    fuse_reshape_epilogue, fuse_sole_use_prologues, group_p2p_lookup_keys,
+    hash_packed_token_blocks_be, hash_prefix_token_blocks, hoist_exec_invariant_ops,
+    hoist_symbolic_dim_expressions, interleave_chunk_major_object_keys, is_supported_arch_dtype,
+    legalize_rowwise_reduction_launch, longest_full_attention_hit, longest_joint_prefix_hit,
+    longest_sliding_window_hit, map_axis_through_static_reshape, mark_cuda_graph_stable_tensors,
+    merge_adjacent_parallel_loops, merge_duplicate_shape_ops, merge_identical_functions,
+    merge_parallel_matmuls, num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve,
+    plan_cacheblend_token_reorder, plan_concat_in_place, plan_device_graph_collective_partition,
+    plan_dynamic_memory_pool, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
+    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
+    recalculate_subchunk_blocks_to_skip, recognize_composite_activations, reuse_dead_loop_buffers,
+    select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
     sink_split_through_reshape, sink_transpose_through_elementwise_and_broadcast,
     stamp_fused_provenance, swim_reshape_through_slice, unfold_chunk_range,
     unique_blend_token_coverage, unpack_token_ids_be, unpermute_slice,
@@ -3409,5 +3410,110 @@ module @sink_bcast_reduce_idempotent {
     assert_eq!(
         m2.values[out_v].ty.as_tensor().unwrap().shape,
         vec![Dim::Static(3), Dim::Static(1), Dim::Static(8)]
+    );
+}
+
+#[test]
+fn test_fold_extend_lifetimes_and_device_graph_collective_partition() {
+    // 1. Verify `fold_extend_lifetimes_into_async_kernels`:
+    //    `%c1 = mogg.async_exec %c0, %a` followed by `%c2 = mgp.extend_lifetimes %c1, %b, %a`
+    //    and a no-op `%c3 = mgp.extend_lifetimes %c2` folds `%b` into `mogg.async_exec`
+    //    (deduplicating `%a`) and forwards `%c3` -> `%c1`!
+    let mlir_lifetime = concat!(
+        "module @simplify_extend_lifetimes {\n",
+        "  func.func @main(%c0: tensor<1xi64>, %a: tensor<4xf32>, %b: tensor<4xf32>) ",
+        "-> tensor<1xi64> {\n",
+        "    %c1 = mogg.async_exec %c0, %a : (tensor<1xi64>, tensor<4xf32>) -> tensor<1xi64>\n",
+        "    %c2 = mgp.extend_lifetimes %c1, %b, %a ",
+        ": (tensor<1xi64>, tensor<4xf32>, tensor<4xf32>) -> tensor<1xi64>\n",
+        "    %c3 = mgp.extend_lifetimes %c2 : (tensor<1xi64>) -> tensor<1xi64>\n",
+        "    return %c3 : tensor<1xi64>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(mlir_lifetime).expect("valid MLIR");
+    assert_eq!(fold_extend_lifetimes_into_async_kernels(&mut m), 2);
+    let func_id = m.functions()[0];
+    let blk_id = m.regions[m.ops[func_id].regions[0]].blocks[0];
+    let ops = &m.blocks[blk_id].ops;
+    assert_eq!(ops.len(), 2);
+    assert!(m.ops[ops[0]].is_op("mogg", "async_exec"));
+    assert_eq!(m.ops[ops[0]].operands.len(), 3);
+    assert_eq!(
+        m.ops[ops[0]]
+            .attributes
+            .get("castforge.extended_lifetime_count"),
+        Some(&castforge::ir::Attribute::Int(1))
+    );
+    assert_eq!(m.ops[ops[1]].operands[0], m.ops[ops[0]].results[0]);
+
+    // 2. Verify `plan_device_graph_collective_partition` across 2 devices:
+    let nodes = vec![
+        CollectiveGraphNodeSpec {
+            node_id: 10,
+            devices: vec![0],
+            is_collective: false,
+            is_graph_capturable: true,
+        },
+        CollectiveGraphNodeSpec {
+            node_id: 11,
+            devices: vec![1],
+            is_collective: false,
+            is_graph_capturable: true,
+        },
+        CollectiveGraphNodeSpec {
+            node_id: 20,
+            devices: vec![0, 1],
+            is_collective: true,
+            is_graph_capturable: true,
+        },
+        CollectiveGraphNodeSpec {
+            node_id: 30,
+            devices: vec![0, 1],
+            is_collective: false,
+            is_graph_capturable: false,
+        },
+        CollectiveGraphNodeSpec {
+            node_id: 40,
+            devices: vec![0, 1],
+            is_collective: false,
+            is_graph_capturable: true,
+        },
+    ];
+
+    // When `capture_collectives_in_graph == false`, node 20 splits the capture into a
+    // pre-collective graph, an `EagerCollectiveStage`, an `EagerHostStage` (node 30), and a
+    // post-host graph (node 40):
+    let stages_split =
+        plan_device_graph_collective_partition(2, &nodes, false).expect("valid partition");
+    assert_eq!(
+        stages_split,
+        vec![
+            DeviceGraphStage::DeviceGraphCapture {
+                device_subgraphs: vec![vec![10], vec![11]],
+            },
+            DeviceGraphStage::EagerCollectiveStage { node_ids: vec![20] },
+            DeviceGraphStage::EagerHostStage { node_ids: vec![30] },
+            DeviceGraphStage::DeviceGraphCapture {
+                device_subgraphs: vec![vec![40], vec![40]],
+            },
+        ]
+    );
+
+    // When `capture_collectives_in_graph == true`, the all-device collective (node 20) is captured
+    // directly inside the first `DeviceGraphCapture` stage!
+    let stages_fused =
+        plan_device_graph_collective_partition(2, &nodes, true).expect("valid partition");
+    assert_eq!(
+        stages_fused,
+        vec![
+            DeviceGraphStage::DeviceGraphCapture {
+                device_subgraphs: vec![vec![10, 20], vec![11, 20]],
+            },
+            DeviceGraphStage::EagerHostStage { node_ids: vec![30] },
+            DeviceGraphStage::DeviceGraphCapture {
+                device_subgraphs: vec![vec![40], vec![40]],
+            },
+        ]
     );
 }

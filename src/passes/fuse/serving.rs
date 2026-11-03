@@ -10074,3 +10074,256 @@ pub fn sink_broadcast_through_reduction(module: &mut Module) -> usize {
 
     rewritten
 }
+
+/// Folds `mgp.extend_lifetimes` (or `castforge.extend_lifetimes`) operations into a preceding
+/// sole-use asynchronous kernel execution (`mogg.async_exec`, `mgp.async_exec`,
+/// `castforge.async_kernel`) or elides no-op lifetime extensions with zero buffer operands.
+///
+/// When folded into an async kernel launch, the extended buffer operands are deduplicated and
+/// appended to the async kernel's operand list, `castforge.extended_lifetime_count` is stamped on
+/// the async kernel, and the `extend_lifetimes` result chain is forwarded to the async kernel's
+/// chain result. Returns the number of `extend_lifetimes` operations eliminated.
+pub fn fold_extend_lifetimes_into_async_kernels(module: &mut Module) -> usize {
+    let mut folded = 0usize;
+    let block_ids: Vec<_> = module.blocks.keys().collect();
+
+    for block_id in block_ids {
+        let mut use_counts: IndexMap<ValueId, usize> = IndexMap::new();
+        for &op_id in &module.blocks[block_id].ops {
+            if let Some(op) = module.ops.get(op_id) {
+                for &v in &op.operands {
+                    *use_counts.entry(v).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let op_ids = module.blocks[block_id].ops.clone();
+        let mut replacements: IndexMap<ValueId, ValueId> = IndexMap::new();
+        let mut to_remove: IndexSet<OpId> = IndexSet::new();
+
+        for op_id in op_ids {
+            let Some(ext_op) = module.ops.get(op_id).cloned() else {
+                continue;
+            };
+            if !matches!(
+                ext_op.name.to_string().as_str(),
+                "mgp.extend_lifetimes" | "castforge.extend_lifetimes"
+            ) || ext_op.operands.is_empty()
+                || ext_op.results.len() != 1
+            {
+                continue;
+            }
+            let chain_in = replacements
+                .get(&ext_op.operands[0])
+                .copied()
+                .unwrap_or(ext_op.operands[0]);
+            let chain_out = ext_op.results[0];
+
+            // Case 1: No-op `extend_lifetimes` with only the input chain and no buffers.
+            if ext_op.operands.len() == 1 {
+                replacements.insert(chain_out, chain_in);
+                to_remove.insert(op_id);
+                folded += 1;
+                continue;
+            }
+
+            // Case 2: Preceding sole-use async kernel producing `chain_in`.
+            if use_counts.get(&chain_in).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            let Some(chain_info) = module.values.get(chain_in) else {
+                continue;
+            };
+            let ValueDef::OpResult { op: async_id, .. } = chain_info.def else {
+                continue;
+            };
+            if !module.blocks[block_id].ops.contains(&async_id) || to_remove.contains(&async_id) {
+                continue;
+            }
+            let Some(async_op) = module.ops.get(async_id) else {
+                continue;
+            };
+            if !matches!(
+                async_op.name.to_string().as_str(),
+                "mogg.async_exec" | "mgp.async_exec" | "castforge.async_kernel"
+            ) {
+                continue;
+            }
+
+            let extra_buffers: Vec<ValueId> = ext_op.operands[1..]
+                .iter()
+                .map(|v| replacements.get(v).copied().unwrap_or(*v))
+                .collect();
+
+            if let Some(async_mut) = module.ops.get_mut(async_id) {
+                let mut added = 0i64;
+                for buf in extra_buffers {
+                    if !async_mut.operands.contains(&buf) {
+                        async_mut.operands.push(buf);
+                        added += 1;
+                    }
+                }
+                let prev = async_mut
+                    .attributes
+                    .get("castforge.extended_lifetime_count")
+                    .and_then(extract_single_int_attr)
+                    .unwrap_or(0);
+                async_mut.attributes.insert(
+                    "castforge.extended_lifetime_count".into(),
+                    Attribute::Int(prev + added),
+                );
+            }
+            replacements.insert(chain_out, chain_in);
+            to_remove.insert(op_id);
+            folded += 1;
+        }
+
+        if !replacements.is_empty() {
+            for &op_id in &module.blocks[block_id].ops {
+                if to_remove.contains(&op_id) {
+                    continue;
+                }
+                if let Some(op_mut) = module.ops.get_mut(op_id) {
+                    for opd in &mut op_mut.operands {
+                        while let Some(&target) = replacements.get(opd) {
+                            *opd = target;
+                        }
+                    }
+                }
+            }
+        }
+        if !to_remove.is_empty() {
+            module.blocks[block_id]
+                .ops
+                .retain(|id| !to_remove.contains(id));
+            for dead_id in to_remove {
+                module.ops.remove(dead_id);
+            }
+        }
+    }
+
+    folded
+}
+
+/// Specification of a single execution node in a multi-device collective execution stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectiveGraphNodeSpec {
+    /// Unique identifier of the operation in topological order.
+    pub node_id: usize,
+    /// Sorted list of device indices (`0..num_devices`) participating in this operation.
+    pub devices: Vec<usize>,
+    /// True if this operation is a multi-device collective (`all_reduce`, `reduce_scatter`,
+    /// `all_gather`, `broadcast`).
+    pub is_collective: bool,
+    /// True if this operation can be captured inside a hardware device graph (`CUDA Graph` /
+    /// `HIP Graph`).
+    pub is_graph_capturable: bool,
+}
+
+/// A partitioned execution stage produced by [`plan_device_graph_collective_partition`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceGraphStage {
+    /// A synchronized hardware device-graph capture stage mapping each device index
+    /// `0..num_devices` to the ordered list of `node_id`s captured on that device's stream.
+    DeviceGraphCapture {
+        /// Per-device captured `node_id` lists of length `num_devices`.
+        device_subgraphs: Vec<Vec<usize>>,
+    },
+    /// A multi-device collective stage executed outside device-graph capture (when
+    /// `capture_collectives_in_graph` is `false` or when only a subset of devices participate).
+    EagerCollectiveStage {
+        /// Ordered `node_id`s of collective operations in this barrier stage.
+        node_ids: Vec<usize>,
+    },
+    /// Host or dynamic-shape operations that cannot be captured in a device graph.
+    EagerHostStage {
+        /// Ordered `node_id`s of non-capturable operations.
+        node_ids: Vec<usize>,
+    },
+}
+
+/// Partitions a sequence of multi-device operations into synchronized [`DeviceGraphStage`]
+/// regions for `mgp.device.graph` capture and collective barrier scheduling.
+///
+/// - Non-capturable operations flush any active [`DeviceGraphStage::DeviceGraphCapture`] stage and
+///   run in [`DeviceGraphStage::EagerHostStage`].
+/// - Capturable non-collective operations accumulate into the active per-device subgraphs.
+/// - Collective operations are captured inside [`DeviceGraphStage::DeviceGraphCapture`] only when
+///   `capture_collectives_in_graph` is `true`, `is_graph_capturable` is `true`, and all
+///   `0..num_devices` participate synchronously; otherwise they flush the open graph capture and
+///   execute in [`DeviceGraphStage::EagerCollectiveStage`].
+pub fn plan_device_graph_collective_partition(
+    num_devices: usize,
+    nodes: &[CollectiveGraphNodeSpec],
+    capture_collectives_in_graph: bool,
+) -> Option<Vec<DeviceGraphStage>> {
+    if num_devices == 0 {
+        return None;
+    }
+    let mut stages: Vec<DeviceGraphStage> = Vec::new();
+    let mut current_capture: Option<Vec<Vec<usize>>> = None;
+
+    let flush_capture = |stages: &mut Vec<DeviceGraphStage>,
+                         current_capture: &mut Option<Vec<Vec<usize>>>| {
+        if let Some(subgraphs) = current_capture.take()
+            && subgraphs.iter().any(|sg| !sg.is_empty())
+        {
+            stages.push(DeviceGraphStage::DeviceGraphCapture {
+                device_subgraphs: subgraphs,
+            });
+        }
+    };
+
+    for node in nodes {
+        if node.devices.is_empty() || node.devices.iter().any(|&d| d >= num_devices) {
+            return None;
+        }
+        let mut unique_devs = node.devices.clone();
+        unique_devs.sort_unstable();
+        unique_devs.dedup();
+        if unique_devs.len() != node.devices.len() {
+            return None;
+        }
+
+        if !node.is_graph_capturable {
+            flush_capture(&mut stages, &mut current_capture);
+            if let Some(DeviceGraphStage::EagerHostStage { node_ids }) = stages.last_mut() {
+                node_ids.push(node.node_id);
+            } else {
+                stages.push(DeviceGraphStage::EagerHostStage {
+                    node_ids: vec![node.node_id],
+                });
+            }
+            continue;
+        }
+
+        if node.is_collective {
+            let all_devices_participate = unique_devs.len() == num_devices;
+            if capture_collectives_in_graph && all_devices_participate {
+                let subgraphs =
+                    current_capture.get_or_insert_with(|| vec![Vec::new(); num_devices]);
+                for &d in &unique_devs {
+                    subgraphs[d].push(node.node_id);
+                }
+            } else {
+                flush_capture(&mut stages, &mut current_capture);
+                if let Some(DeviceGraphStage::EagerCollectiveStage { node_ids }) = stages.last_mut()
+                {
+                    node_ids.push(node.node_id);
+                } else {
+                    stages.push(DeviceGraphStage::EagerCollectiveStage {
+                        node_ids: vec![node.node_id],
+                    });
+                }
+            }
+        } else {
+            let subgraphs = current_capture.get_or_insert_with(|| vec![Vec::new(); num_devices]);
+            for &d in &unique_devs {
+                subgraphs[d].push(node.node_id);
+            }
+        }
+    }
+
+    flush_capture(&mut stages, &mut current_capture);
+    Some(stages)
+}
