@@ -8070,3 +8070,42 @@ fn test_inject_nan_check_instrumentation_with_stride_sampling_and_host_transfer(
     assert_eq!(xfer_ops, 4); // 2 transfers (`nan_count`, `inf_count`) per checked GPU kernel
     assert_eq!(raise_ops, 2);
 }
+
+#[test]
+fn test_tenant_quota_manager_allowlist_vs_default_semantics_and_multi_serde_arity() {
+    use castforge::passes::{TenantQuotaManager, validate_multi_serde_group_size};
+
+    let mut qm = TenantQuotaManager::new("l2_quotas");
+    assert_eq!(qm.name(), "l2_quotas");
+    assert!(qm.set_quota("bad_tenant", -1).is_err());
+    qm.set_quota("tenant_a", 1_048_576).expect("positive quota");
+    qm.set_quota("tenant_zero", 0).expect("zero quota allowed");
+
+    // Allowlist semantics (`get_limit_bytes`) returns 0 for unregistered salts:
+    assert_eq!(qm.get_limit_bytes("tenant_a"), 1_048_576);
+    assert_eq!(qm.get_limit_bytes("unregistered"), 0);
+    assert!(qm.has_quota("tenant_zero"));
+    assert!(!qm.has_quota("unregistered"));
+
+    // Boot default-quota semantics (`effective_limit_bytes`) returns `None` (exempt) for
+    // unregistered salts until `set_default_limit_bytes(Some(0))` arms allowlist enforcement:
+    assert_eq!(qm.effective_limit_bytes("tenant_a"), Some(1_048_576));
+    assert_eq!(qm.effective_limit_bytes("unregistered"), None);
+
+    qm.set_default_limit_bytes(Some(0))
+        .expect("arm allowlist enforcement");
+    assert_eq!(qm.effective_limit_bytes("unregistered"), Some(0));
+
+    let snap = qm.capture();
+    assert!(qm.delete_quota("tenant_a"));
+    assert_eq!(qm.get_limit_bytes("tenant_a"), 0);
+
+    qm.restore(snap);
+    assert_eq!(qm.get_limit_bytes("tenant_a"), 1_048_576);
+    assert_eq!(qm.list_quotas().len(), 2);
+
+    validate_multi_serde_group_size(&[Some(1u8), None], 2, "src").expect("arity 2 matches");
+    let err = validate_multi_serde_group_size(&[Some(1u8)], 2, "dst")
+        .expect_err("arity mismatch must error");
+    assert!(err.contains("MultiSerde dst group length 1 does not match expected 2"));
+}

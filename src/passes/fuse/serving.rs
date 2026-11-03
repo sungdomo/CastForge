@@ -28098,3 +28098,155 @@ pub fn inject_nan_check_instrumentation(module: &mut Module, stride: usize) -> (
 
     (checked_float_results, total_float_results)
 }
+
+/// Snapshot entry for a single tenant's (`cache_salt`) byte quota.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantQuotaEntry {
+    /// Tenant selector salt.
+    pub cache_salt: String,
+    /// Configured byte budget (`>= 0`).
+    pub limit_bytes: i64,
+}
+
+/// Durable snapshot of a [`TenantQuotaManager`]'s per-salt limits and default limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantQuotaSnapshot {
+    /// Explicit per-salt limits (`cache_salt -> limit_bytes`).
+    pub limits: std::collections::BTreeMap<String, i64>,
+    /// Default limit applied to unregistered salts under coordinator default-quota semantics.
+    pub default_limit_bytes: Option<i64>,
+}
+
+/// Per-`cache_salt` byte budget registry supporting both allowlist eviction semantics
+/// (`get_limit_bytes`) and coordinator boot-safe default-quota semantics
+/// (`effective_limit_bytes`).
+#[derive(Debug, Clone)]
+pub struct TenantQuotaManager {
+    section_name: String,
+    limits: std::collections::BTreeMap<String, i64>,
+    default_limit_bytes: Option<i64>,
+}
+
+impl TenantQuotaManager {
+    /// Creates a new [`TenantQuotaManager`] with the given durable `section_name`.
+    #[must_use]
+    pub fn new(section_name: impl Into<String>) -> Self {
+        Self {
+            section_name: section_name.into(),
+            limits: std::collections::BTreeMap::new(),
+            default_limit_bytes: None,
+        }
+    }
+
+    /// Returns the durable document section name for this quota registry.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.section_name
+    }
+
+    /// Creates or updates the byte quota for `cache_salt`, rejecting negative values.
+    pub fn set_quota(
+        &mut self,
+        cache_salt: impl Into<String>,
+        limit_bytes: i64,
+    ) -> Result<(), String> {
+        if limit_bytes < 0 {
+            return Err(format!(
+                "limit_bytes must be non-negative (got {limit_bytes})"
+            ));
+        }
+        self.limits.insert(cache_salt.into(), limit_bytes);
+        Ok(())
+    }
+
+    /// Removes the explicit quota registration for `cache_salt`, returning `true` if present.
+    pub fn delete_quota(&mut self, cache_salt: &str) -> bool {
+        self.limits.remove(cache_salt).is_some()
+    }
+
+    /// Returns the effective byte limit under allowlist semantics (unregistered salts resolve
+    /// to `0` bytes so their objects are evicted on the next cycle).
+    #[must_use]
+    pub fn get_limit_bytes(&self, cache_salt: &str) -> i64 {
+        self.limits.get(cache_salt).copied().unwrap_or(0)
+    }
+
+    /// Configures the default byte limit applied to unregistered salts by
+    /// [`Self::effective_limit_bytes`] (`None` exempts unregistered salts from eviction;
+    /// `Some(0)` arms strict allowlist enforcement).
+    pub fn set_default_limit_bytes(&mut self, limit_bytes: Option<i64>) -> Result<(), String> {
+        if let Some(v) = limit_bytes
+            && v < 0
+        {
+            return Err(format!("limit_bytes must be non-negative (got {v})"));
+        }
+        self.default_limit_bytes = limit_bytes;
+        Ok(())
+    }
+
+    /// Returns the configured default limit for unregistered salts (`None` = exempt).
+    #[must_use]
+    pub const fn get_default_limit_bytes(&self) -> Option<i64> {
+        self.default_limit_bytes
+    }
+
+    /// Returns the byte limit for `cache_salt` under default-quota semantics: explicit limit if
+    /// registered, otherwise [`Self::get_default_limit_bytes`].
+    #[must_use]
+    pub fn effective_limit_bytes(&self, cache_salt: &str) -> Option<i64> {
+        self.limits
+            .get(cache_salt)
+            .copied()
+            .or(self.default_limit_bytes)
+    }
+
+    /// Returns `true` if `cache_salt` has an explicit quota entry (distinguishing an explicit
+    /// `0` limit from an unregistered salt).
+    #[must_use]
+    pub fn has_quota(&self, cache_salt: &str) -> bool {
+        self.limits.contains_key(cache_salt)
+    }
+
+    /// Captures a detached durable snapshot of all per-salt limits and the default limit.
+    #[must_use]
+    pub fn capture(&self) -> TenantQuotaSnapshot {
+        TenantQuotaSnapshot {
+            limits: self.limits.clone(),
+            default_limit_bytes: self.default_limit_bytes,
+        }
+    }
+
+    /// Atomically replaces the quota table and default limit from `snapshot`.
+    pub fn restore(&mut self, snapshot: TenantQuotaSnapshot) {
+        self.limits = snapshot.limits;
+        self.default_limit_bytes = snapshot.default_limit_bytes;
+    }
+
+    /// Returns a detached list of all explicitly registered tenant quotas in sorted key order.
+    #[must_use]
+    pub fn list_quotas(&self) -> Vec<TenantQuotaEntry> {
+        self.limits
+            .iter()
+            .map(|(salt, &limit)| TenantQuotaEntry {
+                cache_salt: salt.clone(),
+                limit_bytes: limit,
+            })
+            .collect()
+    }
+}
+
+/// Validates that a multi-output serde tuple (`role` in `"src"`, `"dst"`, `"layout"`) has exact
+/// arity `expected`.
+pub fn validate_multi_serde_group_size<T>(
+    group: &[T],
+    expected: usize,
+    role: &str,
+) -> Result<(), String> {
+    if group.len() != expected {
+        return Err(format!(
+            "MultiSerde {role} group length {} does not match expected {expected}",
+            group.len()
+        ));
+    }
+    Ok(())
+}
