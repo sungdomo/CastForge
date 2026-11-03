@@ -4857,3 +4857,52 @@ fn test_raise_back_contiguous_views_and_slice_dim_matcher() {
         vec!["mo.static.reshape", "mogg.slice", "func.return"]
     );
 }
+
+#[test]
+fn test_allocate_accumulating_epilogue_buffers_mixed_and_same_precision() {
+    use castforge::ir::mlir::Attribute;
+    use castforge::passes::{
+        allocate_accumulating_epilogue_buffers, is_accumulating_opaque_kernel_name,
+    };
+
+    assert!(is_accumulating_opaque_kernel_name("mo.matmul.f32"));
+    assert!(is_accumulating_opaque_kernel_name("mo.conv"));
+    assert!(!is_accumulating_opaque_kernel_name("mo.softmax"));
+
+    // Kernel 0: `mo.matmul` accumulating in `f32` with an epilogue casting to `f16` (mixed
+    // precision -> allocates a scratch `tensor<4x8xf32>` result before the trailing chain!).
+    // Kernel 1: `mo.matmul` in `f32` with an `f32` epilogue (same precision -> binds directly).
+    let mlir = concat!(
+        "module @accum_buffers {\n",
+        "  func.func @main(%a: tensor<4x8xf32>, %b: tensor<8x8xf32>, %c0: tensor<1xi64>)",
+        " -> (tensor<4x8xf16>, tensor<4x8xf32>, tensor<1xi64>) {\n",
+        "    %mm0, %ch1 = map.iter.opaque %a, %b, %c0 {kernel_name = \"mo.matmul\"}",
+        " : (tensor<4x8xf32>, tensor<8x8xf32>, tensor<1xi64>)",
+        " -> (tensor<4x8xf32>, tensor<1xi64>)\n",
+        "    %epi0 = map.iter.epilogue %mm0 : (tensor<4x8xf32>) -> tensor<4x8xf16>\n",
+        "    %mm1 = map.iter.opaque %a, %b {kernel_name = \"mo.matmul\"}",
+        " : (tensor<4x8xf32>, tensor<8x8xf32>) -> tensor<4x8xf32>\n",
+        "    %epi1 = map.iter.epilogue %mm1 : (tensor<4x8xf32>) -> tensor<4x8xf32>\n",
+        "    return %epi0, %epi1, %ch1 : tensor<4x8xf16>, tensor<4x8xf32>, tensor<1xi64>\n",
+        "  }\n",
+        "}\n",
+    );
+
+    let mut m = parse_mlir(mlir).expect("valid MLIR");
+    let (scratch, direct) = allocate_accumulating_epilogue_buffers(&mut m);
+    assert_eq!((scratch, direct), (1, 1));
+
+    let func_id = m.functions()[0];
+    let blk_id = m.regions[m.ops[func_id].regions[0]].blocks[0];
+    let ops = &m.blocks[blk_id].ops;
+    // `mm0` now has 3 results: `[%mm0, %scratch_f32, %ch1]`:
+    assert_eq!(m.ops[ops[0]].results.len(), 3);
+    assert_eq!(
+        m.ops[ops[1]].attributes.get("uses_scratch_accumulator"),
+        Some(&Attribute::Bool(true))
+    );
+    assert_eq!(
+        m.ops[ops[3]].attributes.get("uses_scratch_accumulator"),
+        Some(&Attribute::Bool(false))
+    );
+}

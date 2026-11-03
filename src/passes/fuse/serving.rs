@@ -15703,3 +15703,135 @@ pub fn raise_back_contiguous_views(module: &mut Module) -> (usize, usize) {
 
     (slices_raised, reshapes_raised)
 }
+
+// ============================================================================
+// Batch 18 Step 4: Mixed-Precision Accumulating Epilogue Buffer Allocator
+// ============================================================================
+
+/// Returns `true` if `kernel_name` names an accumulating opaque operation (`mo.concat`,
+/// `mo.matmul`, `mo.batch_matmul`, `mo.conv`, or `mo.conv_transpose`) that requires accumulating
+/// in its pre-cast element type when followed by a dtype-changing epilogue.
+#[must_use]
+pub fn is_accumulating_opaque_kernel_name(kernel_name: &str) -> bool {
+    kernel_name.contains("mo.concat")
+        || kernel_name.contains("mo.matmul")
+        || kernel_name.contains("mo.batch_matmul")
+        || kernel_name.contains("mo.conv")
+        || kernel_name.contains("mo.conv_transpose")
+}
+
+/// Assigns an explicit intermediate store-target tensor to each `map.iter.epilogue` op in `module`.
+/// When the feeding `map.iter.opaque` kernel is an accumulating op (`mo.matmul`, `mo.conv`, etc.)
+/// and the epilogue casts to a different output element dtype, allocates a pre-cast scratch
+/// accumulation tensor result on the kernel (before any trailing chain result). Returns
+/// `(scratch_buffers_allocated, direct_targets_bound)`.
+pub fn allocate_accumulating_epilogue_buffers(module: &mut Module) -> (usize, usize) {
+    let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+    let mut scratch_allocated = 0usize;
+    let mut direct_bound = 0usize;
+
+    for block_id in block_ids {
+        let ops_snapshot = module.blocks[block_id].ops.clone();
+        for &epi_op in &ops_snapshot {
+            if module.ops[epi_op].name.full_name() != "map.iter.epilogue" {
+                continue;
+            }
+            if matches!(
+                module.ops[epi_op].attributes.get("has_intermediate_tensor"),
+                Some(Attribute::Bool(true))
+            ) {
+                continue;
+            }
+            if module.ops[epi_op].operands.is_empty() || module.ops[epi_op].results.is_empty() {
+                continue;
+            }
+            let in_val = module.ops[epi_op].operands[0];
+            let store_target = if module.ops[epi_op].operands.len() >= 2 {
+                module.ops[epi_op].operands[1]
+            } else {
+                module.ops[epi_op].results[0]
+            };
+
+            let ValueDef::OpResult { op: kernel_op, .. } = module.values[in_val].def else {
+                continue;
+            };
+            if module.ops[kernel_op].name.full_name() != "map.iter.opaque" {
+                continue;
+            }
+            let kernel_name = module.ops[kernel_op]
+                .attributes
+                .get("kernel_name")
+                .and_then(Attribute::as_str)
+                .unwrap_or("")
+                .to_string();
+
+            let in_tensor_ty = module.values[in_val].ty.as_tensor().cloned();
+            let target_tensor_ty = module.values[store_target].ty.as_tensor().cloned();
+            let (Some(in_tty), Some(target_tty)) = (in_tensor_ty, target_tensor_ty) else {
+                continue;
+            };
+
+            let dtype_changes = in_tty.dtype != target_tty.dtype;
+            if dtype_changes && is_accumulating_opaque_kernel_name(&kernel_name) {
+                let scratch_ty =
+                    Type::Tensor(TensorType::new(target_tty.shape.clone(), in_tty.dtype));
+                // Insert scratch result on `kernel_op` before any trailing chain (`tensor<1xi64>`)
+                // result.
+                let res_len = module.ops[kernel_op].results.len();
+                let has_trailing_chain = module.ops[kernel_op]
+                    .results
+                    .last()
+                    .and_then(|&r| module.values[r].ty.as_tensor())
+                    .is_some_and(|t| t.shape == [Dim::Static(1)] && t.dtype == DType::I64);
+                let insert_idx = if has_trailing_chain && res_len >= 1 {
+                    res_len - 1
+                } else {
+                    res_len
+                };
+
+                let scratch_val = module.values.insert_with_key(|id| Value {
+                    id,
+                    ssa_name: None,
+                    ty: scratch_ty,
+                    def: ValueDef::OpResult {
+                        op: kernel_op,
+                        index: insert_idx as u32,
+                    },
+                });
+                module.ops[kernel_op]
+                    .results
+                    .insert(insert_idx, scratch_val);
+                if has_trailing_chain {
+                    let last_idx = module.ops[kernel_op].results.len() - 1;
+                    let chain_val = module.ops[kernel_op].results[last_idx];
+                    module.values[chain_val].def = ValueDef::OpResult {
+                        op: kernel_op,
+                        index: last_idx as u32,
+                    };
+                }
+
+                module.ops[epi_op].operands.push(scratch_val);
+                module.ops[epi_op]
+                    .attributes
+                    .insert("has_intermediate_tensor".to_string(), Attribute::Bool(true));
+                module.ops[epi_op].attributes.insert(
+                    "uses_scratch_accumulator".to_string(),
+                    Attribute::Bool(true),
+                );
+                scratch_allocated += 1;
+            } else {
+                module.ops[epi_op].operands.push(store_target);
+                module.ops[epi_op]
+                    .attributes
+                    .insert("has_intermediate_tensor".to_string(), Attribute::Bool(true));
+                module.ops[epi_op].attributes.insert(
+                    "uses_scratch_accumulator".to_string(),
+                    Attribute::Bool(false),
+                );
+                direct_bound += 1;
+            }
+        }
+    }
+
+    (scratch_allocated, direct_bound)
+}
