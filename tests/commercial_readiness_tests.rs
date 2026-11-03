@@ -14,32 +14,33 @@ use castforge::ir::{
     DType, Dim, Location, TensorBacking, TensorEntry, TensorStore, TensorType, parse_mlir,
 };
 use castforge::passes::{
-    ArcKvEvictionPolicy, AsymK16V8Codec, CBChunkMatch, CBGroupSpec, CacheBlendRopeSpec,
-    CacheGenCdfCodec, ChainedBlockHashConfig, DEFAULT_MAX_KERNELS_IN_FUSION_SET, DeviceTargetArch,
-    DynamicAllocRequest, EngineKvFormat, FULL_ATTENTION_WINDOW, GDS_DEFAULT_ALIGN_BYTES,
-    GdsSlabAddressManager, IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind,
-    KvBlockPool, KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry,
-    KvScaleScope, KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy,
-    LayerGroupPayloadSharder, P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable, P2PPeerSpec,
-    PassManager, PassRegistry, ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST, TOKEN_WIRE_STRIDE,
-    WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
-    annotate_squeeze_unsqueeze_reshapes, anonymize_symbolic_dims, await_hanging_effect_chains,
-    coalesce_partitioning_slices_to_split, compress_splat_constants, decode_kv_fs_filename,
-    decode_kv_storage_key, defer_allocs_to_first_use, direct_copy_format_supported,
-    downsample_subchunk_swa_block_ids, elide_redundant_state_transfers,
-    eliminate_implied_dependencies, encode_kv_fs_filename, encode_kv_storage_key,
-    encode_wide_column_row_key, find_squeeze_axis, find_unsqueeze_axis, flatten_elementwise_chains,
-    fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
-    fuse_sole_use_prologues, group_p2p_lookup_keys, hash_packed_token_blocks_be,
-    hash_prefix_token_blocks, hoist_exec_invariant_ops, hoist_symbolic_dim_expressions,
-    is_supported_arch_dtype, legalize_rowwise_reduction_launch, longest_full_attention_hit,
-    longest_joint_prefix_hit, longest_sliding_window_hit, mark_cuda_graph_stable_tensors,
-    merge_adjacent_parallel_loops, merge_duplicate_shape_ops, merge_identical_functions,
-    num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve, plan_concat_in_place,
-    plan_dynamic_memory_pool, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
-    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
-    recalculate_subchunk_blocks_to_skip, reuse_dead_loop_buffers, stamp_fused_provenance,
-    unfold_chunk_range, unpack_token_ids_be, validate_target_device_dtypes,
+    ArcKvEvictionPolicy, AsymK16V8Codec, BlendMatchSpan, BlendTokenRangeMatcher, CBChunkMatch,
+    CBGroupSpec, CacheBlendRopeSpec, CacheGenCdfCodec, ChainedBlockHashConfig,
+    DEFAULT_MAX_KERNELS_IN_FUSION_SET, DeviceTargetArch, DynamicAllocRequest, EngineKvFormat,
+    FULL_ATTENTION_WINDOW, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
+    IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
+    KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope,
+    KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy, LayerGroupPayloadSharder,
+    P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable, P2PPeerSpec, PassManager, PassRegistry,
+    ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST, TOKEN_WIRE_STRIDE, WarmPrefetchJobTable,
+    WarmPrefetchStatus, analyze_kv_layer_groups, annotate_squeeze_unsqueeze_reshapes,
+    anonymize_symbolic_dims, await_hanging_effect_chains, coalesce_partitioning_slices_to_split,
+    compress_splat_constants, decode_kv_fs_filename, decode_kv_storage_key,
+    defer_allocs_to_first_use, direct_copy_format_supported, downsample_subchunk_swa_block_ids,
+    elide_redundant_state_transfers, eliminate_implied_dependencies, encode_kv_fs_filename,
+    encode_kv_storage_key, encode_wide_column_row_key, find_squeeze_axis, find_unsqueeze_axis,
+    flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
+    fuse_reshape_epilogue, fuse_sole_use_prologues, group_p2p_lookup_keys,
+    hash_packed_token_blocks_be, hash_prefix_token_blocks, hoist_exec_invariant_ops,
+    hoist_symbolic_dim_expressions, is_supported_arch_dtype, legalize_rowwise_reduction_launch,
+    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
+    mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops, merge_duplicate_shape_ops,
+    merge_identical_functions, num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve,
+    plan_concat_in_place, plan_dynamic_memory_pool, plan_jenga_kv_geometry,
+    plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
+    re_rope_key_in_place, recalculate_subchunk_blocks_to_skip, reuse_dead_loop_buffers,
+    stamp_fused_provenance, unfold_chunk_range, unique_blend_token_coverage, unpack_token_ids_be,
+    validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -2457,4 +2458,66 @@ fn test_encode_wide_column_row_key_hash_prefix_and_layer_group_suffix() {
         encode_wide_column_row_key(&unsalted, 0, None),
         "abcd@meta-llama/Llama-3-70B@00000002@1@abcdef0123456789"
     );
+}
+
+#[test]
+fn test_blend_token_range_matcher_sliding_window_and_coverage() {
+    let mut matcher = BlendTokenRangeMatcher::new(4, 10, true);
+    let stored_tokens = vec![10, 20, 30, 40, 50, 60, 70, 80, 10, 20, 30, 40];
+    let chunk_hashes = vec![0x1111, 0x2222, 0x3333];
+    // Chunk 2 (`[10, 20, 30, 40]`) duplicates chunk 0's content, so `dedup_content = true`
+    // indexes only 2 chunks (`0x1111` at offset 0 and `0x2222` at offset 4).
+    assert_eq!(
+        matcher.on_new_token_hashes(&stored_tokens, &chunk_hashes, 0),
+        2
+    );
+
+    // Query contains chunk 1 at offset 2 and chunk 0 at offset 7:
+    let query = vec![99, 98, 50, 60, 70, 80, 97, 10, 20, 30, 40, 96];
+    let matches = matcher.match_sub_sequence(&query);
+    assert_eq!(
+        matches,
+        vec![
+            BlendMatchSpan {
+                old_st: 4,
+                old_ed: 8,
+                cur_st: 2,
+                cur_ed: 6,
+                chunk_hash: 0x2222,
+            },
+            BlendMatchSpan {
+                old_st: 0,
+                old_ed: 4,
+                cur_st: 7,
+                cur_ed: 11,
+                chunk_hash: 0x1111,
+            },
+        ]
+    );
+    assert_eq!(unique_blend_token_coverage(&matches), 8);
+
+    // Overlapping spans `[2, 6)` and `[4, 8)` merge to coverage 6 (not 8):
+    let overlapping = vec![
+        BlendMatchSpan {
+            old_st: 0,
+            old_ed: 4,
+            cur_st: 2,
+            cur_ed: 6,
+            chunk_hash: 1,
+        },
+        BlendMatchSpan {
+            old_st: 4,
+            old_ed: 8,
+            cur_st: 4,
+            cur_ed: 8,
+            chunk_hash: 2,
+        },
+    ];
+    assert_eq!(unique_blend_token_coverage(&overlapping), 6);
+
+    // Evicting chunk `0x2222` removes it from subsequent probes:
+    matcher.remove_chunks(&[0x2222]);
+    let after_evict = matcher.match_sub_sequence(&query);
+    assert_eq!(after_evict.len(), 1);
+    assert_eq!(after_evict[0].chunk_hash, 0x1111);
 }

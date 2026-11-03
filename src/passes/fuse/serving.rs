@@ -6090,3 +6090,264 @@ pub fn encode_wide_column_row_key(
     }
     row_key
 }
+
+/// Fibonacci-hashing polynomial base (`0x9E3779B97F4A7C15`) used for 64-bit chunk and rolling
+/// token window fingerprints (inspired by LMCache
+/// `lmcache/v1/multiprocess/modules/blend/matcher.py` `BlendTokenRangeMatcher._BASE`).
+pub const BLEND_HASH_BASE: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Computes 64-bit polynomial hashes (modulo $2^{64}$ via wrapping arithmetic) over
+/// non-overlapping windows of length `chunk_size`, ignoring trailing tokens that do not fill a
+/// complete chunk (inspired by LMCache `lmcache/v1/multiprocess/token_hasher.py`
+/// `chunk_hash_windows_numba`).
+pub fn chunk_poly_hash_windows(token_ids: &[u64], chunk_size: usize, base: u64) -> Vec<u64> {
+    if chunk_size == 0 || token_ids.len() < chunk_size {
+        return Vec::new();
+    }
+    let num_windows = token_ids.len() / chunk_size;
+    let mut out = Vec::with_capacity(num_windows);
+    for w in 0..num_windows {
+        let start = w * chunk_size;
+        let mut h = 0u64;
+        for &tok in &token_ids[start..start + chunk_size] {
+            h = h.wrapping_mul(base).wrapping_add(tok);
+        }
+        out.push(h);
+    }
+    out
+}
+
+/// Computes $O(1)$ sliding-window 64-bit polynomial hashes (modulo $2^{64}$ via wrapping
+/// arithmetic) across all `token_ids.len() - window_size + 1` positions (inspired by LMCache
+/// `lmcache/v1/multiprocess/token_hasher.py` `rolling_hash_windows_numba`).
+pub fn rolling_poly_hash_windows(token_ids: &[u64], window_size: usize, base: u64) -> Vec<u64> {
+    if window_size == 0 || token_ids.len() < window_size {
+        return Vec::new();
+    }
+    let num_pos = token_ids.len() - window_size + 1;
+    let mut out = Vec::with_capacity(num_pos);
+    let mut power = 1u64;
+    for _ in 0..window_size.saturating_sub(1) {
+        power = power.wrapping_mul(base);
+    }
+    let mut h = 0u64;
+    for &tok in &token_ids[..window_size] {
+        h = h.wrapping_mul(base).wrapping_add(tok);
+    }
+    out.push(h);
+    for i in window_size..token_ids.len() {
+        let old = token_ids[i - window_size];
+        let new = token_ids[i];
+        h = h.wrapping_sub(old.wrapping_mul(power));
+        h = h.wrapping_mul(base).wrapping_add(new);
+        out.push(h);
+    }
+    out
+}
+
+/// A matched sub-sequence chunk span returned by [`BlendTokenRangeMatcher::match_sub_sequence`]
+/// (inspired by LMCache `lmcache/v1/multiprocess/custom_types.py` `CBMatchResult`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlendMatchSpan {
+    /// Start token index in the originally indexed sequence (`old_st`).
+    pub old_st: usize,
+    /// Exclusive end token index in the originally indexed sequence (`old_ed`).
+    pub old_ed: usize,
+    /// Start token index in the query sequence (`cur_st`).
+    pub cur_st: usize,
+    /// Exclusive end token index in the query sequence (`cur_ed`).
+    pub cur_ed: usize,
+    /// Content hash identifier of the matched chunk.
+    pub chunk_hash: u64,
+}
+
+/// Token-level sliding-window fingerprint matcher over a power-of-two direct-address table of
+/// 64-bit chunk polynomial hashes with full-hash collision rejection and content deduplication
+/// (inspired by LMCache `lmcache/v1/multiprocess/modules/blend/matcher.py`
+/// `BlendTokenRangeMatcher`).
+#[derive(Debug, Clone)]
+pub struct BlendTokenRangeMatcher {
+    chunk_size: usize,
+    dedup_content: bool,
+    table_size: usize,
+    mask: u64,
+    table_id: Vec<i64>,
+    chunk_token_hash: Vec<Option<u64>>,
+    chunk_poly_hash: Vec<u64>,
+    token_hash_to_start: std::collections::HashMap<u64, usize>,
+    compact_id_to_slot: Vec<i64>,
+    token_hash_to_compact_id: std::collections::HashMap<u64, usize>,
+}
+
+impl BlendTokenRangeMatcher {
+    /// Creates a new matcher with `chunk_size` tokens per chunk and a direct-address table of
+    /// size `1 << table_bits` (clamped to `[4, 20]`).
+    #[must_use]
+    pub fn new(chunk_size: usize, table_bits: u32, dedup_content: bool) -> Self {
+        let bits = table_bits.clamp(4, 20);
+        let table_size = 1usize << bits;
+        Self {
+            chunk_size: chunk_size.max(1),
+            dedup_content,
+            table_size,
+            mask: (table_size - 1) as u64,
+            table_id: vec![-1; table_size],
+            chunk_token_hash: Vec::new(),
+            chunk_poly_hash: Vec::new(),
+            token_hash_to_start: std::collections::HashMap::new(),
+            compact_id_to_slot: vec![-1; table_size],
+            token_hash_to_compact_id: std::collections::HashMap::new(),
+        }
+    }
+
+    fn poly_hash_registered(&self, poly_hash: u64) -> bool {
+        let slot = (poly_hash & self.mask) as usize;
+        let cid = self.table_id[slot];
+        if cid < 0 {
+            return false;
+        }
+        let cid_usize = cid as usize;
+        self.chunk_poly_hash.get(cid_usize) == Some(&poly_hash)
+            && self
+                .chunk_token_hash
+                .get(cid_usize)
+                .and_then(|h| *h)
+                .is_some()
+    }
+
+    /// Indexes non-overlapping chunks of `token_ids` with their corresponding `token_hashes` and
+    /// `position_offset`, returning the number of newly indexed chunks.
+    pub fn on_new_token_hashes(
+        &mut self,
+        token_ids: &[u64],
+        token_hashes: &[u64],
+        position_offset: usize,
+    ) -> usize {
+        let chunk_hashes = chunk_poly_hash_windows(token_ids, self.chunk_size, BLEND_HASH_BASE);
+        let n = chunk_hashes.len().min(token_hashes.len());
+        if n == 0 {
+            return 0;
+        }
+        let mut new_idxs = Vec::new();
+        let mut batch_poly = std::collections::HashSet::new();
+        for i in 0..n {
+            if self.token_hash_to_compact_id.contains_key(&token_hashes[i]) {
+                continue;
+            }
+            if self.dedup_content {
+                let poly_hash = chunk_hashes[i];
+                if batch_poly.contains(&poly_hash) || self.poly_hash_registered(poly_hash) {
+                    continue;
+                }
+                batch_poly.insert(poly_hash);
+            }
+            new_idxs.push(i);
+        }
+        if new_idxs.is_empty() {
+            return 0;
+        }
+        let base_id = self.chunk_token_hash.len();
+        if base_id + new_idxs.len() > self.table_size {
+            return 0;
+        }
+        for (k, &orig_i) in new_idxs.iter().enumerate() {
+            let cid = base_id + k;
+            let th = token_hashes[orig_i];
+            let poly_hash = chunk_hashes[orig_i];
+            let slot = (poly_hash & self.mask) as usize;
+            self.table_id[slot] = cid as i64;
+            self.chunk_token_hash.push(Some(th));
+            self.chunk_poly_hash.push(poly_hash);
+            self.token_hash_to_start
+                .insert(th, position_offset + orig_i * self.chunk_size);
+            self.compact_id_to_slot[cid] = slot as i64;
+            self.token_hash_to_compact_id.insert(th, cid);
+        }
+        new_idxs.len()
+    }
+
+    /// Probes every sliding-window token position of `token_ids` against the direct-address table,
+    /// rejecting bucket collisions via full 64-bit poly-hash verification and deduplicating by
+    /// compact chunk ID.
+    #[must_use]
+    pub fn match_sub_sequence(&self, token_ids: &[u64]) -> Vec<BlendMatchSpan> {
+        if token_ids.len() < self.chunk_size || self.chunk_token_hash.is_empty() {
+            return Vec::new();
+        }
+        let rolling = rolling_poly_hash_windows(token_ids, self.chunk_size, BLEND_HASH_BASE);
+        let mut seen_cids = std::collections::HashSet::new();
+        let mut results = Vec::new();
+        for (pos, &poly) in rolling.iter().enumerate() {
+            let slot = (poly & self.mask) as usize;
+            let cid_i64 = self.table_id[slot];
+            if cid_i64 < 0 {
+                continue;
+            }
+            let cid = cid_i64 as usize;
+            if seen_cids.contains(&cid) {
+                continue;
+            }
+            if self.chunk_poly_hash.get(cid) != Some(&poly) {
+                continue;
+            }
+            let Some(Some(th)) = self.chunk_token_hash.get(cid).copied() else {
+                continue;
+            };
+            let Some(&old_st) = self.token_hash_to_start.get(&th) else {
+                continue;
+            };
+            seen_cids.insert(cid);
+            results.push(BlendMatchSpan {
+                old_st,
+                old_ed: old_st + self.chunk_size,
+                cur_st: pos,
+                cur_ed: pos + self.chunk_size,
+                chunk_hash: th,
+            });
+        }
+        results
+    }
+
+    /// Evicts `token_hashes` from the direct-address table so subsequent probes ignore them.
+    pub fn remove_chunks(&mut self, token_hashes: &[u64]) {
+        for th in token_hashes {
+            let Some(cid) = self.token_hash_to_compact_id.remove(th) else {
+                continue;
+            };
+            let slot = self.compact_id_to_slot[cid];
+            if slot >= 0 {
+                self.table_id[slot as usize] = -1;
+            }
+            self.compact_id_to_slot[cid] = -1;
+            self.chunk_token_hash[cid] = None;
+            self.chunk_poly_hash[cid] = 0;
+            self.token_hash_to_start.remove(th);
+        }
+    }
+}
+
+/// Computes the total unique token coverage across `spans` by sorting and merging overlapping
+/// `[cur_st, cur_ed)` intervals so overlapping sliding-window matches are not double-counted
+/// (inspired by LMCache `lmcache/v1/multiprocess/modules/blend/matcher.py`
+/// `_unique_token_coverage`).
+#[must_use]
+pub fn unique_blend_token_coverage(spans: &[BlendMatchSpan]) -> usize {
+    if spans.is_empty() {
+        return 0;
+    }
+    let mut intervals: Vec<(usize, usize)> = spans.iter().map(|s| (s.cur_st, s.cur_ed)).collect();
+    intervals.sort_unstable();
+    let mut coverage = 0usize;
+    let mut cur_end = 0usize;
+    let mut first = true;
+    for (st, ed) in intervals {
+        if first || st >= cur_end {
+            coverage += ed.saturating_sub(st);
+            first = false;
+        } else if ed > cur_end {
+            coverage += ed - cur_end;
+        }
+        cur_end = cur_end.max(ed);
+    }
+    coverage
+}
