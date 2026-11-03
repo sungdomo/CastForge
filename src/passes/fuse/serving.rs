@@ -4652,3 +4652,151 @@ impl L2FaultInjectPolicy {
         (load_bitmap, trim_mask)
     }
 }
+
+fn replace_ident_in_text(text: &str, from: &str, to: &str) -> String {
+    if from.is_empty() || from == to {
+        return text.to_string();
+    }
+    let bytes = text.as_bytes();
+    let id_len = from.len();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    while let Some(rel) = text[cursor..].find(from) {
+        let pos = cursor + rel;
+        let before_ok = pos == 0 || !is_word(bytes[pos - 1]);
+        let after_ok = pos + id_len >= bytes.len() || !is_word(bytes[pos + id_len]);
+        if before_ok && after_ok {
+            out.push_str(&text[cursor..pos]);
+            out.push_str(to);
+            cursor = pos + id_len;
+        } else {
+            out.push_str(&text[cursor..pos + 1]);
+            cursor = pos + 1;
+        }
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+fn rewrite_stmt_buffer_name(stmt: &mut crate::ir::loops::LoopStmt, from: &str, to: &str) {
+    use crate::ir::loops::LoopStmt;
+    match stmt {
+        LoopStmt::Comment(_) | LoopStmt::Alloc { .. } => {}
+        LoopStmt::Assign { dst, index, expr } => {
+            if dst == from {
+                *dst = to.to_string();
+            }
+            *index = replace_ident_in_text(index, from, to);
+            *expr = replace_ident_in_text(expr, from, to);
+        }
+        LoopStmt::For { body, .. } => {
+            for inner in body {
+                rewrite_stmt_buffer_name(inner, from, to);
+            }
+        }
+    }
+}
+
+/// Aliases non-overlapping `LoopStmt::Alloc` scratchpad buffers of identical length within each
+/// [`crate::ir::loops::LoopKernel`], prioritizing buffers with higher use counts first
+/// (inspired by Modular `GraphCompiler/lib/MGPDialect/Transforms/SimpleBufferReusePass.cpp`).
+///
+/// Returns the number of redundant `LoopStmt::Alloc` declarations merged and eliminated.
+pub fn reuse_dead_loop_buffers(loop_module: &mut crate::ir::loops::LoopModule) -> usize {
+    use crate::ir::loops::LoopStmt;
+    let mut reused_count = 0usize;
+
+    for kernel in &mut loop_module.kernels {
+        let mut size_groups: IndexMap<usize, Vec<(String, Vec<usize>)>> = IndexMap::new();
+        for stmt in &kernel.body {
+            if let LoopStmt::Alloc { name, len } = stmt {
+                let uses: Vec<usize> = kernel
+                    .body
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, s)| stmt_references_buffer(s, name).then_some(idx))
+                    .collect();
+                if !uses.is_empty() {
+                    size_groups
+                        .entry(*len)
+                        .or_default()
+                        .push((name.clone(), uses));
+                }
+            }
+        }
+
+        let mut erased_allocs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut rewrites: Vec<(String, String)> = Vec::new();
+
+        for (_, mut group) in size_groups {
+            if group.len() < 2 {
+                continue;
+            }
+            // Allocs with more uses go first (`SimpleBufferReusePass.cpp`).
+            group.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
+
+            let mut active = vec![true; group.len()];
+            for i in 0..group.len() {
+                if !active[i] {
+                    continue;
+                }
+                for j in 0..group.len() {
+                    if i == j || !active[j] {
+                        continue;
+                    }
+                    let cur_uses = &group[i].1;
+                    let cand_uses = &group[j].1;
+                    let shares_op = cur_uses.iter().any(|u| cand_uses.contains(u));
+                    if shares_op {
+                        continue;
+                    }
+                    let cur_after_cand = cur_uses
+                        .iter()
+                        .all(|&cu| cand_uses.iter().all(|&du| cu > du));
+                    let cand_after_cur = cand_uses
+                        .iter()
+                        .all(|&du| cur_uses.iter().all(|&cu| du > cu));
+                    if cur_after_cand || cand_after_cur {
+                        let primary_name = group[i].0.clone();
+                        let cand_name = group[j].0.clone();
+                        let mut merged_uses = group[i].1.clone();
+                        merged_uses.extend_from_slice(&group[j].1);
+                        merged_uses.sort_unstable();
+                        group[i].1 = merged_uses;
+                        active[j] = false;
+                        erased_allocs.insert(cand_name.clone());
+                        rewrites.push((cand_name, primary_name));
+                        reused_count += 1;
+                    }
+                }
+            }
+        }
+
+        if !rewrites.is_empty() {
+            for (from, to) in &rewrites {
+                for stmt in &mut kernel.body {
+                    rewrite_stmt_buffer_name(stmt, from, to);
+                }
+            }
+            // Remove erased candidate `Alloc` statements and ensure surviving `Alloc`s precede
+            // their earliest use.
+            let mut hoisted_allocs = Vec::new();
+            let mut remaining = Vec::with_capacity(kernel.body.len());
+            for stmt in kernel.body.drain(..) {
+                if let LoopStmt::Alloc { ref name, .. } = stmt {
+                    if erased_allocs.contains(name) {
+                        continue;
+                    }
+                    hoisted_allocs.push(stmt);
+                } else {
+                    remaining.push(stmt);
+                }
+            }
+            hoisted_allocs.append(&mut remaining);
+            kernel.body = hoisted_allocs;
+        }
+    }
+
+    reused_count
+}

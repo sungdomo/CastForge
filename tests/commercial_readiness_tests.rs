@@ -31,8 +31,8 @@ use castforge::passes::{
     longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_duplicate_shape_ops,
     merge_identical_functions, plan_cacheblend_retrieve, plan_concat_in_place,
     plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
-    promote_narrow_accumulators, re_rope_key_in_place, stamp_fused_provenance, unfold_chunk_range,
-    validate_target_device_dtypes,
+    promote_narrow_accumulators, re_rope_key_in_place, reuse_dead_loop_buffers,
+    stamp_fused_provenance, unfold_chunk_range, validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -1818,4 +1818,63 @@ fn test_l2_fault_inject_policy_tail_ratios_and_trim_mask() {
     let (load_bitmap, trim_mask) = policy.fault_load_bitmap(&keys, &lookup_bitmap);
     assert_eq!(load_bitmap, vec![true, false, false, true, false]);
     assert_eq!(trim_mask, vec![false, true, true, false, true]);
+}
+
+#[test]
+fn test_reuse_dead_loop_buffers_by_use_count_and_disjoint_liveness() {
+    use castforge::ir::loops::{LoopKernel, LoopModule, LoopStmt};
+
+    // `buf_a` (len 16) is used in statements 0 and 1 (2 uses).
+    // `buf_b` (len 16) is used in statements 2 and 3 (2 uses, strictly after `buf_a`).
+    // `buf_c` (len 32) has different length -> not merged with `buf_a`.
+    let mut loop_mod = LoopModule {
+        name: "reuse_test".to_string(),
+        kernels: vec![LoopKernel {
+            name: "main".to_string(),
+            params: vec![("x".to_string(), 16)],
+            output: ("out".to_string(), 16),
+            body: vec![
+                LoopStmt::Alloc {
+                    name: "buf_a".to_string(),
+                    len: 16,
+                },
+                LoopStmt::Alloc {
+                    name: "buf_b".to_string(),
+                    len: 16,
+                },
+                LoopStmt::Alloc {
+                    name: "buf_c".to_string(),
+                    len: 32,
+                },
+                LoopStmt::Assign {
+                    dst: "buf_a".to_string(),
+                    index: "0".to_string(),
+                    expr: "x[0] + 1.0".to_string(),
+                },
+                LoopStmt::Assign {
+                    dst: "buf_c".to_string(),
+                    index: "0".to_string(),
+                    expr: "buf_a[0] * 2.0".to_string(),
+                },
+                LoopStmt::Assign {
+                    dst: "buf_b".to_string(),
+                    index: "0".to_string(),
+                    expr: "buf_c[0] + 3.0".to_string(),
+                },
+                LoopStmt::Assign {
+                    dst: "out".to_string(),
+                    index: "0".to_string(),
+                    expr: "buf_b[0]".to_string(),
+                },
+            ],
+        }],
+    };
+
+    let reused = reuse_dead_loop_buffers(&mut loop_mod);
+    assert_eq!(reused, 1);
+
+    let printed = format!("{loop_mod}");
+    assert!(printed.contains("alloc buf_a: f32[16]"));
+    assert!(!printed.contains("alloc buf_b"));
+    assert!(printed.contains("out[0] = buf_a[0]"));
 }
