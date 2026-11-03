@@ -12813,3 +12813,303 @@ pub fn open_l2_kv_frame(
     xor_keystream_in_place(&dek, &iv, &mut plaintext);
     Some(plaintext)
 }
+
+// ============================================================================
+// Non-Aliasing Mutable Buffer Chain Sequence Relaxation
+// (inspired by Modular `GraphCompiler/lib/MODialect/Transforms/CanonicalizeChainSequences.cpp`)
+// ============================================================================
+
+#[derive(Debug, Clone, Copy)]
+struct MutableChainOpInfo {
+    in_chain: ValueId,
+    out_chain: ValueId,
+    buffer: ValueId,
+    is_write: bool,
+    is_multi_device: bool,
+}
+
+fn inspect_mutable_chain_op(op: &Operation) -> Option<MutableChainOpInfo> {
+    let is_multi_device = matches!(
+        op.attributes.get("multi_device"),
+        Some(Attribute::Bool(true))
+    );
+    match op.name.to_string().as_str() {
+        "mo.mutable.store" if op.operands.len() >= 3 && op.results.len() == 1 => {
+            Some(MutableChainOpInfo {
+                in_chain: op.operands[0],
+                out_chain: op.results[0],
+                buffer: op.operands[2],
+                is_write: true,
+                is_multi_device,
+            })
+        }
+        "mo.mutable.load" if op.operands.len() >= 2 && op.results.len() == 2 => {
+            Some(MutableChainOpInfo {
+                in_chain: op.operands[0],
+                out_chain: op.results[1],
+                buffer: op.operands[1],
+                is_write: false,
+                is_multi_device,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn can_safely_reorder_mutable_ops(a: &MutableChainOpInfo, b: &MutableChainOpInfo) -> bool {
+    if a.is_multi_device || b.is_multi_device {
+        return false;
+    }
+    if a.buffer != b.buffer {
+        return true;
+    }
+    // Same buffer: safe to reorder iff neither operation writes to the buffer (read-read).
+    !a.is_write && !b.is_write
+}
+
+fn prune_implied_chains_in_block(
+    module: &Module,
+    block_id: BlockId,
+    chains: &mut SmallVec<[ValueId; 4]>,
+) {
+    if chains.len() <= 1 {
+        return;
+    }
+    let mut implied: IndexSet<ValueId> = IndexSet::new();
+    let mut worklist: Vec<ValueId> = Vec::new();
+
+    for &start in chains.iter() {
+        if let Some(ValueDef::OpResult { op: def_id, .. }) = module.values.get(start).map(|v| v.def)
+            && module.blocks[block_id].ops.contains(&def_id)
+            && let Some(def_op) = module.ops.get(def_id)
+        {
+            if let Some(info) = inspect_mutable_chain_op(def_op) {
+                worklist.push(info.in_chain);
+            } else if def_op.is_op("mo", "chain.create") {
+                worklist.extend(def_op.operands.iter().copied());
+            }
+        }
+    }
+
+    while let Some(curr) = worklist.pop() {
+        if !implied.insert(curr) {
+            continue;
+        }
+        if let Some(ValueDef::OpResult { op: def_id, .. }) = module.values.get(curr).map(|v| v.def)
+            && module.blocks[block_id].ops.contains(&def_id)
+            && let Some(def_op) = module.ops.get(def_id)
+        {
+            if let Some(info) = inspect_mutable_chain_op(def_op) {
+                worklist.push(info.in_chain);
+            } else if def_op.is_op("mo", "chain.create") {
+                worklist.extend(def_op.operands.iter().copied());
+            }
+        }
+    }
+
+    chains.retain(|v| !implied.contains(v));
+}
+
+/// Relaxes serialized chain dependencies between mutable buffer operations (`mo.mutable.store`,
+/// `mo.mutable.load`) when neither operation is marked `multi_device = true` and their buffer
+/// accesses do not conflict (distinct buffers, or read-read loads on the same buffer).
+///
+/// Rewritesboth direct `parent -> child` chain links and upstream `mo.chain.create` joins into
+/// parallel fork-join diamonds merged via `mo.chain.create`. Returns the number of chain
+/// relaxations performed.
+pub fn relax_non_aliasing_mutable_chain_sequences(module: &mut Module) -> usize {
+    let mut total_relaxed = 0usize;
+    let block_ids: Vec<_> = module.blocks.keys().collect();
+
+    for block_id in block_ids {
+        for _iter in 0..64 {
+            let mut changed = false;
+            let op_ids = module.blocks[block_id].ops.clone();
+
+            for (pos, &op_id) in op_ids.iter().enumerate() {
+                let Some(op) = module.ops.get(op_id).cloned() else {
+                    continue;
+                };
+                let Some(mut_info) = inspect_mutable_chain_op(&op) else {
+                    continue;
+                };
+                let Some(ValueDef::OpResult { op: parent_id, .. }) =
+                    module.values.get(mut_info.in_chain).map(|v| v.def)
+                else {
+                    continue;
+                };
+                if !module.blocks[block_id].ops.contains(&parent_id) {
+                    continue;
+                }
+                let Some(parent_op) = module.ops.get(parent_id).cloned() else {
+                    continue;
+                };
+
+                // Case A: Direct mutable parent op in the same block.
+                if let Some(parent_info) = inspect_mutable_chain_op(&parent_op)
+                    && parent_info.out_chain == mut_info.in_chain
+                    && can_safely_reorder_mutable_ops(&mut_info, &parent_info)
+                {
+                    let chain_ty = module.values[mut_info.out_chain].ty.clone();
+                    if let Some(mut_op_mut) = module.ops.get_mut(op_id) {
+                        mut_op_mut.operands[0] = parent_info.in_chain;
+                    }
+                    let merge_op_id = module.ops.insert_with_key(|id| Operation {
+                        id,
+                        name: OpName::new("mo", "chain.create"),
+                        operands: SmallVec::from_slice(&[
+                            mut_info.out_chain,
+                            parent_info.out_chain,
+                        ]),
+                        results: SmallVec::new(),
+                        attributes: IndexMap::new(),
+                        regions: Vec::new(),
+                        custom_syntax: false,
+                        location: op.location.clone(),
+                    });
+                    let merged_val = module.values.insert_with_key(|id| Value {
+                        id,
+                        ssa_name: None,
+                        ty: chain_ty,
+                        def: ValueDef::OpResult {
+                            op: merge_op_id,
+                            index: 0,
+                        },
+                    });
+                    module.ops[merge_op_id].results.push(merged_val);
+                    module.blocks[block_id].ops.insert(pos + 1, merge_op_id);
+
+                    for &other_id in &module.blocks[block_id].ops {
+                        if other_id == merge_op_id {
+                            continue;
+                        }
+                        if let Some(other_op) = module.ops.get_mut(other_id) {
+                            for opd in &mut other_op.operands {
+                                if *opd == mut_info.out_chain {
+                                    *opd = merged_val;
+                                }
+                            }
+                        }
+                    }
+
+                    total_relaxed += 1;
+                    changed = true;
+                    break;
+                }
+
+                // Case B: Upstream `mo.chain.create` with one or more non-aliasing mutable inputs.
+                if parent_op.is_op("mo", "chain.create") {
+                    let mut new_create_operands: SmallVec<[ValueId; 4]> = SmallVec::new();
+                    let mut residual_operands: SmallVec<[ValueId; 4]> = SmallVec::new();
+
+                    for &opd in &parent_op.operands {
+                        let mut bypassed = false;
+                        if let Some(ValueDef::OpResult { op: up_id, .. }) =
+                            module.values.get(opd).map(|v| v.def)
+                            && module.blocks[block_id].ops.contains(&up_id)
+                            && let Some(up_op) = module.ops.get(up_id)
+                            && let Some(up_info) = inspect_mutable_chain_op(up_op)
+                            && up_info.out_chain == opd
+                            && can_safely_reorder_mutable_ops(&mut_info, &up_info)
+                        {
+                            new_create_operands.push(opd);
+                            if !residual_operands.contains(&up_info.in_chain) {
+                                residual_operands.push(up_info.in_chain);
+                            }
+                            bypassed = true;
+                        }
+                        if !bypassed && !residual_operands.contains(&opd) {
+                            residual_operands.push(opd);
+                        }
+                    }
+
+                    if !new_create_operands.is_empty() && !residual_operands.is_empty() {
+                        prune_implied_chains_in_block(module, block_id, &mut residual_operands);
+                        let chain_ty = module.values[mut_info.out_chain].ty.clone();
+                        let new_in_chain = if residual_operands.len() == 1 {
+                            residual_operands[0]
+                        } else {
+                            let in_create_id = module.ops.insert_with_key(|id| Operation {
+                                id,
+                                name: OpName::new("mo", "chain.create"),
+                                operands: residual_operands,
+                                results: SmallVec::new(),
+                                attributes: IndexMap::new(),
+                                regions: Vec::new(),
+                                custom_syntax: false,
+                                location: op.location.clone(),
+                            });
+                            let in_val = module.values.insert_with_key(|id| Value {
+                                id,
+                                ssa_name: None,
+                                ty: chain_ty.clone(),
+                                def: ValueDef::OpResult {
+                                    op: in_create_id,
+                                    index: 0,
+                                },
+                            });
+                            module.ops[in_create_id].results.push(in_val);
+                            module.blocks[block_id].ops.insert(pos, in_create_id);
+                            in_val
+                        };
+
+                        if let Some(mut_op_mut) = module.ops.get_mut(op_id) {
+                            mut_op_mut.operands[0] = new_in_chain;
+                        }
+
+                        new_create_operands.push(mut_info.out_chain);
+                        let merge_op_id = module.ops.insert_with_key(|id| Operation {
+                            id,
+                            name: OpName::new("mo", "chain.create"),
+                            operands: new_create_operands,
+                            results: SmallVec::new(),
+                            attributes: IndexMap::new(),
+                            regions: Vec::new(),
+                            custom_syntax: false,
+                            location: op.location.clone(),
+                        });
+                        let merged_val = module.values.insert_with_key(|id| Value {
+                            id,
+                            ssa_name: None,
+                            ty: chain_ty,
+                            def: ValueDef::OpResult {
+                                op: merge_op_id,
+                                index: 0,
+                            },
+                        });
+                        module.ops[merge_op_id].results.push(merged_val);
+                        let mut_pos = module.blocks[block_id]
+                            .ops
+                            .iter()
+                            .position(|&id| id == op_id)
+                            .unwrap_or(pos);
+                        module.blocks[block_id].ops.insert(mut_pos + 1, merge_op_id);
+
+                        for &other_id in &module.blocks[block_id].ops {
+                            if other_id == merge_op_id {
+                                continue;
+                            }
+                            if let Some(other_op) = module.ops.get_mut(other_id) {
+                                for opd in &mut other_op.operands {
+                                    if *opd == mut_info.out_chain {
+                                        *opd = merged_val;
+                                    }
+                                }
+                            }
+                        }
+
+                        total_relaxed += 1;
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    total_relaxed
+}

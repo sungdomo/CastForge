@@ -63,8 +63,9 @@ use castforge::passes::{
     plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
     plan_l1_prefetch_retention, plan_multi_tier_prefetch_load, promote_narrow_accumulators,
     re_rope_key_in_place, recalculate_subchunk_blocks_to_skip, recognize_composite_activations,
-    recover_contiguous_or_dim0_padded_view, resolve_l1_memory_affinity, reuse_dead_loop_buffers,
-    seal_l2_kv_frame, select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
+    recover_contiguous_or_dim0_padded_view, relax_non_aliasing_mutable_chain_sequences,
+    resolve_l1_memory_affinity, reuse_dead_loop_buffers, seal_l2_kv_frame,
+    select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
     sink_split_through_reshape, sink_transpose_through_elementwise_and_broadcast,
     slice_block_ids_per_group, solve_lloyd_max_gaussian, stamp_fused_provenance,
     swim_reshape_through_slice, unfold_chunk_range, unique_blend_token_coverage,
@@ -4240,4 +4241,47 @@ fn test_salt_key_provider_and_l2_authenticated_kv_frame_codec() {
     let mut tampered = frame.clone();
     tampered[15] ^= 0x01;
     assert!(open_l2_kv_frame(&mut provider, "tenant-alpha", &tampered, plaintext.len()).is_none());
+}
+
+#[test]
+fn test_relax_non_aliasing_mutable_chain_sequences() {
+    // Three serialized mutable ops starting from `%c0`:
+    //   `%c1 = mo.mutable.store %c0, %x, %buf1`
+    //   `%c2 = mo.mutable.store %c1, %y, %buf2` (disjoint buffer -> relaxes to `%c0`)
+    //   `%c3 = mo.mutable.store %c2, %z, %buf1` (bypasses `%buf2` in `mo.chain.create`)
+    let mlir = concat!(
+        "module @relax_mutable_chains {\n",
+        "  func.func @main(%c0: tensor<1xi64>, %x: tensor<4xf32>, %y: tensor<4xf32>, ",
+        "%z: tensor<4xf32>, %buf1: tensor<4xf32>, %buf2: tensor<4xf32>) -> tensor<1xi64> {\n",
+        "    %c1 = mo.mutable.store %c0, %x, %buf1 ",
+        ": (tensor<1xi64>, tensor<4xf32>, tensor<4xf32>) -> tensor<1xi64>\n",
+        "    %c2 = mo.mutable.store %c1, %y, %buf2 ",
+        ": (tensor<1xi64>, tensor<4xf32>, tensor<4xf32>) -> tensor<1xi64>\n",
+        "    %c3 = mo.mutable.store %c2, %z, %buf1 ",
+        ": (tensor<1xi64>, tensor<4xf32>, tensor<4xf32>) -> tensor<1xi64>\n",
+        "    return %c3 : tensor<1xi64>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(mlir).expect("valid MLIR");
+    assert_eq!(relax_non_aliasing_mutable_chain_sequences(&mut m), 2);
+    let func_id = m.functions()[0];
+    let blk_id = m.regions[m.ops[func_id].regions[0]].blocks[0];
+    let c0_arg = m.blocks[blk_id].arguments[0];
+    let store_ops: Vec<_> = m.blocks[blk_id]
+        .ops
+        .iter()
+        .copied()
+        .filter(|&id| m.ops[id].is_op("mo", "mutable.store"))
+        .collect();
+    assert_eq!(store_ops.len(), 3);
+    // Both the first store (`%buf1`) and second store (`%buf2`) now take `%c0` directly!
+    assert_eq!(m.ops[store_ops[0]].operands[0], c0_arg);
+    assert_eq!(m.ops[store_ops[1]].operands[0], c0_arg);
+    // The third store (`%buf1`) depends directly on the first store's out_chain (`%c1`),
+    // bypassing the second store (`%buf2`)!
+    assert_eq!(
+        m.ops[store_ops[2]].operands[0],
+        m.ops[store_ops[0]].results[0]
+    );
 }
