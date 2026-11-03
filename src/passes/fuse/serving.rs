@@ -5312,3 +5312,179 @@ pub fn plan_dynamic_memory_pool(allocs: &[DynamicAllocRequest]) -> DynamicMemory
         fused_location: fuse_locations(&locs),
     }
 }
+
+fn stmt_has_non_pointwise_access(
+    stmt: &crate::ir::loops::LoopStmt,
+    buf_name: &str,
+    loop_var: &str,
+) -> bool {
+    use crate::ir::loops::LoopStmt;
+    let exact_ref = format!("{buf_name}[{loop_var}]");
+    match stmt {
+        LoopStmt::Comment(_) | LoopStmt::Alloc { .. } => false,
+        LoopStmt::Assign { dst, index, expr } => {
+            if dst == buf_name && index != loop_var {
+                return true;
+            }
+            let stripped_idx = index.replace(&exact_ref, "");
+            let stripped_expr = expr.replace(&exact_ref, "");
+            expr_contains_ident(&stripped_idx, buf_name)
+                || expr_contains_ident(&stripped_expr, buf_name)
+        }
+        LoopStmt::For { body, .. } => body
+            .iter()
+            .any(|s| stmt_has_non_pointwise_access(s, buf_name, loop_var)),
+    }
+}
+
+/// Merges adjacent parallel `LoopStmt::For` regions sharing identical `(lower, upper, step)`
+/// bounds when all shared producer-to-consumer buffer accesses are strictly pointwise at `[var]`,
+/// forwarding sole-use producer yields directly into the consumer body and dropping dead producer
+/// intermediate stores and allocations
+/// (inspired by Modular `GraphCompiler/lib/MODialect/Transforms/MergeAdjacentParallels.cpp`).
+///
+/// Returns the number of adjacent parallel loop pairs merged.
+pub fn merge_adjacent_parallel_loops(loop_module: &mut crate::ir::loops::LoopModule) -> usize {
+    use crate::ir::loops::LoopStmt;
+    let mut merged_count = 0usize;
+
+    for kernel in &mut loop_module.kernels {
+        loop {
+            let mut merged_pair: Option<(usize, LoopStmt, std::collections::HashSet<String>)> =
+                None;
+
+            for idx in 0..kernel.body.len().saturating_sub(1) {
+                let (
+                    LoopStmt::For {
+                        var: p_var,
+                        lower: p_lo,
+                        upper: p_hi,
+                        step: p_step,
+                        parallel: true,
+                        vectorized: p_vec,
+                        unroll: p_unroll,
+                        body: p_body,
+                    },
+                    LoopStmt::For {
+                        var: c_var,
+                        lower: c_lo,
+                        upper: c_hi,
+                        step: c_step,
+                        parallel: true,
+                        vectorized: c_vec,
+                        unroll: c_unroll,
+                        body: c_body,
+                    },
+                ) = (&kernel.body[idx], &kernel.body[idx + 1])
+                else {
+                    continue;
+                };
+
+                if p_lo != c_lo || p_hi != c_hi || p_step != c_step || p_var != c_var {
+                    continue;
+                }
+
+                // Collect buffers written pointwisely (`dst[var] = expr`) by the producer loop.
+                let mut prod_writes: IndexMap<String, String> = IndexMap::new();
+                let mut valid_prod = true;
+                for stmt in p_body {
+                    match stmt {
+                        LoopStmt::Assign { dst, index, expr } if index == p_var => {
+                            prod_writes.insert(dst.clone(), expr.clone());
+                        }
+                        LoopStmt::Comment(_) => {}
+                        _ => {
+                            valid_prod = false;
+                            break;
+                        }
+                    }
+                }
+                if !valid_prod || prod_writes.is_empty() {
+                    continue;
+                }
+
+                // Verify that the consumer loop has no non-pointwise (cross-iteration) access to
+                // any buffer written by the producer (`nonSharedInputDependsOnProducer`).
+                let has_cross_iter_hazard = prod_writes.keys().any(|buf| {
+                    c_body
+                        .iter()
+                        .any(|s| stmt_has_non_pointwise_access(s, buf, p_var))
+                });
+                if has_cross_iter_hazard {
+                    continue;
+                }
+
+                // Identify producer outputs used ONLY by `consumer` (not kernel output, and not
+                // referenced by any statement outside `idx` and `idx + 1`).
+                let mut dead_after_consumer: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for buf in prod_writes.keys() {
+                    if *buf == kernel.output.0 {
+                        continue;
+                    }
+                    let used_outside = kernel.body.iter().enumerate().any(|(k, s)| {
+                        k != idx
+                            && k != idx + 1
+                            && !matches!(s, LoopStmt::Alloc { .. })
+                            && stmt_references_buffer(s, buf)
+                    });
+                    if !used_outside {
+                        dead_after_consumer.insert(buf.clone());
+                    }
+                }
+
+                let mut combined_body = Vec::with_capacity(p_body.len() + c_body.len());
+                for stmt in p_body {
+                    if let LoopStmt::Assign { dst, .. } = stmt
+                        && dead_after_consumer.contains(dst)
+                    {
+                        continue;
+                    }
+                    combined_body.push(stmt.clone());
+                }
+
+                for stmt in c_body {
+                    let mut cloned = stmt.clone();
+                    if let LoopStmt::Assign { ref mut expr, .. } = cloned {
+                        for buf in &dead_after_consumer {
+                            if let Some(prod_expr) = prod_writes.get(buf) {
+                                let target = format!("{buf}[{p_var}]");
+                                let replacement = format!("({prod_expr})");
+                                *expr = expr.replace(&target, &replacement);
+                            }
+                        }
+                    }
+                    combined_body.push(cloned);
+                }
+
+                let merged_for = LoopStmt::For {
+                    var: p_var.clone(),
+                    lower: *p_lo,
+                    upper: *p_hi,
+                    step: *p_step,
+                    parallel: true,
+                    vectorized: *p_vec && *c_vec,
+                    unroll: (*p_unroll).max(*c_unroll),
+                    body: combined_body,
+                };
+                merged_pair = Some((idx, merged_for, dead_after_consumer));
+                break;
+            }
+
+            if let Some((idx, merged_for, dead_bufs)) = merged_pair {
+                kernel.body[idx] = merged_for;
+                kernel.body.remove(idx + 1);
+                if !dead_bufs.is_empty() {
+                    kernel.body.retain(
+                        |s| !matches!(s, LoopStmt::Alloc { name, .. } if dead_bufs.contains(name)),
+                    );
+                }
+                merged_count += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    merged_count
+}

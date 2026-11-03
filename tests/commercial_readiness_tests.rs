@@ -31,12 +31,12 @@ use castforge::passes::{
     hash_prefix_token_blocks, hoist_exec_invariant_ops, hoist_symbolic_dim_expressions,
     is_supported_arch_dtype, legalize_rowwise_reduction_launch, longest_full_attention_hit,
     longest_joint_prefix_hit, longest_sliding_window_hit, mark_cuda_graph_stable_tensors,
-    merge_duplicate_shape_ops, merge_identical_functions, num_packed_tokens, pack_token_ids_be,
-    plan_cacheblend_retrieve, plan_concat_in_place, plan_dynamic_memory_pool,
-    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
-    promote_narrow_accumulators, re_rope_key_in_place, recalculate_subchunk_blocks_to_skip,
-    reuse_dead_loop_buffers, stamp_fused_provenance, unfold_chunk_range, unpack_token_ids_be,
-    validate_target_device_dtypes,
+    merge_adjacent_parallel_loops, merge_duplicate_shape_ops, merge_identical_functions,
+    num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve, plan_concat_in_place,
+    plan_dynamic_memory_pool, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
+    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
+    recalculate_subchunk_blocks_to_skip, reuse_dead_loop_buffers, stamp_fused_provenance,
+    unfold_chunk_range, unpack_token_ids_be, validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -2101,4 +2101,107 @@ fn test_dynamic_memory_pool_lcm_alignment_can_share_and_bulk_slice() {
         plan.fused_location,
         Location::Named("loc_a+loc_b+loc_late".to_string())
     );
+}
+
+#[test]
+fn test_merge_adjacent_parallel_loops_forwards_yield_and_rejects_cross_iter_hazard() {
+    use castforge::ir::loops::{LoopKernel, LoopModule, LoopStmt};
+
+    // Kernel 0: Producer writes `tmp[i] = x[i] + 1.0`, consumer reads `tmp[i] * 2.0` -> merged!
+    // `tmp` is used only by the consumer -> `tmp`'s `Alloc` and store are dropped!
+    // Kernel 1: Consumer reads `tmp[i + 1]` (cross-iteration stencil hazard) -> NOT merged!
+    let mut loop_mod = LoopModule {
+        name: "merge_parallels".to_string(),
+        kernels: vec![
+            LoopKernel {
+                name: "pointwise_ok".to_string(),
+                params: vec![("x".to_string(), 16)],
+                output: ("out".to_string(), 16),
+                body: vec![
+                    LoopStmt::Alloc {
+                        name: "tmp".to_string(),
+                        len: 16,
+                    },
+                    LoopStmt::For {
+                        var: "i".to_string(),
+                        lower: 0,
+                        upper: 16,
+                        step: 1,
+                        parallel: true,
+                        vectorized: true,
+                        unroll: 4,
+                        body: vec![LoopStmt::Assign {
+                            dst: "tmp".to_string(),
+                            index: "i".to_string(),
+                            expr: "x[i] + 1.0".to_string(),
+                        }],
+                    },
+                    LoopStmt::For {
+                        var: "i".to_string(),
+                        lower: 0,
+                        upper: 16,
+                        step: 1,
+                        parallel: true,
+                        vectorized: true,
+                        unroll: 4,
+                        body: vec![LoopStmt::Assign {
+                            dst: "out".to_string(),
+                            index: "i".to_string(),
+                            expr: "tmp[i] * 2.0".to_string(),
+                        }],
+                    },
+                ],
+            },
+            LoopKernel {
+                name: "cross_iter_hazard".to_string(),
+                params: vec![("x".to_string(), 16)],
+                output: ("out".to_string(), 16),
+                body: vec![
+                    LoopStmt::Alloc {
+                        name: "tmp".to_string(),
+                        len: 16,
+                    },
+                    LoopStmt::For {
+                        var: "i".to_string(),
+                        lower: 0,
+                        upper: 16,
+                        step: 1,
+                        parallel: true,
+                        vectorized: true,
+                        unroll: 1,
+                        body: vec![LoopStmt::Assign {
+                            dst: "tmp".to_string(),
+                            index: "i".to_string(),
+                            expr: "x[i] + 1.0".to_string(),
+                        }],
+                    },
+                    LoopStmt::For {
+                        var: "i".to_string(),
+                        lower: 0,
+                        upper: 16,
+                        step: 1,
+                        parallel: true,
+                        vectorized: false,
+                        unroll: 1,
+                        body: vec![LoopStmt::Assign {
+                            dst: "out".to_string(),
+                            index: "i".to_string(),
+                            expr: "tmp[i + 1] * 2.0".to_string(),
+                        }],
+                    },
+                ],
+            },
+        ],
+    };
+
+    let merged = merge_adjacent_parallel_loops(&mut loop_mod);
+    assert_eq!(merged, 1);
+
+    // Kernel 0 now has a single `For` loop (and `alloc tmp` was eliminated!)
+    assert_eq!(loop_mod.kernels[0].body.len(), 1);
+    let printed_k0 = format!("{}", loop_mod);
+    assert!(printed_k0.contains("out[i] = (x[i] + 1.0) * 2.0"));
+
+    // Kernel 1 (cross-iteration hazard `tmp[i + 1]`) remains unmerged (Alloc + 2 For loops)
+    assert_eq!(loop_mod.kernels[1].body.len(), 3);
 }
