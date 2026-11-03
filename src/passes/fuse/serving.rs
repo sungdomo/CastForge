@@ -24087,3 +24087,395 @@ pub fn rewrite_opaque_types(
 
     Ok(rewritten)
 }
+
+fn strip_dim_name_in_type(ty: &mut Type) -> bool {
+    if let Type::Opaque(raw) = ty {
+        for (prefix, bare) in [
+            ("!mogg.dim<", "!mogg.dim"),
+            ("!castforge.dim<", "!castforge.dim"),
+        ] {
+            if raw.starts_with(prefix) && raw.ends_with('>') {
+                *raw = bare.to_string();
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Drops the parameter-reference name from every `!mogg.dim<name>` or `!castforge.dim<name>`
+/// block argument of top-level functions and updates their `"function_type"` attributes
+/// accordingly. Returns the number of functions whose signatures were updated.
+pub fn anonymize_dim_names(module: &mut Module) -> usize {
+    let mut updated_funcs = 0usize;
+    let func_ids = module.functions();
+
+    for func_id in func_ids {
+        if module.ops[func_id].regions.is_empty() {
+            continue;
+        }
+        let reg_id = module.ops[func_id].regions[0];
+        if module.regions[reg_id].blocks.is_empty() {
+            continue;
+        }
+        let blk_id = module.regions[reg_id].blocks[0];
+        let args = module.blocks[blk_id].arguments.clone();
+        let mut changed = false;
+        let mut new_arg_types: Vec<Type> = Vec::with_capacity(args.len());
+
+        for arg_v in args {
+            if strip_dim_name_in_type(&mut module.values[arg_v].ty) {
+                changed = true;
+            }
+            new_arg_types.push(module.values[arg_v].ty.clone());
+        }
+
+        if !changed {
+            continue;
+        }
+
+        if let Some(Attribute::Type(Type::Function { inputs, .. })) =
+            module.ops[func_id].attributes.get_mut("function_type")
+        {
+            *inputs = new_arg_types;
+        }
+        updated_funcs += 1;
+    }
+
+    updated_funcs
+}
+
+/// Renames all top-level symbols in `module` sequentially to `__S0`, `__S1`, ..., rewrites all
+/// `Attribute::SymbolRef` references across the module to match, and normalizes scoped
+/// parameter declarations (`input_parameters` arrays and `kgen.param.declare` /
+/// `castforge.param.declare` ops) to `__P0`, `__P1`, ... within each top-level operation.
+pub fn normalize_all_names(module: &mut Module) -> Result<usize, String> {
+    use std::collections::HashMap;
+
+    let Some(root_reg) = module.regions.get(module.root_region) else {
+        return Ok(0);
+    };
+    let Some(&root_blk) = root_reg.blocks.first() else {
+        return Ok(0);
+    };
+    let top_ops = module.blocks[root_blk].ops.clone();
+
+    let mut sym_map: HashMap<String, String> = HashMap::new();
+    let mut sym_idx = 0usize;
+
+    for &op_id in &top_ops {
+        if let Some(old_name) = module.ops[op_id]
+            .attributes
+            .get("sym_name")
+            .and_then(|a| a.as_str())
+            .map(str::to_string)
+        {
+            let new_name = format!("__S{sym_idx}");
+            sym_idx += 1;
+            module.ops[op_id]
+                .attributes
+                .insert("sym_name".to_string(), Attribute::String(new_name.clone()));
+            sym_map.insert(old_name, new_name);
+        }
+    }
+
+    // Scoped parameter uniquing within each top-level operation.
+    for &top_id in &top_ops {
+        let mut param_counter = 0usize;
+        let mut param_map: HashMap<String, String> = HashMap::new();
+
+        if let Some(Attribute::Array(arr)) = module.ops[top_id].attributes.get("input_parameters") {
+            let old_params: Vec<String> = arr
+                .iter()
+                .filter_map(|a| a.as_str().map(str::to_string))
+                .collect();
+            let mut new_arr: Vec<Attribute> = Vec::with_capacity(old_params.len());
+            for old_p in old_params {
+                if param_map.contains_key(&old_p) {
+                    return Err(format!("Shadowing of parameter name '{old_p}' detected"));
+                }
+                let new_p = format!("__P{param_counter}");
+                param_counter += 1;
+                param_map.insert(old_p, new_p.clone());
+                new_arr.push(Attribute::String(new_p));
+            }
+            module.ops[top_id]
+                .attributes
+                .insert("input_parameters".to_string(), Attribute::Array(new_arr));
+        }
+
+        let regions = module.ops[top_id].regions.clone();
+        for reg_id in regions {
+            let blocks = module.regions[reg_id].blocks.clone();
+            for blk_id in blocks {
+                let mut block_scope = param_map.clone();
+                let ops = module.blocks[blk_id].ops.clone();
+                for &oid in &ops {
+                    let full = module.ops[oid].name.full_name();
+                    if (full == "kgen.param.declare" || full == "castforge.param.declare")
+                        && let Some(old_p) = module.ops[oid]
+                            .attributes
+                            .get("param_name")
+                            .and_then(|a| a.as_str())
+                            .map(str::to_string)
+                    {
+                        if block_scope.contains_key(&old_p) {
+                            return Err(format!("Shadowing of parameter name '{old_p}' detected"));
+                        }
+                        let new_p = format!("__P{param_counter}");
+                        param_counter += 1;
+                        block_scope.insert(old_p, new_p.clone());
+                        module.ops[oid]
+                            .attributes
+                            .insert("param_name".to_string(), Attribute::String(new_p));
+                    }
+                }
+                for &oid in &ops {
+                    if let Some(old_ref) = module.ops[oid]
+                        .attributes
+                        .get("param_ref")
+                        .and_then(|a| a.as_str())
+                        .map(str::to_string)
+                        && let Some(new_ref) = block_scope.get(&old_ref)
+                    {
+                        module.ops[oid]
+                            .attributes
+                            .insert("param_ref".to_string(), Attribute::String(new_ref.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Rewrite all SymbolRef attributes across the module.
+    let all_ops: Vec<OpId> = module.ops.keys().collect();
+    for oid in all_ops {
+        let keys: Vec<String> = module.ops[oid].attributes.keys().cloned().collect();
+        for k in keys {
+            if let Some(Attribute::SymbolRef(s)) = module.ops[oid].attributes.get_mut(&k) {
+                let bare = s.trim_start_matches('@');
+                if let Some(mapped) = sym_map.get(bare) {
+                    *s = mapped.clone();
+                }
+            }
+        }
+    }
+
+    Ok(sym_idx)
+}
+
+/// Computes call-graph-aware 64-bit semantic hashes (16-char lowercase hex) for every top-level
+/// function in `module` and stamps `"semantic_hash"` onto each function's attributes:
+/// - A function's generator hash combines its signature, discardable attributes (excluding
+///   `"sym_name"`, `"source_name"`, `"linkage_name"`, and `"semantic_hash"`), and its body's
+///   structural hash while masking out direct symbol names of external callees.
+/// - Incorporates the resolved `"semantic_hash"` of every called function in call order so two
+///   callers are semantically equivalent if and only if both their bodies and their callees'
+///   semantic hashes match.
+pub fn hash_module_contents(module: &mut Module) -> usize {
+    use std::collections::HashMap;
+
+    let func_ids = module.functions();
+    if func_ids.is_empty() {
+        return 0;
+    }
+
+    let mut sym_to_func: HashMap<String, OpId> = HashMap::new();
+    let mut gen_hashes: HashMap<String, u64> = HashMap::new();
+    let mut call_edges: HashMap<String, Vec<String>> = HashMap::new();
+
+    for &fn_id in &func_ids {
+        let Some(sym) = module.ops[fn_id]
+            .attributes
+            .get("sym_name")
+            .and_then(|a| a.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        sym_to_func.insert(sym.clone(), fn_id);
+
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let fn_mix = |acc: &mut u64, bytes: &[u8]| {
+            for &b in bytes {
+                *acc ^= u64::from(b);
+                *acc = acc.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+
+        let mut attr_parts: Vec<String> = Vec::new();
+        for (k, v) in &module.ops[fn_id].attributes {
+            if matches!(
+                k.as_str(),
+                "sym_name" | "source_name" | "linkage_name" | "semantic_hash"
+            ) {
+                continue;
+            }
+            attr_parts.push(format!("{k}={v}"));
+        }
+        attr_parts.sort();
+        for part in &attr_parts {
+            fn_mix(&mut h, part.as_bytes());
+        }
+
+        let mut callees: Vec<String> = Vec::new();
+        if let Some(&reg_id) = module.ops[fn_id].regions.first() {
+            for &blk_id in &module.regions[reg_id].blocks {
+                for &oid in &module.blocks[blk_id].ops {
+                    fn_mix(&mut h, module.ops[oid].name.full_name().as_bytes());
+                    for (ak, av) in &module.ops[oid].attributes {
+                        if let Attribute::SymbolRef(target) = av {
+                            let bare = target.trim_start_matches('@').to_string();
+                            callees.push(bare);
+                            fn_mix(&mut h, ak.as_bytes());
+                        } else {
+                            fn_mix(&mut h, format!("{ak}={av}").as_bytes());
+                        }
+                    }
+                }
+            }
+        }
+
+        gen_hashes.insert(sym.clone(), h);
+        call_edges.insert(sym, callees);
+    }
+
+    // Iteratively propagate callee hashes (handles both DAGs and SCCs deterministically).
+    let mut total_hashes: HashMap<String, u64> = gen_hashes.clone();
+    for _ in 0..func_ids.len().max(1) {
+        let prev = total_hashes.clone();
+        for (sym, &base_h) in &gen_hashes {
+            let mut h = base_h;
+            if let Some(callees) = call_edges.get(sym) {
+                for c in callees {
+                    let ch = prev.get(c).copied().unwrap_or(0);
+                    for &b in &ch.to_le_bytes() {
+                        h ^= u64::from(b);
+                        h = h.wrapping_mul(0x0100_0000_01b3);
+                    }
+                }
+            }
+            total_hashes.insert(sym.clone(), h);
+        }
+    }
+
+    let mut stamped = 0usize;
+    for (sym, fn_id) in sym_to_func {
+        if let Some(&h) = total_hashes.get(&sym) {
+            module.ops[fn_id].attributes.insert(
+                "semantic_hash".to_string(),
+                Attribute::String(format!("{h:016x}")),
+            );
+            stamped += 1;
+        }
+    }
+    stamped
+}
+
+/// Applies semantic hash-based naming (`<name_prefix><semantic_hash>`) to `symbols_to_rename`,
+/// deduplicating any functions that share an identical `"semantic_hash"`, erasing their
+/// `"source_name"` and `"linkage_name"` attributes, and rewriting all `SymbolRef` references across
+/// `module`. Returns the map from original symbol name to final canonical symbol name.
+pub fn apply_semantic_naming(
+    module: &mut Module,
+    symbols_to_rename: &[String],
+    name_prefix: &str,
+) -> Result<IndexMap<String, String>, String> {
+    use std::collections::{HashMap, HashSet};
+
+    if symbols_to_rename.is_empty() {
+        return Ok(IndexMap::new());
+    }
+
+    // Index functions by `sym_name` and `linkage_name`.
+    let mut name_to_fn: HashMap<String, OpId> = HashMap::new();
+    for fn_id in module.functions() {
+        if let Some(s) = module.ops[fn_id]
+            .attributes
+            .get("sym_name")
+            .and_then(|a| a.as_str())
+        {
+            name_to_fn.insert(s.to_string(), fn_id);
+        }
+        if let Some(ln) = module.ops[fn_id]
+            .attributes
+            .get("linkage_name")
+            .and_then(|a| a.as_str())
+        {
+            name_to_fn.insert(ln.to_string(), fn_id);
+        }
+    }
+
+    for sym in symbols_to_rename {
+        let &fn_id = name_to_fn
+            .get(sym)
+            .ok_or_else(|| format!("symbol '{sym}' not found in module"))?;
+        module.ops[fn_id].attributes.shift_remove("source_name");
+    }
+
+    hash_module_contents(module);
+
+    let mut visited_hash_to_sym: HashMap<String, String> = HashMap::new();
+    let mut old_sym_to_new_sym: HashMap<String, String> = HashMap::new();
+    let mut result_map: IndexMap<String, String> = IndexMap::new();
+    let mut dead_fns: HashSet<OpId> = HashSet::new();
+
+    for sym in symbols_to_rename {
+        let fn_id = name_to_fn[sym];
+        let hash = module.ops[fn_id]
+            .attributes
+            .get("semantic_hash")
+            .and_then(|a| a.as_str())
+            .ok_or_else(|| "module has not had semantic hashes computed".to_string())?
+            .to_string();
+        let old_sym = module.ops[fn_id]
+            .attributes
+            .get("sym_name")
+            .and_then(|a| a.as_str())
+            .unwrap_or(sym)
+            .to_string();
+
+        if let Some(existing_sym) = visited_hash_to_sym.get(&hash) {
+            old_sym_to_new_sym.insert(old_sym, existing_sym.clone());
+            result_map.insert(sym.clone(), existing_sym.clone());
+            dead_fns.insert(fn_id);
+        } else {
+            let new_sym = format!("{name_prefix}{hash}");
+            old_sym_to_new_sym.insert(old_sym, new_sym.clone());
+            result_map.insert(sym.clone(), new_sym.clone());
+            module.ops[fn_id]
+                .attributes
+                .insert("sym_name".to_string(), Attribute::String(new_sym.clone()));
+            module.ops[fn_id].attributes.shift_remove("linkage_name");
+            visited_hash_to_sym.insert(hash, new_sym);
+        }
+    }
+
+    let all_ops: Vec<OpId> = module.ops.keys().collect();
+    for oid in all_ops {
+        let keys: Vec<String> = module.ops[oid].attributes.keys().cloned().collect();
+        for k in keys {
+            if let Some(Attribute::SymbolRef(s)) = module.ops[oid].attributes.get_mut(&k) {
+                let bare = s.trim_start_matches('@');
+                if let Some(mapped) = old_sym_to_new_sym.get(bare) {
+                    *s = mapped.clone();
+                }
+            }
+        }
+    }
+
+    if !dead_fns.is_empty() {
+        if let Some(root_reg) = module.regions.get(module.root_region)
+            && let Some(&root_blk) = root_reg.blocks.first()
+        {
+            module.blocks[root_blk]
+                .ops
+                .retain(|id| !dead_fns.contains(id));
+        }
+        for dead_id in dead_fns {
+            module.ops.remove(dead_id);
+        }
+    }
+
+    Ok(result_map)
+}

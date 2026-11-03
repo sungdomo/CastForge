@@ -7370,3 +7370,89 @@ fn test_wrap_funcs_with_trace_and_rewrite_opaque_types() {
     m.values[arg_val].ty = Type::Opaque("!mo.opaque<\"MyKernelStruct\">".to_string());
     assert!(rewrite_opaque_types(&mut m, &mapping).is_err());
 }
+
+#[test]
+fn test_anonymize_dim_names_normalize_all_names_and_semantic_hashing() {
+    use castforge::ir::{Attribute, Type};
+    use castforge::passes::{
+        anonymize_dim_names, apply_semantic_naming, hash_module_contents, normalize_all_names,
+    };
+
+    let mlir_src = concat!(
+        "module {\n",
+        "  func.func @helper_one(%d: tensor<1xi64>) -> tensor<1xi64> {\n",
+        "    %p = \"castforge.param.declare\"(%d)",
+        " {param_name = \"BLOCK_M\", param_ref = \"BLOCK_M\"}",
+        " : (tensor<1xi64>) -> tensor<1xi64>\n",
+        "    return %p : tensor<1xi64>\n",
+        "  }\n",
+        "  func.func @helper_two(%d: tensor<1xi64>) -> tensor<1xi64> {\n",
+        "    %p = \"castforge.param.declare\"(%d)",
+        " {param_name = \"TILE_M\", param_ref = \"TILE_M\"}",
+        " : (tensor<1xi64>) -> tensor<1xi64>\n",
+        "    return %p : tensor<1xi64>\n",
+        "  }\n",
+        "  func.func @entry_fn(%d: tensor<1xi64>) -> tensor<1xi64> {\n",
+        "    %0 = \"castforge.call\"(%d) {callee = @helper_two}",
+        " : (tensor<1xi64>) -> tensor<1xi64>\n",
+        "    return %0 : tensor<1xi64>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(mlir_src).expect("valid mlir");
+    let funcs = m.functions();
+    let f1 = funcs[0];
+    let f2 = funcs[1];
+    let f_entry = funcs[2];
+
+    // Give f1 and f2 named dimension types (`!mogg.dim<batch_a>` vs `!mogg.dim<batch_b>`):
+    let arg1 = m.blocks[m.regions[m.ops[f1].regions[0]].blocks[0]].arguments[0];
+    let arg2 = m.blocks[m.regions[m.ops[f2].regions[0]].blocks[0]].arguments[0];
+    m.values[arg1].ty = Type::Opaque("!mogg.dim<batch_a>".to_string());
+    m.values[arg2].ty = Type::Opaque("!mogg.dim<batch_b>".to_string());
+
+    let anon_count = anonymize_dim_names(&mut m);
+    assert_eq!(anon_count, 2);
+    assert_eq!(m.values[arg1].ty, Type::Opaque("!mogg.dim".to_string()));
+    assert_eq!(m.values[arg2].ty, Type::Opaque("!mogg.dim".to_string()));
+
+    let norm_count = normalize_all_names(&mut m).expect("normalize succeeds");
+    assert_eq!(norm_count, 3);
+
+    // After `normalize_all_names`, symbols are `__S0`, `__S1`, `__S2`, and both helper bodies
+    // have `param_name = "__P0"` and `param_ref = "__P0"`, so their semantic hashes match:
+    let hashed = hash_module_contents(&mut m);
+    assert_eq!(hashed, 3);
+    let h0 = m.ops[f1]
+        .attributes
+        .get("semantic_hash")
+        .and_then(Attribute::as_str)
+        .expect("h0")
+        .to_string();
+    let h1 = m.ops[f2]
+        .attributes
+        .get("semantic_hash")
+        .and_then(Attribute::as_str)
+        .expect("h1")
+        .to_string();
+    assert_eq!(h0, h1);
+
+    // `apply_semantic_naming` on `["__S0", "__S1"]` deduplicates `__S1` into `kern_<h0>` and
+    // rewrites `@entry_fn`'s call target to `kern_<h0>`:
+    let renamed = apply_semantic_naming(&mut m, &["__S0".to_string(), "__S1".to_string()], "kern_")
+        .expect("semantic naming succeeds");
+    let expected_name = format!("kern_{h0}");
+    assert_eq!(renamed.get("__S0"), Some(&expected_name));
+    assert_eq!(renamed.get("__S1"), Some(&expected_name));
+    assert_eq!(m.functions().len(), 2);
+
+    let entry_blk = m.regions[m.ops[f_entry].regions[0]].blocks[0];
+    let call_op = m.blocks[entry_blk].ops[0];
+    assert_eq!(
+        m.ops[call_op]
+            .attributes
+            .get("callee")
+            .and_then(Attribute::as_str),
+        Some(expected_name.as_str())
+    );
+}
