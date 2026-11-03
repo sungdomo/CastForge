@@ -18,10 +18,11 @@ use castforge::passes::{
     EngineKvFormat, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode,
     KvPageSpec, KvScaleScope, PassManager, PassRegistry, analyze_kv_layer_groups,
     anonymize_symbolic_dims, compress_splat_constants, direct_copy_format_supported,
-    fuse_locations, fuse_sole_use_prologues, hash_prefix_token_blocks, longest_full_attention_hit,
-    longest_joint_prefix_hit, longest_sliding_window_hit, mark_cuda_graph_stable_tensors,
-    merge_identical_functions, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
-    plan_kv_dma_transfer, re_rope_key_in_place, stamp_fused_provenance,
+    fuse_locations, fuse_reshape_epilogue, fuse_sole_use_prologues, hash_prefix_token_blocks,
+    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
+    mark_cuda_graph_stable_tensors, merge_identical_functions, plan_jenga_kv_geometry,
+    plan_kernel_sequence_fusion, plan_kv_dma_transfer, re_rope_key_in_place,
+    stamp_fused_provenance,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -1032,4 +1033,39 @@ module @dedup_funcs {
     assert!(!printed.contains("func.func @layer_b("));
     assert_eq!(printed.matches("func.call @layer_a(").count(), 2);
     assert!(printed.contains("src_layer_a+src_layer_b"));
+}
+
+#[test]
+fn test_reshape_epilogue_fusion_into_matmul_bias_tanh() {
+    let mlir = concat!(
+        "module @reshape_epilogue {\n",
+        "  func.func @main(%x: tensor<4x4xf32>, %w: tensor<4x4xf32>, ",
+        "%b: tensor<4x4xf32>) -> tensor<2x2x4xf32> {\n",
+        "    %dot = stablehlo.dot_general %x, %w ",
+        ": (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xf32>\n",
+        "    %r0 = stablehlo.reshape %dot : (tensor<4x4xf32>) -> tensor<2x2x4xf32>\n",
+        "    %rb = stablehlo.reshape %b : (tensor<4x4xf32>) -> tensor<2x2x4xf32>\n",
+        "    %add = stablehlo.add %r0, %rb : tensor<2x2x4xf32>\n",
+        "    %act = stablehlo.tanh %add : tensor<2x2x4xf32>\n",
+        "    func.return %act : tensor<2x2x4xf32>\n",
+        "  }\n",
+        "}\n",
+    );
+    let mut module = parse_mlir(mlir).unwrap();
+    let x = vec![0.25f32; 16];
+    let w = vec![0.5f32; 16];
+    let b = vec![0.1f32; 16];
+    let out_before = evaluate_module(&module, &[x.clone(), w.clone(), b.clone()]).unwrap();
+
+    // Commute `reshape` past `add` and `tanh` and fuse into `castforge.fused_matmul_epilogue`
+    let commuted = fuse_reshape_epilogue(&mut module);
+    assert_eq!(commuted, 2);
+
+    let printed = castforge::ir::print_mlir(&module);
+    assert!(printed.contains("castforge.fused_matmul_epilogue"));
+    assert!(printed.contains("epilogue = \"bias_tanh\""));
+    assert_eq!(printed.matches("stablehlo.reshape").count(), 1);
+
+    let out_after = evaluate_module(&module, &[x, w, b]).unwrap();
+    assert_eq!(out_before, out_after);
 }

@@ -2112,3 +2112,151 @@ pub fn merge_identical_functions(module: &mut Module) -> usize {
     }
     merged_count
 }
+
+/// Fuses elementwise epilogue consumers across an intervening `stablehlo.reshape` into a
+/// preceding `dot_general` or `fused_matmul_epilogue` (inspired by Modular
+/// `ReshapeEpilogueFuser.cpp`).
+///
+/// Moves the bijective `reshape` past sole-use unary (`tanh`, `abs`, `negate`, `exponential`,
+/// `log`, `logistic`, `sqrt`, `rsqrt`) or binary (`add`, `multiply`, `maximum`) elementwise
+/// operations and invokes [`crate::passes::FuseMatmulEpiloguePass`] so `matmul -> reshape ->
+/// bias -> activation` collapses into `fused_matmul_epilogue -> reshape`.
+///
+/// Returns the number of reshape-epilogue commutations performed.
+pub fn fuse_reshape_epilogue(module: &mut Module) -> usize {
+    let mut total_commuted = 0usize;
+
+    for fn_op_id in module.functions() {
+        let Some(&reg_id) = module.ops[fn_op_id].regions.first() else {
+            continue;
+        };
+        let Some(&block_id) = module.regions[reg_id].blocks.first() else {
+            continue;
+        };
+
+        loop {
+            let mut commuted_in_iter = false;
+            let ops = module.blocks[block_id].ops.clone();
+
+            for &cons_id in &ops {
+                let Some(cons_op) = module.ops.get(cons_id).cloned() else {
+                    continue;
+                };
+                if cons_op.name.dialect != "stablehlo" || cons_op.results.len() != 1 {
+                    continue;
+                }
+                let op_short = cons_op.name.name.as_str();
+                let is_unary = cons_op.operands.len() == 1
+                    && matches!(
+                        op_short,
+                        "tanh"
+                            | "abs"
+                            | "negate"
+                            | "exponential"
+                            | "log"
+                            | "logistic"
+                            | "sqrt"
+                            | "rsqrt"
+                    );
+                let is_binary = cons_op.operands.len() == 2
+                    && matches!(op_short, "add" | "multiply" | "maximum");
+                if !is_unary && !is_binary {
+                    continue;
+                }
+
+                // Check if operand 0 is a sole-use `stablehlo.reshape` fed by GEMM/epilogue/add
+                let r_val = cons_op.operands[0];
+                if module.use_count(r_val) != 1 {
+                    continue;
+                }
+                let ValueDef::OpResult { op: resh_id, .. } = module.values[r_val].def else {
+                    continue;
+                };
+                let Some(resh_op) = module.ops.get(resh_id).cloned() else {
+                    continue;
+                };
+                if !resh_op.is_op("stablehlo", "reshape") || resh_op.operands.len() != 1 {
+                    continue;
+                }
+                let src_val = resh_op.operands[0];
+                let src_ty = module.values[src_val].ty.clone();
+                let ValueDef::OpResult { op: prod_id, .. } = module.values[src_val].def else {
+                    continue;
+                };
+                let Some(prod_op) = module.ops.get(prod_id) else {
+                    continue;
+                };
+                let prod_eligible = prod_op.is_op("stablehlo", "dot_general")
+                    || prod_op.is_op("stablehlo", "add")
+                    || prod_op.is_op("stablehlo", "composite");
+                if !prod_eligible {
+                    continue;
+                }
+
+                // For binary ops, resolve operand 1 in pre-reshape `src_ty` space
+                let mut new_operands: SmallVec<[ValueId; 4]> = smallvec::smallvec![src_val];
+                let mut dead_other_resh: Option<OpId> = None;
+                if is_binary {
+                    let other_val = cons_op.operands[1];
+                    let ValueDef::OpResult { op: other_def, .. } = module.values[other_val].def
+                    else {
+                        continue;
+                    };
+                    let Some(other_op) = module.ops.get(other_def).cloned() else {
+                        continue;
+                    };
+                    if other_op.is_op("stablehlo", "reshape")
+                        && other_op.operands.len() == 1
+                        && module.values[other_op.operands[0]].ty == src_ty
+                    {
+                        new_operands.push(other_op.operands[0]);
+                        if module.use_count(other_val) == 1 {
+                            dead_other_resh = Some(other_def);
+                        }
+                    } else if other_op.is_op("stablehlo", "constant")
+                        && module.use_count(other_val) == 1
+                    {
+                        // Retype sole-use splat/dense constant to `src_ty`
+                        module.values[other_val].ty = src_ty.clone();
+                        new_operands.push(other_val);
+                    } else {
+                        continue;
+                    }
+                }
+
+                // Commute in-place:
+                // - `resh_id` becomes the elementwise op (`cons_op.name`) on `src_ty` -> `r_val`
+                // - `cons_id` becomes `stablehlo.reshape` on `[r_val]` -> `cons_op.results[0]`
+                module.values[r_val].ty = src_ty;
+                let merged_locs = [resh_op.location.clone(), cons_op.location.clone()];
+                if let Some(elem_mut) = module.ops.get_mut(resh_id) {
+                    elem_mut.name = cons_op.name.clone();
+                    elem_mut.operands = new_operands;
+                    elem_mut.attributes = cons_op.attributes.clone();
+                    stamp_fused_provenance(elem_mut, &merged_locs);
+                }
+                if let Some(resh_mut) = module.ops.get_mut(cons_id) {
+                    resh_mut.name = OpName::new("stablehlo", "reshape");
+                    resh_mut.operands = smallvec::smallvec![r_val];
+                    resh_mut.attributes = resh_op.attributes.clone();
+                    stamp_fused_provenance(resh_mut, &merged_locs);
+                }
+                if let Some(dead_id) = dead_other_resh {
+                    module.remove_op(block_id, dead_id);
+                }
+                total_commuted += 1;
+                commuted_in_iter = true;
+                break;
+            }
+
+            if !commuted_in_iter {
+                break;
+            }
+        }
+    }
+
+    if total_commuted > 0 {
+        let _ = crate::passes::FuseMatmulEpiloguePass.run(module);
+    }
+    total_commuted
+}
