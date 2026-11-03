@@ -10327,3 +10327,257 @@ pub fn plan_device_graph_collective_partition(
     flush_capture(&mut stages, &mut current_capture);
     Some(stages)
 }
+
+/// Compression presets for the TurboQuant KV-cache serializer/deserializer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurboQuantPreset {
+    /// 8-bit FP8 keys, 4-bit quantized values, without norm correction (`turboquant_k8v4`).
+    K8V4,
+    /// 4-bit MSE-centroid keys and 4-bit values with norm correction (`turboquant_4bit_nc`).
+    FourBitNc,
+    /// 3-bit MSE-centroid keys and 4-bit values with norm correction (`turboquant_k3v4_nc`).
+    K3V4Nc,
+    /// 3-bit MSE-centroid keys and 3-bit values with norm correction (`turboquant_3bit_nc`).
+    ThreeBitNc,
+}
+
+impl TurboQuantPreset {
+    /// Parses a preset name string (`turboquant_k8v4`, `turboquant_4bit_nc`,
+    /// `turboquant_k3v4_nc`, `turboquant_3bit_nc`).
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "turboquant_k8v4" => Some(Self::K8V4),
+            "turboquant_4bit_nc" => Some(Self::FourBitNc),
+            "turboquant_k3v4_nc" => Some(Self::K3V4Nc),
+            "turboquant_3bit_nc" => Some(Self::ThreeBitNc),
+            _ => None,
+        }
+    }
+
+    /// Returns `(key_quant_bits, value_quant_bits, norm_correction)` for this preset.
+    pub fn params(self) -> (usize, usize, bool) {
+        match self {
+            Self::K8V4 => (8, 4, false),
+            Self::FourBitNc => (4, 4, true),
+            Self::K3V4Nc => (3, 4, true),
+            Self::ThreeBitNc => (3, 3, true),
+        }
+    }
+}
+
+/// Configuration and slot-geometry planner for TurboQuant KV-cache compression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurboQuantSerdeConfig {
+    /// Compression bit-width preset.
+    pub preset: TurboQuantPreset,
+    /// Per-head hidden dimension (must be a positive power of two for WHT rotation).
+    pub head_dim: usize,
+    /// Token block size used by the compressed layout.
+    pub block_size: usize,
+    /// Number of leading transformer layers stored uncompressed.
+    pub skip_first_layers: usize,
+    /// Number of trailing transformer layers stored uncompressed.
+    pub skip_last_layers: usize,
+}
+
+impl TurboQuantSerdeConfig {
+    /// Creates a new [`TurboQuantSerdeConfig`], returning `None` if `head_dim == 0` or
+    /// `block_size == 0`.
+    pub fn new(
+        preset: TurboQuantPreset,
+        head_dim: usize,
+        block_size: usize,
+        skip_first_layers: usize,
+        skip_last_layers: usize,
+    ) -> Option<Self> {
+        if head_dim == 0 || block_size == 0 {
+            return None;
+        }
+        Some(Self {
+            preset,
+            head_dim,
+            block_size,
+            skip_first_layers,
+            skip_last_layers,
+        })
+    }
+
+    /// Returns true when keys are stored in 8-bit FP8 format (`key_quant_bits == 8`).
+    pub fn key_fp8(&self) -> bool {
+        self.preset.params().0 == 8
+    }
+
+    /// Returns the number of MSE Lloyd-Max quantization bits per key coordinate (`0` when FP8).
+    pub fn key_mse_bits(&self) -> usize {
+        if self.key_fp8() {
+            0
+        } else {
+            self.preset.params().0
+        }
+    }
+
+    /// Returns the number of bits used for the Lloyd-Max centroid codebook.
+    pub fn centroid_bits(&self) -> usize {
+        let (k_bits, v_bits, _) = self.preset.params();
+        if k_bits == 8 { v_bits } else { k_bits }
+    }
+
+    /// Returns the packed byte size of one head's key vector (including 2-byte FP16 norm when
+    /// sub-8-bit MSE quantization is used).
+    pub fn key_packed_size(&self) -> usize {
+        if self.key_fp8() {
+            self.head_dim
+        } else {
+            (self.head_dim * self.key_mse_bits()).div_ceil(8) + 2
+        }
+    }
+
+    /// Returns the packed byte size of one head's value vector (including 4 bytes for FP16 scale
+    /// and FP16 zero-point).
+    pub fn value_packed_size(&self) -> usize {
+        let v_bits = self.preset.params().1;
+        (self.head_dim * v_bits).div_ceil(8) + 4
+    }
+
+    /// Returns the unaligned per-head slot size in bytes (`key_packed_size + value_packed_size`).
+    pub fn slot_size(&self) -> usize {
+        self.key_packed_size() + self.value_packed_size()
+    }
+
+    /// Returns the 2-byte aligned per-head slot size in bytes.
+    pub fn slot_size_aligned(&self) -> usize {
+        let s = self.slot_size();
+        s + (s % 2)
+    }
+
+    /// Returns the half-open layer index range `(quant_start, quant_end)` compressed with
+    /// TurboQuant out of `num_layers`.
+    pub fn layer_ranges(&self, num_layers: usize) -> (usize, usize) {
+        let quant_start = self.skip_first_layers.min(num_layers);
+        let quant_end = num_layers
+            .saturating_sub(self.skip_last_layers)
+            .max(quant_start);
+        (quant_start, quant_end)
+    }
+
+    /// Computes total serialized byte size for a 4D KV tensor `[2, num_layers, num_tokens,
+    /// hidden_dim]` with `elem_bytes` per uncompressed element.
+    pub fn serialized_nbytes_for_shape(
+        &self,
+        num_layers: usize,
+        num_tokens: usize,
+        hidden_dim: usize,
+        elem_bytes: usize,
+    ) -> Option<usize> {
+        if hidden_dim == 0 || !hidden_dim.is_multiple_of(self.head_dim) || elem_bytes == 0 {
+            return None;
+        }
+        let num_heads = hidden_dim / self.head_dim;
+        let num_blocks = num_tokens.div_ceil(self.block_size);
+        let (quant_start, quant_end) = self.layer_ranges(num_layers);
+        let quant_layers = quant_end - quant_start;
+        let raw_layers = num_layers - quant_layers;
+        let raw_bytes = 2usize
+            .checked_mul(raw_layers)?
+            .checked_mul(num_tokens)?
+            .checked_mul(hidden_dim)?
+            .checked_mul(elem_bytes)?;
+        let quant_bytes = quant_layers
+            .checked_mul(num_blocks)?
+            .checked_mul(self.block_size)?
+            .checked_mul(num_heads)?
+            .checked_mul(self.slot_size_aligned())?;
+        raw_bytes.checked_add(quant_bytes)
+    }
+}
+
+/// Solves the 1D Lloyd-Max optimal scalar quantizer for a zero-mean Gaussian distribution
+/// $\mathcal{N}(0, 1/\text{head\_dim})$ with `2^bits` reconstruction centroids and `(2^bits) - 1`
+/// decision boundaries using composite trapezoidal integration.
+pub fn solve_lloyd_max_gaussian(
+    head_dim: usize,
+    bits: usize,
+    max_iter: usize,
+    tol: f64,
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    if head_dim == 0 || bits == 0 || bits > 8 {
+        return None;
+    }
+    let n_levels = 1usize << bits;
+    let sigma2 = 1.0 / (head_dim as f64);
+    let sigma = sigma2.sqrt();
+    let inv_norm = 1.0 / (2.0 * std::f64::consts::PI * sigma2).sqrt();
+    let pdf = |x: f64| -> f64 { inv_norm * (-x * x / (2.0 * sigma2)).exp() };
+    let trapz = |f: &dyn Fn(f64) -> f64, a: f64, b: f64| -> f64 {
+        let n = 200usize;
+        let h = (b - a) / (n as f64);
+        let mut sum = 0.5 * (f(a) + f(b));
+        for i in 1..n {
+            sum += f(a + (i as f64) * h);
+        }
+        sum * h
+    };
+
+    let lo = -3.5 * sigma;
+    let hi = 3.5 * sigma;
+    let mut centroids: Vec<f64> = (0..n_levels)
+        .map(|i| lo + (hi - lo) * ((i as f64) + 0.5) / (n_levels as f64))
+        .collect();
+
+    for _ in 0..max_iter {
+        let mut edges = Vec::with_capacity(n_levels + 1);
+        edges.push(lo * 3.0);
+        for i in 0..(n_levels - 1) {
+            edges.push(0.5 * (centroids[i] + centroids[i + 1]));
+        }
+        edges.push(hi * 3.0);
+
+        let mut new_centroids = Vec::with_capacity(n_levels);
+        let mut max_diff = 0.0f64;
+        for i in 0..n_levels {
+            let a = edges[i];
+            let b = edges[i + 1];
+            let num = trapz(&|x| x * pdf(x), a, b);
+            let den = trapz(&pdf, a, b);
+            let next_c = if den > 1e-15 { num / den } else { centroids[i] };
+            max_diff = max_diff.max((next_c - centroids[i]).abs());
+            new_centroids.push(next_c);
+        }
+        centroids = new_centroids;
+        if max_diff < tol {
+            break;
+        }
+    }
+
+    let boundaries: Vec<f32> = (0..(n_levels - 1))
+        .map(|i| (0.5 * (centroids[i] + centroids[i + 1])) as f32)
+        .collect();
+    let centroids_f32: Vec<f32> = centroids.into_iter().map(|c| c as f32).collect();
+    Some((centroids_f32, boundaries))
+}
+
+/// Constructs the row-major `head_dim x head_dim` orthonormal Sylvester Walsh-Hadamard matrix
+/// $H_d / \sqrt{d}$ for a power-of-two `head_dim`.
+pub fn build_orthonormal_hadamard(head_dim: usize) -> Option<Vec<f32>> {
+    if head_dim == 0 || !head_dim.is_power_of_two() {
+        return None;
+    }
+    let mut mat = vec![1.0f32; head_dim * head_dim];
+    let mut size = 1usize;
+    while size < head_dim {
+        for r in 0..size {
+            for c in 0..size {
+                let v = mat[r * head_dim + c];
+                mat[r * head_dim + (c + size)] = v;
+                mat[(r + size) * head_dim + c] = v;
+                mat[(r + size) * head_dim + (c + size)] = -v;
+            }
+        }
+        size *= 2;
+    }
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    for v in &mut mat {
+        *v *= scale;
+    }
+    Some(mat)
+}

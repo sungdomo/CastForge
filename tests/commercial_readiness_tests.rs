@@ -28,13 +28,14 @@ use castforge::passes::{
     P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable, P2PPeerSpec, PassManager, PassRegistry,
     PlacementRecord, RAW_BLOCK_META_MAGIC, RAW_BLOCK_SLOT_MAGIC, ROWWISE_CHEAP_OP_COST,
     ROWWISE_EXPENSIVE_OP_COST, RawBlockMetaCheckpointHeader, ReshapeDimMapping, TOKEN_WIRE_STRIDE,
-    WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
-    analyze_static_reshape_dim_mapping, annotate_squeeze_unsqueeze_reshapes,
-    anonymize_symbolic_dims, await_hanging_effect_chains, classify_blend_read_groups,
-    coalesce_exhaustive_gathers_to_split, coalesce_partitioning_slices_to_split,
-    compress_splat_constants, compute_cb_group_rope_geometry, compute_ieee_crc32,
-    decode_kv_fs_filename, decode_kv_storage_key, decode_raw_block_slot_header,
-    defer_allocs_to_first_use, direct_copy_format_supported, downsample_subchunk_swa_block_ids,
+    TurboQuantPreset, TurboQuantSerdeConfig, WarmPrefetchJobTable, WarmPrefetchStatus,
+    analyze_kv_layer_groups, analyze_static_reshape_dim_mapping,
+    annotate_squeeze_unsqueeze_reshapes, anonymize_symbolic_dims, await_hanging_effect_chains,
+    build_orthonormal_hadamard, classify_blend_read_groups, coalesce_exhaustive_gathers_to_split,
+    coalesce_partitioning_slices_to_split, compress_splat_constants,
+    compute_cb_group_rope_geometry, compute_ieee_crc32, decode_kv_fs_filename,
+    decode_kv_storage_key, decode_raw_block_slot_header, defer_allocs_to_first_use,
+    direct_copy_format_supported, downsample_subchunk_swa_block_ids,
     elide_redundant_state_transfers, eliminate_implied_dependencies, encode_kv_fs_filename,
     encode_kv_storage_key, encode_raw_block_meta_checkpoint, encode_raw_block_slot_header,
     encode_wide_column_row_key, find_squeeze_axis, find_unsqueeze_axis, flatten_elementwise_chains,
@@ -52,8 +53,8 @@ use castforge::passes::{
     recalculate_subchunk_blocks_to_skip, recognize_composite_activations, reuse_dead_loop_buffers,
     select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
     sink_split_through_reshape, sink_transpose_through_elementwise_and_broadcast,
-    stamp_fused_provenance, swim_reshape_through_slice, unfold_chunk_range,
-    unique_blend_token_coverage, unpack_token_ids_be, unpermute_slice,
+    solve_lloyd_max_gaussian, stamp_fused_provenance, swim_reshape_through_slice,
+    unfold_chunk_range, unique_blend_token_coverage, unpack_token_ids_be, unpermute_slice,
     validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
@@ -3516,4 +3517,60 @@ fn test_fold_extend_lifetimes_and_device_graph_collective_partition() {
             },
         ]
     );
+}
+
+#[test]
+fn test_turboquant_serde_config_lloyd_max_and_orthonormal_hadamard() {
+    assert_eq!(
+        TurboQuantPreset::from_name("turboquant_k3v4_nc"),
+        Some(TurboQuantPreset::K3V4Nc)
+    );
+    assert!(TurboQuantPreset::from_name("unknown").is_none());
+
+    // 1. Verify `TurboQuantSerdeConfig` slot geometry and serialized byte calculation:
+    //    For `turboquant_k3v4_nc` with `head_dim = 128`:
+    //    - `key_packed_size = ceil(128 * 3 / 8) + 2 = 48 + 2 = 50`
+    //    - `value_packed_size = ceil(128 * 4 / 8) + 4 = 64 + 4 = 68`
+    //    - `slot_size = 118`, `slot_size_aligned = 118`
+    let cfg = TurboQuantSerdeConfig::new(TurboQuantPreset::K3V4Nc, 128, 16, 2, 2).expect("valid");
+    assert!(!cfg.key_fp8());
+    assert_eq!(cfg.key_mse_bits(), 3);
+    assert_eq!(cfg.centroid_bits(), 3);
+    assert_eq!(cfg.key_packed_size(), 50);
+    assert_eq!(cfg.value_packed_size(), 68);
+    assert_eq!(cfg.slot_size(), 118);
+    assert_eq!(cfg.slot_size_aligned(), 118);
+    assert_eq!(cfg.layer_ranges(10), (2, 8));
+    // 10 layers (4 raw, 6 quantized), 32 tokens (2 blocks of 16), hidden_dim=512 (4 heads), fp16:
+    // raw_bytes = 2 * 4 * 32 * 512 * 2 = 262_144
+    // quant_bytes = 6 * 2 * 16 * 4 * 118 = 90_624
+    assert_eq!(
+        cfg.serialized_nbytes_for_shape(10, 32, 512, 2),
+        Some(262_144 + 90_624)
+    );
+
+    // 2. Verify `solve_lloyd_max_gaussian` symmetry, strict monotonicity, and midpoint boundaries:
+    let (centroids, boundaries) =
+        solve_lloyd_max_gaussian(128, 3, 200, 1e-10).expect("valid lloyd-max");
+    assert_eq!(centroids.len(), 8);
+    assert_eq!(boundaries.len(), 7);
+    for i in 0..7 {
+        assert!(centroids[i] < boundaries[i]);
+        assert!(boundaries[i] < centroids[i + 1]);
+    }
+    for i in 0..4 {
+        assert!((centroids[i] + centroids[7 - i]).abs() < 1e-5);
+    }
+
+    // 3. Verify `build_orthonormal_hadamard` produces $H^T H = I$:
+    assert!(build_orthonormal_hadamard(6).is_none());
+    let h = build_orthonormal_hadamard(8).expect("valid hadamard");
+    assert_eq!(h.len(), 64);
+    for i in 0..8 {
+        for j in 0..8 {
+            let dot: f32 = (0..8).map(|k| h[i * 8 + k] * h[j * 8 + k]).sum();
+            let expected = if i == j { 1.0 } else { 0.0 };
+            assert!((dot - expected).abs() < 1e-5);
+        }
+    }
 }
