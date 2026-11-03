@@ -5078,3 +5078,65 @@ pub fn hoist_symbolic_dim_expressions(module: &mut Module) -> usize {
 
     total_hoisted
 }
+
+/// Downsamples per-group paged KV `block_ids` for sub-chunk sliding-window attention (SWA) groups
+/// (inspired by LMCache `lmcache/v1/multiprocess/object_group_transfer.py`
+/// `downsample_and_stage_block_ids`).
+///
+/// For a kernel group with `block_size_tokens`, `chunk_tokens`, and `subchunk_sw_tokens` (`0` or
+/// `>= chunk_tokens` for full attention; `< chunk_tokens` for sub-chunk SWA such as DeepSeek-V4):
+/// - `total_blocks_per_chunk = chunk_tokens.div_ceil(block_size_tokens)`
+/// - `keep_blocks_per_chunk = chunk_tokens.min(subchunk_sw_tokens).div_ceil(block_size_tokens)`
+///
+/// Keeps only the trailing `keep_blocks_per_chunk` block IDs from each chunk of
+/// `total_blocks_per_chunk` blocks. Returns `None` if `group_block_ids.len()` is not a multiple of
+/// `total_blocks_per_chunk`.
+pub fn downsample_subchunk_swa_block_ids(
+    group_block_ids: &[u64],
+    chunk_tokens: usize,
+    subchunk_sw_tokens: usize,
+    block_size_tokens: usize,
+) -> Option<Vec<u64>> {
+    if chunk_tokens == 0 || block_size_tokens == 0 {
+        return None;
+    }
+    let eff_sw = if subchunk_sw_tokens == 0 {
+        chunk_tokens
+    } else {
+        chunk_tokens.min(subchunk_sw_tokens)
+    };
+    let total_blocks_per_chunk = chunk_tokens.div_ceil(block_size_tokens);
+    let keep_blocks_per_chunk = eff_sw.div_ceil(block_size_tokens);
+    if !group_block_ids.len().is_multiple_of(total_blocks_per_chunk) {
+        return None;
+    }
+    if keep_blocks_per_chunk >= total_blocks_per_chunk {
+        return Some(group_block_ids.to_vec());
+    }
+    let mut out = Vec::with_capacity(
+        (group_block_ids.len() / total_blocks_per_chunk) * keep_blocks_per_chunk,
+    );
+    for chunk in group_block_ids.chunks_exact(total_blocks_per_chunk) {
+        let start = total_blocks_per_chunk - keep_blocks_per_chunk;
+        out.extend_from_slice(&chunk[start..]);
+    }
+    Some(out)
+}
+
+/// Recalculates the number of downsampled blocks to skip when `blocks_per_window <=
+/// blocks_per_chunk` (inspired by LMCache `lmcache/v1/multiprocess/object_group_transfer.py`
+/// `recalculate_blocks_to_skip`).
+pub fn recalculate_subchunk_blocks_to_skip(
+    blocks_per_chunk: usize,
+    blocks_per_window: usize,
+    blocks_to_skip: usize,
+) -> usize {
+    if blocks_per_chunk == 0 || blocks_per_window >= blocks_per_chunk {
+        return blocks_to_skip;
+    }
+    let full_windows_to_skip = blocks_to_skip / blocks_per_chunk;
+    let tail_blocks = blocks_to_skip % blocks_per_chunk;
+    let dropped_per_chunk = blocks_per_chunk - blocks_per_window;
+    let tail_blocks_to_skip = tail_blocks.saturating_sub(dropped_per_chunk);
+    full_windows_to_skip * blocks_per_window + tail_blocks_to_skip
+}

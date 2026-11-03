@@ -23,16 +23,17 @@ use castforge::passes::{
     PassManager, PassRegistry, ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST,
     WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups, anonymize_symbolic_dims,
     compress_splat_constants, decode_kv_fs_filename, decode_kv_storage_key,
-    defer_allocs_to_first_use, direct_copy_format_supported, elide_redundant_state_transfers,
-    encode_kv_fs_filename, encode_kv_storage_key, flatten_elementwise_chains,
-    fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
-    fuse_sole_use_prologues, hash_prefix_token_blocks, hoist_exec_invariant_ops,
-    hoist_symbolic_dim_expressions, is_supported_arch_dtype, legalize_rowwise_reduction_launch,
-    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
-    mark_cuda_graph_stable_tensors, merge_duplicate_shape_ops, merge_identical_functions,
-    plan_cacheblend_retrieve, plan_concat_in_place, plan_jenga_kv_geometry,
-    plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
-    re_rope_key_in_place, reuse_dead_loop_buffers, stamp_fused_provenance, unfold_chunk_range,
+    defer_allocs_to_first_use, direct_copy_format_supported, downsample_subchunk_swa_block_ids,
+    elide_redundant_state_transfers, encode_kv_fs_filename, encode_kv_storage_key,
+    flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
+    fuse_reshape_epilogue, fuse_sole_use_prologues, hash_prefix_token_blocks,
+    hoist_exec_invariant_ops, hoist_symbolic_dim_expressions, is_supported_arch_dtype,
+    legalize_rowwise_reduction_launch, longest_full_attention_hit, longest_joint_prefix_hit,
+    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_duplicate_shape_ops,
+    merge_identical_functions, plan_cacheblend_retrieve, plan_concat_in_place,
+    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
+    promote_narrow_accumulators, re_rope_key_in_place, recalculate_subchunk_blocks_to_skip,
+    reuse_dead_loop_buffers, stamp_fused_provenance, unfold_chunk_range,
     validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
@@ -1995,4 +1996,32 @@ module @param_expr {
         decls.get("param_expr_1"),
         Some(&Attribute::String("hidden+64".to_string()))
     );
+}
+
+#[test]
+fn test_subchunk_swa_block_id_downsampling_and_skip_recalculation() {
+    // Example from LMCache `downsample_and_stage_block_ids`:
+    // block_size = 32, chunk_tokens = 128 (4 blocks/chunk), 2 chunks (8 blocks total):
+    // - Full attention (subchunk_sw = 128): keeps all [1..=8]
+    // - SWA (subchunk_sw = 64 -> 2 blocks/chunk): keeps trailing 2 blocks -> [13, 14, 17, 18]
+    let full_blocks = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    let swa_blocks = vec![11, 12, 13, 14, 15, 16, 17, 18];
+
+    assert_eq!(
+        downsample_subchunk_swa_block_ids(&full_blocks, 128, 128, 32),
+        Some(vec![1, 2, 3, 4, 5, 6, 7, 8])
+    );
+    assert_eq!(
+        downsample_subchunk_swa_block_ids(&swa_blocks, 128, 64, 32),
+        Some(vec![13, 14, 17, 18])
+    );
+    // Non-multiple of blocks_per_chunk (4) is rejected
+    assert!(downsample_subchunk_swa_block_ids(&[11, 12, 13], 128, 64, 32).is_none());
+
+    // Skip recalculation when blocks_per_chunk = 4, blocks_per_window = 2:
+    // - skipping 5 original blocks = 1 full chunk (2 window blocks) + 1 tail block (which falls
+    //   inside the 2 already-dropped blocks of chunk 1 -> 0 extra tail skip) = 2
+    // - skipping 7 original blocks = 1 full chunk (2 window blocks) + (3 - 2 = 1 tail skip) = 3
+    assert_eq!(recalculate_subchunk_blocks_to_skip(4, 2, 5), 2);
+    assert_eq!(recalculate_subchunk_blocks_to_skip(4, 2, 7), 3);
 }
