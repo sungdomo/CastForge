@@ -7,7 +7,7 @@ use crate::ir::{
 };
 use crate::passes::{Pass, PassResult};
 use anyhow::Result;
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use smallvec::SmallVec;
 
 /// Autoregressive KV-Cache Injection Pass (`inject-kv-cache`).
@@ -9100,5 +9100,295 @@ impl CoordinatorKeyDirectory {
         keys.iter()
             .map(|k| self.directory.get(k).map_or(0, |r| r.access_count))
             .collect()
+    }
+}
+
+/// 8-byte ASCII magic header (`LMCBLK01`) for raw-block per-slot on-disk headers.
+pub const RAW_BLOCK_SLOT_MAGIC: &[u8; 8] = b"LMCBLK01";
+
+/// 8-byte ASCII magic header (`LMCIDX01`) for raw-block metadata checkpoint containers.
+pub const RAW_BLOCK_META_MAGIC: &[u8; 8] = b"LMCIDX01";
+
+/// Computes the standard IEEE 802.3 CRC-32 checksum over `data` (polynomial `0xEDB88320`).
+pub fn compute_ieee_crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
+/// Encodes a 24-byte raw-block slot header (`LMCBLK01`, `slot_identity`, `payload_len` in
+/// little-endian byte order) padded with zeros to `header_bytes`.
+///
+/// Returns `None` if `header_bytes < 24`.
+pub fn encode_raw_block_slot_header(
+    slot_identity: u64,
+    payload_len: u64,
+    header_bytes: usize,
+) -> Option<Vec<u8>> {
+    if header_bytes < 24 {
+        return None;
+    }
+    let mut out = vec![0u8; header_bytes];
+    out[0..8].copy_from_slice(RAW_BLOCK_SLOT_MAGIC);
+    out[8..16].copy_from_slice(&slot_identity.to_le_bytes());
+    out[16..24].copy_from_slice(&payload_len.to_le_bytes());
+    Some(out)
+}
+
+/// Decodes a raw-block slot header and returns `(slot_identity, payload_len)` when the
+/// buffer begins with [`RAW_BLOCK_SLOT_MAGIC`].
+pub fn decode_raw_block_slot_header(buf: &[u8]) -> Option<(u64, u64)> {
+    if buf.len() < 24 || &buf[0..8] != RAW_BLOCK_SLOT_MAGIC {
+        return None;
+    }
+    let slot_identity = u64::from_le_bytes(buf[8..16].try_into().ok()?);
+    let payload_len = u64::from_le_bytes(buf[16..24].try_into().ok()?);
+    Some((slot_identity, payload_len))
+}
+
+/// Parsed metadata checkpoint container header for double-buffered raw-block index persistence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawBlockMetaCheckpointHeader {
+    /// Monotonically increasing checkpoint sequence number.
+    pub seq: u64,
+    /// Unpadded byte length of the serialized metadata payload.
+    pub payload_len: u64,
+    /// IEEE CRC-32 checksum over the unpadded payload bytes.
+    pub crc32: u32,
+    /// Byte offset of the selected container on the raw block device.
+    pub container_offset: u64,
+}
+
+/// Encodes a block-aligned metadata checkpoint container (`LMCIDX01`, `version`, `flags = 0`,
+/// `seq`, `payload_len`, `crc32`, `reserved = 0` at offset `0..40`, followed by `payload` at
+/// `block_align..block_align + payload.len()`, rounded up to a multiple of `block_align`).
+pub fn encode_raw_block_meta_checkpoint(
+    version: u32,
+    seq: u64,
+    payload: &[u8],
+    block_align: usize,
+) -> Option<Vec<u8>> {
+    if block_align < 40 || !block_align.is_power_of_two() {
+        return None;
+    }
+    let payload_padded = if payload.is_empty() {
+        block_align
+    } else {
+        payload.len().div_ceil(block_align) * block_align
+    };
+    let total_len = block_align.checked_add(payload_padded)?;
+    let mut buf = vec![0u8; total_len];
+    let crc32 = compute_ieee_crc32(payload);
+    buf[0..8].copy_from_slice(RAW_BLOCK_META_MAGIC);
+    buf[8..12].copy_from_slice(&version.to_le_bytes());
+    buf[12..16].copy_from_slice(&0u32.to_le_bytes());
+    buf[16..24].copy_from_slice(&seq.to_le_bytes());
+    buf[24..32].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+    buf[32..36].copy_from_slice(&crc32.to_le_bytes());
+    buf[36..40].copy_from_slice(&0u32.to_le_bytes());
+    buf[block_align..block_align + payload.len()].copy_from_slice(payload);
+    Some(buf)
+}
+
+/// Scans double-buffered metadata checkpoint containers `(container_offset, raw_bytes)` and
+/// returns the valid container with the highest `seq` number whose magic, `expected_version`,
+/// bounds, and IEEE CRC-32 match.
+pub fn select_latest_valid_meta_checkpoint(
+    containers: &[(u64, Vec<u8>)],
+    block_align: usize,
+    expected_version: u32,
+) -> Option<(RawBlockMetaCheckpointHeader, Vec<u8>)> {
+    if block_align < 40 {
+        return None;
+    }
+    let mut best: Option<(RawBlockMetaCheckpointHeader, Vec<u8>)> = None;
+    for (container_offset, raw) in containers {
+        if raw.len() < block_align || &raw[0..8] != RAW_BLOCK_META_MAGIC {
+            continue;
+        }
+        let version = u32::from_le_bytes(raw[8..12].try_into().ok()?);
+        let flags = u32::from_le_bytes(raw[12..16].try_into().ok()?);
+        let seq = u64::from_le_bytes(raw[16..24].try_into().ok()?);
+        let payload_len = u64::from_le_bytes(raw[24..32].try_into().ok()?);
+        let crc32 = u32::from_le_bytes(raw[32..36].try_into().ok()?);
+        if version != expected_version || flags != 0 || payload_len == 0 {
+            continue;
+        }
+        let Ok(plen) = usize::try_from(payload_len) else {
+            continue;
+        };
+        let Some(end) = block_align.checked_add(plen) else {
+            continue;
+        };
+        if end > raw.len() {
+            continue;
+        }
+        let payload = &raw[block_align..end];
+        if compute_ieee_crc32(payload) != crc32 {
+            continue;
+        }
+        let header = RawBlockMetaCheckpointHeader {
+            seq,
+            payload_len,
+            crc32,
+            container_offset: *container_offset,
+        };
+        if best.as_ref().is_none_or(|(prev, _)| seq >= prev.seq) {
+            best = Some((header, payload.to_vec()));
+        }
+    }
+    best
+}
+
+/// NVMe Flexible Data Placement (FDP) affinity raw-block slot allocator with crash-safe
+/// free-list reconstruction from committed index checkpoints.
+#[derive(Debug, Clone)]
+pub struct FdpRawBlockSlotManager {
+    max_slots: usize,
+    next_slot: usize,
+    free_slots: Vec<usize>,
+    free_slots_by_placement_id: IndexMap<u16, Vec<usize>>,
+    slot_placement_ids: IndexMap<usize, u16>,
+    fdp_affinity_enabled: bool,
+    fdp_affinity_hits: usize,
+    fdp_affinity_fallbacks: usize,
+}
+
+impl FdpRawBlockSlotManager {
+    /// Creates a new [`FdpRawBlockSlotManager`] with capacity `max_slots`.
+    pub fn new(max_slots: usize, fdp_affinity_enabled: bool) -> Self {
+        Self {
+            max_slots,
+            next_slot: 0,
+            free_slots: Vec::new(),
+            free_slots_by_placement_id: IndexMap::new(),
+            slot_placement_ids: IndexMap::new(),
+            fdp_affinity_enabled,
+            fdp_affinity_hits: 0,
+            fdp_affinity_fallbacks: 0,
+        }
+    }
+
+    /// Returns `(next_slot, free_slots_count, fdp_affinity_hits, fdp_affinity_fallbacks)`.
+    pub fn stats(&self) -> (usize, usize, usize, usize) {
+        (
+            self.next_slot,
+            self.free_slots.len(),
+            self.fdp_affinity_hits,
+            self.fdp_affinity_fallbacks,
+        )
+    }
+
+    /// Returns the last NVMe FDP placement identifier recorded for `slot`, if any.
+    pub fn slot_placement_id(&self, slot: usize) -> Option<u16> {
+        self.slot_placement_ids.get(&slot).copied()
+    }
+
+    /// Allocates a slot, preferring a recycled slot that previously carried the same NVMe FDP
+    /// `placement_id` (reclaim unit handle) when `fdp_affinity_enabled` is true.
+    pub fn allocate_slot(&mut self, placement_id: Option<u16>) -> Option<usize> {
+        if self.fdp_affinity_enabled
+            && let Some(pid) = placement_id
+        {
+            if let Some(bucket) = self.free_slots_by_placement_id.get_mut(&pid)
+                && let Some(slot) = bucket.pop()
+            {
+                if bucket.is_empty() {
+                    self.free_slots_by_placement_id.shift_remove(&pid);
+                }
+                if let Some(pos) = self.free_slots.iter().rposition(|&s| s == slot) {
+                    self.free_slots.remove(pos);
+                }
+                self.slot_placement_ids.insert(slot, pid);
+                self.fdp_affinity_hits += 1;
+                return Some(slot);
+            }
+            if !self.free_slots.is_empty() {
+                self.fdp_affinity_fallbacks += 1;
+            }
+        }
+        let slot = if let Some(recycled) = self.free_slots.pop() {
+            if self.fdp_affinity_enabled
+                && let Some(&old_pid) = self.slot_placement_ids.get(&recycled)
+                && let Some(bucket) = self.free_slots_by_placement_id.get_mut(&old_pid)
+            {
+                if let Some(pos) = bucket.iter().rposition(|&s| s == recycled) {
+                    bucket.remove(pos);
+                }
+                if bucket.is_empty() {
+                    self.free_slots_by_placement_id.shift_remove(&old_pid);
+                }
+            }
+            recycled
+        } else {
+            if self.next_slot >= self.max_slots {
+                return None;
+            }
+            let fresh = self.next_slot;
+            self.next_slot += 1;
+            fresh
+        };
+        if self.fdp_affinity_enabled {
+            if let Some(pid) = placement_id {
+                self.slot_placement_ids.insert(slot, pid);
+            } else {
+                self.slot_placement_ids.shift_remove(&slot);
+            }
+        }
+        Some(slot)
+    }
+
+    /// Returns `slot` to the free list and indexes it under its last FDP placement identifier.
+    pub fn free_slot(&mut self, slot: usize) {
+        if slot >= self.next_slot || self.free_slots.contains(&slot) {
+            return;
+        }
+        self.free_slots.push(slot);
+        if self.fdp_affinity_enabled
+            && let Some(&pid) = self.slot_placement_ids.get(&slot)
+        {
+            self.free_slots_by_placement_id
+                .entry(pid)
+                .or_default()
+                .push(slot);
+        }
+    }
+
+    /// Reconstructs the allocator state from a checkpointed `next_slot` high-water mark and
+    /// `committed_slots` set, recovering any uncommitted in-flight slots from `[0, next_slot)`
+    /// back into `free_slots`.
+    pub fn rebuild_free_slots_from_committed(
+        &mut self,
+        next_slot: usize,
+        committed_slots: &[usize],
+    ) -> bool {
+        if next_slot > self.max_slots {
+            return false;
+        }
+        let mut occupied = IndexSet::new();
+        for &slot in committed_slots {
+            if slot >= next_slot || !occupied.insert(slot) {
+                return false;
+            }
+        }
+        self.next_slot = next_slot;
+        self.free_slots.clear();
+        self.free_slots_by_placement_id.clear();
+        self.slot_placement_ids.clear();
+        for slot in 0..next_slot {
+            if !occupied.contains(&slot) {
+                self.free_slots.push(slot);
+            }
+        }
+        true
     }
 }

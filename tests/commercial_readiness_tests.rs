@@ -21,32 +21,35 @@ use castforge::passes::{
     ChainedBlockHashConfig, CoordinatorEventGate, CoordinatorKeyDirectory,
     DEFAULT_MAX_KERNELS_IN_FUSION_SET, DaxGenerationSlotArena, DaxPutOutcome, DeviceTargetArch,
     DynamicAllocRequest, EngineKvFormat, EventIngestOutcome, FULL_ATTENTION_WINDOW,
-    GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager, IsolatedLruEvictionPolicy,
-    KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode, KvPageSpec,
-    KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope, KvStorageKeySpec, L2FaultInjectConfig,
-    L2FaultInjectPolicy, LayerGroupPayloadSharder, P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable,
-    P2PPeerSpec, PassManager, PassRegistry, PlacementRecord, ROWWISE_CHEAP_OP_COST,
-    ROWWISE_EXPENSIVE_OP_COST, ReshapeDimMapping, TOKEN_WIRE_STRIDE, WarmPrefetchJobTable,
-    WarmPrefetchStatus, analyze_kv_layer_groups, analyze_static_reshape_dim_mapping,
-    annotate_squeeze_unsqueeze_reshapes, anonymize_symbolic_dims, await_hanging_effect_chains,
-    classify_blend_read_groups, coalesce_exhaustive_gathers_to_split,
-    coalesce_partitioning_slices_to_split, compress_splat_constants,
-    compute_cb_group_rope_geometry, decode_kv_fs_filename, decode_kv_storage_key,
+    FdpRawBlockSlotManager, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
+    IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
+    KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope,
+    KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy, LayerGroupPayloadSharder,
+    P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable, P2PPeerSpec, PassManager, PassRegistry,
+    PlacementRecord, RAW_BLOCK_META_MAGIC, RAW_BLOCK_SLOT_MAGIC, ROWWISE_CHEAP_OP_COST,
+    ROWWISE_EXPENSIVE_OP_COST, RawBlockMetaCheckpointHeader, ReshapeDimMapping, TOKEN_WIRE_STRIDE,
+    WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
+    analyze_static_reshape_dim_mapping, annotate_squeeze_unsqueeze_reshapes,
+    anonymize_symbolic_dims, await_hanging_effect_chains, classify_blend_read_groups,
+    coalesce_exhaustive_gathers_to_split, coalesce_partitioning_slices_to_split,
+    compress_splat_constants, compute_cb_group_rope_geometry, compute_ieee_crc32,
+    decode_kv_fs_filename, decode_kv_storage_key, decode_raw_block_slot_header,
     defer_allocs_to_first_use, direct_copy_format_supported, downsample_subchunk_swa_block_ids,
     elide_redundant_state_transfers, eliminate_implied_dependencies, encode_kv_fs_filename,
-    encode_kv_storage_key, encode_wide_column_row_key, find_squeeze_axis, find_unsqueeze_axis,
-    flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
-    fuse_reshape_epilogue, fuse_sole_use_prologues, group_p2p_lookup_keys,
-    hash_packed_token_blocks_be, hash_prefix_token_blocks, hoist_exec_invariant_ops,
-    hoist_symbolic_dim_expressions, interleave_chunk_major_object_keys, is_supported_arch_dtype,
-    legalize_rowwise_reduction_launch, longest_full_attention_hit, longest_joint_prefix_hit,
-    longest_sliding_window_hit, map_axis_through_static_reshape, mark_cuda_graph_stable_tensors,
-    merge_adjacent_parallel_loops, merge_duplicate_shape_ops, merge_identical_functions,
-    merge_parallel_matmuls, num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve,
-    plan_cacheblend_token_reorder, plan_concat_in_place, plan_dynamic_memory_pool,
-    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
-    promote_narrow_accumulators, re_rope_key_in_place, recalculate_subchunk_blocks_to_skip,
-    recognize_composite_activations, reuse_dead_loop_buffers,
+    encode_kv_storage_key, encode_raw_block_meta_checkpoint, encode_raw_block_slot_header,
+    encode_wide_column_row_key, find_squeeze_axis, find_unsqueeze_axis, flatten_elementwise_chains,
+    fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
+    fuse_sole_use_prologues, group_p2p_lookup_keys, hash_packed_token_blocks_be,
+    hash_prefix_token_blocks, hoist_exec_invariant_ops, hoist_symbolic_dim_expressions,
+    interleave_chunk_major_object_keys, is_supported_arch_dtype, legalize_rowwise_reduction_launch,
+    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
+    map_axis_through_static_reshape, mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops,
+    merge_duplicate_shape_ops, merge_identical_functions, merge_parallel_matmuls,
+    num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve, plan_cacheblend_token_reorder,
+    plan_concat_in_place, plan_dynamic_memory_pool, plan_jenga_kv_geometry,
+    plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
+    re_rope_key_in_place, recalculate_subchunk_blocks_to_skip, recognize_composite_activations,
+    reuse_dead_loop_buffers, select_latest_valid_meta_checkpoint,
     sink_transpose_through_elementwise_and_broadcast, stamp_fused_provenance, unfold_chunk_range,
     unique_blend_token_coverage, unpack_token_ids_be, unpermute_slice,
     validate_target_device_dtypes,
@@ -3207,4 +3210,84 @@ fn test_coordinator_key_directory_l1_fencing_shared_l2_and_histogram() {
             ("+Inf".to_string(), 3),
         ]
     );
+}
+
+#[test]
+fn test_fdp_raw_block_slot_manager_and_double_buffered_meta_checkpoint() {
+    // 1. Verify raw-block per-slot header codec (`LMCBLK01` + slot_identity + payload_len):
+    assert_eq!(RAW_BLOCK_SLOT_MAGIC, b"LMCBLK01");
+    assert_eq!(RAW_BLOCK_META_MAGIC, b"LMCIDX01");
+    assert!(encode_raw_block_slot_header(0x1122_3344_5566_7788, 65536, 16).is_none());
+    let slot_hdr =
+        encode_raw_block_slot_header(0x1122_3344_5566_7788, 65536, 4096).expect("valid header");
+    assert_eq!(slot_hdr.len(), 4096);
+    assert_eq!(
+        decode_raw_block_slot_header(&slot_hdr),
+        Some((0x1122_3344_5566_7788, 65536))
+    );
+
+    // 2. Verify double-buffered metadata checkpoint container selection and CRC32 validation:
+    let payload_v1 = br#"{"next_slot":3,"entries":[0,2]}"#;
+    let payload_v2 = br#"{"next_slot":4,"entries":[0,2,3]}"#;
+    let container_a =
+        encode_raw_block_meta_checkpoint(1, 10, payload_v1, 4096).expect("valid checkpoint a");
+    let container_b =
+        encode_raw_block_meta_checkpoint(1, 11, payload_v2, 4096).expect("valid checkpoint b");
+
+    // Both containers valid -> selects higher `seq = 11`:
+    let (hdr, chosen_payload) = select_latest_valid_meta_checkpoint(
+        &[(0, container_a.clone()), (65536, container_b.clone())],
+        4096,
+        1,
+    )
+    .expect("should pick valid checkpoint");
+    assert_eq!(
+        hdr,
+        RawBlockMetaCheckpointHeader {
+            seq: 11,
+            payload_len: payload_v2.len() as u64,
+            crc32: compute_ieee_crc32(payload_v2),
+            container_offset: 65536,
+        }
+    );
+    assert_eq!(chosen_payload, payload_v2);
+
+    // Corrupt a byte in container B's payload -> falls back to container A (`seq = 10`):
+    let mut corrupted_b = container_b;
+    corrupted_b[4100] ^= 0x5A;
+    let (fallback_hdr, fallback_payload) =
+        select_latest_valid_meta_checkpoint(&[(0, container_a), (65536, corrupted_b)], 4096, 1)
+            .expect("should fall back to container A");
+    assert_eq!(fallback_hdr.seq, 10);
+    assert_eq!(fallback_hdr.container_offset, 0);
+    assert_eq!(fallback_payload, payload_v1);
+
+    // 3. Verify NVMe FDP placement-affinity slot recycling and crash-safe free-list rebuild:
+    let mut mgr = FdpRawBlockSlotManager::new(4, true);
+    let s0 = mgr.allocate_slot(Some(100)).expect("slot 0");
+    let s1 = mgr.allocate_slot(Some(200)).expect("slot 1");
+    let s2 = mgr.allocate_slot(Some(100)).expect("slot 2");
+    assert_eq!((s0, s1, s2), (0, 1, 2));
+    assert_eq!(mgr.slot_placement_id(s1), Some(200));
+
+    // Free slots 0 (PID 100) and 1 (PID 200), then request PID 100 -> affinity hit on slot 0!
+    mgr.free_slot(s0);
+    mgr.free_slot(s1);
+    let s_reused_100 = mgr.allocate_slot(Some(100)).expect("affinity hit");
+    assert_eq!(s_reused_100, 0);
+    assert_eq!(mgr.stats(), (3, 1, 1, 0));
+
+    // Request PID 300 while slot 1 (PID 200) is in free list -> fallback recycle of slot 1!
+    let s_fallback_300 = mgr.allocate_slot(Some(300)).expect("fallback recycle");
+    assert_eq!(s_fallback_300, 1);
+    assert_eq!(mgr.slot_placement_id(1), Some(300));
+    assert_eq!(mgr.stats(), (3, 0, 1, 1));
+
+    // Simulate crash recovery where `next_slot = 4` had uncommitted in-flight slot 1 and freed
+    // slot 3, with only slots `[0, 2]` committed in the checkpoint:
+    assert!(mgr.rebuild_free_slots_from_committed(4, &[0, 2]));
+    assert_eq!(mgr.stats(), (4, 2, 1, 1));
+    assert_eq!(mgr.allocate_slot(None), Some(3));
+    assert_eq!(mgr.allocate_slot(None), Some(1));
+    assert_eq!(mgr.allocate_slot(None), None);
 }
