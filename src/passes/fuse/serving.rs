@@ -11045,3 +11045,169 @@ impl FleetWatermarkEvictionController {
         batches
     }
 }
+
+fn is_horizontally_fusible_elementwise(op: &Operation) -> bool {
+    is_sinkable_unary_elementwise(op) || is_sinkable_binary_elementwise(op)
+}
+
+fn op_transitively_depends_on(
+    module: &Module,
+    block_ops: &[OpId],
+    source_op: OpId,
+    target_op: OpId,
+) -> bool {
+    let mut reachable_vals: IndexSet<ValueId> = IndexSet::new();
+    if let Some(src) = module.ops.get(source_op) {
+        for &r in &src.results {
+            reachable_vals.insert(r);
+        }
+    }
+    for &op_id in block_ops {
+        let Some(op) = module.ops.get(op_id) else {
+            continue;
+        };
+        if op.operands.iter().any(|v| reachable_vals.contains(v)) {
+            if op_id == target_op {
+                return true;
+            }
+            for &r in &op.results {
+                reachable_vals.insert(r);
+            }
+        }
+    }
+    false
+}
+
+/// Fuses pairs of sibling pure elementwise operations in a basic block that share the same output
+/// shape, device placement, and at least one common input operand into a multi-result
+/// `mo.horizontal_fused` operation so the shared input is loaded only once.
+///
+/// The merged operation is placed at the later sibling's position (`b`), provided no operation
+/// between `a` and `b` reads `a`'s result (`resultsUnusedBefore(a, b)`) and `b` does not depend
+/// directly or transitively on `a`. Returns the number of horizontal sibling pairs fused.
+pub fn fuse_horizontal_shared_input_ops(module: &mut Module) -> usize {
+    let mut fused_pairs = 0usize;
+    let block_ids: Vec<_> = module.blocks.keys().collect();
+
+    for block_id in block_ids {
+        let op_ids = module.blocks[block_id].ops.clone();
+        let mut consumed: IndexSet<OpId> = IndexSet::new();
+
+        for i in 0..op_ids.len() {
+            let a_id = op_ids[i];
+            if consumed.contains(&a_id) {
+                continue;
+            }
+            let Some(a_op) = module.ops.get(a_id).cloned() else {
+                continue;
+            };
+            if !is_horizontally_fusible_elementwise(&a_op) {
+                continue;
+            }
+            let a_res = a_op.results[0];
+            let Some(a_res_tt) = module
+                .values
+                .get(a_res)
+                .and_then(|v| v.ty.as_tensor())
+                .cloned()
+            else {
+                continue;
+            };
+
+            for j in (i + 1)..op_ids.len() {
+                let b_id = op_ids[j];
+                if consumed.contains(&b_id) {
+                    continue;
+                }
+                let Some(b_op) = module.ops.get(b_id).cloned() else {
+                    continue;
+                };
+                if !is_horizontally_fusible_elementwise(&b_op) {
+                    continue;
+                }
+                if a_op.attributes.get("castforge.device")
+                    != b_op.attributes.get("castforge.device")
+                {
+                    continue;
+                }
+                let b_res = b_op.results[0];
+                let Some(b_res_tt) = module
+                    .values
+                    .get(b_res)
+                    .and_then(|v| v.ty.as_tensor())
+                    .cloned()
+                else {
+                    continue;
+                };
+                if a_res_tt.shape != b_res_tt.shape {
+                    continue;
+                }
+
+                // Require at least one shared input tensor operand.
+                let shares_input = a_op.operands.iter().any(|v| b_op.operands.contains(v));
+                if !shares_input {
+                    continue;
+                }
+
+                // Check `resultsUnusedBefore(a, b)` over `(i + 1)..=j` and absence of transitive
+                // dependency from `a` to `b`.
+                let used_before_or_at_b = op_ids[(i + 1)..=j].iter().any(|&mid_id| {
+                    !consumed.contains(&mid_id)
+                        && module
+                            .ops
+                            .get(mid_id)
+                            .is_some_and(|op| op.operands.contains(&a_res))
+                });
+                if used_before_or_at_b || op_transitively_depends_on(module, &op_ids, a_id, b_id) {
+                    continue;
+                }
+
+                // Merge `a` and `b` into `mo.horizontal_fused` at `b_id`.
+                let mut merged_operands: SmallVec<[ValueId; 4]> = a_op.operands.clone();
+                for &opd in &b_op.operands {
+                    if !merged_operands.contains(&opd) {
+                        merged_operands.push(opd);
+                    }
+                }
+                let a_name = a_op.name.to_string();
+                let b_name = b_op.name.to_string();
+                let a_loc = a_op.location.clone();
+                let b_loc = b_op.location.clone();
+
+                if let Some(v_a) = module.values.get_mut(a_res) {
+                    v_a.def = ValueDef::OpResult { op: b_id, index: 0 };
+                }
+                if let Some(v_b) = module.values.get_mut(b_res) {
+                    v_b.def = ValueDef::OpResult { op: b_id, index: 1 };
+                }
+                if let Some(b_mut) = module.ops.get_mut(b_id) {
+                    b_mut.name = OpName::new("mo", "horizontal_fused");
+                    b_mut.operands = merged_operands;
+                    b_mut.results = SmallVec::from_slice(&[a_res, b_res]);
+                    b_mut.attributes.insert(
+                        "fused_ops".into(),
+                        Attribute::Array(vec![
+                            Attribute::String(a_name),
+                            Attribute::String(b_name),
+                        ]),
+                    );
+                    stamp_fused_provenance(b_mut, &[a_loc, b_loc]);
+                }
+
+                consumed.insert(a_id);
+                consumed.insert(b_id);
+                module.ops.remove(a_id);
+                fused_pairs += 1;
+                break;
+            }
+        }
+
+        if !consumed.is_empty() {
+            module.blocks[block_id]
+                .ops
+                .retain(|id| module.ops.contains_key(*id));
+        }
+    }
+
+    fused_pairs
+}

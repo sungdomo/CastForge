@@ -41,19 +41,20 @@ use castforge::passes::{
     encode_kv_storage_key, encode_raw_block_meta_checkpoint, encode_raw_block_slot_header,
     encode_wide_column_row_key, expected_contiguous_shape_from_strides, find_squeeze_axis,
     find_unsqueeze_axis, flatten_elementwise_chains, fold_extend_lifetimes_into_async_kernels,
-    fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
-    fuse_sole_use_prologues, group_p2p_lookup_keys, hash_packed_token_blocks_be,
-    hash_prefix_token_blocks, hoist_exec_invariant_ops, hoist_symbolic_dim_expressions,
-    interleave_chunk_major_object_keys, is_supported_arch_dtype, legalize_rowwise_reduction_launch,
-    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
-    map_axis_through_static_reshape, mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops,
-    merge_duplicate_shape_ops, merge_identical_functions, merge_parallel_matmuls,
-    num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve, plan_cacheblend_token_reorder,
-    plan_concat_in_place, plan_device_graph_collective_partition, plan_dynamic_memory_pool,
-    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
-    promote_narrow_accumulators, re_rope_key_in_place, recalculate_subchunk_blocks_to_skip,
-    recognize_composite_activations, recover_contiguous_or_dim0_padded_view,
-    reuse_dead_loop_buffers, select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
+    fold_unfold_hybrid_prefix_bitmaps, fuse_horizontal_shared_input_ops, fuse_locations,
+    fuse_reshape_epilogue, fuse_sole_use_prologues, group_p2p_lookup_keys,
+    hash_packed_token_blocks_be, hash_prefix_token_blocks, hoist_exec_invariant_ops,
+    hoist_symbolic_dim_expressions, interleave_chunk_major_object_keys, is_supported_arch_dtype,
+    legalize_rowwise_reduction_launch, longest_full_attention_hit, longest_joint_prefix_hit,
+    longest_sliding_window_hit, map_axis_through_static_reshape, mark_cuda_graph_stable_tensors,
+    merge_adjacent_parallel_loops, merge_duplicate_shape_ops, merge_identical_functions,
+    merge_parallel_matmuls, num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve,
+    plan_cacheblend_token_reorder, plan_concat_in_place, plan_device_graph_collective_partition,
+    plan_dynamic_memory_pool, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
+    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
+    recalculate_subchunk_blocks_to_skip, recognize_composite_activations,
+    recover_contiguous_or_dim0_padded_view, reuse_dead_loop_buffers,
+    select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
     sink_split_through_reshape, sink_transpose_through_elementwise_and_broadcast,
     solve_lloyd_max_gaussian, stamp_fused_provenance, swim_reshape_through_slice,
     unfold_chunk_range, unique_blend_token_coverage, unpack_token_ids_be, unpermute_slice,
@@ -3743,4 +3744,46 @@ fn test_fleet_cache_usage_view_and_watermark_eviction_controller() {
             ("tenant-a".to_string(), vec![10]),
         ]
     );
+}
+
+#[test]
+fn test_fuse_horizontal_shared_input_ops_and_def_before_use_guard() {
+    // 1. Sibling elementwise ops `%a = stablehlo.add %x, %y` and `%b = stablehlo.multiply %x, %z`
+    //    share `%x` and have no dependency between them -> fuse into `mo.horizontal_fused`!
+    let mlir_fusible = r#"
+module @horizontal_fuse_ok {
+  func.func @main(%x: tensor<4xf32>, %y: tensor<4xf32>, %z: tensor<4xf32>) -> tensor<4xf32> {
+    %a = stablehlo.add %x, %y : tensor<4xf32>
+    %b = stablehlo.multiply %x, %z : tensor<4xf32>
+    %out = stablehlo.subtract %a, %b : tensor<4xf32>
+    return %out : tensor<4xf32>
+  }
+}
+"#;
+    let mut m1 = parse_mlir(mlir_fusible).expect("valid MLIR");
+    assert_eq!(fuse_horizontal_shared_input_ops(&mut m1), 1);
+    let f1 = m1.functions()[0];
+    let b1 = m1.regions[m1.ops[f1].regions[0]].blocks[0];
+    let ops1 = &m1.blocks[b1].ops;
+    assert_eq!(ops1.len(), 3);
+    assert!(m1.ops[ops1[0]].is_op("mo", "horizontal_fused"));
+    assert_eq!(m1.ops[ops1[0]].operands.len(), 3);
+    assert_eq!(m1.ops[ops1[0]].results.len(), 2);
+
+    // 2. When an intermediate op `%mid` between `%a` and `%b` reads `%a`, moving `%a` down to `%b`
+    //    would violate def-before-use (`resultsUnusedBefore(a, b) == false`), so horizontal fusion
+    //    is rejected!
+    let mlir_blocked = r#"
+module @horizontal_fuse_blocked {
+  func.func @main(%x: tensor<4xf32>, %y: tensor<4xf32>, %z: tensor<4xf32>) -> tensor<4xf32> {
+    %a = stablehlo.add %x, %y : tensor<4xf32>
+    %mid = stablehlo.tanh %a : tensor<4xf32>
+    %b = stablehlo.multiply %x, %z : tensor<4xf32>
+    %out = stablehlo.subtract %mid, %b : tensor<4xf32>
+    return %out : tensor<4xf32>
+  }
+}
+"#;
+    let mut m2 = parse_mlir(mlir_blocked).expect("valid MLIR");
+    assert_eq!(fuse_horizontal_shared_input_ops(&mut m2), 0);
 }
