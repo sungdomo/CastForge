@@ -5048,3 +5048,40 @@ fn test_simplify_device_graph_dependencies_transitive_reduction() {
         Some(&Attribute::DenseIntArray(vec![1]))
     );
 }
+
+#[test]
+fn test_simplify_extend_lifetimes_absorbs_into_async_routine() {
+    use castforge::ir::mlir::Attribute;
+    use castforge::passes::simplify_extend_lifetimes;
+
+    let mlir = concat!(
+        "module @simplify_extend {\n",
+        "  func.func @main(%x: tensor<4xf32>, %buf0: tensor<4xf32>, %buf1: tensor<4xf32>)",
+        " -> tensor<1xi64> {\n",
+        "    %gate = mogg.routine.async %x {in_out_signature = [\"in\"]}",
+        " : (tensor<4xf32>) -> tensor<1xi64>\n",
+        "    %ch = mgp.extend_lifetime %gate, %buf0, %buf1",
+        " : (tensor<1xi64>, tensor<4xf32>, tensor<4xf32>) -> tensor<1xi64>\n",
+        "    return %ch : tensor<1xi64>\n",
+        "  }\n",
+        "}\n",
+    );
+
+    let mut m = parse_mlir(mlir).expect("valid MLIR");
+    assert_eq!(simplify_extend_lifetimes(&mut m), 1);
+
+    let func_id = m.functions()[0];
+    let blk_id = m.regions[m.ops[func_id].regions[0]].blocks[0];
+    let ops = &m.blocks[blk_id].ops;
+    assert_eq!(ops.len(), 2); // `mogg.routine.async` + `func.return`
+    let routine_id = ops[0];
+    assert_eq!(m.ops[routine_id].operands.len(), 3);
+    assert_eq!(
+        m.ops[routine_id].attributes.get("in_out_signature"),
+        Some(&Attribute::Array(vec![
+            Attribute::String("in".to_string()),
+            Attribute::String("none".to_string()),
+            Attribute::String("none".to_string()),
+        ]))
+    );
+}

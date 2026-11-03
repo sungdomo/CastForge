@@ -16255,3 +16255,72 @@ pub fn simplify_device_graph_dependencies(module: &mut Module) -> usize {
 
     eliminated_total
 }
+
+// ============================================================================
+// Batch 19 Step 3: Async Routine Lifetime Extension Absorber
+// ============================================================================
+
+/// Absorbs `mgp.extend_lifetime` operations whose `gate` chain (`operands[0]`) is produced by a
+/// `mogg.routine.async` operation into that routine's operand list (appending `"none"` entries to
+/// the routine's `"in_out_signature"` attribute), replaces uses of the `mgp.extend_lifetime`
+/// result with `gate`, and erases the `mgp.extend_lifetime` op. Returns the number of absorbed ops.
+pub fn simplify_extend_lifetimes(module: &mut Module) -> usize {
+    let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+    let mut absorbed = 0usize;
+
+    for blk_id in block_ids {
+        let orig_ops = module.blocks[blk_id].ops.clone();
+        let mut erased: IndexSet<OpId> = IndexSet::new();
+
+        for &op_id in &orig_ops {
+            if module.ops[op_id].name.full_name() != "mgp.extend_lifetime"
+                || module.ops[op_id].operands.is_empty()
+                || module.ops[op_id].results.is_empty()
+            {
+                continue;
+            }
+            let gate = module.ops[op_id].operands[0];
+            let inputs: Vec<ValueId> = module.ops[op_id].operands[1..].to_vec();
+            let ext_res = module.ops[op_id].results[0];
+
+            let ValueDef::OpResult { op: kernel_op, .. } = module.values[gate].def else {
+                continue;
+            };
+            if module.ops[kernel_op].name.full_name() != "mogg.routine.async" {
+                continue;
+            }
+
+            let mut sig: Vec<Attribute> =
+                match module.ops[kernel_op].attributes.get("in_out_signature") {
+                    Some(Attribute::Array(items)) => items.clone(),
+                    _ => Vec::new(),
+                };
+            for &inp in &inputs {
+                module.ops[kernel_op].operands.push(inp);
+                sig.push(Attribute::String("none".to_string()));
+            }
+            module.ops[kernel_op]
+                .attributes
+                .insert("in_out_signature".to_string(), Attribute::Array(sig));
+
+            for &cand_op in &module.blocks[blk_id].ops {
+                if cand_op == op_id {
+                    continue;
+                }
+                for opd in &mut module.ops[cand_op].operands {
+                    if *opd == ext_res {
+                        *opd = gate;
+                    }
+                }
+            }
+            erased.insert(op_id);
+            absorbed += 1;
+        }
+
+        if !erased.is_empty() {
+            module.blocks[blk_id].ops.retain(|id| !erased.contains(id));
+        }
+    }
+
+    absorbed
+}
