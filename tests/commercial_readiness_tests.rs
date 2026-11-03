@@ -5413,3 +5413,46 @@ fn test_parametric_topology_sort_and_rooted_components() {
     let comp = extract_rooted_parametric_components(&m, blk_id, prod_op).expect("acyclic");
     assert_eq!(comp.len(), 5);
 }
+
+#[test]
+fn test_strided_kv_contiguous_view_recovery_and_sub_byte_serde_layout() {
+    use castforge::passes::{
+        SubByteKvSerdePreset, SubByteKvSerdeSpec, recover_strided_kv_contiguous_view,
+    };
+
+    // 1. Logical shape `[2, 4, 16, 8, 64]` (`[2, NB, BS, NH, HS]`) physically laid out as HND
+    // `[2, 4, 8, 16, 64]` (`[2, NB, NH, BS, HS]`), so strides are `[32768, 8192, 64, 1024, 1]`:
+    let shape = [2, 4, 16, 8, 64];
+    let strides = [32768, 8192, 64, 1024, 1];
+    let view = recover_strided_kv_contiguous_view(&shape, &strides).expect("valid HND recovery");
+    assert_eq!(view.perm, vec![0, 1, 3, 2, 4]);
+    assert_eq!(view.canonical_shape, vec![2, 4, 8, 16, 64]);
+    assert_eq!(view.padding_per_block_elems, 0);
+
+    // 2. Dim-0-padded pool view (`stride[0]` inflated by 512 elements per block):
+    let padded_shape = [4, 8, 64];
+    let padded_strides = [1024, 64, 1]; // tight inner = 8 * 64 = 512; padding = 512
+    let padded_view =
+        recover_strided_kv_contiguous_view(&padded_shape, &padded_strides).expect("dim0 padded");
+    assert_eq!(padded_view.padding_per_block_elems, 512);
+
+    // 3. Sub-byte KV serde layout with 4-bit norm-corrected preset:
+    let spec = SubByteKvSerdeSpec {
+        preset: SubByteKvSerdePreset::K4V4NormCorr,
+        head_dim: 128,
+        block_size: 16,
+        skip_first_layers: 2,
+        skip_last_layers: 2,
+    };
+    assert_eq!(spec.key_packed_size(), 66); // 128 * 4 / 8 + 2 = 66
+    assert_eq!(spec.value_packed_size(), 68); // 128 * 4 / 8 + 4 = 68
+    assert_eq!(spec.slot_size_aligned(), 134);
+    assert_eq!(spec.quantized_layer_range(10), (2, 8));
+    // Shape [2, 10, 32, 256] (10 layers, 32 tokens = 2 blocks of 16, 2 heads of 128):
+    // 4 raw fp16 layers = 2 * 4 * 32 * 256 * 2 = 131072 bytes
+    // 6 quant layers = 6 * 2 * 16 * 2 * 134 = 51456 bytes
+    let total = spec
+        .serialized_nbytes(&[2, 10, 32, 256], 2)
+        .expect("valid layout");
+    assert_eq!(total, 131_072 + 51_456);
+}

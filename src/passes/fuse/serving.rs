@@ -17617,3 +17617,223 @@ pub fn extract_rooted_parametric_components(
     graph.sort_op_slice(&mut component)?;
     Ok(component)
 }
+
+// ============================================================================
+// Batch 21 Step 1: Strided KV Contiguous View Recovery & Sub-Byte Serde Layout
+// ============================================================================
+
+/// Computes the dimension permutation that sorts dimensions by descending stride magnitude,
+/// breaking ties by placing size-1 dimensions innermost (`shape[i] != 1` ordered before `false`).
+#[must_use]
+pub fn compute_stride_permutation(shape: &[usize], strides: &[usize]) -> Vec<usize> {
+    let n = shape.len().min(strides.len());
+    let mut perm: Vec<usize> = (0..n).collect();
+    perm.sort_by(|&a, &b| {
+        let key_a = (strides[a], shape[a] != 1);
+        let key_b = (strides[b], shape[b] != 1);
+        key_b.cmp(&key_a)
+    });
+    perm
+}
+
+/// Validates that a stride-sorted tensor view satisfies the dim-0-padding-only layout invariant:
+/// - `ndim >= 2`
+/// - `strides[ndim - 1] == 1` and `strides[ndim - 2] == shape[ndim - 1]`
+/// - Every interior dimension `1 <= i < ndim - 1` has `strides[i] == prod(shape[i + 1..])`
+/// - `strides[0] >= prod(shape[1..])`
+///
+/// Returns `padding_per_block_elems = strides[0] - prod(shape[1..])`.
+pub fn validate_dim0_padded_strided_layout(
+    shape: &[usize],
+    strides: &[usize],
+) -> Result<usize, String> {
+    if shape.len() != strides.len() {
+        return Err("shape and strides rank mismatch".to_string());
+    }
+    let ndim = shape.len();
+    if ndim < 2 {
+        return Err("ndim < 2".to_string());
+    }
+    if strides[ndim - 1] != 1 {
+        return Err("strides[-1] != 1 (inner dim not contiguous)".to_string());
+    }
+    if strides[ndim - 2] != shape[ndim - 1] {
+        return Err("strides[-2] != shape[-1] (last-two dims not tightly packed)".to_string());
+    }
+    let mut inner_tight = 1usize;
+    for i in (1..ndim).rev() {
+        if i < ndim - 1 && strides[i] != inner_tight {
+            return Err(format!(
+                "dim {i} stride {} != tight {inner_tight} (interior-dim padding not supported)",
+                strides[i]
+            ));
+        }
+        inner_tight = inner_tight.saturating_mul(shape[i]);
+    }
+    if strides[0] < inner_tight {
+        return Err(format!(
+            "dim-0 stride {} < prod(shape[1..])={inner_tight} (overlapping blocks)",
+            strides[0]
+        ));
+    }
+    Ok(strides[0] - inner_tight)
+}
+
+/// Result of zero-copy strided KV contiguous/dim-0-padded view recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredStridedKvView {
+    /// Dimension permutation sorting strides in descending order.
+    pub perm: Vec<usize>,
+    /// Canonical shape after permutation (or expected contiguous shape when `padding_elems == 0`).
+    pub canonical_shape: Vec<usize>,
+    /// Strides after applying `perm`.
+    pub permuted_strides: Vec<usize>,
+    /// Per-block padding elements on dim 0 (`0` for strictly contiguous views).
+    pub padding_per_block_elems: usize,
+}
+
+/// Recovers a zero-copy contiguous or dim-0-padded view from `(shape, strides)` by permuting
+/// dimensions into descending stride order.
+pub fn recover_strided_kv_contiguous_view(
+    shape: &[usize],
+    strides: &[usize],
+) -> Result<RecoveredStridedKvView, String> {
+    if shape.is_empty() || shape.len() != strides.len() {
+        return Err("shape and strides must be non-empty and of equal rank".to_string());
+    }
+    let perm = compute_stride_permutation(shape, strides);
+    let perm_shape: Vec<usize> = perm.iter().map(|&i| shape[i]).collect();
+    let perm_strides: Vec<usize> = perm.iter().map(|&i| strides[i]).collect();
+    let pad = validate_dim0_padded_strided_layout(&perm_shape, &perm_strides)?;
+    if pad == 0 {
+        let num_elems: usize = perm_shape.iter().product();
+        let expected = expected_contiguous_shape_from_strides(&perm_strides, num_elems)
+            .ok_or_else(|| "invalid strides for contiguous shape".to_string())?;
+        Ok(RecoveredStridedKvView {
+            perm,
+            canonical_shape: expected,
+            permuted_strides: perm_strides,
+            padding_per_block_elems: 0,
+        })
+    } else {
+        Ok(RecoveredStridedKvView {
+            perm,
+            canonical_shape: perm_shape,
+            permuted_strides: perm_strides,
+            padding_per_block_elems: pad,
+        })
+    }
+}
+
+/// Sub-byte KV quantization preset specifying per-element bit-widths and norm correction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubByteKvSerdePreset {
+    /// 8-bit FP8 keys, 4-bit values, no norm correction.
+    K8V4,
+    /// 4-bit keys, 4-bit values, with norm correction.
+    K4V4NormCorr,
+    /// 3-bit keys, 4-bit values, with norm correction.
+    K3V4NormCorr,
+    /// 3-bit keys, 3-bit values, with norm correction.
+    K3V3NormCorr,
+}
+
+impl SubByteKvSerdePreset {
+    /// Returns `(key_quant_bits, value_quant_bits, norm_correction)`.
+    #[must_use]
+    pub const fn params(self) -> (usize, usize, bool) {
+        match self {
+            Self::K8V4 => (8, 4, false),
+            Self::K4V4NormCorr => (4, 4, true),
+            Self::K3V4NormCorr => (3, 4, true),
+            Self::K3V3NormCorr => (3, 3, true),
+        }
+    }
+}
+
+/// Configuration and byte-layout calculator for sub-byte quantized KV-cache serialization with
+/// unquantized leading/trailing layer bypass (`skip_first_layers` / `skip_last_layers`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubByteKvSerdeSpec {
+    /// Compression preset.
+    pub preset: SubByteKvSerdePreset,
+    /// Per-head hidden dimension.
+    pub head_dim: usize,
+    /// Token block size used by the compressed layout.
+    pub block_size: usize,
+    /// Number of leading layers stored without quantization.
+    pub skip_first_layers: usize,
+    /// Number of trailing layers stored without quantization.
+    pub skip_last_layers: usize,
+}
+
+impl SubByteKvSerdeSpec {
+    /// Packed byte size of one head's key vector.
+    #[must_use]
+    pub const fn key_packed_size(&self) -> usize {
+        let (k_bits, _, _) = self.preset.params();
+        if k_bits == 8 {
+            self.head_dim
+        } else {
+            (self.head_dim * k_bits).div_ceil(8) + 2
+        }
+    }
+
+    /// Packed byte size of one head's value vector (including 4-byte fp16 scale + zero-point).
+    #[must_use]
+    pub const fn value_packed_size(&self) -> usize {
+        let (_, v_bits, _) = self.preset.params();
+        (self.head_dim * v_bits).div_ceil(8) + 4
+    }
+
+    /// 2-byte aligned slot size in bytes (`key_packed_size + value_packed_size` rounded up to
+    /// even).
+    #[must_use]
+    pub const fn slot_size_aligned(&self) -> usize {
+        let s = self.key_packed_size() + self.value_packed_size();
+        s + (s % 2)
+    }
+
+    /// Half-open layer range `(quant_start, quant_end)` compressed with sub-byte quantization.
+    #[must_use]
+    pub fn quantized_layer_range(&self, num_layers: usize) -> (usize, usize) {
+        let start = self.skip_first_layers.min(num_layers);
+        let end = num_layers.saturating_sub(self.skip_last_layers).max(start);
+        (start, end)
+    }
+
+    /// Validates a 4-D KV tensor shape `[2, num_layers, num_tokens, hidden_dim]` and returns
+    /// `(num_layers, num_tokens, num_heads, head_dim)`.
+    pub fn validate_kv_shape(
+        &self,
+        shape: &[usize],
+    ) -> Result<(usize, usize, usize, usize), String> {
+        if shape.len() != 4 || shape[0] != 2 {
+            return Err(
+                "expected 4D KV tensor shape [2, num_layers, num_tokens, hidden_dim]".into(),
+            );
+        }
+        if self.head_dim == 0 || self.block_size == 0 || !shape[3].is_multiple_of(self.head_dim) {
+            return Err("hidden_dim must be divisible by positive head_dim and block_size".into());
+        }
+        Ok((shape[1], shape[2], shape[3] / self.head_dim, self.head_dim))
+    }
+
+    /// Computes the total serialized byte count for `shape` (`[2, L, T, D]`) given `raw_elem_bytes`
+    /// for the bypassed unquantized layers.
+    pub fn serialized_nbytes(
+        &self,
+        shape: &[usize],
+        raw_elem_bytes: usize,
+    ) -> Result<usize, String> {
+        let (num_layers, num_tokens, num_heads, _) = self.validate_kv_shape(shape)?;
+        let num_blocks = num_tokens.div_ceil(self.block_size);
+        let (q_start, q_end) = self.quantized_layer_range(num_layers);
+        let quant_layers = q_end - q_start;
+        let raw_layers = num_layers - quant_layers;
+        let raw_bytes = 2 * raw_layers * num_tokens * shape[3] * raw_elem_bytes;
+        let quant_bytes =
+            quant_layers * num_blocks * self.block_size * num_heads * self.slot_size_aligned();
+        Ok(raw_bytes + quant_bytes)
+    }
+}
