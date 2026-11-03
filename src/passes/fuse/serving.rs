@@ -3456,3 +3456,81 @@ pub fn fold_unfold_hybrid_prefix_bitmaps(
     }
     (hit_length, servable, retain_masks)
 }
+
+/// Per-tenant isolated LRU eviction policy partitioned by `cache_salt`
+/// (inspired by LMCache `lmcache/v1/distributed/eviction_policy/isolated_lru.py`).
+///
+/// Maintains an independent ordered LRU bucket per tenant `cache_salt`. Keys created within a
+/// single request batch are inserted in **reverse order** so that later sequence chunks (which are
+/// less valuable for future prefix reuse) sit closer to the LRU eviction head than earlier prefix
+/// chunks.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IsolatedLruEvictionPolicy {
+    buckets: IndexMap<String, IndexMap<u64, ()>>,
+}
+
+impl IsolatedLruEvictionPolicy {
+    /// Creates an empty per-salt isolated LRU eviction policy.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of resident keys currently tracked for `cache_salt`.
+    pub fn resident_len_for_salt(&self, cache_salt: &str) -> usize {
+        self.buckets.get(cache_salt).map_or(0, IndexMap::len)
+    }
+
+    /// Total number of resident keys across all tenant buckets.
+    pub fn total_resident_len(&self) -> usize {
+        self.buckets.values().map(IndexMap::len).sum()
+    }
+
+    /// Records newly created `keys` under `cache_salt` in reverse request order so later chunks
+    /// are evicted before earlier prefix chunks.
+    pub fn on_keys_created(&mut self, cache_salt: &str, keys: &[u64]) {
+        let bucket = self.buckets.entry(cache_salt.to_string()).or_default();
+        for &key in keys.iter().rev() {
+            bucket.shift_remove(&key);
+            bucket.insert(key, ());
+        }
+    }
+
+    /// Promotes accessed `keys` in `cache_salt` to the MRU tail in reverse order.
+    pub fn on_keys_touched(&mut self, cache_salt: &str, keys: &[u64]) {
+        if let Some(bucket) = self.buckets.get_mut(cache_salt) {
+            for &key in keys.iter().rev() {
+                if bucket.shift_remove(&key).is_some() {
+                    bucket.insert(key, ());
+                }
+            }
+        }
+    }
+
+    /// Removes `keys` from `cache_salt` when deleted externally.
+    pub fn on_keys_removed(&mut self, cache_salt: &str, keys: &[u64]) {
+        if let Some(bucket) = self.buckets.get_mut(cache_salt) {
+            for &key in keys {
+                bucket.shift_remove(&key);
+            }
+        }
+    }
+
+    /// Evicts `ceil(len * expected_ratio)` LRU keys strictly from `cache_salt`'s bucket without
+    /// disturbing any other tenant's resident keys.
+    pub fn evict_for_salt(&mut self, cache_salt: &str, expected_ratio: f64) -> Vec<u64> {
+        let ratio = expected_ratio.clamp(0.0, 1.0);
+        if ratio <= 0.0 {
+            return Vec::new();
+        }
+        let Some(bucket) = self.buckets.get_mut(cache_salt) else {
+            return Vec::new();
+        };
+        let num_to_evict = ((bucket.len() as f64) * ratio).ceil() as usize;
+        let count = num_to_evict.min(bucket.len());
+        let victims: Vec<u64> = bucket.keys().take(count).copied().collect();
+        for &v in &victims {
+            bucket.shift_remove(&v);
+        }
+        victims
+    }
+}

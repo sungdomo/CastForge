@@ -16,17 +16,17 @@ use castforge::ir::{
 use castforge::passes::{
     ArcKvEvictionPolicy, AsymK16V8Codec, CBChunkMatch, CBGroupSpec, CacheBlendRopeSpec,
     CacheGenCdfCodec, ChainedBlockHashConfig, DEFAULT_MAX_KERNELS_IN_FUSION_SET, DeviceTargetArch,
-    EngineKvFormat, FULL_ATTENTION_WINDOW, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind,
-    KvBlockPool, KvDmaTransferMode, KvPageSpec, KvSaltQuotaRegistry, KvScaleScope, PassManager,
-    PassRegistry, analyze_kv_layer_groups, anonymize_symbolic_dims, compress_splat_constants,
-    direct_copy_format_supported, elide_redundant_state_transfers, flatten_elementwise_chains,
-    fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
-    fuse_sole_use_prologues, hash_prefix_token_blocks, is_supported_arch_dtype,
-    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
-    mark_cuda_graph_stable_tensors, merge_identical_functions, plan_cacheblend_retrieve,
-    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
-    promote_narrow_accumulators, re_rope_key_in_place, stamp_fused_provenance, unfold_chunk_range,
-    validate_target_device_dtypes,
+    EngineKvFormat, FULL_ATTENTION_WINDOW, IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL,
+    KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode, KvPageSpec, KvSaltQuotaRegistry,
+    KvScaleScope, PassManager, PassRegistry, analyze_kv_layer_groups, anonymize_symbolic_dims,
+    compress_splat_constants, direct_copy_format_supported, elide_redundant_state_transfers,
+    flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
+    fuse_reshape_epilogue, fuse_sole_use_prologues, hash_prefix_token_blocks,
+    is_supported_arch_dtype, longest_full_attention_hit, longest_joint_prefix_hit,
+    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_identical_functions,
+    plan_cacheblend_retrieve, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
+    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
+    stamp_fused_provenance, unfold_chunk_range, validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -1389,4 +1389,27 @@ fn test_hybrid_prefix_bitmap_fold_unfold_non_monotonic_recovery() {
     assert_eq!(retain[0], vec![true, true, true, false]); // Full attention: [0..3)
     assert_eq!(retain[1], vec![false, true, true, false]); // Sliding w=2: [1..3)
     assert_eq!(retain[2], vec![false, false, true, false]); // Mamba w=1: [2..3)
+}
+
+#[test]
+fn test_isolated_lru_per_salt_eviction_preserves_other_tenants() {
+    let mut policy = IsolatedLruEvictionPolicy::new();
+
+    // Tenant A creates sequence chunks [10, 11, 12, 13] -> inserted in reverse order
+    // so LRU order is [13, 12, 11, 10] (later chunks evicted before earlier prefix chunks!)
+    policy.on_keys_created("tenant-a", &[10, 11, 12, 13]);
+    policy.on_keys_created("tenant-b", &[20, 21]);
+
+    assert_eq!(policy.resident_len_for_salt("tenant-a"), 4);
+    assert_eq!(policy.resident_len_for_salt("tenant-b"), 2);
+    assert_eq!(policy.total_resident_len(), 6);
+
+    // Touching chunk 13 in tenant-a promotes it to MRU -> LRU order becomes [12, 11, 10, 13]
+    policy.on_keys_touched("tenant-a", &[13]);
+
+    // Evict 50% of tenant-a's bucket -> evicts [12, 11]; tenant-b is completely untouched!
+    let evicted = policy.evict_for_salt("tenant-a", 0.5);
+    assert_eq!(evicted, vec![12, 11]);
+    assert_eq!(policy.resident_len_for_salt("tenant-a"), 2);
+    assert_eq!(policy.resident_len_for_salt("tenant-b"), 2);
 }
