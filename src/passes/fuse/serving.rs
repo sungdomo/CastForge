@@ -2260,3 +2260,212 @@ pub fn fuse_reshape_epilogue(module: &mut Module) -> usize {
     }
     total_commuted
 }
+
+/// CacheGen 16-bit strictly monotonic Cumulative Distribution Function (CDF) and lossless
+/// arithmetic range codec for quantized KV-cache token streams (inspired by LMCache
+/// `csrc/cuda/cal_cdf.cu`, `ac_enc.cu`, and `ac_dec.cu`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheGenCdfCodec {
+    pub max_bins: usize,
+}
+
+impl CacheGenCdfCodec {
+    pub const MAX_BINS_SUPPORTED: usize = 64;
+    pub const PRECISION_BITS: u32 = 16;
+
+    pub fn new(max_bins: usize) -> Self {
+        Self {
+            max_bins: max_bins.clamp(2, Self::MAX_BINS_SUPPORTED),
+        }
+    }
+
+    /// Computes the normalized 16-bit strictly monotonic CDF of length `max_bins + 1` across
+    /// `symbols` in a single `(layer, channel)` stream using LMCache's `normalize_cdf_value`
+    /// (`floor((0xFFFF - max_bins) * cum / ntokens) + i`), guaranteeing every bin has width
+    /// `>= 1`.
+    pub fn compute_channel_cdf(&self, symbols: &[u8]) -> Vec<u16> {
+        let bins = self.max_bins;
+        let mut hist = vec![0u32; bins + 1];
+        for &sym in symbols {
+            let idx = (sym as usize).min(bins - 1);
+            hist[idx + 1] += 1;
+        }
+        let mut local_sum = 0u32;
+        for count in hist.iter_mut().skip(1) {
+            let v = *count;
+            *count += local_sum;
+            local_sum += v;
+        }
+        let max_u16_val = (0xFFFFusize).saturating_sub(bins) as u32;
+        let mut cdf = vec![0u16; bins + 1];
+        for (i, &cum) in hist.iter().enumerate() {
+            let norm = (max_u16_val * cum).checked_div(local_sum).unwrap_or(0) as u16;
+            cdf[i] = norm + (i as u16);
+        }
+        cdf
+    }
+
+    /// Encodes a channel's quantized `symbols` (`0..max_bins`) into a compact byte stream using
+    /// 16-bit precision integer arithmetic coding (`ac_enc.cu`).
+    pub fn encode_channel(&self, cdf: &[u16], symbols: &[u8]) -> Vec<u8> {
+        struct BitWriter {
+            out_bytes: Vec<u8>,
+            cur_byte: u8,
+            bit_count: u8,
+        }
+        impl BitWriter {
+            fn push_bit(&mut self, bit: u8) {
+                self.cur_byte = (self.cur_byte << 1) | (bit & 1);
+                self.bit_count += 1;
+                if self.bit_count == 8 {
+                    self.out_bytes.push(self.cur_byte);
+                    self.cur_byte = 0;
+                    self.bit_count = 0;
+                }
+            }
+            fn emit_with_pending(&mut self, bit: u8, pending: &mut u64) {
+                self.push_bit(bit);
+                let inv = 1 - (bit & 1);
+                while *pending > 0 {
+                    self.push_bit(inv);
+                    *pending -= 1;
+                }
+            }
+        }
+
+        let max_sym = cdf.len().saturating_sub(2);
+        let mut low: u32 = 0;
+        let mut high: u32 = 0xFFFF_FFFF;
+        let mut pending_bits: u64 = 0;
+        let mut writer = BitWriter {
+            out_bytes: Vec::new(),
+            cur_byte: 0,
+            bit_count: 0,
+        };
+
+        for &raw_sym in symbols {
+            let sym = (raw_sym as usize).min(max_sym);
+            let span = (high as u64) - (low as u64) + 1;
+            let c_low = cdf[sym] as u64;
+            let c_high = if sym == max_sym {
+                0x10000u64
+            } else {
+                cdf[sym + 1] as u64
+            };
+            high = low
+                .wrapping_sub(1)
+                .wrapping_add(((span * c_high) >> Self::PRECISION_BITS) as u32);
+            low = low.wrapping_add(((span * c_low) >> Self::PRECISION_BITS) as u32);
+
+            loop {
+                if high < 0x8000_0000 {
+                    writer.emit_with_pending(0, &mut pending_bits);
+                    low <<= 1;
+                    high = (high << 1) | 1;
+                } else if low >= 0x8000_0000 {
+                    writer.emit_with_pending(1, &mut pending_bits);
+                    low <<= 1;
+                    high = (high << 1) | 1;
+                } else if low >= 0x4000_0000 && high < 0xC000_0000 {
+                    pending_bits += 1;
+                    low = (low << 1) & 0x7FFF_FFFF;
+                    high = (high << 1) | 0x8000_0001;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        pending_bits += 1;
+        if low < 0x4000_0000 {
+            writer.emit_with_pending(0, &mut pending_bits);
+        } else {
+            writer.emit_with_pending(1, &mut pending_bits);
+        }
+        if writer.bit_count > 0 {
+            writer.cur_byte <<= 8 - writer.bit_count;
+            writer.out_bytes.push(writer.cur_byte);
+        }
+        writer.out_bytes
+    }
+
+    /// Decodes `num_tokens` quantized symbols from a CacheGen arithmetic-coded `bitstream` using
+    /// binary search over the 16-bit `cdf` (`ac_dec.cu`).
+    pub fn decode_channel(&self, cdf: &[u16], bitstream: &[u8], num_tokens: usize) -> Vec<u8> {
+        let max_sym = cdf.len().saturating_sub(2);
+        let mut low: u32 = 0;
+        let mut high: u32 = 0xFFFF_FFFF;
+        let mut value: u32 = 0;
+        let mut bit_cursor: usize = 0;
+
+        let read_bit = |cursor: &mut usize| -> u32 {
+            let byte_idx = *cursor / 8;
+            let bit_idx = 7 - (*cursor % 8);
+            *cursor += 1;
+            if byte_idx < bitstream.len() {
+                ((bitstream[byte_idx] >> bit_idx) & 1) as u32
+            } else {
+                0
+            }
+        };
+
+        for _ in 0..32 {
+            value = (value << 1) | read_bit(&mut bit_cursor);
+        }
+
+        let mut decoded = Vec::with_capacity(num_tokens);
+        for tok_idx in 0..num_tokens {
+            let span = (high as u64) - (low as u64) + 1;
+            let count = ((((value as u64) - (low as u64) + 1) * 0x10000u64 - 1) / span) as u16;
+
+            // Binary search over `cdf[0..=max_sym]` (`binsearch` in `ac_dec.cu`)
+            let mut left = 0usize;
+            let mut right = max_sym + 1;
+            while left + 1 < right {
+                let mid = (left + right) / 2;
+                let v = cdf[mid];
+                if v < count {
+                    left = mid;
+                } else if v > count {
+                    right = mid;
+                } else {
+                    left = mid;
+                    break;
+                }
+            }
+            let sym = left;
+            decoded.push(sym as u8);
+            if tok_idx + 1 == num_tokens {
+                break;
+            }
+
+            let c_low = cdf[sym] as u64;
+            let c_high = if sym == max_sym {
+                0x10000u64
+            } else {
+                cdf[sym + 1] as u64
+            };
+            high = low
+                .wrapping_sub(1)
+                .wrapping_add(((span * c_high) >> Self::PRECISION_BITS) as u32);
+            low = low.wrapping_add(((span * c_low) >> Self::PRECISION_BITS) as u32);
+
+            loop {
+                if high < 0x8000_0000 || low >= 0x8000_0000 {
+                    low <<= 1;
+                    high = (high << 1) | 1;
+                    value = (value << 1) | read_bit(&mut bit_cursor);
+                } else if low >= 0x4000_0000 && high < 0xC000_0000 {
+                    low = (low << 1) & 0x7FFF_FFFF;
+                    high = (high << 1) | 0x8000_0001;
+                    value = (value & 0x8000_0000)
+                        | ((value << 1) & 0x7FFF_FFFE)
+                        | read_bit(&mut bit_cursor);
+                } else {
+                    break;
+                }
+            }
+        }
+        decoded
+    }
+}

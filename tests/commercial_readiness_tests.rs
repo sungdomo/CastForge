@@ -14,15 +14,15 @@ use castforge::ir::{
     DType, Dim, Location, TensorBacking, TensorEntry, TensorStore, TensorType, parse_mlir,
 };
 use castforge::passes::{
-    AsymK16V8Codec, CacheBlendRopeSpec, ChainedBlockHashConfig, DEFAULT_MAX_KERNELS_IN_FUSION_SET,
-    EngineKvFormat, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode,
-    KvPageSpec, KvScaleScope, PassManager, PassRegistry, analyze_kv_layer_groups,
-    anonymize_symbolic_dims, compress_splat_constants, direct_copy_format_supported,
-    fuse_locations, fuse_reshape_epilogue, fuse_sole_use_prologues, hash_prefix_token_blocks,
-    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
-    mark_cuda_graph_stable_tensors, merge_identical_functions, plan_jenga_kv_geometry,
-    plan_kernel_sequence_fusion, plan_kv_dma_transfer, re_rope_key_in_place,
-    stamp_fused_provenance,
+    AsymK16V8Codec, CacheBlendRopeSpec, CacheGenCdfCodec, ChainedBlockHashConfig,
+    DEFAULT_MAX_KERNELS_IN_FUSION_SET, EngineKvFormat, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind,
+    KvBlockPool, KvDmaTransferMode, KvPageSpec, KvScaleScope, PassManager, PassRegistry,
+    analyze_kv_layer_groups, anonymize_symbolic_dims, compress_splat_constants,
+    direct_copy_format_supported, fuse_locations, fuse_reshape_epilogue, fuse_sole_use_prologues,
+    hash_prefix_token_blocks, longest_full_attention_hit, longest_joint_prefix_hit,
+    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_identical_functions,
+    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
+    re_rope_key_in_place, stamp_fused_provenance,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -1068,4 +1068,32 @@ fn test_reshape_epilogue_fusion_into_matmul_bias_tanh() {
 
     let out_after = evaluate_module(&module, &[x, w, b]).unwrap();
     assert_eq!(out_before, out_after);
+}
+
+#[test]
+fn test_cachegen_16bit_monotonic_cdf_and_arithmetic_coding_roundtrip() {
+    let codec = CacheGenCdfCodec::new(16);
+    // Highly skewed KV quantization bin stream (concentrated around center bin 8)
+    let symbols: Vec<u8> = (0..64)
+        .map(|i| match i % 8 {
+            0..=5 => 8,
+            6 => 7,
+            _ => 9,
+        })
+        .collect();
+
+    let cdf = codec.compute_channel_cdf(&symbols);
+    assert_eq!(cdf.len(), 17);
+    assert_eq!(cdf[0], 0);
+    // Strictly monotonic (`cdf[i + 1] > cdf[i]` even for zero-count bins!)
+    for pair in cdf.windows(2) {
+        assert!(pair[1] > pair[0]);
+    }
+
+    let bitstream = codec.encode_channel(&cdf, &symbols);
+    // Skewed 64-symbol stream compresses well below 64 raw bytes
+    assert!(bitstream.len() < 32);
+
+    let decoded = codec.decode_channel(&cdf, &bitstream, symbols.len());
+    assert_eq!(decoded, symbols);
 }
