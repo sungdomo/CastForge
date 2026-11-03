@@ -7679,3 +7679,70 @@ fn test_merge_adjacent_parallels_fuses_producer_consumer_and_drops_internal_yiel
         .collect();
     assert_eq!(body_ops, vec!["mo.add", "mo.relu", "mo.yield"]);
 }
+
+#[test]
+fn test_infer_tensor_layouts_and_mark_stable_tensors() {
+    use castforge::ir::Attribute;
+    use castforge::passes::{infer_tensor_layouts, mark_stable_tensors};
+
+    let src = concat!(
+        "module {\n",
+        "  \"kgen.kernel_decl\"() {sym_name = \"custom_conv_epilogue\"} : () -> ()\n",
+        "  func.func @device_conv_graph(\n",
+        "    %x: tensor<1x32x32x16xf32>,\n",
+        "    %w: tensor<64x16x3x3xf32>,\n",
+        "    %b: tensor<1x32x32x64xf32>\n",
+        "  ) -> tensor<1x32x32x64xf32> attributes {is_device_graph = true} {\n",
+        "    %x_relu = \"mo.relu\"(%x) : (tensor<1x32x32x16xf32>) -> tensor<1x32x32x16xf32>\n",
+        "    %conv = \"mo.conv\"(%x_relu, %w) : ",
+        "(tensor<1x32x32x16xf32>, tensor<64x16x3x3xf32>) -> tensor<1x32x32x64xf32>\n",
+        "    %out = \"mo.custom\"(%conv, %b) {symbol = \"custom_conv_epilogue\"} : ",
+        "(tensor<1x32x32x64xf32>, tensor<1x32x32x64xf32>) -> tensor<1x32x32x64xf32>\n",
+        "    return %out : tensor<1x32x32x64xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(src).unwrap();
+    let root_blk = m.regions[m.root_region].blocks[0];
+    let decl_op = m.blocks[root_blk].ops[0];
+    m.ops[decl_op].attributes.insert(
+        "stable_arg_indices".to_string(),
+        Attribute::Array(vec![Attribute::Int(0)]),
+    );
+
+    // 1. Infer layouts: `mo.conv` seeds `NHWC` on `%x_relu` and `FCRS` on `%w`, and propagates
+    // `NHWC` backward across `mo.relu` to `%x`:
+    let layouts = infer_tensor_layouts(&mut m).expect("layout inference succeeds");
+    let fn_id = m.functions()[0];
+    let blk = m.regions[m.ops[fn_id].regions[0]].blocks[0];
+    let x_arg = m.blocks[blk].arguments[0];
+    let w_arg = m.blocks[blk].arguments[1];
+    let relu_op = m.blocks[blk].ops[0];
+    let relu_res = m.ops[relu_op].results[0];
+    assert_eq!(layouts.get(&x_arg).map(String::as_str), Some("NHWC"));
+    assert_eq!(layouts.get(&relu_res).map(String::as_str), Some("NHWC"));
+    assert_eq!(layouts.get(&w_arg).map(String::as_str), Some("FCRS"));
+
+    // 2. Mark stable tensors: `custom_conv_epilogue` requires operand 0 (`%conv`) to be wrapped
+    // in `mo.stable.create`, and running a second time is idempotent:
+    let inserted = mark_stable_tensors(&mut m).expect("mark_stable_tensors succeeds");
+    assert_eq!(inserted, 1);
+    let inserted_again = mark_stable_tensors(&mut m).expect("idempotent second run");
+    assert_eq!(inserted_again, 0);
+
+    let op_names: Vec<String> = m.blocks[blk]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        op_names,
+        vec![
+            "mo.relu",
+            "mo.conv",
+            "mo.stable.create",
+            "mo.custom",
+            "func.return"
+        ]
+    );
+}

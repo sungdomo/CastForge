@@ -26102,3 +26102,337 @@ pub fn merge_adjacent_parallels(module: &mut Module) -> usize {
     }
     merged_count
 }
+
+fn is_layout_propagating_op(op: &crate::ir::mlir::Operation) -> bool {
+    if matches!(
+        op.attributes.get("same_operands_and_result_type"),
+        Some(Attribute::Bool(true))
+    ) {
+        return true;
+    }
+    matches!(
+        op.name.full_name().as_str(),
+        "mo.transfer"
+            | "mo.add"
+            | "mo.sub"
+            | "mo.mul"
+            | "mo.div"
+            | "mo.relu"
+            | "mo.exp"
+            | "mo.tanh"
+            | "mo.sigmoid"
+            | "mo.neg"
+            | "mo.abs"
+            | "mo.sqrt"
+            | "mo.rsqrt"
+    )
+}
+
+fn constrain_value_layout(
+    inferred: &mut std::collections::HashMap<ValueId, String>,
+    value_id: ValueId,
+    layout: &str,
+) -> Result<(), String> {
+    if let Some(existing) = inferred.get(&value_id) {
+        if existing != layout {
+            return Err(format!(
+                "Attempting to constrain value {value_id:?} to layout '{layout}' \
+                 when it is already constrained to layout '{existing}'"
+            ));
+        }
+        return Ok(());
+    }
+    inferred.insert(value_id, layout.to_string());
+    Ok(())
+}
+
+/// Seeds tensor layout constraints from `mo.conv` (`NHWC`/`FCRS` for 2D, `NDHWC`/`FCQRS` for 3D),
+/// `mo.conv_transpose` (`NHWC`/`RSFC` for 2D, `NDHWC`/`QRSFC` for 3D), and `mo.matmul` (`KN` for
+/// weights), then propagates them bidirectionally across `mo.guard`, `mo.transfer`, and
+/// layout-preserving elementwise operations.
+///
+/// Annotates defining operations with `"inferred_layout"` attributes and returns the map of
+/// constrained `ValueId`s to layout strings, or `Err` on unsupported conv rank or conflicting
+/// layout constraints.
+pub fn infer_tensor_layouts(
+    module: &mut Module,
+) -> Result<std::collections::HashMap<ValueId, String>, String> {
+    let mut inferred: std::collections::HashMap<ValueId, String> = std::collections::HashMap::new();
+
+    let op_ids: Vec<OpId> = module.ops.keys().collect();
+    for oid in op_ids {
+        let op = &module.ops[oid];
+        let full = op.name.full_name();
+        if (full == "mo.conv" || full == "mo.conv_transpose") && op.operands.len() >= 2 {
+            let input_v = op.operands[0];
+            let filter_v = op.operands[1];
+            let input_rank = module
+                .values
+                .get(input_v)
+                .and_then(|v| v.ty.as_tensor())
+                .map(|t| t.shape.len())
+                .unwrap_or(0);
+            let filter_rank = module
+                .values
+                .get(filter_v)
+                .and_then(|v| v.ty.as_tensor())
+                .map(|t| t.shape.len())
+                .unwrap_or(0);
+            let (in_layout, flt_layout) = match (full.as_str(), input_rank, filter_rank) {
+                ("mo.conv", 4, 4) => ("NHWC", "FCRS"),
+                ("mo.conv", 5, 5) => ("NDHWC", "FCQRS"),
+                ("mo.conv_transpose", 4, 4) => ("NHWC", "RSFC"),
+                ("mo.conv_transpose", 5, 5) => ("NDHWC", "QRSFC"),
+                _ => {
+                    return Err(format!(
+                        "Unsupported rank pair ({input_rank}, {filter_rank}) for {full}"
+                    ));
+                }
+            };
+            constrain_value_layout(&mut inferred, input_v, in_layout)?;
+            constrain_value_layout(&mut inferred, filter_v, flt_layout)?;
+        } else if full == "mo.matmul" && op.operands.len() >= 2 {
+            let weights_v = op.operands[1];
+            if module
+                .values
+                .get(weights_v)
+                .and_then(|v| v.ty.as_tensor())
+                .is_some()
+            {
+                constrain_value_layout(&mut inferred, weights_v, "KN")?;
+            }
+        }
+    }
+
+    let mut worklist: Vec<ValueId> = inferred.keys().copied().collect();
+    let mut visited: std::collections::HashSet<ValueId> = worklist.iter().copied().collect();
+
+    while let Some(val_id) = worklist.pop() {
+        let Some(layout) = inferred.get(&val_id).cloned() else {
+            continue;
+        };
+        let mut affected_ops: Vec<OpId> = module
+            .ops
+            .iter()
+            .filter_map(|(oid, op)| op.operands.contains(&val_id).then_some(oid))
+            .collect();
+        if let Some(crate::ir::mlir::ValueDef::OpResult { op: def_op, .. }) =
+            module.values.get(val_id).map(|v| v.def)
+        {
+            affected_ops.push(def_op);
+        }
+
+        for oid in affected_ops {
+            let op = &module.ops[oid];
+            let full = op.name.full_name();
+            let propagate_vals: Vec<ValueId> = if full == "mo.guard" {
+                op.operands
+                    .iter()
+                    .skip(1)
+                    .chain(op.results.iter())
+                    .copied()
+                    .collect()
+            } else if is_layout_propagating_op(op) {
+                op.operands
+                    .iter()
+                    .chain(op.results.iter())
+                    .copied()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            for pv in propagate_vals {
+                if module
+                    .values
+                    .get(pv)
+                    .and_then(|v| v.ty.as_tensor())
+                    .is_some()
+                {
+                    constrain_value_layout(&mut inferred, pv, &layout)?;
+                    if visited.insert(pv) {
+                        worklist.push(pv);
+                    }
+                }
+            }
+        }
+    }
+
+    for (&val_id, layout) in &inferred {
+        if let Some(crate::ir::mlir::ValueDef::OpResult { op: def_op, .. }) =
+            module.values.get(val_id).map(|v| v.def)
+            && let Some(op) = module.ops.get_mut(def_op)
+        {
+            op.attributes.insert(
+                "inferred_layout".to_string(),
+                Attribute::String(layout.clone()),
+            );
+        }
+    }
+
+    Ok(inferred)
+}
+
+/// Inserts `mo.stable.create` wrappers for tensor operands feeding kernel `build_graph`
+/// arguments that require stable tensor storage inside device-graph functions
+/// (`is_device_graph = true`).
+///
+/// Looks up `kgen.kernel_decl` declarations (by `mo.custom` `"symbol"` or built-in op name) and
+/// reads their `stable_arg_indices` integer array attribute (or per-op `stable_operand_indices`).
+/// Returns the number of `mo.stable.create` operations inserted, or `Err` if a required stable
+/// operand is not a tensor.
+pub fn mark_stable_tensors(module: &mut Module) -> Result<usize, String> {
+    use crate::ir::mlir::{Location, OpName, Operation, Value, ValueDef};
+
+    // Collect `kgen.kernel_decl` -> stable operand indices:
+    let mut decl_stable_indices: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for op in module.ops.values() {
+        if op.name.full_name() == "kgen.kernel_decl" {
+            let sym = op
+                .attributes
+                .get("sym_name")
+                .or_else(|| op.attributes.get("kernel_name"))
+                .and_then(Attribute::as_str);
+            if let Some(sym_str) = sym
+                && let Some(Attribute::Array(items)) = op.attributes.get("stable_arg_indices")
+            {
+                let indices: Vec<usize> = items
+                    .iter()
+                    .filter_map(|a| match a {
+                        Attribute::Int(i) if *i >= 0 => Some(*i as usize),
+                        _ => None,
+                    })
+                    .collect();
+                if !indices.is_empty() {
+                    decl_stable_indices.insert(sym_str.to_string(), indices);
+                }
+            }
+        }
+    }
+
+    let mut inserted_count = 0usize;
+    let func_ids = module.functions();
+    for fn_id in func_ids {
+        let is_device_graph = matches!(
+            module.ops[fn_id].attributes.get("is_device_graph"),
+            Some(Attribute::Bool(true))
+        );
+        if !is_device_graph {
+            continue;
+        }
+        let regions = module.ops[fn_id].regions.clone();
+        for reg_id in regions {
+            let blocks = module.regions[reg_id].blocks.clone();
+            for bid in blocks {
+                let ops_snapshot = module.blocks[bid].ops.clone();
+                for op_id in ops_snapshot {
+                    let op = module.ops[op_id].clone();
+                    let full = op.name.full_name();
+                    if matches!(
+                        full.as_str(),
+                        "func.return" | "return" | "mo.output" | "mo.yield" | "mo.stable.create"
+                    ) {
+                        continue;
+                    }
+                    let reg_name = if full == "mo.custom" {
+                        op.attributes
+                            .get("symbol")
+                            .and_then(Attribute::as_str)
+                            .unwrap_or(full.as_str())
+                            .to_string()
+                    } else {
+                        full
+                    };
+
+                    let stable_positions: Vec<usize> = if let Some(Attribute::Array(items)) =
+                        op.attributes.get("stable_operand_indices")
+                    {
+                        items
+                            .iter()
+                            .filter_map(|a| match a {
+                                Attribute::Int(i) if *i >= 0 => Some(*i as usize),
+                                _ => None,
+                            })
+                            .collect()
+                    } else if let Some(idxs) = decl_stable_indices.get(&reg_name) {
+                        idxs.clone()
+                    } else {
+                        continue;
+                    };
+
+                    let mut pre_ops = Vec::new();
+                    for pos in stable_positions {
+                        if pos >= module.ops[op_id].operands.len() {
+                            continue;
+                        }
+                        let orig_val = module.ops[op_id].operands[pos];
+                        let val_ty = module
+                            .values
+                            .get(orig_val)
+                            .map(|v| v.ty.clone())
+                            .ok_or_else(|| format!("Missing SSA value at operand {pos}"))?;
+                        if val_ty.as_tensor().is_none() {
+                            return Err(format!(
+                                "Operand at position {pos} feeds a stable tensor argument of \
+                                 kernel '{reg_name}' but is not a tensor"
+                            ));
+                        }
+                        // Skip if already produced by `mo.stable.create`:
+                        if let Some(ValueDef::OpResult { op: def_op, .. }) =
+                            module.values.get(orig_val).map(|v| v.def)
+                            && module
+                                .ops
+                                .get(def_op)
+                                .is_some_and(|d| d.name.full_name() == "mo.stable.create")
+                        {
+                            continue;
+                        }
+
+                        let stable_val = module.values.insert(Value {
+                            id: ValueId::default(),
+                            ssa_name: None,
+                            ty: val_ty,
+                            def: ValueDef::BlockArgument {
+                                block: bid,
+                                index: 0,
+                            },
+                        });
+                        module.values[stable_val].id = stable_val;
+                        let mut attrs = indexmap::IndexMap::new();
+                        attrs.insert("is_stable".to_string(), Attribute::Bool(true));
+                        let stable_op = module.ops.insert(Operation {
+                            id: OpId::default(),
+                            name: OpName::new("mo", "stable.create"),
+                            operands: smallvec::smallvec![orig_val],
+                            results: smallvec::smallvec![stable_val],
+                            attributes: attrs,
+                            regions: Vec::new(),
+                            custom_syntax: false,
+                            location: Location::Unknown,
+                        });
+                        module.ops[stable_op].id = stable_op;
+                        module.values[stable_val].def = ValueDef::OpResult {
+                            op: stable_op,
+                            index: 0,
+                        };
+                        module.ops[op_id].operands[pos] = stable_val;
+                        pre_ops.push(stable_op);
+                        inserted_count += 1;
+                    }
+
+                    if !pre_ops.is_empty()
+                        && let Some(slot_pos) =
+                            module.blocks[bid].ops.iter().position(|&id| id == op_id)
+                    {
+                        for (offset, s_op) in pre_ops.into_iter().enumerate() {
+                            module.blocks[bid].ops.insert(slot_pos + offset, s_op);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(inserted_count)
+}
