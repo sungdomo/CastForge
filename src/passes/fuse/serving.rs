@@ -3534,3 +3534,132 @@ impl IsolatedLruEvictionPolicy {
         victims
     }
 }
+
+/// Default GPUDirect Storage (`cuFile` / `O_DIRECT`) filesystem block alignment (`4096` bytes).
+pub const GDS_DEFAULT_ALIGN_BYTES: u64 = 4096;
+
+/// Aligned physical slab region in a GPUDirect Storage (GDS) L1 backing file
+/// (inspired by LMCache `lmcache/v1/distributed/memory_manager/gds_l1_memory_manager.py`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GdsSlabRegion {
+    /// Aligned starting byte offset in the backing file.
+    pub offset: u64,
+    /// Aligned physical span length in bytes (`ceil(logical_bytes / align_bytes) * align_bytes`).
+    pub physical_size: u64,
+}
+
+/// GPUDirect Storage (GDS) 4 KiB-aligned all-or-nothing slab address allocator with sorted
+/// free-interval coalescing
+/// (inspired by LMCache `lmcache/v1/distributed/memory_manager/gds_l1_memory_manager.py`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GdsSlabAddressManager {
+    total_size_bytes: u64,
+    align_bytes: u64,
+    free_regions: Vec<GdsSlabRegion>,
+}
+
+impl GdsSlabAddressManager {
+    /// Creates a new GDS slab allocator over `total_size_bytes` rounded down to a multiple of
+    /// `align_bytes` (defaults to [`GDS_DEFAULT_ALIGN_BYTES`] when `align_bytes == 0`).
+    pub fn new(total_size_bytes: u64, align_bytes: u64) -> Self {
+        let align = if align_bytes == 0 {
+            GDS_DEFAULT_ALIGN_BYTES
+        } else {
+            align_bytes
+        };
+        let aligned_total = (total_size_bytes / align) * align;
+        let free_regions = if aligned_total > 0 {
+            vec![GdsSlabRegion {
+                offset: 0,
+                physical_size: aligned_total,
+            }]
+        } else {
+            Vec::new()
+        };
+        Self {
+            total_size_bytes: aligned_total,
+            align_bytes: align,
+            free_regions,
+        }
+    }
+
+    /// Rounds `logical_bytes` up to the nearest non-zero multiple of `self.align_bytes`.
+    pub fn align_up(&self, logical_bytes: u64) -> u64 {
+        let n = logical_bytes.max(1);
+        n.div_ceil(self.align_bytes) * self.align_bytes
+    }
+
+    /// Total free physical bytes across all coalesced free regions.
+    pub fn free_size_bytes(&self) -> u64 {
+        self.free_regions.iter().map(|r| r.physical_size).sum()
+    }
+
+    /// Number of disjoint free fragments currently tracked.
+    pub fn free_fragment_count(&self) -> usize {
+        self.free_regions.len()
+    }
+
+    fn allocate_single(&mut self, physical_size: u64) -> Option<GdsSlabRegion> {
+        let idx = self
+            .free_regions
+            .iter()
+            .position(|r| r.physical_size >= physical_size)?;
+        let region = &mut self.free_regions[idx];
+        let allocated = GdsSlabRegion {
+            offset: region.offset,
+            physical_size,
+        };
+        region.offset += physical_size;
+        region.physical_size -= physical_size;
+        if region.physical_size == 0 {
+            self.free_regions.remove(idx);
+        }
+        Some(allocated)
+    }
+
+    /// Allocates `count` aligned slabs of `logical_chunk_bytes` with **all-or-nothing** semantics:
+    /// if any slab cannot be satisfied, all slabs allocated earlier in the batch are rolled back
+    /// and coalesced before returning `None`.
+    pub fn allocate_batch(
+        &mut self,
+        logical_chunk_bytes: u64,
+        count: usize,
+    ) -> Option<Vec<GdsSlabRegion>> {
+        if count == 0 {
+            return Some(Vec::new());
+        }
+        let phys = self.align_up(logical_chunk_bytes);
+        let mut allocated = Vec::with_capacity(count);
+        for _ in 0..count {
+            if let Some(slab) = self.allocate_single(phys) {
+                allocated.push(slab);
+            } else {
+                for prev in allocated {
+                    self.free_region(prev);
+                }
+                return None;
+            }
+        }
+        Some(allocated)
+    }
+
+    /// Frees `region` and coalesces adjacent free intervals in sorted offset order.
+    pub fn free_region(&mut self, region: GdsSlabRegion) {
+        if region.physical_size == 0 {
+            return;
+        }
+        self.free_regions.push(region);
+        self.free_regions.sort_by_key(|r| r.offset);
+        let mut merged: Vec<GdsSlabRegion> = Vec::with_capacity(self.free_regions.len());
+        for r in self.free_regions.drain(..) {
+            if let Some(last) = merged.last_mut()
+                && last.offset + last.physical_size == r.offset
+            {
+                last.physical_size += r.physical_size;
+            } else {
+                merged.push(r);
+            }
+        }
+        self.free_regions = merged;
+    }
+}

@@ -16,17 +16,18 @@ use castforge::ir::{
 use castforge::passes::{
     ArcKvEvictionPolicy, AsymK16V8Codec, CBChunkMatch, CBGroupSpec, CacheBlendRopeSpec,
     CacheGenCdfCodec, ChainedBlockHashConfig, DEFAULT_MAX_KERNELS_IN_FUSION_SET, DeviceTargetArch,
-    EngineKvFormat, FULL_ATTENTION_WINDOW, IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL,
-    KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode, KvPageSpec, KvSaltQuotaRegistry,
-    KvScaleScope, PassManager, PassRegistry, analyze_kv_layer_groups, anonymize_symbolic_dims,
-    compress_splat_constants, direct_copy_format_supported, elide_redundant_state_transfers,
-    flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
-    fuse_reshape_epilogue, fuse_sole_use_prologues, hash_prefix_token_blocks,
-    is_supported_arch_dtype, longest_full_attention_hit, longest_joint_prefix_hit,
-    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_identical_functions,
-    plan_cacheblend_retrieve, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
-    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
-    stamp_fused_provenance, unfold_chunk_range, validate_target_device_dtypes,
+    EngineKvFormat, FULL_ATTENTION_WINDOW, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
+    IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
+    KvDmaTransferMode, KvPageSpec, KvSaltQuotaRegistry, KvScaleScope, PassManager, PassRegistry,
+    analyze_kv_layer_groups, anonymize_symbolic_dims, compress_splat_constants,
+    direct_copy_format_supported, elide_redundant_state_transfers, flatten_elementwise_chains,
+    fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
+    fuse_sole_use_prologues, hash_prefix_token_blocks, is_supported_arch_dtype,
+    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
+    mark_cuda_graph_stable_tensors, merge_identical_functions, plan_cacheblend_retrieve,
+    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
+    promote_narrow_accumulators, re_rope_key_in_place, stamp_fused_provenance, unfold_chunk_range,
+    validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -1412,4 +1413,36 @@ fn test_isolated_lru_per_salt_eviction_preserves_other_tenants() {
     assert_eq!(evicted, vec![12, 11]);
     assert_eq!(policy.resident_len_for_salt("tenant-a"), 2);
     assert_eq!(policy.resident_len_for_salt("tenant-b"), 2);
+}
+
+#[test]
+fn test_gds_slab_address_manager_alignment_all_or_nothing_and_coalescing() {
+    // 16 KiB total backing file (4 x 4096-byte pages)
+    let mut mgr = GdsSlabAddressManager::new(16_384, GDS_DEFAULT_ALIGN_BYTES);
+    assert_eq!(mgr.free_size_bytes(), 16_384);
+    assert_eq!(mgr.align_up(5_000), 8_192);
+
+    // Allocate 2 slabs of 3,000 logical bytes -> each rounds up to 4,096 physical bytes
+    let batch1 = mgr
+        .allocate_batch(3_000, 2)
+        .expect("2 x 4KiB should succeed");
+    assert_eq!(batch1.len(), 2);
+    assert_eq!(batch1[0].offset, 0);
+    assert_eq!(batch1[0].physical_size, 4_096);
+    assert_eq!(batch1[1].offset, 4_096);
+    assert_eq!(mgr.free_size_bytes(), 8_192);
+
+    // Request 3 more 4KiB slabs when only 2 (8,192B) remain -> all-or-nothing rollback!
+    assert!(mgr.allocate_batch(3_000, 3).is_none());
+    // Free size and fragment count must be completely restored after rollback!
+    assert_eq!(mgr.free_size_bytes(), 8_192);
+    assert_eq!(mgr.free_fragment_count(), 1);
+
+    // Freeing the first slab creates 2 fragments ([0..4096) and [8192..16384));
+    // freeing the second slab ([4096..8192)) coalesces everything back into 1 contiguous region!
+    mgr.free_region(batch1[0]);
+    assert_eq!(mgr.free_fragment_count(), 2);
+    mgr.free_region(batch1[1]);
+    assert_eq!(mgr.free_fragment_count(), 1);
+    assert_eq!(mgr.free_size_bytes(), 16_384);
 }
