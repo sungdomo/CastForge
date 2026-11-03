@@ -17,11 +17,11 @@ use castforge::passes::{
     AsymK16V8Codec, CacheBlendRopeSpec, ChainedBlockHashConfig, DEFAULT_MAX_KERNELS_IN_FUSION_SET,
     EngineKvFormat, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode,
     KvPageSpec, KvScaleScope, PassManager, PassRegistry, analyze_kv_layer_groups,
-    compress_splat_constants, direct_copy_format_supported, fuse_locations,
-    fuse_sole_use_prologues, hash_prefix_token_blocks, longest_full_attention_hit,
+    anonymize_symbolic_dims, compress_splat_constants, direct_copy_format_supported,
+    fuse_locations, fuse_sole_use_prologues, hash_prefix_token_blocks, longest_full_attention_hit,
     longest_joint_prefix_hit, longest_sliding_window_hit, mark_cuda_graph_stable_tensors,
-    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
-    re_rope_key_in_place, stamp_fused_provenance,
+    merge_identical_functions, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
+    plan_kv_dma_transfer, re_rope_key_in_place, stamp_fused_provenance,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -980,4 +980,56 @@ module @provenance_fusion {
         .generate("cuda", &module, &TargetConfig::default())
         .unwrap();
     assert!(cuda_src.contains("Provenance: layer0.input_tanh+model.py:88:12"));
+}
+
+#[test]
+fn test_anonymize_symbolic_dims_and_merge_identical_functions() {
+    let mlir = r#"
+module @dedup_funcs {
+  func.func @layer_b(%x: tensor<sym_bxf32>) -> tensor<sym_bxf32> {
+    %0 = stablehlo.tanh %x : tensor<sym_bxf32>
+    %1 = stablehlo.abs %0 : tensor<sym_bxf32>
+    func.return %1 : tensor<sym_bxf32>
+  }
+  func.func @layer_a(%y: tensor<sym_axf32>) -> tensor<sym_axf32> {
+    %p = stablehlo.tanh %y : tensor<sym_axf32>
+    %q = stablehlo.abs %p : tensor<sym_axf32>
+    func.return %q : tensor<sym_axf32>
+  }
+  func.func @main(%in: tensor<?xf32>) -> tensor<?xf32> {
+    %t0 = func.call @layer_b(%in) : (tensor<?xf32>) -> tensor<?xf32>
+    %t1 = func.call @layer_a(%t0) : (tensor<?xf32>) -> tensor<?xf32>
+    func.return %t1 : tensor<?xf32>
+  }
+}
+"#;
+    let mut module = parse_mlir(mlir).unwrap();
+    for &fn_id in &module.functions() {
+        let sym = module.ops[fn_id]
+            .attributes
+            .get("sym_name")
+            .and_then(|a| a.as_str())
+            .unwrap()
+            .to_string();
+        module.ops[fn_id].location = Location::Named(format!("src_{sym}"));
+    }
+
+    // 1. Anonymize symbolic dimensions (`sym_a`, `sym_b` -> `?`) so `@layer_a` and `@layer_b`
+    // become structurally identical
+    let anon_count = anonymize_symbolic_dims(&mut module);
+    assert!(anon_count >= 6);
+    assert_eq!(anonymize_symbolic_dims(&mut module), 0); // idempotent
+
+    // 2. Merge identical functions -> `@layer_a` is chosen lexicographically over `@layer_b`,
+    // `@layer_b` is removed, its location is fused into `@layer_a`, and both `func.call` ops
+    // now invoke `@layer_a`!
+    let merged = merge_identical_functions(&mut module);
+    assert_eq!(merged, 1);
+    assert_eq!(module.functions().len(), 2);
+
+    let printed = castforge::ir::print_mlir(&module);
+    assert!(printed.contains("func.func @layer_a("));
+    assert!(!printed.contains("func.func @layer_b("));
+    assert_eq!(printed.matches("func.call @layer_a(").count(), 2);
+    assert!(printed.contains("src_layer_a+src_layer_b"));
 }

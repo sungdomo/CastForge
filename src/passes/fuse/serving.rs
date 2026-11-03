@@ -2,7 +2,8 @@
 
 use super::attention::*;
 use crate::ir::{
-    Attribute, BlockId, Location, Module, OpId, OpName, Operation, Value, ValueDef, ValueId,
+    Attribute, BlockId, Dim, Location, Module, OpId, OpName, Operation, Type, Value, ValueDef,
+    ValueId,
 };
 use crate::passes::{Pass, PassResult};
 use anyhow::Result;
@@ -1959,4 +1960,155 @@ pub fn stamp_fused_provenance(target_op: &mut Operation, source_locs: &[Location
             );
         }
     }
+}
+
+fn anonymize_type_dims(ty: &mut Type) -> usize {
+    match ty {
+        Type::Tensor(t) => {
+            let mut count = 0usize;
+            for dim in &mut t.shape {
+                if matches!(dim, Dim::Symbolic(_)) {
+                    *dim = Dim::Dynamic;
+                    count += 1;
+                }
+            }
+            count
+        }
+        Type::Tuple(items) => items.iter_mut().map(anonymize_type_dims).sum(),
+        Type::Function { inputs, results } => {
+            let a: usize = inputs.iter_mut().map(anonymize_type_dims).sum();
+            let b: usize = results.iter_mut().map(anonymize_type_dims).sum();
+            a + b
+        }
+        _ => 0,
+    }
+}
+
+/// Strips symbolic dimension names (`Dim::Symbolic(name)` -> `Dim::Dynamic`) across all SSA
+/// values and function signatures in `module` (inspired by Modular `AnonymizeDimNames.cpp`
+/// `stripStubDimNames`).
+///
+/// Idempotent: returns the number of symbolic dimension slots anonymized.
+pub fn anonymize_symbolic_dims(module: &mut Module) -> usize {
+    let mut count = 0usize;
+    for (_, val) in module.values.iter_mut() {
+        count += anonymize_type_dims(&mut val.ty);
+    }
+    for (_, op) in module.ops.iter_mut() {
+        for (_, attr) in op.attributes.iter_mut() {
+            if let Attribute::Type(ty) = attr {
+                count += anonymize_type_dims(ty);
+            }
+        }
+    }
+    count
+}
+
+/// Deduplicates structurally identical `func.func` definitions in `module` modulo `@sym_name`,
+/// SSA value numbering, and source locations (inspired by Modular `MergeIdenticalFuncs.cpp`).
+///
+/// For each equivalence class of 2 or more functions:
+/// 1. Selects a deterministic canonical symbol (`@main` / `@forward` if present, otherwise the
+///    lexicographically smallest symbol name),
+/// 2. Fuses all duplicate functions' [`Location`]s into the canonical function via
+///    [`stamp_fused_provenance`],
+/// 3. Rewrites all `func.call` callee attributes across `module` to reference the canonical
+///    symbol, and
+/// 4. Removes the duplicate `func.func` operations from `module`.
+///
+/// Returns the number of duplicate functions merged and eliminated.
+pub fn merge_identical_functions(module: &mut Module) -> usize {
+    let fns = module.functions();
+    if fns.len() <= 1 {
+        return 0;
+    }
+
+    // Group functions by (signature_string, body_structural_hash)
+    type FuncStubEntry = (OpId, String, Location);
+    let mut groups: IndexMap<(String, u64), Vec<FuncStubEntry>> = IndexMap::new();
+    for &fn_id in &fns {
+        let Some(op) = module.ops.get(fn_id) else {
+            continue;
+        };
+        let Some(sym_name) = op
+            .attributes
+            .get("sym_name")
+            .and_then(|a| a.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(&reg_id) = op.regions.first() else {
+            continue;
+        };
+        let sig_str = op
+            .attributes
+            .get("function_type")
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        let body_hash = crate::codegen::compute_region_structural_hash(module, reg_id);
+        groups.entry((sig_str, body_hash)).or_default().push((
+            fn_id,
+            sym_name,
+            op.location.clone(),
+        ));
+    }
+
+    let mut replacements: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut dead_fn_ops: std::collections::HashSet<OpId> = std::collections::HashSet::new();
+
+    for (_, mut candidates) in groups {
+        if candidates.len() <= 1 {
+            continue;
+        }
+        // Sort deterministically: prefer entry points (`main`/`forward`), then lexicographical name
+        candidates.sort_by(|a, b| {
+            let a_entry = matches!(a.1.as_str(), "main" | "forward");
+            let b_entry = matches!(b.1.as_str(), "main" | "forward");
+            b_entry.cmp(&a_entry).then_with(|| a.1.cmp(&b.1))
+        });
+
+        let (canon_id, canon_name, _) = candidates[0].clone();
+        let all_locs: Vec<Location> = candidates.iter().map(|(_, _, loc)| loc.clone()).collect();
+        if let Some(canon_op) = module.ops.get_mut(canon_id) {
+            stamp_fused_provenance(canon_op, &all_locs);
+        }
+
+        for (dup_id, dup_name, _) in candidates.into_iter().skip(1) {
+            replacements.insert(dup_name, canon_name.clone());
+            dead_fn_ops.insert(dup_id);
+        }
+    }
+
+    if dead_fn_ops.is_empty() {
+        return 0;
+    }
+
+    // Rewrite `func.call` callee attributes across all remaining operations
+    for (_, op) in module.ops.iter_mut() {
+        if op.is_op("func", "call")
+            && let Some(callee) = op.attributes.get("callee").and_then(|a| a.as_str())
+            && let Some(new_callee) = replacements.get(callee)
+        {
+            op.attributes.insert(
+                "callee".to_string(),
+                Attribute::SymbolRef(new_callee.clone()),
+            );
+        }
+    }
+
+    // Remove duplicate functions from the module root block and ops arena
+    if let Some(root_reg) = module.regions.get(module.root_region)
+        && let Some(&root_blk) = root_reg.blocks.first()
+    {
+        module.blocks[root_blk]
+            .ops
+            .retain(|id| !dead_fn_ops.contains(id));
+    }
+    let merged_count = dead_fn_ops.len();
+    for dead_id in dead_fn_ops {
+        module.ops.remove(dead_id);
+    }
+    merged_count
 }
