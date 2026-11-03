@@ -16,14 +16,14 @@ use castforge::ir::{
 use castforge::passes::{
     AffinitySlotRouter, ArcKvEvictionPolicy, AsymK16V8Codec, BLEND_REORDER_LMIN, Bitmap2D,
     BlendMatchSpan, BlendObjectGroupKind, BlendReadGroupSet, BlendTokenRangeMatcher,
-    BucketHistogram, CBChunkMatch, CBGroupRopeGeometry, CBGroupSpec, CHUNK_COUNT_HISTOGRAM_BOUNDS,
-    COORDINATOR_CHECKPOINT_MAGIC, CacheBlendRopeSpec, CacheEventBatchSpec, CacheEventEntrySpec,
-    CacheEventOpKind, CacheEventTier, CacheGenCdfCodec, ChainedBlockHashConfig,
-    CollectiveGraphNodeSpec, ContiguousViewPlan, CoordinatorEventGate, CoordinatorKeyDirectory,
-    DEFAULT_MAX_KERNELS_IN_FUSION_SET, DaxGenerationSlotArena, DaxPutOutcome, DeviceGraphStage,
-    DeviceTargetArch, DynamicAllocRequest, EXCLUDED_ENGINE_GROUP, EngineGroupInfoSpec,
-    EngineKvFormat, EventIngestOutcome, FULL_ATTENTION_WINDOW, FdpRawBlockSlotManager,
-    FleetCacheUsageView, FleetInstanceRegistry, FleetMembershipCounters,
+    BucketHistogram, BufferDependencyTree, CBChunkMatch, CBGroupRopeGeometry, CBGroupSpec,
+    CHUNK_COUNT_HISTOGRAM_BOUNDS, COORDINATOR_CHECKPOINT_MAGIC, CacheBlendRopeSpec,
+    CacheEventBatchSpec, CacheEventEntrySpec, CacheEventOpKind, CacheEventTier, CacheGenCdfCodec,
+    ChainedBlockHashConfig, CollectiveGraphNodeSpec, ContiguousViewPlan, CoordinatorEventGate,
+    CoordinatorKeyDirectory, DEFAULT_MAX_KERNELS_IN_FUSION_SET, DaxGenerationSlotArena,
+    DaxPutOutcome, DeviceGraphStage, DeviceTargetArch, DynamicAllocRequest, EXCLUDED_ENGINE_GROUP,
+    EngineGroupInfoSpec, EngineKvFormat, EventIngestOutcome, FULL_ATTENTION_WINDOW,
+    FdpRawBlockSlotManager, FleetCacheUsageView, FleetInstanceRegistry, FleetMembershipCounters,
     FleetWatermarkEvictionController, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
     IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KafkaStreamPositionTable,
     KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter,
@@ -39,30 +39,31 @@ use castforge::passes::{
     anonymize_symbolic_dims, await_hanging_effect_chains, build_orthonormal_hadamard,
     classify_blend_read_groups, coalesce_exhaustive_gathers_to_split,
     coalesce_partitioning_slices_to_split, coalesce_unbundle_consumers_to_parallel,
-    compress_splat_constants, compute_cb_group_rope_geometry, compute_ieee_crc32,
-    decode_coordinator_checkpoint_envelope, decode_kv_fs_filename, decode_kv_storage_key,
-    decode_raw_block_slot_header, defer_allocs_to_first_use, direct_copy_format_supported,
-    downsample_subchunk_swa_block_ids, elide_redundant_mutable_buffer_ops,
-    elide_redundant_state_transfers, eliminate_implied_dependencies,
-    encode_coordinator_checkpoint_envelope, encode_kv_fs_filename, encode_kv_storage_key,
-    encode_raw_block_meta_checkpoint, encode_raw_block_slot_header, encode_wide_column_row_key,
-    engine_group_layer_indices, estimate_l2_framed_size, expand_engine_block_ids,
-    expected_contiguous_shape_from_strides, find_squeeze_axis, find_unsqueeze_axis,
-    flatten_elementwise_chains, fold_extend_lifetimes_into_async_kernels,
+    collect_alloc_uses_in_block, compress_splat_constants, compute_cb_group_rope_geometry,
+    compute_ieee_crc32, decode_coordinator_checkpoint_envelope, decode_kv_fs_filename,
+    decode_kv_storage_key, decode_raw_block_slot_header, defer_allocs_to_first_use,
+    direct_copy_format_supported, downsample_subchunk_swa_block_ids,
+    elide_redundant_mutable_buffer_ops, elide_redundant_state_transfers,
+    eliminate_implied_dependencies, encode_coordinator_checkpoint_envelope, encode_kv_fs_filename,
+    encode_kv_storage_key, encode_raw_block_meta_checkpoint, encode_raw_block_slot_header,
+    encode_wide_column_row_key, engine_group_layer_indices, estimate_l2_framed_size,
+    expand_engine_block_ids, expected_contiguous_shape_from_strides, find_squeeze_axis,
+    find_unsqueeze_axis, flatten_elementwise_chains, fold_extend_lifetimes_into_async_kernels,
     fold_unfold_hybrid_prefix_bitmaps, fuse_horizontal_shared_input_ops, fuse_locations,
     fuse_reshape_epilogue, fuse_sole_use_prologues, get_engine_group_indices,
     group_p2p_lookup_keys, hash_packed_token_blocks_be, hash_prefix_token_blocks,
     hoist_callsite_invariant_subgraph_ops, hoist_exec_invariant_ops,
-    hoist_symbolic_dim_expressions, interleave_chunk_major_object_keys, is_supported_arch_dtype,
-    legalize_rowwise_reduction_launch, longest_full_attention_hit, longest_joint_prefix_hit,
-    longest_sliding_window_hit, map_axis_through_static_reshape, mark_cuda_graph_stable_tensors,
-    merge_adjacent_parallel_loops, merge_duplicate_shape_ops, merge_identical_functions,
-    merge_parallel_matmuls, num_engine_groups, num_packed_tokens, open_l2_kv_frame,
-    pack_token_ids_be, plan_cacheblend_retrieve, plan_cacheblend_token_reorder,
-    plan_concat_in_place, plan_device_graph_collective_partition, plan_dynamic_memory_pool,
-    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
-    plan_l1_prefetch_retention, plan_multi_tier_prefetch_load, promote_narrow_accumulators,
-    re_rope_key_in_place, recalculate_subchunk_blocks_to_skip, recognize_composite_activations,
+    hoist_symbolic_dim_expressions, insert_explicit_buffer_frees,
+    interleave_chunk_major_object_keys, is_supported_arch_dtype, legalize_rowwise_reduction_launch,
+    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
+    map_axis_through_static_reshape, mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops,
+    merge_duplicate_shape_ops, merge_identical_functions, merge_parallel_matmuls,
+    num_engine_groups, num_packed_tokens, open_l2_kv_frame, pack_token_ids_be,
+    plan_cacheblend_retrieve, plan_cacheblend_token_reorder, plan_concat_in_place,
+    plan_device_graph_collective_partition, plan_dynamic_memory_pool, plan_jenga_kv_geometry,
+    plan_kernel_sequence_fusion, plan_kv_dma_transfer, plan_l1_prefetch_retention,
+    plan_multi_tier_prefetch_load, promote_narrow_accumulators, re_rope_key_in_place,
+    recalculate_subchunk_blocks_to_skip, recognize_composite_activations,
     recover_contiguous_or_dim0_padded_view, relax_non_aliasing_mutable_chain_sequences,
     resolve_l1_memory_affinity, reuse_dead_loop_buffers, seal_l2_kv_frame,
     select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
@@ -4284,4 +4285,65 @@ fn test_relax_non_aliasing_mutable_chain_sequences() {
         m.ops[store_ops[2]].operands[0],
         m.ops[store_ops[0]].results[0]
     );
+}
+
+#[test]
+fn test_buffer_dependency_tree_lca_and_insert_explicit_buffer_frees() {
+    // Buffer `%buf` is allocated by `mgp.buffer.alloc`, viewed via `mgp.view` (`%v`),
+    // and used by two parallel branches (`%u1`, `%u2`) whose chains join at `mo.chain.create`
+    // (`%c_join`), followed by a downstream op (`%c_end`).
+    // The post-dominator LCA of `%buf`'s uses (`%v`, `%u1`, `%u2`) is `%c_join`, which produces a
+    // chain output `tensor<1xi64>`, so `mgp.buffer.free` is inserted right after `%c_join` and
+    // before `%c_end`!
+    let mlir = concat!(
+        "module @explicit_buffer_lifetimes {\n",
+        "  func.func @main(%c0: tensor<1xi64>) -> tensor<1xi64> {\n",
+        "    %buf, %c_alloc = mgp.buffer.alloc %c0 ",
+        ": (tensor<1xi64>) -> (tensor<8xf32>, tensor<1xi64>)\n",
+        "    %spec = mgp.tensor.extract_tensor_spec %buf : (tensor<8xf32>) -> tensor<1xi64>\n",
+        "    %v = mgp.view %buf : (tensor<8xf32>) -> tensor<2x4xf32>\n",
+        "    %c1 = mgp.kernel_a %c_alloc, %buf : (tensor<1xi64>, tensor<8xf32>) -> tensor<1xi64>\n",
+        "    %c2 = mgp.kernel_b %c_alloc, %v : (tensor<1xi64>, tensor<2x4xf32>) -> tensor<1xi64>\n",
+        "    %c_join = mo.chain.create %c1, %c2 ",
+        ": (tensor<1xi64>, tensor<1xi64>) -> tensor<1xi64>\n",
+        "    %c_end = mgp.epilogue %c_join, %spec ",
+        ": (tensor<1xi64>, tensor<1xi64>) -> tensor<1xi64>\n",
+        "    return %c_end : tensor<1xi64>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(mlir).expect("valid MLIR");
+    let func_id = m.functions()[0];
+    let blk_id = m.regions[m.ops[func_id].regions[0]].blocks[0];
+    let ops_before = m.blocks[blk_id].ops.clone();
+    let alloc_id = ops_before[0];
+    let view_id = ops_before[2];
+    let ka_id = ops_before[3];
+    let kb_id = ops_before[4];
+    let join_id = ops_before[5];
+    let epilogue_id = ops_before[6];
+
+    // 1. Verify `collect_alloc_uses_in_block` ignores `mgp.tensor.extract_tensor_spec` and follows
+    //    `mgp.view` alias to `mgp.kernel_b`:
+    let uses = collect_alloc_uses_in_block(&m, blk_id, alloc_id).expect("valid uses");
+    assert_eq!(uses, vec![view_id, ka_id, kb_id]);
+
+    // 2. Verify `BufferDependencyTree` post-dominator LCA and strict `executes_after`:
+    let tree = BufferDependencyTree::build_for_block(&m, blk_id).expect("DAG block");
+    assert_eq!(tree.find_lca(&uses), Some(join_id));
+    assert!(!tree.executes_after(ka_id, ka_id));
+    assert!(tree.executes_after(join_id, ka_id));
+    assert!(tree.executes_after(join_id, kb_id));
+    assert!(tree.all_execute_after(&[join_id, epilogue_id], &[ka_id, kb_id]));
+
+    // 3. Run `insert_explicit_buffer_frees` and verify `mgp.buffer.free` is placed right after
+    //    `%c_join` and spliced into `%c_end`:
+    assert_eq!(insert_explicit_buffer_frees(&mut m), 1);
+    let ops_after = &m.blocks[blk_id].ops;
+    let join_pos = ops_after.iter().position(|&id| id == join_id).unwrap();
+    let free_id = ops_after[join_pos + 1];
+    assert!(m.ops[free_id].is_op("mgp", "buffer.free"));
+    assert_eq!(m.ops[free_id].operands[0], m.ops[join_id].results[0]);
+    assert_eq!(m.ops[free_id].operands[1], m.ops[alloc_id].results[0]);
+    assert_eq!(m.ops[epilogue_id].operands[0], m.ops[free_id].results[0]);
 }
