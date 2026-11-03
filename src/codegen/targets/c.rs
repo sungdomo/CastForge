@@ -50,6 +50,20 @@ pub fn emit_c_module_with_config(module: &Module, base_cfg: &TargetConfig) -> Re
         )?;
     }
     writeln!(out, "#include <stdint.h>\n#include <math.h>")?;
+    let has_profiling = module.live_ops().into_iter().any(|op_id| {
+        let op = &module.ops[op_id];
+        op.attributes.contains_key("castforge.profiled")
+            || op
+                .attributes
+                .get("name")
+                .and_then(|a| a.as_str())
+                .is_some_and(|n| n == "castforge.profile_region")
+    });
+    if has_profiling {
+        writeln!(out, "#ifdef CASTFORGE_ENABLE_NVTX")?;
+        writeln!(out, "#include <nvToolsExt.h>")?;
+        writeln!(out, "#endif")?;
+    }
     match config.simd_isa {
         SimdIsa::Avx2 => {
             writeln!(out, "#if defined(__AVX2__) && defined(__FMA__)")?;
@@ -1405,10 +1419,16 @@ fn emit_c_hlo_op(
                     out,
                     "    /* [profile:region(id={pid}, label=\"{label}\")] */"
                 )?;
+                writeln!(out, "#ifdef CASTFORGE_ENABLE_NVTX")?;
+                writeln!(out, "    nvtxRangePushA(\"{label}\");")?;
+                writeln!(out, "#endif")?;
                 writeln!(
                     out,
                     "    for (int i = 0; i < {res_len}; ++i) {res_name}[i] = {src}[i];"
                 )?;
+                writeln!(out, "#ifdef CASTFORGE_ENABLE_NVTX")?;
+                writeln!(out, "    nvtxRangePop();")?;
+                writeln!(out, "#endif")?;
             } else {
                 let src = value_ident(module, inputs[0], names, counter);
                 writeln!(

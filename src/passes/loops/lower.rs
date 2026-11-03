@@ -128,6 +128,14 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                 )));
             }
 
+            let is_profiled = op
+                .attributes
+                .get("castforge.profiled")
+                .is_some_and(|a| matches!(a, Attribute::Bool(true)));
+            if is_profiled {
+                body.push(LoopStmt::Comment(format!("PROF_PUSH:{}", op.name)));
+            }
+
             let (dialect, op_name) = if op.is_op("stablehlo", "composite") {
                 if let Some((d, n)) = op
                     .attributes
@@ -624,6 +632,19 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                     ("fused_swiglu" | "fused_gated_mlp", [x, wg, wu]) => {
                         format!("((({x} * {wg}) / (1.0f + expf(-({x} * {wg})))) * ({x} * {wu}))")
                     }
+                    ("profile_region", [a]) => {
+                        let pid = match op.attributes.get("profile_id") {
+                            Some(Attribute::Int(v)) => *v,
+                            _ => 0,
+                        };
+                        let label = op
+                            .attributes
+                            .get("profile_label")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("op");
+                        body.push(LoopStmt::Comment(format!("PROF_MARK:{pid}:{label}")));
+                        a.clone()
+                    }
                     _ => format!("{op_str}({})", ops_str.join(", ")),
                 };
                 body.push(LoopStmt::For {
@@ -640,6 +661,9 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                         expr,
                     }],
                 });
+            }
+            if is_profiled {
+                body.push(LoopStmt::Comment(format!("PROF_POP:{}", op.name)));
             }
         }
 

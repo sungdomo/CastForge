@@ -1583,6 +1583,7 @@ fn emit_rust_hlo_op(
                 let src = r_idx(module, plan, inputs[0], "i", names, counter);
                 let dst = r_idx(module, plan, res_val, "i", names, counter);
                 writeln!(out, "    // [profile:region(id={pid}, label=\"{label}\")]")?;
+                writeln!(out, "    let _ = std::hint::black_box(\"{label}\");")?;
                 writeln!(out, "    for i in 0..{res_len} {{")?;
                 writeln!(out, "        {dst} = {src};")?;
                 writeln!(out, "    }}")?;

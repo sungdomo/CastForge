@@ -495,3 +495,47 @@ module @transformer_3_layers {
     assert_ne!(fn_hashes[0].1, fn_hashes[3].1);
     assert_eq!(CompilationCache::analyze_layer_reuse(&multi_mod), (2, 4));
 }
+
+#[test]
+fn test_nvtx_roctx_hardware_profiler_range_emission() {
+    let mlir = r#"
+module @profiler_test {
+  func.func @main(%x: tensor<2x4xf32>, %y: tensor<2x4xf32>) -> tensor<2x4xf32> {
+    %0 = stablehlo.add %x, %y : tensor<2x4xf32>
+    func.return %0 : tensor<2x4xf32>
+  }
+}
+"#;
+    let mut module = parse_mlir(mlir).unwrap();
+    let pass_reg = PassRegistry::with_builtin_passes();
+    let mut pm =
+        PassManager::from_pipeline_str(&pass_reg, "instrument-profiling(filter=all)").unwrap();
+    pm.run(&mut module).unwrap();
+
+    let backend_reg = BackendRegistry::with_builtin_backends();
+    let cfg = TargetConfig::default();
+
+    let c_src = backend_reg.generate("c", &module, &cfg).unwrap();
+    assert!(c_src.contains("#ifdef CASTFORGE_ENABLE_NVTX"));
+    assert!(c_src.contains("#include <nvToolsExt.h>"));
+    assert!(c_src.contains("nvtxRangePushA(\"stablehlo.add\");"));
+    assert!(c_src.contains("nvtxRangePop();"));
+
+    let cuda_src = backend_reg.generate("cuda", &module, &cfg).unwrap();
+    assert!(cuda_src.contains("#ifdef CASTFORGE_ENABLE_NVTX"));
+    assert!(cuda_src.contains("#include <nvToolsExt.h>"));
+    assert!(cuda_src.contains("void main_cuda_launch("));
+    assert!(cuda_src.contains("nvtxRangePushA(\"main:stablehlo.add\");"));
+    assert!(cuda_src.contains("nvtxRangePop();"));
+
+    let hip_src = backend_reg.generate("hip", &module, &cfg).unwrap();
+    assert!(hip_src.contains("#ifdef CASTFORGE_ENABLE_ROCTX"));
+    assert!(hip_src.contains("#include <roctx.h>"));
+    assert!(hip_src.contains("void main_hip_launch("));
+    assert!(hip_src.contains("roctxRangePushA(\"main:stablehlo.add\");"));
+    assert!(hip_src.contains("roctxRangePop();"));
+
+    let rust_src = backend_reg.generate("rust", &module, &cfg).unwrap();
+    assert!(rust_src.contains("// [profile:region(id=0, label=\"stablehlo.add\")]"));
+    assert!(rust_src.contains("std::hint::black_box(\"stablehlo.add\")"));
+}
