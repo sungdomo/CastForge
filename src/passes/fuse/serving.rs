@@ -4800,3 +4800,136 @@ pub fn reuse_dead_loop_buffers(loop_module: &mut crate::ir::loops::LoopModule) -
 
     reused_count
 }
+
+fn is_invariant_root_op(op: &Operation) -> bool {
+    op.operands.is_empty()
+        && matches!(
+            op.name.to_string().as_str(),
+            "stablehlo.constant" | "castforge.weight_ref" | "stablehlo.iota"
+        )
+}
+
+fn is_trivial_invariant_op(op: &Operation) -> bool {
+    matches!(
+        op.name.to_string().as_str(),
+        "stablehlo.constant"
+            | "castforge.weight_ref"
+            | "stablehlo.iota"
+            | "stablehlo.reshape"
+            | "stablehlo.broadcast_in_dim"
+            | "stablehlo.bitcast_convert"
+    )
+}
+
+fn is_terminator_or_side_effecting(op: &Operation) -> bool {
+    matches!(
+        op.name.to_string().as_str(),
+        "func.return" | "return" | "stablehlo.return" | "castforge.nan_check"
+    )
+}
+
+/// Identifies execution-invariant weight/constant subgraphs, filters out standalone trivial ops
+/// (`isLiftableTrivialOp`) that do not feed any non-trivial invariant compute op, assigns
+/// `castforge.exec_invariant_slot` cache indices to non-trivial invariant ops, and hoists the
+/// lifted subgraph to the entry of the block
+/// (inspired by Modular `GraphCompiler/lib/MGPDialect/Transforms/ExecInvariantCodeMotionPass.cpp`).
+///
+/// Returns the number of non-trivial execution-invariant operations assigned cache slots.
+pub fn hoist_exec_invariant_ops(module: &mut Module) -> usize {
+    let mut cached_nontrivial = 0usize;
+    let func_ids = module.functions();
+
+    for func_id in func_ids {
+        let Some(&reg_id) = module.ops[func_id].regions.first() else {
+            continue;
+        };
+        let Some(&block_id) = module.regions[reg_id].blocks.first() else {
+            continue;
+        };
+        let op_ids = module.blocks[block_id].ops.clone();
+
+        // Forward pass: find all ops whose operands come strictly from other invariant ops.
+        let mut invariant_ops: std::collections::HashSet<OpId> = std::collections::HashSet::new();
+        let mut invariant_vals: std::collections::HashSet<ValueId> =
+            std::collections::HashSet::new();
+
+        for &op_id in &op_ids {
+            let Some(op) = module.ops.get(op_id) else {
+                continue;
+            };
+            if is_terminator_or_side_effecting(op) || !op.regions.is_empty() {
+                continue;
+            }
+            let is_inv = if op.operands.is_empty() {
+                is_invariant_root_op(op)
+            } else {
+                op.operands.iter().all(|v| invariant_vals.contains(v))
+            };
+            if is_inv {
+                invariant_ops.insert(op_id);
+                for &res in &op.results {
+                    invariant_vals.insert(res);
+                }
+            }
+        }
+
+        // Backward pass from non-trivial invariant ops: trivial ops are only lifted if they feed
+        // at least one non-trivial invariant op (`isLiftableTrivialOp` in Modular).
+        let mut lifted_ops: std::collections::HashSet<OpId> = std::collections::HashSet::new();
+        for &op_id in op_ids.iter().rev() {
+            if !invariant_ops.contains(&op_id) {
+                continue;
+            }
+            let Some(op) = module.ops.get(op_id) else {
+                continue;
+            };
+            let should_lift = !is_trivial_invariant_op(op) || lifted_ops.contains(&op_id);
+            if should_lift {
+                lifted_ops.insert(op_id);
+                for &in_val in &op.operands {
+                    if let Some(v_info) = module.values.get(in_val)
+                        && let ValueDef::OpResult { op: prod_id, .. } = v_info.def
+                        && invariant_ops.contains(&prod_id)
+                    {
+                        lifted_ops.insert(prod_id);
+                    }
+                }
+            }
+        }
+
+        if lifted_ops.is_empty() {
+            continue;
+        }
+
+        let mut next_slot = 0i64;
+        let mut hoisted = Vec::with_capacity(lifted_ops.len());
+        let mut runtime_ops = Vec::with_capacity(op_ids.len());
+
+        for op_id in op_ids {
+            if lifted_ops.contains(&op_id) {
+                if let Some(op_mut) = module.ops.get_mut(op_id) {
+                    op_mut.attributes.insert(
+                        "castforge.exec_invariant_init".to_string(),
+                        Attribute::Bool(true),
+                    );
+                    if !is_trivial_invariant_op(op_mut) {
+                        op_mut.attributes.insert(
+                            "castforge.exec_invariant_slot".to_string(),
+                            Attribute::Int(next_slot),
+                        );
+                        next_slot += 1;
+                        cached_nontrivial += 1;
+                    }
+                }
+                hoisted.push(op_id);
+            } else {
+                runtime_ops.push(op_id);
+            }
+        }
+
+        hoisted.append(&mut runtime_ops);
+        module.blocks[block_id].ops = hoisted;
+    }
+
+    cached_nontrivial
+}

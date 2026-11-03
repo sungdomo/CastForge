@@ -26,13 +26,14 @@ use castforge::passes::{
     defer_allocs_to_first_use, direct_copy_format_supported, elide_redundant_state_transfers,
     encode_kv_fs_filename, encode_kv_storage_key, flatten_elementwise_chains,
     fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
-    fuse_sole_use_prologues, hash_prefix_token_blocks, is_supported_arch_dtype,
-    legalize_rowwise_reduction_launch, longest_full_attention_hit, longest_joint_prefix_hit,
-    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_duplicate_shape_ops,
-    merge_identical_functions, plan_cacheblend_retrieve, plan_concat_in_place,
-    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
-    promote_narrow_accumulators, re_rope_key_in_place, reuse_dead_loop_buffers,
-    stamp_fused_provenance, unfold_chunk_range, validate_target_device_dtypes,
+    fuse_sole_use_prologues, hash_prefix_token_blocks, hoist_exec_invariant_ops,
+    is_supported_arch_dtype, legalize_rowwise_reduction_launch, longest_full_attention_hit,
+    longest_joint_prefix_hit, longest_sliding_window_hit, mark_cuda_graph_stable_tensors,
+    merge_duplicate_shape_ops, merge_identical_functions, plan_cacheblend_retrieve,
+    plan_concat_in_place, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
+    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
+    reuse_dead_loop_buffers, stamp_fused_provenance, unfold_chunk_range,
+    validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -1877,4 +1878,54 @@ fn test_reuse_dead_loop_buffers_by_use_count_and_disjoint_liveness() {
     assert!(printed.contains("alloc buf_a: f32[16]"));
     assert!(!printed.contains("alloc buf_b"));
     assert!(printed.contains("out[0] = buf_a[0]"));
+}
+
+#[test]
+fn test_hoist_exec_invariant_ops_trivial_filter_and_slot_assignment() {
+    use castforge::ir::Attribute;
+
+    // `%x_abs` depends on runtime argument `%x` (not invariant).
+    // `%c0` (`stablehlo.constant`) + `%w_trans` (`stablehlo.transpose` of `%c0`) form a non-trivial
+    // execution-invariant subgraph placed AFTER `%x_abs` -> should be lifted & hoisted to top!
+    // `%i_trivial` (`stablehlo.iota`) only feeds runtime `%out` -> trivial op, NOT lifted!
+    let mlir = r#"
+module @exec_invariant {
+  func.func @main(%x: tensor<4x4xf32>) -> tensor<4x4xf32> {
+    %x_abs = stablehlo.abs %x : tensor<4x4xf32>
+    %c0 = stablehlo.constant dense<2.0> : tensor<4x4xf32>
+    %w_t = stablehlo.transpose %c0 : (tensor<4x4xf32>) -> tensor<4x4xf32>
+    %i_trivial = stablehlo.iota {iota_dimension = 0 : i64} : tensor<4x4xf32>
+    %sum = stablehlo.add %x_abs, %w_t : tensor<4x4xf32>
+    %out = stablehlo.add %sum, %i_trivial : tensor<4x4xf32>
+    return %out : tensor<4x4xf32>
+  }
+}
+"#;
+    let mut module = parse_mlir(mlir).expect("valid MLIR");
+    let cached = hoist_exec_invariant_ops(&mut module);
+    assert_eq!(cached, 1);
+
+    let func_id = module.functions()[0];
+    let func_block = module.regions[module.ops[func_id].regions[0]].blocks[0];
+    let ops = &module.blocks[func_block].ops;
+
+    // `%c0` and `%w_trans` are hoisted to positions 0 and 1 before `%x_abs`!
+    assert_eq!(module.ops[ops[0]].name.to_string(), "stablehlo.constant");
+    assert_eq!(module.ops[ops[1]].name.to_string(), "stablehlo.transpose");
+    assert_eq!(
+        module.ops[ops[1]]
+            .attributes
+            .get("castforge.exec_invariant_slot"),
+        Some(&Attribute::Int(0))
+    );
+    assert_eq!(module.ops[ops[2]].name.to_string(), "stablehlo.abs");
+
+    // Standalone trivial `%i_trivial` (`stablehlo.iota`) is NOT marked `exec_invariant_init`
+    let iota_op = &module.ops[ops[3]];
+    assert_eq!(iota_op.name.to_string(), "stablehlo.iota");
+    assert!(
+        !iota_op
+            .attributes
+            .contains_key("castforge.exec_invariant_init")
+    );
 }
