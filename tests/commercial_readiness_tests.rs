@@ -7507,3 +7507,61 @@ fn test_bucket_location_object_codec_partial_batch_and_meta_cache() {
     assert!(cache.invalidate("k2.bin"));
     assert_eq!(cache.get_size("k2.bin", 112.0), None);
 }
+
+#[test]
+fn test_canonicalize_chain_sequences_and_elide_redundant_mutable_ops() {
+    use castforge::passes::{canonicalize_chain_sequences, elide_redundant_mutable_ops};
+
+    let src = concat!(
+        "module {\n",
+        "  func.func @chain_and_mutable(\n",
+        "    %ch0: !mo.chain,\n",
+        "    %b0: !mo.buffer<4xf32>,\n",
+        "    %b1: !mo.buffer<4xf32>,\n",
+        "    %t0: tensor<4xf32>,\n",
+        "    %t1: tensor<4xf32>\n",
+        "  ) -> (tensor<4xf32>, !mo.chain) {\n",
+        "    %ch1 = \"mo.mutable.store\"(%ch0, %b0, %t0) : ",
+        "(!mo.chain, !mo.buffer<4xf32>, tensor<4xf32>) -> !mo.chain\n",
+        "    %ch2 = \"mo.mutable.store\"(%ch1, %b0, %t1) : ",
+        "(!mo.chain, !mo.buffer<4xf32>, tensor<4xf32>) -> !mo.chain\n",
+        "    %loaded, %ch3 = \"mo.mutable.load\"(%ch2, %b0) : ",
+        "(!mo.chain, !mo.buffer<4xf32>) -> (tensor<4xf32>, !mo.chain)\n",
+        "    %ch4 = \"mo.mutable.store\"(%ch3, %b1, %t0) : ",
+        "(!mo.chain, !mo.buffer<4xf32>, tensor<4xf32>) -> !mo.chain\n",
+        "    return %loaded, %ch4 : tensor<4xf32>, !mo.chain\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(src).unwrap();
+    // 1. Elide dead first store to `%b0` and redundant load from `%b0`:
+    let elided = elide_redundant_mutable_ops(&mut m);
+    assert_eq!(elided, 2);
+
+    // 2. Now `%ch2 = store(%ch0, %b0, %t1)` and `%ch4 = store(%ch2, %b1, %t0)` write to
+    // distinct buffers `%b0` and `%b1`, so `canonicalize_chain_sequences` relaxes their chain
+    // and inserts `mo.chain.create`:
+    let relaxed = canonicalize_chain_sequences(&mut m);
+    assert_eq!(relaxed, 1);
+
+    let fn_id = m.functions()[0];
+    let blk = m.regions[m.ops[fn_id].regions[0]].blocks[0];
+    let op_names: Vec<String> = m.blocks[blk]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        op_names,
+        vec![
+            "mo.mutable.store",
+            "mo.mutable.store",
+            "mo.chain.create",
+            "func.return"
+        ]
+    );
+    // Both stores now take `%ch0` as their input chain:
+    let s0 = m.blocks[blk].ops[0];
+    let s1 = m.blocks[blk].ops[1];
+    assert_eq!(m.ops[s0].operands[0], m.ops[s1].operands[0]);
+}

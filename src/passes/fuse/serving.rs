@@ -24678,3 +24678,314 @@ impl BucketObjectMetaCache {
         self.entries.is_empty()
     }
 }
+
+fn is_chain_type(ty: &Type) -> bool {
+    matches!(ty, Type::Opaque(s) if s == "!mo.chain" || s.starts_with("!mo.chain<"))
+}
+
+fn is_mutable_operand_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Opaque(s)
+            if s.starts_with("!mo.buffer")
+                || s.starts_with("!mo.opaque")
+                || s.starts_with("!mogg.buffer")
+    )
+}
+
+fn extract_opaque_symbol(ty: &Type) -> Option<&str> {
+    if let Type::Opaque(s) = ty
+        && let Some(rest) = s.strip_prefix("!mo.opaque<")
+    {
+        return rest.strip_suffix('>');
+    }
+    None
+}
+
+fn single_in_out_chains(module: &Module, op_id: OpId) -> Option<(usize, ValueId, ValueId)> {
+    let op = module.ops.get(op_id)?;
+    if op.name.full_name() == "mo.chain.create" {
+        return None;
+    }
+    let mut in_chains = Vec::new();
+    for (idx, &v) in op.operands.iter().enumerate() {
+        if let Some(val) = module.values.get(v)
+            && is_chain_type(&val.ty)
+        {
+            in_chains.push((idx, v));
+        }
+    }
+    let mut out_chains = Vec::new();
+    for &r in &op.results {
+        if let Some(val) = module.values.get(r)
+            && is_chain_type(&val.ty)
+        {
+            out_chains.push(r);
+        }
+    }
+    if in_chains.len() == 1 && out_chains.len() == 1 {
+        Some((in_chains[0].0, in_chains[0].1, out_chains[0]))
+    } else {
+        None
+    }
+}
+
+fn collect_mutable_and_write_operands(
+    module: &Module,
+    op_id: OpId,
+) -> (
+    std::collections::HashSet<ValueId>,
+    std::collections::HashSet<ValueId>,
+    std::collections::HashSet<String>,
+) {
+    let mut mutable_set = std::collections::HashSet::new();
+    let mut write_set = std::collections::HashSet::new();
+    let mut opaque_syms = std::collections::HashSet::new();
+    let Some(op) = module.ops.get(op_id) else {
+        return (mutable_set, write_set, opaque_syms);
+    };
+    let is_read_only_load = op.name.full_name() == "mo.mutable.load"
+        || matches!(
+            op.attributes.get("memory_effect"),
+            Some(Attribute::String(s)) if s == "read"
+        );
+    for &v in &op.operands {
+        if let Some(val) = module.values.get(v)
+            && is_mutable_operand_type(&val.ty)
+        {
+            mutable_set.insert(v);
+            if !is_read_only_load {
+                write_set.insert(v);
+            }
+            if let Some(sym) = extract_opaque_symbol(&val.ty) {
+                opaque_syms.insert(sym.to_string());
+            }
+        }
+    }
+    (mutable_set, write_set, opaque_syms)
+}
+
+fn can_reorder_chained_mutable_ops(module: &Module, op1: OpId, op2: OpId) -> bool {
+    for oid in [op1, op2] {
+        if matches!(
+            module.ops[oid].attributes.get("multi_device"),
+            Some(Attribute::Bool(true))
+        ) {
+            return false;
+        }
+    }
+    let (mut1, write1, opq1) = collect_mutable_and_write_operands(module, op1);
+    let (mut2, write2, opq2) = collect_mutable_and_write_operands(module, op2);
+    if mut1.iter().any(|v| write2.contains(v)) || mut2.iter().any(|v| write1.contains(v)) {
+        return false;
+    }
+    if opq1.iter().any(|s| opq2.contains(s)) {
+        return false;
+    }
+    true
+}
+
+/// Relaxes execution chains across independent buffer-mutating operations in the same block,
+/// joining their output chains via `mo.chain.create` when no write-after-read, read-after-write,
+/// write-after-write, multi-device, or opaque-alias hazard exists.
+///
+/// Returns the number of chain dependencies relaxed.
+pub fn canonicalize_chain_sequences(module: &mut Module) -> usize {
+    use crate::ir::mlir::{Location, OpName, Operation, Value, ValueDef};
+
+    let mut relaxed = 0usize;
+    let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+    for bid in block_ids {
+        let mut idx = 0usize;
+        while idx < module.blocks[bid].ops.len() {
+            let op_id = module.blocks[bid].ops[idx];
+            let Some((in_chain_operand_idx, in_chain_val, out_chain_val)) =
+                single_in_out_chains(module, op_id)
+            else {
+                idx += 1;
+                continue;
+            };
+            let Some(ValueDef::OpResult {
+                op: parent_op_id, ..
+            }) = module.values.get(in_chain_val).map(|v| v.def)
+            else {
+                idx += 1;
+                continue;
+            };
+            if !module.blocks[bid].ops[..idx].contains(&parent_op_id) {
+                idx += 1;
+                continue;
+            }
+            let Some((_, parent_in_chain, parent_out_chain)) =
+                single_in_out_chains(module, parent_op_id)
+            else {
+                idx += 1;
+                continue;
+            };
+            if !can_reorder_chained_mutable_ops(module, op_id, parent_op_id) {
+                idx += 1;
+                continue;
+            }
+
+            module.ops[op_id].operands[in_chain_operand_idx] = parent_in_chain;
+            let chain_ty = module.values[out_chain_val].ty.clone();
+            let merged_chain_val = module.values.insert(Value {
+                id: ValueId::default(),
+                ssa_name: None,
+                ty: chain_ty,
+                def: ValueDef::BlockArgument {
+                    block: bid,
+                    index: 0,
+                },
+            });
+            module.values[merged_chain_val].id = merged_chain_val;
+            let merge_op_id = module.ops.insert(Operation {
+                id: OpId::default(),
+                name: OpName::new("mo", "chain.create"),
+                operands: smallvec::smallvec![out_chain_val, parent_out_chain],
+                results: smallvec::smallvec![merged_chain_val],
+                attributes: indexmap::IndexMap::new(),
+                regions: Vec::new(),
+                custom_syntax: false,
+                location: Location::Unknown,
+            });
+            module.ops[merge_op_id].id = merge_op_id;
+            module.values[merged_chain_val].def = ValueDef::OpResult {
+                op: merge_op_id,
+                index: 0,
+            };
+
+            let all_ops: Vec<OpId> = module.ops.keys().collect();
+            for other_id in all_ops {
+                if other_id == merge_op_id || other_id == op_id {
+                    continue;
+                }
+                for opnd in &mut module.ops[other_id].operands {
+                    if *opnd == out_chain_val {
+                        *opnd = merged_chain_val;
+                    }
+                }
+            }
+            module.blocks[bid].ops.insert(idx + 1, merge_op_id);
+            relaxed += 1;
+            idx += 2;
+        }
+    }
+    relaxed
+}
+
+/// Eliminates redundant `mo.mutable.store` -> `mo.mutable.load` pairs and dead overwritten
+/// `mo.mutable.store` -> `mo.mutable.store` pairs on the same buffer when connected by a
+/// single-use execution chain.
+///
+/// Returns the total number of redundant mutable operations eliminated.
+pub fn elide_redundant_mutable_ops(module: &mut Module) -> usize {
+    let mut elided = 0usize;
+    loop {
+        let mut changed_in_iter = false;
+        let use_counts = {
+            let mut counts: std::collections::HashMap<ValueId, usize> =
+                std::collections::HashMap::new();
+            for op in module.ops.values() {
+                for &v in &op.operands {
+                    *counts.entry(v).or_insert(0) += 1;
+                }
+            }
+            counts
+        };
+
+        let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+        for bid in block_ids {
+            let ops_snapshot = module.blocks[bid].ops.clone();
+            for &op_id in &ops_snapshot {
+                let Some(op) = module.ops.get(op_id).cloned() else {
+                    continue;
+                };
+                if op.name.full_name() == "mo.mutable.load"
+                    && op.operands.len() >= 2
+                    && op.results.len() >= 2
+                {
+                    let in_chain = op.operands[0];
+                    let load_buf = op.operands[1];
+                    if use_counts.get(&in_chain).copied().unwrap_or(0) != 1 {
+                        continue;
+                    }
+                    let Some(crate::ir::mlir::ValueDef::OpResult { op: store_id, .. }) =
+                        module.values.get(in_chain).map(|v| v.def)
+                    else {
+                        continue;
+                    };
+                    let Some(store_op) = module.ops.get(store_id).cloned() else {
+                        continue;
+                    };
+                    if store_op.name.full_name() == "mo.mutable.store"
+                        && store_op.operands.len() >= 3
+                        && store_op.operands[1] == load_buf
+                    {
+                        let stored_tensor = store_op.operands[2];
+                        let store_out_chain = store_op.results[0];
+                        let load_out_tensor = op.results[0];
+                        let load_out_chain = op.results[1];
+                        let all_ops: Vec<OpId> = module.ops.keys().collect();
+                        for oid in all_ops {
+                            for opnd in &mut module.ops[oid].operands {
+                                if *opnd == load_out_tensor {
+                                    *opnd = stored_tensor;
+                                } else if *opnd == load_out_chain {
+                                    *opnd = store_out_chain;
+                                }
+                            }
+                        }
+                        module.blocks[bid].ops.retain(|&id| id != op_id);
+                        module.ops.remove(op_id);
+                        elided += 1;
+                        changed_in_iter = true;
+                        break;
+                    }
+                } else if op.name.full_name() == "mo.mutable.store"
+                    && op.operands.len() >= 3
+                    && !op.results.is_empty()
+                {
+                    let curr_in_chain = op.operands[0];
+                    let curr_buf = op.operands[1];
+                    let curr_out_chain = op.results[0];
+                    if use_counts.get(&curr_out_chain).copied().unwrap_or(0) != 1 {
+                        continue;
+                    }
+                    let user_id = module.ops.keys().find(|&oid| {
+                        oid != op_id && module.ops[oid].operands.contains(&curr_out_chain)
+                    });
+                    let Some(next_id) = user_id else {
+                        continue;
+                    };
+                    let Some(next_op) = module.ops.get(next_id).cloned() else {
+                        continue;
+                    };
+                    if next_op.name.full_name() == "mo.mutable.store"
+                        && next_op.operands.len() >= 3
+                        && next_op.operands[0] == curr_out_chain
+                        && next_op.operands[1] == curr_buf
+                    {
+                        for opnd in &mut module.ops[next_id].operands {
+                            if *opnd == curr_out_chain {
+                                *opnd = curr_in_chain;
+                            }
+                        }
+                        module.blocks[bid].ops.retain(|&id| id != op_id);
+                        module.ops.remove(op_id);
+                        elided += 1;
+                        changed_in_iter = true;
+                        break;
+                    }
+                }
+            }
+            if changed_in_iter {
+                break;
+            }
+        }
+        if !changed_in_iter {
+            break;
+        }
+    }
+    elided
+}
