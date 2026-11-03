@@ -20,35 +20,38 @@ use castforge::passes::{
     CacheEventEntrySpec, CacheEventOpKind, CacheEventTier, CacheGenCdfCodec,
     ChainedBlockHashConfig, CollectiveGraphNodeSpec, ContiguousViewPlan, CoordinatorEventGate,
     CoordinatorKeyDirectory, DEFAULT_MAX_KERNELS_IN_FUSION_SET, DaxGenerationSlotArena,
-    DaxPutOutcome, DeviceGraphStage, DeviceTargetArch, DynamicAllocRequest, EngineKvFormat,
-    EventIngestOutcome, FULL_ATTENTION_WINDOW, FdpRawBlockSlotManager, FleetCacheUsageView,
-    FleetWatermarkEvictionController, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
-    IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
-    KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope,
-    KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy, LayerGroupPayloadSharder,
-    P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable, P2PPeerSpec, PassManager, PassRegistry,
-    PlacementRecord, RAW_BLOCK_META_MAGIC, RAW_BLOCK_SLOT_MAGIC, ROWWISE_CHEAP_OP_COST,
-    ROWWISE_EXPENSIVE_OP_COST, RawBlockMetaCheckpointHeader, ReshapeDimMapping, TOKEN_WIRE_STRIDE,
-    TurboQuantPreset, TurboQuantSerdeConfig, WarmPrefetchJobTable, WarmPrefetchStatus,
-    analyze_kv_layer_groups, analyze_static_reshape_dim_mapping,
-    annotate_squeeze_unsqueeze_reshapes, anonymize_symbolic_dims, await_hanging_effect_chains,
-    build_orthonormal_hadamard, classify_blend_read_groups, coalesce_exhaustive_gathers_to_split,
+    DaxPutOutcome, DeviceGraphStage, DeviceTargetArch, DynamicAllocRequest, EXCLUDED_ENGINE_GROUP,
+    EngineGroupInfoSpec, EngineKvFormat, EventIngestOutcome, FULL_ATTENTION_WINDOW,
+    FdpRawBlockSlotManager, FleetCacheUsageView, FleetWatermarkEvictionController,
+    GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager, IsolatedLruEvictionPolicy,
+    KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode, KvPageSpec,
+    KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope, KvStorageKeySpec, L2FaultInjectConfig,
+    L2FaultInjectPolicy, LayerGroupPayloadSharder, P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable,
+    P2PPeerSpec, PassManager, PassRegistry, PlacementRecord, RAW_BLOCK_META_MAGIC,
+    RAW_BLOCK_SLOT_MAGIC, ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST,
+    RawBlockMetaCheckpointHeader, ReshapeDimMapping, TOKEN_WIRE_STRIDE, TurboQuantPreset,
+    TurboQuantSerdeConfig, WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
+    analyze_static_reshape_dim_mapping, annotate_squeeze_unsqueeze_reshapes,
+    anonymize_symbolic_dims, await_hanging_effect_chains, build_orthonormal_hadamard,
+    classify_blend_read_groups, coalesce_exhaustive_gathers_to_split,
     coalesce_partitioning_slices_to_split, compress_splat_constants,
     compute_cb_group_rope_geometry, compute_ieee_crc32, decode_kv_fs_filename,
     decode_kv_storage_key, decode_raw_block_slot_header, defer_allocs_to_first_use,
     direct_copy_format_supported, downsample_subchunk_swa_block_ids,
     elide_redundant_state_transfers, eliminate_implied_dependencies, encode_kv_fs_filename,
     encode_kv_storage_key, encode_raw_block_meta_checkpoint, encode_raw_block_slot_header,
-    encode_wide_column_row_key, expected_contiguous_shape_from_strides, find_squeeze_axis,
-    find_unsqueeze_axis, flatten_elementwise_chains, fold_extend_lifetimes_into_async_kernels,
+    encode_wide_column_row_key, engine_group_layer_indices, expand_engine_block_ids,
+    expected_contiguous_shape_from_strides, find_squeeze_axis, find_unsqueeze_axis,
+    flatten_elementwise_chains, fold_extend_lifetimes_into_async_kernels,
     fold_unfold_hybrid_prefix_bitmaps, fuse_horizontal_shared_input_ops, fuse_locations,
-    fuse_reshape_epilogue, fuse_sole_use_prologues, group_p2p_lookup_keys,
-    hash_packed_token_blocks_be, hash_prefix_token_blocks, hoist_callsite_invariant_subgraph_ops,
-    hoist_exec_invariant_ops, hoist_symbolic_dim_expressions, interleave_chunk_major_object_keys,
-    is_supported_arch_dtype, legalize_rowwise_reduction_launch, longest_full_attention_hit,
-    longest_joint_prefix_hit, longest_sliding_window_hit, map_axis_through_static_reshape,
-    mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops, merge_duplicate_shape_ops,
-    merge_identical_functions, merge_parallel_matmuls, num_packed_tokens, pack_token_ids_be,
+    fuse_reshape_epilogue, fuse_sole_use_prologues, get_engine_group_indices,
+    group_p2p_lookup_keys, hash_packed_token_blocks_be, hash_prefix_token_blocks,
+    hoist_callsite_invariant_subgraph_ops, hoist_exec_invariant_ops,
+    hoist_symbolic_dim_expressions, interleave_chunk_major_object_keys, is_supported_arch_dtype,
+    legalize_rowwise_reduction_launch, longest_full_attention_hit, longest_joint_prefix_hit,
+    longest_sliding_window_hit, map_axis_through_static_reshape, mark_cuda_graph_stable_tensors,
+    merge_adjacent_parallel_loops, merge_duplicate_shape_ops, merge_identical_functions,
+    merge_parallel_matmuls, num_engine_groups, num_packed_tokens, pack_token_ids_be,
     plan_cacheblend_retrieve, plan_cacheblend_token_reorder, plan_concat_in_place,
     plan_device_graph_collective_partition, plan_dynamic_memory_pool, plan_jenga_kv_geometry,
     plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
@@ -56,9 +59,9 @@ use castforge::passes::{
     recover_contiguous_or_dim0_padded_view, reuse_dead_loop_buffers,
     select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
     sink_split_through_reshape, sink_transpose_through_elementwise_and_broadcast,
-    solve_lloyd_max_gaussian, stamp_fused_provenance, swim_reshape_through_slice,
-    unfold_chunk_range, unique_blend_token_coverage, unpack_token_ids_be, unpermute_slice,
-    validate_target_device_dtypes,
+    slice_block_ids_per_group, solve_lloyd_max_gaussian, stamp_fused_provenance,
+    swim_reshape_through_slice, unfold_chunk_range, unique_blend_token_coverage,
+    unpack_token_ids_be, unpermute_slice, validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -3834,4 +3837,62 @@ module @hoist_subgraph_invariant {
     assert!(m.ops[main_ops[1]].is_op("stablehlo", "tanh"));
     assert!(m.ops[main_ops[2]].is_op("func", "call"));
     assert!(m.ops[main_ops[3]].is_op("func", "call"));
+}
+
+#[test]
+fn test_hybrid_engine_group_view_and_token_range_block_slicer() {
+    // 3 LMCache groups over 2 engine groups (engine group 0 split into two physical views `[0, 2]`
+    // and `[1]`, engine group 1 holding `[3]` with layer `4` excluded as a KV-sharing layer):
+    let groups = vec![
+        EngineGroupInfoSpec {
+            engine_group_id: 0,
+            layer_indices: vec![0, 2],
+            tokens_per_block: 64,
+            sw_size_tokens: -1,
+            extra_object_group_tag: 0,
+            recurrent_state: false,
+        },
+        EngineGroupInfoSpec {
+            engine_group_id: 0,
+            layer_indices: vec![1],
+            tokens_per_block: 64,
+            sw_size_tokens: -1,
+            extra_object_group_tag: 0,
+            recurrent_state: false,
+        },
+        EngineGroupInfoSpec {
+            engine_group_id: 1,
+            layer_indices: vec![3],
+            tokens_per_block: 256,
+            sw_size_tokens: 1024,
+            extra_object_group_tag: 0,
+            recurrent_state: true,
+        },
+    ];
+
+    assert_eq!(num_engine_groups(&groups), 2);
+    assert_eq!(
+        engine_group_layer_indices(&groups),
+        vec![vec![0, 1, 2], vec![3]]
+    );
+    assert_eq!(
+        expand_engine_block_ids(&groups, &[vec![10, 11, 12, 13], vec![99]]),
+        Some(vec![vec![10, 11, 12, 13], vec![10, 11, 12, 13], vec![99]])
+    );
+    assert_eq!(
+        get_engine_group_indices(&groups, 5),
+        Some(vec![0, 0, 0, 1, EXCLUDED_ENGINE_GROUP])
+    );
+
+    // Slice token range `[256, 512)` across engine group 0 (`tpb=64` -> blocks `4..8`),
+    // engine group 1 (`tpb=256` -> block `1..2`), and scratch group 2 (`tpb=0` -> `[]`):
+    let mut alloc = indexmap::IndexMap::new();
+    alloc.insert(0usize, vec![10, 11, 12, 13, 14, 15, 16, 17]);
+    alloc.insert(1usize, vec![100, 200]);
+    assert_eq!(
+        slice_block_ids_per_group(&alloc, &[64, 256, 0], 256, 512),
+        Some(vec![vec![14, 15, 16, 17], vec![200], vec![]])
+    );
+    // Unaligned token range (`[128, 512)` is not divisible by `256`) returns `None`:
+    assert!(slice_block_ids_per_group(&alloc, &[64, 256, 0], 128, 512).is_none());
 }

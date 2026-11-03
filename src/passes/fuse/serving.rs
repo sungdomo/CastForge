@@ -11457,3 +11457,133 @@ pub fn hoist_callsite_invariant_subgraph_ops(module: &mut Module) -> usize {
 
     total_hoisted
 }
+
+/// Sentinel engine-group index (`-1`) assigned to cross-layer KV-sharing layers whose KV state
+/// lives in their target owner's paged blocks.
+pub const EXCLUDED_ENGINE_GROUP: i32 = -1;
+
+/// Engine-neutral descriptor of one KV-cache group exposed by a hybrid serving engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineGroupInfoSpec {
+    /// Dense 0-based engine group identifier (one distinct paged-block address space).
+    pub engine_group_id: usize,
+    /// Registered KV tensor layer indices assigned to this group.
+    pub layer_indices: Vec<usize>,
+    /// Logical tokens covered by one paged chunk (`0` = scratch or unreported group).
+    pub tokens_per_block: usize,
+    /// Sliding-window size in tokens (`-1` = full attention).
+    pub sw_size_tokens: i64,
+    /// Connector-private extra object-group tag (`0` = regular group, `> 0` = auxiliary group).
+    pub extra_object_group_tag: u16,
+    /// True if pages hold recurrent state snapshots (Mamba / GDN) rather than attention KV.
+    pub recurrent_state: bool,
+}
+
+/// Returns the number of distinct engine paged-block address spaces (`max(engine_group_id) + 1`,
+/// or `1` when `groups` is empty).
+pub fn num_engine_groups(groups: &[EngineGroupInfoSpec]) -> usize {
+    groups
+        .iter()
+        .map(|g| g.engine_group_id + 1)
+        .max()
+        .unwrap_or(1)
+}
+
+/// Unions and sorts `layer_indices` per `engine_group_id` across `groups`.
+pub fn engine_group_layer_indices(groups: &[EngineGroupInfoSpec]) -> Vec<Vec<usize>> {
+    if groups.is_empty() {
+        return Vec::new();
+    }
+    let n = num_engine_groups(groups);
+    let mut per_group = vec![Vec::new(); n];
+    for g in groups {
+        per_group[g.engine_group_id].extend_from_slice(&g.layer_indices);
+    }
+    for list in &mut per_group {
+        list.sort_unstable();
+        list.dedup();
+    }
+    per_group
+}
+
+/// Expands per-engine-group block ID lists `engine_side_block_ids` (indexed by `engine_group_id`)
+/// into one block ID list per [`EngineGroupInfoSpec`] in protocol order.
+pub fn expand_engine_block_ids(
+    groups: &[EngineGroupInfoSpec],
+    engine_side_block_ids: &[Vec<usize>],
+) -> Option<Vec<Vec<usize>>> {
+    if groups.is_empty() {
+        return Some(vec![
+            engine_side_block_ids.first().cloned().unwrap_or_default(),
+        ]);
+    }
+    let mut out = Vec::with_capacity(groups.len());
+    for g in groups {
+        let block_ids = engine_side_block_ids.get(g.engine_group_id)?;
+        out.push(block_ids.clone());
+    }
+    Some(out)
+}
+
+/// Slices each engine group's `allocated_block_ids` over the token interval
+/// `[start_token_idx, end_token_idx)` using `group_tokens_per_block`.
+///
+/// Groups with `tokens_per_block == 0` (scratch groups) slice to an empty vector. Returns `None`
+/// if `end_token_idx < start_token_idx`, if `start_token_idx` or `end_token_idx` is not a multiple
+/// of `tokens_per_block`, or if the sliced block range exceeds a group's allocated block list.
+pub fn slice_block_ids_per_group(
+    allocated_block_ids: &IndexMap<usize, Vec<usize>>,
+    group_tokens_per_block: &[usize],
+    start_token_idx: usize,
+    end_token_idx: usize,
+) -> Option<Vec<Vec<usize>>> {
+    if end_token_idx < start_token_idx {
+        return None;
+    }
+    let mut sliced = Vec::with_capacity(group_tokens_per_block.len());
+    for (group_idx, &tpb) in group_tokens_per_block.iter().enumerate() {
+        if tpb == 0 {
+            sliced.push(Vec::new());
+            continue;
+        }
+        if !start_token_idx.is_multiple_of(tpb) || !end_token_idx.is_multiple_of(tpb) {
+            return None;
+        }
+        let b_start = start_token_idx / tpb;
+        let b_end = end_token_idx / tpb;
+        let Some(group_blocks) = allocated_block_ids.get(&group_idx) else {
+            if b_start == b_end {
+                sliced.push(Vec::new());
+                continue;
+            }
+            return None;
+        };
+        if b_end > group_blocks.len() {
+            return None;
+        }
+        sliced.push(group_blocks[b_start..b_end].to_vec());
+    }
+    Some(sliced)
+}
+
+/// Maps each registered layer `0..num_registered_layers` to its `engine_group_id`, marking layers
+/// not referenced by any group with [`EXCLUDED_ENGINE_GROUP`] (`-1`).
+pub fn get_engine_group_indices(
+    groups: &[EngineGroupInfoSpec],
+    num_registered_layers: usize,
+) -> Option<Vec<i32>> {
+    if groups.is_empty() || num_registered_layers == 0 {
+        return None;
+    }
+    let mut per_layer = vec![EXCLUDED_ENGINE_GROUP; num_registered_layers];
+    for g in groups {
+        let gid = i32::try_from(g.engine_group_id).ok()?;
+        for &layer_idx in &g.layer_indices {
+            if layer_idx >= num_registered_layers {
+                return None;
+            }
+            per_layer[layer_idx] = gid;
+        }
+    }
+    Some(per_layer)
+}
