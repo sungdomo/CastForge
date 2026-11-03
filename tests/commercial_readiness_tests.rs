@@ -39,26 +39,27 @@ use castforge::passes::{
     compute_cb_group_rope_geometry, compute_ieee_crc32, decode_coordinator_checkpoint_envelope,
     decode_kv_fs_filename, decode_kv_storage_key, decode_raw_block_slot_header,
     defer_allocs_to_first_use, direct_copy_format_supported, downsample_subchunk_swa_block_ids,
-    elide_redundant_state_transfers, eliminate_implied_dependencies,
-    encode_coordinator_checkpoint_envelope, encode_kv_fs_filename, encode_kv_storage_key,
-    encode_raw_block_meta_checkpoint, encode_raw_block_slot_header, encode_wide_column_row_key,
-    engine_group_layer_indices, expand_engine_block_ids, expected_contiguous_shape_from_strides,
-    find_squeeze_axis, find_unsqueeze_axis, flatten_elementwise_chains,
-    fold_extend_lifetimes_into_async_kernels, fold_unfold_hybrid_prefix_bitmaps,
-    fuse_horizontal_shared_input_ops, fuse_locations, fuse_reshape_epilogue,
-    fuse_sole_use_prologues, get_engine_group_indices, group_p2p_lookup_keys,
-    hash_packed_token_blocks_be, hash_prefix_token_blocks, hoist_callsite_invariant_subgraph_ops,
-    hoist_exec_invariant_ops, hoist_symbolic_dim_expressions, interleave_chunk_major_object_keys,
-    is_supported_arch_dtype, legalize_rowwise_reduction_launch, longest_full_attention_hit,
-    longest_joint_prefix_hit, longest_sliding_window_hit, map_axis_through_static_reshape,
-    mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops, merge_duplicate_shape_ops,
-    merge_identical_functions, merge_parallel_matmuls, num_engine_groups, num_packed_tokens,
-    pack_token_ids_be, plan_cacheblend_retrieve, plan_cacheblend_token_reorder,
-    plan_concat_in_place, plan_device_graph_collective_partition, plan_dynamic_memory_pool,
-    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
-    promote_narrow_accumulators, re_rope_key_in_place, recalculate_subchunk_blocks_to_skip,
-    recognize_composite_activations, recover_contiguous_or_dim0_padded_view,
-    reuse_dead_loop_buffers, select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
+    elide_redundant_mutable_buffer_ops, elide_redundant_state_transfers,
+    eliminate_implied_dependencies, encode_coordinator_checkpoint_envelope, encode_kv_fs_filename,
+    encode_kv_storage_key, encode_raw_block_meta_checkpoint, encode_raw_block_slot_header,
+    encode_wide_column_row_key, engine_group_layer_indices, expand_engine_block_ids,
+    expected_contiguous_shape_from_strides, find_squeeze_axis, find_unsqueeze_axis,
+    flatten_elementwise_chains, fold_extend_lifetimes_into_async_kernels,
+    fold_unfold_hybrid_prefix_bitmaps, fuse_horizontal_shared_input_ops, fuse_locations,
+    fuse_reshape_epilogue, fuse_sole_use_prologues, get_engine_group_indices,
+    group_p2p_lookup_keys, hash_packed_token_blocks_be, hash_prefix_token_blocks,
+    hoist_callsite_invariant_subgraph_ops, hoist_exec_invariant_ops,
+    hoist_symbolic_dim_expressions, interleave_chunk_major_object_keys, is_supported_arch_dtype,
+    legalize_rowwise_reduction_launch, longest_full_attention_hit, longest_joint_prefix_hit,
+    longest_sliding_window_hit, map_axis_through_static_reshape, mark_cuda_graph_stable_tensors,
+    merge_adjacent_parallel_loops, merge_duplicate_shape_ops, merge_identical_functions,
+    merge_parallel_matmuls, num_engine_groups, num_packed_tokens, pack_token_ids_be,
+    plan_cacheblend_retrieve, plan_cacheblend_token_reorder, plan_concat_in_place,
+    plan_device_graph_collective_partition, plan_dynamic_memory_pool, plan_jenga_kv_geometry,
+    plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
+    re_rope_key_in_place, recalculate_subchunk_blocks_to_skip, recognize_composite_activations,
+    recover_contiguous_or_dim0_padded_view, reuse_dead_loop_buffers,
+    select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
     sink_split_through_reshape, sink_transpose_through_elementwise_and_broadcast,
     slice_block_ids_per_group, solve_lloyd_max_gaussian, stamp_fused_provenance,
     swim_reshape_through_slice, unfold_chunk_range, unique_blend_token_coverage,
@@ -4001,4 +4002,41 @@ fn test_quiesce_state_machine_stream_position_and_checkpoint_envelope() {
         Some(&b"checkpoint-payload"[..])
     );
     assert!(decode_coordinator_checkpoint_envelope(&env, 2).is_none());
+}
+
+#[test]
+fn test_elide_redundant_mutable_buffer_ops_cascade() {
+    // Cascade on the same buffer `%buf`:
+    //   `%c1 = mo.mutable.store %c0, %x, %buf`
+    //   `%val, %c2 = mo.mutable.load %c1, %buf`
+    //   `%y = stablehlo.add %val, %x`
+    //   `%c3 = mo.mutable.store %c2, %y, %buf`
+    // First elides `%val, %c2 = mo.mutable.load` (forwarding `%val -> %x` and `%c2 -> %c1`),
+    // which exposes `%c1` directly feeding `%c3 = mo.mutable.store %c1, %y, %buf` on the same
+    // buffer, so the overwritten first store `%c1` is also elided in the same fixed-point pass!
+    let mlir = concat!(
+        "module @elide_mutable_cascade {\n",
+        "  func.func @main(%c0: tensor<1xi64>, %x: tensor<4xf32>, %buf: tensor<4xf32>) ",
+        "-> tensor<1xi64> {\n",
+        "    %c1 = mo.mutable.store %c0, %x, %buf ",
+        ": (tensor<1xi64>, tensor<4xf32>, tensor<4xf32>) -> tensor<1xi64>\n",
+        "    %val, %c2 = mo.mutable.load %c1, %buf ",
+        ": (tensor<1xi64>, tensor<4xf32>) -> (tensor<4xf32>, tensor<1xi64>)\n",
+        "    %y = stablehlo.add %val, %x : tensor<4xf32>\n",
+        "    %c3 = mo.mutable.store %c2, %y, %buf ",
+        ": (tensor<1xi64>, tensor<4xf32>, tensor<4xf32>) -> tensor<1xi64>\n",
+        "    return %c3 : tensor<1xi64>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(mlir).expect("valid MLIR");
+    assert_eq!(elide_redundant_mutable_buffer_ops(&mut m), 2);
+    let func_id = m.functions()[0];
+    let blk_id = m.regions[m.ops[func_id].regions[0]].blocks[0];
+    let ops = &m.blocks[blk_id].ops;
+    assert_eq!(ops.len(), 3);
+    assert!(m.ops[ops[0]].is_op("stablehlo", "add"));
+    assert_eq!(m.ops[ops[0]].operands[0], m.ops[ops[0]].operands[1]);
+    assert!(m.ops[ops[1]].is_op("mo", "mutable.store"));
+    assert_eq!(m.ops[ops[1]].operands[0], m.blocks[blk_id].arguments[0]);
 }

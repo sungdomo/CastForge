@@ -11876,3 +11876,139 @@ impl QuiesceStateMachine {
         (self.quiesce_requested, self.in_flight)
     }
 }
+
+/// Elides redundant mutable buffer store-load and store-store pairs on the same buffer and
+/// effect chain (`mo.mutable.store` / `mo.mutable.load`).
+///
+/// - **Redundant load elision:** When `mo.mutable.load(in_chain, buffer) -> (out_tensor,
+///   out_chain)` has exclusive access (`hasOneUse`) to `in_chain` produced by
+///   `mo.mutable.store(prev_chain, in_tensor, buffer) -> in_chain` on the same `buffer` and
+///   device, forwards `out_tensor` to `in_tensor` and `out_chain` to `in_chain`.
+/// - **Redundant store elision:** When `curr = mo.mutable.store(in_chain, val1, buffer) ->
+///   mid_chain` has `mid_chain` uniquely consumed by `next = mo.mutable.store(mid_chain, val2,
+///   buffer)` on the same `buffer` and device, forwards `mid_chain` to `in_chain` and erases the
+///   overwritten `curr` store.
+///
+/// Runs to a fixed point per basic block so cascading `store -> load -> store` chains collapse in
+/// a single pass. Returns the total number of mutable operations elided.
+pub fn elide_redundant_mutable_buffer_ops(module: &mut Module) -> usize {
+    let mut total_elided = 0usize;
+    let block_ids: Vec<_> = module.blocks.keys().collect();
+
+    for block_id in block_ids {
+        loop {
+            let mut changed = false;
+            let mut use_counts: IndexMap<ValueId, usize> = IndexMap::new();
+            let mut unique_user: IndexMap<ValueId, OpId> = IndexMap::new();
+            for &op_id in &module.blocks[block_id].ops {
+                if let Some(op) = module.ops.get(op_id) {
+                    for &v in &op.operands {
+                        *use_counts.entry(v).or_insert(0) += 1;
+                        unique_user.insert(v, op_id);
+                    }
+                }
+            }
+
+            let op_ids = module.blocks[block_id].ops.clone();
+            let mut erased_op: Option<OpId> = None;
+            let mut replacements: Vec<(ValueId, ValueId)> = Vec::new();
+
+            for op_id in op_ids {
+                let Some(op) = module.ops.get(op_id).cloned() else {
+                    continue;
+                };
+                let name = op.name.to_string();
+
+                if name == "mo.mutable.load" && op.operands.len() == 2 && op.results.len() == 2 {
+                    let in_chain = op.operands[0];
+                    let in_buf = op.operands[1];
+                    if use_counts.get(&in_chain).copied().unwrap_or(0) != 1 {
+                        continue;
+                    }
+                    let Some(chain_info) = module.values.get(in_chain) else {
+                        continue;
+                    };
+                    let ValueDef::OpResult { op: store_id, .. } = chain_info.def else {
+                        continue;
+                    };
+                    if !module.blocks[block_id].ops.contains(&store_id) {
+                        continue;
+                    }
+                    let Some(store_op) = module.ops.get(store_id) else {
+                        continue;
+                    };
+                    if store_op.name.to_string() == "mo.mutable.store"
+                        && store_op.operands.len() == 3
+                        && store_op.results.len() == 1
+                        && store_op.operands[2] == in_buf
+                        && store_op.attributes.get("castforge.device")
+                            == op.attributes.get("castforge.device")
+                    {
+                        replacements.push((op.results[0], store_op.operands[1]));
+                        replacements.push((op.results[1], store_op.results[0]));
+                        erased_op = Some(op_id);
+                        break;
+                    }
+                } else if name == "mo.mutable.store"
+                    && op.operands.len() == 3
+                    && op.results.len() == 1
+                {
+                    let out_chain = op.results[0];
+                    if use_counts.get(&out_chain).copied().unwrap_or(0) != 1 {
+                        continue;
+                    }
+                    let Some(&next_id) = unique_user.get(&out_chain) else {
+                        continue;
+                    };
+                    if !module.blocks[block_id].ops.contains(&next_id) {
+                        continue;
+                    }
+                    let Some(next_op) = module.ops.get(next_id) else {
+                        continue;
+                    };
+                    if next_op.name.to_string() == "mo.mutable.store"
+                        && next_op.operands.len() == 3
+                        && next_op.operands[0] == out_chain
+                        && next_op.operands[2] == op.operands[2]
+                        && next_op.attributes.get("castforge.device")
+                            == op.attributes.get("castforge.device")
+                    {
+                        replacements.push((out_chain, op.operands[0]));
+                        erased_op = Some(op_id);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(dead_id) = erased_op {
+                for &rem_id in &module.blocks[block_id].ops {
+                    if rem_id == dead_id {
+                        continue;
+                    }
+                    if let Some(rem_op) = module.ops.get_mut(rem_id) {
+                        for opd in &mut rem_op.operands {
+                            for &(old_v, new_v) in &replacements {
+                                if *opd == old_v {
+                                    *opd = new_v;
+                                }
+                            }
+                        }
+                    }
+                }
+                module.blocks[block_id].ops.retain(|&id| id != dead_id);
+                module.ops.remove(dead_id);
+                for (old_v, _) in replacements {
+                    module.values.remove(old_v);
+                }
+                total_elided += 1;
+                changed = true;
+            }
+
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    total_elided
+}
