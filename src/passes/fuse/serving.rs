@@ -15835,3 +15835,118 @@ pub fn allocate_accumulating_epilogue_buffers(module: &mut Module) -> (usize, us
 
     (scratch_allocated, direct_bound)
 }
+
+// ============================================================================
+// Batch 18 Step 5: Staged Device-Graph Dependency Synthesizer
+// ============================================================================
+
+/// Returns the ordering source value for `operand`: if `operand` is produced by
+/// `mgp.device_graph.stable.tensor` whose address (`operands[0]`) is produced by
+/// `mgp.device_graph.stable.place`, returns the placed tensor (`place_op.operands[0]`) so
+/// per-device ordering is preserved from the producer of the placed tensor.
+#[must_use]
+pub fn resolve_device_graph_ordering_source(module: &Module, operand: ValueId) -> ValueId {
+    if let ValueDef::OpResult { op: stable_op, .. } = module.values[operand].def
+        && module.ops[stable_op].name.full_name() == "mgp.device_graph.stable.tensor"
+        && let Some(&addr_val) = module.ops[stable_op].operands.first()
+        && let ValueDef::OpResult { op: place_op, .. } = module.values[addr_val].def
+        && module.ops[place_op].name.full_name() == "mgp.device_graph.stable.place"
+        && let Some(&placed_tensor) = module.ops[place_op].operands.first()
+    {
+        return placed_tensor;
+    }
+    operand
+}
+
+/// Converts staged `mogg.routine.async` operations in `module` into
+/// `mgp.device_graph.dependencies` operations with explicit producer-consumer DAG edges (resolving
+/// `mgp.device_graph.stable.tensor` -> `mgp.device_graph.stable.place` to its placed tensor
+/// producer) and aggregates `"constant_resources"` onto the enclosing function. Returns the number
+/// of converted `mogg.routine.async` operations.
+pub fn compute_device_graph_dependencies(module: &mut Module) -> usize {
+    let func_ids = module.functions();
+    let mut converted_count = 0usize;
+
+    for f_id in func_ids {
+        let mut resources_seen: IndexSet<String> = IndexSet::new();
+        let reg_ids = module.ops[f_id].regions.clone();
+
+        for reg_id in reg_ids {
+            let block_ids = module.regions[reg_id].blocks.clone();
+            for blk_id in block_ids {
+                let routine_ops: Vec<OpId> = module.blocks[blk_id]
+                    .ops
+                    .iter()
+                    .copied()
+                    .filter(|&op_id| module.ops[op_id].name.full_name() == "mogg.routine.async")
+                    .collect();
+                if routine_ops.is_empty() {
+                    continue;
+                }
+
+                let mut op_to_node_info: IndexMap<OpId, (usize, ValueId)> = IndexMap::new();
+                for (node_idx, &op_id) in routine_ops.iter().enumerate() {
+                    let res_idx = module.ops[op_id].results.len() as u32;
+                    let node_token = module.values.insert_with_key(|id| Value {
+                        id,
+                        ssa_name: None,
+                        ty: Type::Tensor(TensorType::new(vec![Dim::Static(1)], DType::I64)),
+                        def: ValueDef::OpResult {
+                            op: op_id,
+                            index: res_idx,
+                        },
+                    });
+                    module.ops[op_id].results.push(node_token);
+                    op_to_node_info.insert(op_id, (node_idx, node_token));
+                }
+
+                for &op_id in &routine_ops {
+                    let orig_operands = module.ops[op_id].operands.clone();
+                    let mut dep_indices: Vec<i64> = Vec::new();
+                    let mut dep_tokens: Vec<ValueId> = Vec::new();
+                    let mut seen_producers: IndexSet<OpId> = IndexSet::new();
+
+                    for &opd in &orig_operands {
+                        let src = resolve_device_graph_ordering_source(module, opd);
+                        if let ValueDef::OpResult { op: prod_op, .. } = module.values[src].def
+                            && let Some(&(prod_idx, prod_token)) = op_to_node_info.get(&prod_op)
+                            && seen_producers.insert(prod_op)
+                        {
+                            dep_indices.push(prod_idx as i64);
+                            dep_tokens.push(prod_token);
+                        }
+                    }
+
+                    if let Some(Attribute::Array(items)) =
+                        module.ops[op_id].attributes.get("constant_resources")
+                    {
+                        for item in items {
+                            if let Some(s) = item.as_str() {
+                                resources_seen.insert(s.to_string());
+                            }
+                        }
+                    }
+
+                    module.ops[op_id].name = OpName::new("mgp.device_graph", "dependencies");
+                    for tok in dep_tokens {
+                        module.ops[op_id].operands.push(tok);
+                    }
+                    module.ops[op_id].attributes.insert(
+                        "dep_node_indices".to_string(),
+                        Attribute::DenseIntArray(dep_indices),
+                    );
+                    converted_count += 1;
+                }
+            }
+        }
+
+        if !resources_seen.is_empty() {
+            let agg: Vec<Attribute> = resources_seen.into_iter().map(Attribute::String).collect();
+            module.ops[f_id]
+                .attributes
+                .insert("constant_resources".to_string(), Attribute::Array(agg));
+        }
+    }
+
+    converted_count
+}

@@ -4906,3 +4906,65 @@ fn test_allocate_accumulating_epilogue_buffers_mixed_and_same_precision() {
         Some(&Attribute::Bool(false))
     );
 }
+
+#[test]
+fn test_compute_device_graph_dependencies_and_stable_place_ordering() {
+    use castforge::ir::mlir::Attribute;
+    use castforge::passes::compute_device_graph_dependencies;
+
+    // Routine 0 (`%r0`) -> `mgp.device_graph.stable.place` (`%addr`) ->
+    // `mgp.device_graph.stable.tensor` (`%st`) -> Routine 1 (`%r1`).
+    // Routine 2 consumes both `%r0` and `%r1`.
+    let mlir = concat!(
+        "module @device_graph_deps {\n",
+        "  func.func @main(%x: tensor<4xf32>) -> tensor<4xf32> {\n",
+        "    %r0 = mogg.routine.async %x {constant_resources = [\"w0\"]}",
+        " : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %addr = mgp.device_graph.stable.place %r0 : (tensor<4xf32>) -> tensor<1xi64>\n",
+        "    %st = mgp.device_graph.stable.tensor %addr : (tensor<1xi64>) -> tensor<4xf32>\n",
+        "    %r1 = mogg.routine.async %st {constant_resources = [\"w1\", \"w0\"]}",
+        " : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %r2 = mogg.routine.async %r0, %r1",
+        " : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %r2 : tensor<4xf32>\n",
+        "  }\n",
+        "}\n",
+    );
+
+    let mut m = parse_mlir(mlir).expect("valid MLIR");
+    let converted = compute_device_graph_dependencies(&mut m);
+    assert_eq!(converted, 3);
+
+    let func_id = m.functions()[0];
+    let blk_id = m.regions[m.ops[func_id].regions[0]].blocks[0];
+    let deps_ops: Vec<_> = m.blocks[blk_id]
+        .ops
+        .iter()
+        .copied()
+        .filter(|&id| m.ops[id].name.full_name() == "mgp.device_graph.dependencies")
+        .collect();
+    assert_eq!(deps_ops.len(), 3);
+
+    assert_eq!(
+        m.ops[deps_ops[0]].attributes.get("dep_node_indices"),
+        Some(&Attribute::DenseIntArray(vec![]))
+    );
+    // Routine 1 depends on Routine 0 through `stable.tensor` -> `stable.place`:
+    assert_eq!(
+        m.ops[deps_ops[1]].attributes.get("dep_node_indices"),
+        Some(&Attribute::DenseIntArray(vec![0]))
+    );
+    // Routine 2 depends on both Routine 0 and Routine 1:
+    assert_eq!(
+        m.ops[deps_ops[2]].attributes.get("dep_node_indices"),
+        Some(&Attribute::DenseIntArray(vec![0, 1]))
+    );
+    // Enclosing function aggregates deduplicated `"constant_resources"`:
+    assert_eq!(
+        m.ops[func_id].attributes.get("constant_resources"),
+        Some(&Attribute::Array(vec![
+            Attribute::String("w0".to_string()),
+            Attribute::String("w1".to_string()),
+        ]))
+    );
+}
