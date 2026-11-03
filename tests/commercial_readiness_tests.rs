@@ -49,10 +49,10 @@ use castforge::passes::{
     plan_concat_in_place, plan_dynamic_memory_pool, plan_jenga_kv_geometry,
     plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
     re_rope_key_in_place, recalculate_subchunk_blocks_to_skip, recognize_composite_activations,
-    reuse_dead_loop_buffers, select_latest_valid_meta_checkpoint,
-    sink_transpose_through_elementwise_and_broadcast, stamp_fused_provenance, unfold_chunk_range,
-    unique_blend_token_coverage, unpack_token_ids_be, unpermute_slice,
-    validate_target_device_dtypes,
+    reuse_dead_loop_buffers, select_latest_valid_meta_checkpoint, sink_split_through_reshape,
+    sink_transpose_through_elementwise_and_broadcast, stamp_fused_provenance,
+    swim_reshape_through_slice, unfold_chunk_range, unique_blend_token_coverage,
+    unpack_token_ids_be, unpermute_slice, validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -3290,4 +3290,66 @@ fn test_fdp_raw_block_slot_manager_and_double_buffered_meta_checkpoint() {
     assert_eq!(mgr.allocate_slot(None), Some(3));
     assert_eq!(mgr.allocate_slot(None), Some(1));
     assert_eq!(mgr.allocate_slot(None), None);
+}
+
+#[test]
+fn test_swim_reshape_through_slice_and_sink_split_through_reshape() {
+    // 1. Verify `swim_reshape_through_slice`:
+    //    `slice(tensor<8x6xf32> -> tensor<4x6xf32>, start=[2, 0], limit=[6, 6], strides=[1, 1])`
+    //    followed by `reshape(tensor<4x6xf32> -> tensor<2x2x6xf32>)`
+    //    commutes into `reshape(tensor<8x6xf32> -> tensor<4x2x6xf32>)` followed by
+    //    `slice(tensor<4x2x6xf32> -> tensor<2x2x6xf32>, start=[1, 0, 0], limit=[3, 2, 6])`!
+    let mlir_slice_reshape = concat!(
+        "module @swim_reshape_slice {\n",
+        "  func.func @main(%x: tensor<8x6xf32>) -> tensor<2x2x6xf32> {\n",
+        "    %s = stablehlo.slice %x ",
+        "{start_indices = [2, 0], limit_indices = [6, 6], strides = [1, 1]} ",
+        ": (tensor<8x6xf32>) -> tensor<4x6xf32>\n",
+        "    %r = stablehlo.reshape %s : (tensor<4x6xf32>) -> tensor<2x2x6xf32>\n",
+        "    return %r : tensor<2x2x6xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m1 = parse_mlir(mlir_slice_reshape).expect("valid MLIR");
+    assert_eq!(swim_reshape_through_slice(&mut m1), 1);
+    let f1 = m1.functions()[0];
+    let b1 = m1.regions[m1.ops[f1].regions[0]].blocks[0];
+    let ops1 = &m1.blocks[b1].ops;
+    assert!(m1.ops[ops1[0]].is_op("stablehlo", "reshape"));
+    assert!(m1.ops[ops1[1]].is_op("stablehlo", "slice"));
+    let mid_v = m1.ops[ops1[0]].results[0];
+    assert_eq!(
+        m1.values[mid_v].ty.as_tensor().unwrap().shape,
+        vec![Dim::Static(4), Dim::Static(2), Dim::Static(6)]
+    );
+
+    // 2. Verify `sink_split_through_reshape`:
+    //    `mo.split %x {axis = 0} : (tensor<4x6xf32>) -> (tensor<2x6xf32>, tensor<2x6xf32>)`
+    //    followed by two identical `stablehlo.reshape` ops `tensor<2x6xf32> -> tensor<2x2x3xf32>`
+    //    commutes into a single `stablehlo.reshape` (`tensor<4x6xf32> -> tensor<4x2x3xf32>`)
+    //    followed by `mo.split` along `axis = 0`!
+    let mlir_split_reshape = r#"
+module @sink_split_reshape {
+  func.func @main(%x: tensor<4x6xf32>) -> tensor<2x2x3xf32> {
+    %s0, %s1 = mo.split %x {axis = 0} : (tensor<4x6xf32>) -> (tensor<2x6xf32>, tensor<2x6xf32>)
+    %r0 = stablehlo.reshape %s0 : (tensor<2x6xf32>) -> tensor<2x2x3xf32>
+    %r1 = stablehlo.reshape %s1 : (tensor<2x6xf32>) -> tensor<2x2x3xf32>
+    %sum = stablehlo.add %r0, %r1 : tensor<2x2x3xf32>
+    return %sum : tensor<2x2x3xf32>
+  }
+}
+"#;
+    let mut m2 = parse_mlir(mlir_split_reshape).expect("valid MLIR");
+    assert_eq!(sink_split_through_reshape(&mut m2), 1);
+    let f2 = m2.functions()[0];
+    let b2 = m2.regions[m2.ops[f2].regions[0]].blocks[0];
+    let ops2 = &m2.blocks[b2].ops;
+    assert_eq!(ops2.len(), 4);
+    assert!(m2.ops[ops2[0]].is_op("stablehlo", "reshape"));
+    assert!(m2.ops[ops2[1]].is_op("mo", "split"));
+    let pre_split_v = m2.ops[ops2[0]].results[0];
+    assert_eq!(
+        m2.values[pre_split_v].ty.as_tensor().unwrap().shape,
+        vec![Dim::Static(4), Dim::Static(2), Dim::Static(3)]
+    );
 }

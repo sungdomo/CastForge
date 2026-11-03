@@ -9392,3 +9392,472 @@ impl FdpRawBlockSlotManager {
         true
     }
 }
+
+fn static_i64_dims(tt: &TensorType) -> Option<Vec<i64>> {
+    let mut out = Vec::with_capacity(tt.shape.len());
+    for d in &tt.shape {
+        match d {
+            Dim::Static(v) if *v > 0 => out.push(*v),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Commutes a sole-use `stablehlo.slice` followed by `stablehlo.reshape` into `stablehlo.reshape`
+/// followed by `stablehlo.slice` when the sliced dimension maps cleanly through the reshape
+/// (either 1-to-1, factored by an integer divisor with unit step, or merged with trailing
+/// dimensions with unit step).
+///
+/// Returns the number of slice-reshape pairs commuted.
+pub fn swim_reshape_through_slice(module: &mut Module) -> usize {
+    let mut commuted = 0usize;
+    let block_ids: Vec<_> = module.blocks.keys().collect();
+
+    for block_id in block_ids {
+        let mut use_counts: IndexMap<ValueId, usize> = IndexMap::new();
+        for &op_id in &module.blocks[block_id].ops {
+            if let Some(op) = module.ops.get(op_id) {
+                for &v in &op.operands {
+                    *use_counts.entry(v).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let op_ids = module.blocks[block_id].ops.clone();
+        for op_id in op_ids {
+            let Some(reshape_op) = module.ops.get(op_id).cloned() else {
+                continue;
+            };
+            if !matches!(
+                reshape_op.name.to_string().as_str(),
+                "stablehlo.reshape" | "mo.reshape"
+            ) || reshape_op.operands.len() != 1
+                || reshape_op.results.len() != 1
+            {
+                continue;
+            }
+            let slice_out_val = reshape_op.operands[0];
+            if use_counts.get(&slice_out_val).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            let Some(slice_out_info) = module.values.get(slice_out_val).cloned() else {
+                continue;
+            };
+            let ValueDef::OpResult { op: slice_id, .. } = slice_out_info.def else {
+                continue;
+            };
+            if !module.blocks[block_id].ops.contains(&slice_id) {
+                continue;
+            }
+            let Some(slice_op) = module.ops.get(slice_id).cloned() else {
+                continue;
+            };
+            if !slice_op.is_op("stablehlo", "slice")
+                || slice_op.operands.len() != 1
+                || slice_op.results.len() != 1
+            {
+                continue;
+            }
+            if slice_op.attributes.get("castforge.device")
+                != reshape_op.attributes.get("castforge.device")
+            {
+                continue;
+            }
+
+            let slice_in_val = slice_op.operands[0];
+            let reshape_out_val = reshape_op.results[0];
+            let (Some(in_info), Some(out_info)) = (
+                module.values.get(slice_in_val),
+                module.values.get(reshape_out_val),
+            ) else {
+                continue;
+            };
+            let (Type::Tensor(in_tt), Type::Tensor(mid_tt), Type::Tensor(out_tt)) =
+                (&in_info.ty, &slice_out_info.ty, &out_info.ty)
+            else {
+                continue;
+            };
+            let (Some(slice_in_dims), Some(slice_out_dims), Some(reshape_out_dims)) = (
+                static_i64_dims(in_tt),
+                static_i64_dims(mid_tt),
+                static_i64_dims(out_tt),
+            ) else {
+                continue;
+            };
+            let in_rank = slice_in_dims.len();
+            if in_rank == 0 || slice_out_dims.len() != in_rank {
+                continue;
+            }
+
+            let Some(starts) = extract_int_list_attr(&slice_op, "start_indices") else {
+                continue;
+            };
+            let limits = extract_int_list_attr(&slice_op, "limit_indices").unwrap_or_else(|| {
+                starts
+                    .iter()
+                    .zip(slice_out_dims.iter())
+                    .map(|(&s, &len)| s + len)
+                    .collect()
+            });
+            let strides = extract_int_list_attr(&slice_op, "strides")
+                .unwrap_or_else(|| vec![1; slice_in_dims.len()]);
+            if starts.len() != in_rank || limits.len() != in_rank || strides.len() != in_rank {
+                continue;
+            }
+
+            // Identify the single sliced dimension.
+            let mut sliced_axes = Vec::new();
+            for d in 0..in_rank {
+                if starts[d] != 0
+                    || limits[d] != slice_in_dims[d]
+                    || strides[d] != 1
+                    || slice_out_dims[d] != slice_in_dims[d]
+                {
+                    sliced_axes.push(d);
+                }
+            }
+            if sliced_axes.len() != 1 {
+                continue;
+            }
+            let slice_axis = sliced_axes[0];
+            let start = starts[slice_axis];
+            let limit = limits[slice_axis];
+            let step = strides[slice_axis];
+            if start < 0 || limit <= start || step <= 0 {
+                continue;
+            }
+
+            let Some(new_axis) =
+                map_axis_through_static_reshape(&slice_out_dims, &reshape_out_dims, slice_axis)
+            else {
+                continue;
+            };
+
+            let old_sliced_dim = slice_out_dims[slice_axis];
+            let new_sliced_dim = reshape_out_dims[new_axis];
+            let slice_in_axis_dim = slice_in_dims[slice_axis];
+
+            let (new_reshape_axis_dim, new_start, new_limit, new_step) =
+                if old_sliced_dim == new_sliced_dim {
+                    (slice_in_axis_dim, start, limit, step)
+                } else if old_sliced_dim > new_sliced_dim {
+                    let factor = old_sliced_dim / new_sliced_dim;
+                    if step != 1
+                        || old_sliced_dim % new_sliced_dim != 0
+                        || slice_in_axis_dim % factor != 0
+                        || start % factor != 0
+                        || limit % factor != 0
+                    {
+                        continue;
+                    }
+                    (
+                        slice_in_axis_dim / factor,
+                        start / factor,
+                        limit / factor,
+                        1,
+                    )
+                } else {
+                    let factor = new_sliced_dim / old_sliced_dim;
+                    if step != 1 || new_sliced_dim % old_sliced_dim != 0 {
+                        continue;
+                    }
+                    (
+                        slice_in_axis_dim * factor,
+                        start * factor,
+                        limit * factor,
+                        1,
+                    )
+                };
+
+            let mut new_reshape_dims = reshape_out_dims.clone();
+            new_reshape_dims[new_axis] = new_reshape_axis_dim;
+            if analyze_static_reshape_dim_mapping(&slice_in_dims, &new_reshape_dims).is_none() {
+                continue;
+            }
+
+            let out_rank = reshape_out_dims.len();
+            let mut new_starts = vec![0i64; out_rank];
+            let mut new_limits = new_reshape_dims.clone();
+            let mut new_strides = vec![1i64; out_rank];
+            new_starts[new_axis] = new_start;
+            new_limits[new_axis] = new_limit;
+            new_strides[new_axis] = new_step;
+
+            let new_mid_tt = TensorType {
+                shape: new_reshape_dims.into_iter().map(Dim::Static).collect(),
+                dtype: out_tt.dtype.clone(),
+                encoding: out_tt.encoding.clone(),
+            };
+
+            // Mutate `slice_id` into `stablehlo.reshape` and `op_id` into `stablehlo.slice`.
+            if let Some(mid_val_mut) = module.values.get_mut(slice_out_val) {
+                mid_val_mut.ty = Type::Tensor(new_mid_tt);
+            }
+            if let Some(first_op) = module.ops.get_mut(slice_id) {
+                first_op.name = OpName::new("stablehlo", "reshape");
+                first_op.attributes.shift_remove("start_indices");
+                first_op.attributes.shift_remove("limit_indices");
+                first_op.attributes.shift_remove("strides");
+            }
+            if let Some(second_op) = module.ops.get_mut(op_id) {
+                second_op.name = OpName::new("stablehlo", "slice");
+                second_op
+                    .attributes
+                    .insert("start_indices".into(), Attribute::DenseIntArray(new_starts));
+                second_op
+                    .attributes
+                    .insert("limit_indices".into(), Attribute::DenseIntArray(new_limits));
+                second_op
+                    .attributes
+                    .insert("strides".into(), Attribute::DenseIntArray(new_strides));
+            }
+            commuted += 1;
+        }
+    }
+
+    commuted
+}
+
+/// Sinks a uniform `mo.split` through identical static `stablehlo.reshape` operations on every
+/// split output when the split axis maps cleanly through the reshape.
+///
+/// Rewrites `split -> [reshape_0, ..., reshape_{K-1}]` into `reshape -> split`, replacing the `K`
+/// individual reshapes with a single pre-split `stablehlo.reshape`. Returns the number of splits
+/// sunk.
+pub fn sink_split_through_reshape(module: &mut Module) -> usize {
+    let mut sunk = 0usize;
+    let block_ids: Vec<_> = module.blocks.keys().collect();
+
+    for block_id in block_ids {
+        let mut single_consumer: IndexMap<ValueId, (OpId, usize)> = IndexMap::new();
+        for &op_id in &module.blocks[block_id].ops {
+            if let Some(op) = module.ops.get(op_id) {
+                for &v in &op.operands {
+                    let entry = single_consumer.entry(v).or_insert((op_id, 0));
+                    entry.0 = op_id;
+                    entry.1 += 1;
+                }
+            }
+        }
+
+        let op_ids = module.blocks[block_id].ops.clone();
+        let mut to_remove: IndexSet<OpId> = IndexSet::new();
+
+        for split_id in op_ids {
+            if to_remove.contains(&split_id) {
+                continue;
+            }
+            let Some(split_op) = module.ops.get(split_id).cloned() else {
+                continue;
+            };
+            if split_op.name.to_string() != "mo.split"
+                || split_op.operands.len() != 1
+                || split_op.results.len() < 2
+            {
+                continue;
+            }
+            let num_splits = split_op.results.len();
+            let split_in_val = split_op.operands[0];
+            let Some(in_info) = module.values.get(split_in_val).cloned() else {
+                continue;
+            };
+            let Type::Tensor(ref split_in_tt) = in_info.ty else {
+                continue;
+            };
+            let Some(split_in_dims) = static_i64_dims(split_in_tt) else {
+                continue;
+            };
+
+            let mut reshape_ids = Vec::with_capacity(num_splits);
+            let mut split_out_dims_opt: Option<Vec<i64>> = None;
+            let mut reshape_out_tt_opt: Option<TensorType> = None;
+            let mut reshape_out_dims_opt: Option<Vec<i64>> = None;
+            let mut reshape_results = Vec::with_capacity(num_splits);
+            let mut valid = true;
+
+            for &res_v in &split_op.results {
+                let Some(&(consumer_id, count)) = single_consumer.get(&res_v) else {
+                    valid = false;
+                    break;
+                };
+                if count != 1 || !module.blocks[block_id].ops.contains(&consumer_id) {
+                    valid = false;
+                    break;
+                }
+                let Some(res_info) = module.values.get(res_v) else {
+                    valid = false;
+                    break;
+                };
+                let Type::Tensor(ref res_tt) = res_info.ty else {
+                    valid = false;
+                    break;
+                };
+                let Some(res_dims) = static_i64_dims(res_tt) else {
+                    valid = false;
+                    break;
+                };
+                if let Some(ref prev) = split_out_dims_opt {
+                    if prev != &res_dims {
+                        valid = false;
+                        break;
+                    }
+                } else {
+                    split_out_dims_opt = Some(res_dims);
+                }
+
+                let Some(r_op) = module.ops.get(consumer_id) else {
+                    valid = false;
+                    break;
+                };
+                if !matches!(
+                    r_op.name.to_string().as_str(),
+                    "stablehlo.reshape" | "mo.reshape"
+                ) || r_op.operands.len() != 1
+                    || r_op.results.len() != 1
+                    || r_op.attributes.get("castforge.device")
+                        != split_op.attributes.get("castforge.device")
+                {
+                    valid = false;
+                    break;
+                }
+                let r_out_v = r_op.results[0];
+                let Some(r_out_info) = module.values.get(r_out_v) else {
+                    valid = false;
+                    break;
+                };
+                let Type::Tensor(ref r_out_tt) = r_out_info.ty else {
+                    valid = false;
+                    break;
+                };
+                let Some(r_out_dims) = static_i64_dims(r_out_tt) else {
+                    valid = false;
+                    break;
+                };
+                if let Some(ref prev_out) = reshape_out_dims_opt {
+                    if prev_out != &r_out_dims {
+                        valid = false;
+                        break;
+                    }
+                } else {
+                    reshape_out_dims_opt = Some(r_out_dims);
+                    reshape_out_tt_opt = Some(r_out_tt.clone());
+                }
+                reshape_ids.push(consumer_id);
+                reshape_results.push(r_out_v);
+            }
+            if !valid {
+                continue;
+            }
+            let (Some(split_out_dims), Some(reshape_out_dims), Some(reshape_out_tt)) =
+                (split_out_dims_opt, reshape_out_dims_opt, reshape_out_tt_opt)
+            else {
+                continue;
+            };
+            if split_in_dims.len() != split_out_dims.len() {
+                continue;
+            }
+
+            // Determine `split_axis` from attribute or shape difference.
+            let attr_axis = split_op
+                .attributes
+                .get("axis")
+                .or_else(|| split_op.attributes.get("split_dim"))
+                .and_then(extract_single_int_attr)
+                .and_then(|a| usize::try_from(a).ok());
+            let inferred_axis = (0..split_in_dims.len()).find(|&d| {
+                split_in_dims[d] == split_out_dims[d] * (num_splits as i64)
+                    && (0..split_in_dims.len())
+                        .all(|k| k == d || split_in_dims[k] == split_out_dims[k])
+            });
+            let Some(split_axis) = attr_axis.or(inferred_axis) else {
+                continue;
+            };
+            if split_axis >= split_in_dims.len()
+                || split_in_dims[split_axis] != split_out_dims[split_axis] * (num_splits as i64)
+            {
+                continue;
+            }
+
+            let Some(new_axis) =
+                map_axis_through_static_reshape(&split_out_dims, &reshape_out_dims, split_axis)
+            else {
+                continue;
+            };
+            let mut pre_split_reshape_dims = reshape_out_dims.clone();
+            pre_split_reshape_dims[new_axis] *= num_splits as i64;
+            if analyze_static_reshape_dim_mapping(&split_in_dims, &pre_split_reshape_dims).is_none()
+            {
+                continue;
+            }
+
+            let pre_split_tt = TensorType {
+                shape: pre_split_reshape_dims
+                    .iter()
+                    .copied()
+                    .map(Dim::Static)
+                    .collect(),
+                dtype: reshape_out_tt.dtype.clone(),
+                encoding: reshape_out_tt.encoding.clone(),
+            };
+            let pre_split_val = split_op.results[0];
+            if let Some(v_mut) = module.values.get_mut(pre_split_val) {
+                v_mut.ty = Type::Tensor(pre_split_tt);
+                v_mut.def = ValueDef::OpResult {
+                    op: split_id,
+                    index: 0,
+                };
+            }
+            for &dead_v in &split_op.results[1..] {
+                module.values.remove(dead_v);
+            }
+
+            // Rewrite `split_id` in place into `stablehlo.reshape`.
+            if let Some(op_mut) = module.ops.get_mut(split_id) {
+                op_mut.name = OpName::new("stablehlo", "reshape");
+                op_mut.attributes.shift_remove("axis");
+                op_mut.attributes.shift_remove("split_dim");
+                op_mut.attributes.shift_remove("split_sizes");
+                op_mut.results = SmallVec::from_slice(&[pre_split_val]);
+            }
+
+            // Reuse `reshape_ids[0]` as the new `mo.split` producing all `reshape_results`.
+            let new_split_id = reshape_ids[0];
+            for (idx, &res_v) in reshape_results.iter().enumerate() {
+                if let Some(v_mut) = module.values.get_mut(res_v) {
+                    v_mut.def = ValueDef::OpResult {
+                        op: new_split_id,
+                        index: idx as u32,
+                    };
+                }
+            }
+            let split_sizes = vec![reshape_out_dims[new_axis]; num_splits];
+            if let Some(new_split_op) = module.ops.get_mut(new_split_id) {
+                new_split_op.name = OpName::new("mo", "split");
+                new_split_op.operands = SmallVec::from_slice(&[pre_split_val]);
+                new_split_op.results = SmallVec::from_vec(reshape_results);
+                new_split_op
+                    .attributes
+                    .insert("axis".into(), Attribute::Int(new_axis as i64));
+                new_split_op
+                    .attributes
+                    .insert("split_sizes".into(), Attribute::DenseIntArray(split_sizes));
+            }
+            for &dead_id in &reshape_ids[1..] {
+                to_remove.insert(dead_id);
+            }
+            sunk += 1;
+        }
+
+        if !to_remove.is_empty() {
+            module.blocks[block_id]
+                .ops
+                .retain(|id| !to_remove.contains(id));
+            for dead_id in to_remove {
+                module.ops.remove(dead_id);
+            }
+        }
+    }
+
+    sunk
+}
