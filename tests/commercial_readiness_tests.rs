@@ -7565,3 +7565,56 @@ fn test_canonicalize_chain_sequences_and_elide_redundant_mutable_ops() {
     let s1 = m.blocks[blk].ops[1];
     assert_eq!(m.ops[s0].operands[0], m.ops[s1].operands[0]);
 }
+
+#[test]
+fn test_create_parallel_from_unbundle_and_fold_identity_tensor_bundles() {
+    use castforge::passes::{create_parallel_from_unbundle, fold_identity_tensor_bundles};
+
+    let src = concat!(
+        "module {\n",
+        "  func.func @unbundle_peers(\n",
+        "    %b_in: !mo.bundle<tensor<4xf32>, tensor<4xf32>>,\n",
+        "    %w0: tensor<4xf32>,\n",
+        "    %w1: tensor<4xf32>\n",
+        "  ) -> (tensor<4xf32>, tensor<4xf32>) {\n",
+        "    %u0, %u1 = \"mo.tensor.unbundle\"(%b_in) : ",
+        "(!mo.bundle<tensor<4xf32>, tensor<4xf32>>) -> (tensor<4xf32>, tensor<4xf32>)\n",
+        "    %a0 = \"mo.add\"(%u0, %w0) {device = \"gpu:0\"} : ",
+        "(tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %a1 = \"mo.add\"(%u1, %w1) {device = \"gpu:1\"} : ",
+        "(tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %r0 = \"mo.relu\"(%a0) {device = \"gpu:0\"} : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %r1 = \"mo.relu\"(%a1) {device = \"gpu:1\"} : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %r0, %r1 : tensor<4xf32>, tensor<4xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(src).unwrap();
+    // Wrapping runs iteratively: first wraps the two `mo.add` peers into a `mo.parallel`,
+    // then wraps the two downstream `mo.relu` peers consuming the new unbundle into a second
+    // `mo.parallel`:
+    let wrapped = create_parallel_from_unbundle(&mut m);
+    assert_eq!(wrapped, 2);
+
+    // Folding identity `bundle(unbundle(X))` eliminates the two transient round-trip bundles:
+    let folded = fold_identity_tensor_bundles(&mut m);
+    assert_eq!(folded, 2);
+
+    let fn_id = m.functions()[0];
+    let blk = m.regions[m.ops[fn_id].regions[0]].blocks[0];
+    let op_names: Vec<String> = m.blocks[blk]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        op_names,
+        vec![
+            "mo.tensor.bundle",
+            "mo.parallel",
+            "mo.parallel",
+            "mo.tensor.unbundle",
+            "func.return"
+        ]
+    );
+}

@@ -24989,3 +24989,502 @@ pub fn elide_redundant_mutable_ops(module: &mut Module) -> usize {
     }
     elided
 }
+
+fn is_absorbable_unbundle_consumer(module: &Module, op_id: OpId) -> bool {
+    let Some(op) = module.ops.get(op_id) else {
+        return false;
+    };
+    if op.results.len() != 1 || !op.regions.is_empty() {
+        return false;
+    }
+    let full = op.name.full_name();
+    if matches!(
+        full.as_str(),
+        "func.return"
+            | "return"
+            | "mo.yield"
+            | "mo.tensor.bundle"
+            | "mo.tensor.unbundle"
+            | "mo.parallel"
+    ) {
+        return false;
+    }
+    let Some(res_val) = module.values.get(op.results[0]) else {
+        return false;
+    };
+    if !matches!(res_val.ty, Type::Tensor(_)) {
+        return false;
+    }
+    for &opnd in &op.operands {
+        let Some(v) = module.values.get(opnd) else {
+            return false;
+        };
+        if is_chain_type(&v.ty) || is_mutable_operand_type(&v.ty) {
+            return false;
+        }
+    }
+    true
+}
+
+fn unbundle_consumers_match(module: &Module, a_id: OpId, b_id: OpId) -> bool {
+    let (Some(a), Some(b)) = (module.ops.get(a_id), module.ops.get(b_id)) else {
+        return false;
+    };
+    if a.name != b.name
+        || a.operands.len() != b.operands.len()
+        || a.results.len() != b.results.len()
+    {
+        return false;
+    }
+    let a_filtered: std::collections::BTreeMap<&String, &Attribute> = a
+        .attributes
+        .iter()
+        .filter(|(k, _)| k.as_str() != "device")
+        .collect();
+    let b_filtered: std::collections::BTreeMap<&String, &Attribute> = b
+        .attributes
+        .iter()
+        .filter(|(k, _)| k.as_str() != "device")
+        .collect();
+    a_filtered == b_filtered
+}
+
+fn can_bundle_per_launch_values(module: &Module, values: &[ValueId]) -> bool {
+    let Some(&first_val) = values.first() else {
+        return false;
+    };
+    let Some(Type::Tensor(first_t)) = module.values.get(first_val).map(|v| &v.ty) else {
+        return false;
+    };
+    for &v in &values[1..] {
+        let Some(Type::Tensor(t)) = module.values.get(v).map(|val| &val.ty) else {
+            return false;
+        };
+        if t.shape != first_t.shape || t.dtype != first_t.dtype {
+            return false;
+        }
+    }
+    true
+}
+
+fn format_bundle_type(module: &Module, elem_values: &[ValueId]) -> Type {
+    let mut parts = Vec::with_capacity(elem_values.len());
+    for &v in elem_values {
+        if let Some(val) = module.values.get(v) {
+            parts.push(format!("{}", val.ty));
+        }
+    }
+    Type::Opaque(format!("!mo.bundle<{}>", parts.join(", ")))
+}
+
+/// Wraps structurally identical single-use consumers of a `mo.tensor.unbundle` operation's
+/// results into a `mo.parallel` region followed by a new `mo.tensor.unbundle`.
+///
+/// Iterates to a fixed point so downstream consumer chains of newly created unbundles are also
+/// wrapped. Returns the total number of `mo.parallel` operations created.
+pub fn create_parallel_from_unbundle(module: &mut Module) -> usize {
+    use crate::ir::mlir::{Block, Location, OpName, Operation, Region, RegionId, Value, ValueDef};
+
+    let mut wrapped_count = 0usize;
+    loop {
+        let mut changed = false;
+        let use_map = {
+            let mut map: std::collections::HashMap<ValueId, Vec<OpId>> =
+                std::collections::HashMap::new();
+            for (oid, op) in &module.ops {
+                for &v in &op.operands {
+                    map.entry(v).or_default().push(oid);
+                }
+            }
+            map
+        };
+
+        let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+        for bid in block_ids {
+            let ops_snapshot = module.blocks[bid].ops.clone();
+            for &unbundle_id in &ops_snapshot {
+                let Some(unbundle_op) = module.ops.get(unbundle_id).cloned() else {
+                    continue;
+                };
+                if unbundle_op.name.full_name() != "mo.tensor.unbundle"
+                    || unbundle_op.results.is_empty()
+                {
+                    continue;
+                }
+                let num_launches = unbundle_op.results.len();
+                let mut consumers = Vec::with_capacity(num_launches);
+                let mut unique_consumers = std::collections::HashSet::new();
+                let mut valid = true;
+                for &res_v in &unbundle_op.results {
+                    let Some(users) = use_map.get(&res_v) else {
+                        valid = false;
+                        break;
+                    };
+                    if users.len() != 1 {
+                        valid = false;
+                        break;
+                    }
+                    let c_id = users[0];
+                    if !module.blocks[bid].ops.contains(&c_id) || !unique_consumers.insert(c_id) {
+                        valid = false;
+                        break;
+                    }
+                    consumers.push(c_id);
+                }
+                if !valid {
+                    continue;
+                }
+
+                let rep_id = consumers[0];
+                if !is_absorbable_unbundle_consumer(module, rep_id) {
+                    continue;
+                }
+                if consumers[1..]
+                    .iter()
+                    .any(|&peer| !unbundle_consumers_match(module, rep_id, peer))
+                {
+                    continue;
+                }
+
+                let rep_operands = module.ops[rep_id].operands.clone();
+                let Some(driving_idx) = rep_operands
+                    .iter()
+                    .position(|&v| v == unbundle_op.results[0])
+                else {
+                    continue;
+                };
+                if consumers[1..].iter().enumerate().any(|(i, &peer)| {
+                    module.ops[peer].operands[driving_idx] != unbundle_op.results[i + 1]
+                }) {
+                    continue;
+                }
+
+                // Plan per-operand bundles:
+                let num_operands = rep_operands.len();
+                let mut bundles: Vec<Vec<ValueId>> = vec![unbundle_op.results.to_vec()];
+                let mut operand_to_block_arg = vec![0usize; num_operands];
+                let mut plan_ok = true;
+                for idx in 0..num_operands {
+                    if idx == driving_idx {
+                        continue;
+                    }
+                    let outer_vals: Vec<ValueId> = consumers
+                        .iter()
+                        .map(|&cid| module.ops[cid].operands[idx])
+                        .collect();
+                    if num_launches > 1 && outer_vals.iter().all(|&v| v == outer_vals[0]) {
+                        plan_ok = false;
+                        break;
+                    }
+                    if !can_bundle_per_launch_values(module, &outer_vals) {
+                        plan_ok = false;
+                        break;
+                    }
+                    bundles.push(outer_vals);
+                    operand_to_block_arg[idx] = bundles.len() - 1;
+                }
+                if !plan_ok {
+                    continue;
+                }
+
+                let mut inserted_ops = Vec::new();
+                let mut parallel_inputs = smallvec::SmallVec::<[ValueId; 4]>::new();
+                for bundle_vals in &bundles {
+                    let b_ty = format_bundle_type(module, bundle_vals);
+                    let b_res = module.values.insert(Value {
+                        id: ValueId::default(),
+                        ssa_name: None,
+                        ty: b_ty,
+                        def: ValueDef::BlockArgument {
+                            block: bid,
+                            index: 0,
+                        },
+                    });
+                    module.values[b_res].id = b_res;
+                    let b_op = module.ops.insert(Operation {
+                        id: OpId::default(),
+                        name: OpName::new("mo", "tensor.bundle"),
+                        operands: bundle_vals.iter().copied().collect(),
+                        results: smallvec::smallvec![b_res],
+                        attributes: indexmap::IndexMap::new(),
+                        regions: Vec::new(),
+                        custom_syntax: false,
+                        location: Location::Unknown,
+                    });
+                    module.ops[b_op].id = b_op;
+                    module.values[b_res].def = ValueDef::OpResult { op: b_op, index: 0 };
+                    inserted_ops.push(b_op);
+                    parallel_inputs.push(b_res);
+                }
+
+                let out_elem_vals: Vec<ValueId> = consumers
+                    .iter()
+                    .map(|&cid| module.ops[cid].results[0])
+                    .collect();
+                let out_bundle_ty = format_bundle_type(module, &out_elem_vals);
+
+                let body_block_id = module.blocks.insert(Block {
+                    id: BlockId::default(),
+                    label: None,
+                    arguments: Vec::new(),
+                    ops: Vec::new(),
+                });
+                module.blocks[body_block_id].id = body_block_id;
+
+                let mut block_args = Vec::with_capacity(bundles.len());
+                for (arg_i, bundle_vals) in bundles.iter().enumerate() {
+                    let elem_ty = module.values[bundle_vals[0]].ty.clone();
+                    let arg_val = module.values.insert(Value {
+                        id: ValueId::default(),
+                        ssa_name: None,
+                        ty: elem_ty,
+                        def: ValueDef::BlockArgument {
+                            block: body_block_id,
+                            index: arg_i as u32,
+                        },
+                    });
+                    module.values[arg_val].id = arg_val;
+                    block_args.push(arg_val);
+                }
+                module.blocks[body_block_id].arguments = block_args.clone();
+
+                let cloned_operands: smallvec::SmallVec<[ValueId; 4]> = (0..num_operands)
+                    .map(|i| block_args[operand_to_block_arg[i]])
+                    .collect();
+                let rep_res_ty = module.values[module.ops[rep_id].results[0]].ty.clone();
+                let cloned_res = module.values.insert(Value {
+                    id: ValueId::default(),
+                    ssa_name: None,
+                    ty: rep_res_ty,
+                    def: ValueDef::BlockArgument {
+                        block: body_block_id,
+                        index: 0,
+                    },
+                });
+                module.values[cloned_res].id = cloned_res;
+                let mut cloned_attrs = module.ops[rep_id].attributes.clone();
+                cloned_attrs.shift_remove("device");
+                let cloned_op = module.ops.insert(Operation {
+                    id: OpId::default(),
+                    name: module.ops[rep_id].name.clone(),
+                    operands: cloned_operands,
+                    results: smallvec::smallvec![cloned_res],
+                    attributes: cloned_attrs,
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: Location::Unknown,
+                });
+                module.ops[cloned_op].id = cloned_op;
+                module.values[cloned_res].def = ValueDef::OpResult {
+                    op: cloned_op,
+                    index: 0,
+                };
+
+                let yield_op = module.ops.insert(Operation {
+                    id: OpId::default(),
+                    name: OpName::new("mo", "yield"),
+                    operands: smallvec::smallvec![cloned_res],
+                    results: smallvec::SmallVec::new(),
+                    attributes: indexmap::IndexMap::new(),
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: Location::Unknown,
+                });
+                module.ops[yield_op].id = yield_op;
+                module.blocks[body_block_id].ops = vec![cloned_op, yield_op];
+
+                let body_region_id = module.regions.insert(Region {
+                    id: RegionId::default(),
+                    blocks: vec![body_block_id],
+                });
+                module.regions[body_region_id].id = body_region_id;
+
+                let parallel_res = module.values.insert(Value {
+                    id: ValueId::default(),
+                    ssa_name: None,
+                    ty: out_bundle_ty,
+                    def: ValueDef::BlockArgument {
+                        block: bid,
+                        index: 0,
+                    },
+                });
+                module.values[parallel_res].id = parallel_res;
+                let parallel_op = module.ops.insert(Operation {
+                    id: OpId::default(),
+                    name: OpName::new("mo", "parallel"),
+                    operands: parallel_inputs,
+                    results: smallvec::smallvec![parallel_res],
+                    attributes: indexmap::IndexMap::new(),
+                    regions: vec![body_region_id],
+                    custom_syntax: false,
+                    location: Location::Unknown,
+                });
+                module.ops[parallel_op].id = parallel_op;
+                module.values[parallel_res].def = ValueDef::OpResult {
+                    op: parallel_op,
+                    index: 0,
+                };
+                inserted_ops.push(parallel_op);
+
+                let mut new_unbundle_results = smallvec::SmallVec::<[ValueId; 2]>::new();
+                for (i, &cid) in consumers.iter().enumerate() {
+                    let old_res = module.ops[cid].results[0];
+                    let res_ty = module.values[old_res].ty.clone();
+                    let new_res = module.values.insert(Value {
+                        id: ValueId::default(),
+                        ssa_name: None,
+                        ty: res_ty,
+                        def: ValueDef::BlockArgument {
+                            block: bid,
+                            index: i as u32,
+                        },
+                    });
+                    module.values[new_res].id = new_res;
+                    new_unbundle_results.push(new_res);
+                }
+                let new_unbundle_op = module.ops.insert(Operation {
+                    id: OpId::default(),
+                    name: OpName::new("mo", "tensor.unbundle"),
+                    operands: smallvec::smallvec![parallel_res],
+                    results: new_unbundle_results.clone(),
+                    attributes: indexmap::IndexMap::new(),
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: Location::Unknown,
+                });
+                module.ops[new_unbundle_op].id = new_unbundle_op;
+                for (i, &r) in new_unbundle_results.iter().enumerate() {
+                    module.values[r].def = ValueDef::OpResult {
+                        op: new_unbundle_op,
+                        index: i as u32,
+                    };
+                }
+                inserted_ops.push(new_unbundle_op);
+
+                // Replace uses of each consumer's output with the new unbundle's result:
+                let all_ops: Vec<OpId> = module.ops.keys().collect();
+                for (i, &cid) in consumers.iter().enumerate() {
+                    let old_res = module.ops[cid].results[0];
+                    let replacement = new_unbundle_results[i];
+                    for oid in &all_ops {
+                        for opnd in &mut module.ops[*oid].operands {
+                            if *opnd == old_res {
+                                *opnd = replacement;
+                            }
+                        }
+                    }
+                }
+
+                // Insert the new ops right after the last consumer in block order
+                // and erase the old consumers:
+                let consumer_set: std::collections::HashSet<OpId> =
+                    consumers.iter().copied().collect();
+                let insert_after = module.blocks[bid]
+                    .ops
+                    .iter()
+                    .rposition(|id| consumer_set.contains(id))
+                    .unwrap_or(0);
+                let mut new_block_ops =
+                    Vec::with_capacity(module.blocks[bid].ops.len() + inserted_ops.len());
+                for (pos, &oid) in module.blocks[bid].ops.iter().enumerate() {
+                    if !consumer_set.contains(&oid) {
+                        new_block_ops.push(oid);
+                    }
+                    if pos == insert_after {
+                        new_block_ops.extend(inserted_ops.iter().copied());
+                    }
+                }
+                module.blocks[bid].ops = new_block_ops;
+                for cid in consumers {
+                    module.ops.remove(cid);
+                }
+
+                wrapped_count += 1;
+                changed = true;
+                break;
+            }
+            if changed {
+                break;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    wrapped_count
+}
+
+/// Folds `mo.tensor.bundle(mo.tensor.unbundle(X)#0..N-1)` back to `X` and removes dead
+/// `mo.tensor.unbundle` operations.
+///
+/// Returns the number of identity `mo.tensor.bundle` operations folded.
+pub fn fold_identity_tensor_bundles(module: &mut Module) -> usize {
+    let mut folded = 0usize;
+    let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+    for bid in block_ids {
+        let ops_snapshot = module.blocks[bid].ops.clone();
+        for &op_id in &ops_snapshot {
+            let Some(op) = module.ops.get(op_id).cloned() else {
+                continue;
+            };
+            if op.name.full_name() != "mo.tensor.bundle"
+                || op.operands.is_empty()
+                || op.results.len() != 1
+            {
+                continue;
+            }
+            let Some(crate::ir::mlir::ValueDef::OpResult {
+                op: unbundle_id,
+                index: 0,
+            }) = module.values.get(op.operands[0]).map(|v| v.def)
+            else {
+                continue;
+            };
+            let Some(unbundle_op) = module.ops.get(unbundle_id).cloned() else {
+                continue;
+            };
+            if unbundle_op.name.full_name() != "mo.tensor.unbundle"
+                || unbundle_op.operands.len() != 1
+                || unbundle_op.results.len() != op.operands.len()
+            {
+                continue;
+            }
+            if unbundle_op
+                .results
+                .iter()
+                .zip(op.operands.iter())
+                .any(|(&u, &b)| u != b)
+            {
+                continue;
+            }
+            let source_bundle = unbundle_op.operands[0];
+            let bundle_res = op.results[0];
+            let all_ops: Vec<OpId> = module.ops.keys().collect();
+            for oid in all_ops {
+                for opnd in &mut module.ops[oid].operands {
+                    if *opnd == bundle_res {
+                        *opnd = source_bundle;
+                    }
+                }
+            }
+            module.blocks[bid].ops.retain(|&id| id != op_id);
+            module.ops.remove(op_id);
+            folded += 1;
+
+            // Remove `unbundle_id` if none of its results have remaining uses:
+            let still_used = module.ops.values().any(|other| {
+                other
+                    .operands
+                    .iter()
+                    .any(|v| unbundle_op.results.contains(v))
+            });
+            if !still_used {
+                for b in module.blocks.values_mut() {
+                    b.ops.retain(|&id| id != unbundle_id);
+                }
+                module.ops.remove(unbundle_id);
+            }
+        }
+    }
+    folded
+}
