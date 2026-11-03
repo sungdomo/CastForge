@@ -18,40 +18,42 @@ use castforge::passes::{
     BlendReadGroupSet, BlendTokenRangeMatcher, BucketHistogram, CBChunkMatch, CBGroupRopeGeometry,
     CBGroupSpec, CHUNK_COUNT_HISTOGRAM_BOUNDS, CacheBlendRopeSpec, CacheEventBatchSpec,
     CacheEventEntrySpec, CacheEventOpKind, CacheEventTier, CacheGenCdfCodec,
-    ChainedBlockHashConfig, CollectiveGraphNodeSpec, CoordinatorEventGate, CoordinatorKeyDirectory,
-    DEFAULT_MAX_KERNELS_IN_FUSION_SET, DaxGenerationSlotArena, DaxPutOutcome, DeviceGraphStage,
-    DeviceTargetArch, DynamicAllocRequest, EngineKvFormat, EventIngestOutcome,
-    FULL_ATTENTION_WINDOW, FdpRawBlockSlotManager, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
-    IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
-    KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope,
-    KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy, LayerGroupPayloadSharder,
-    P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable, P2PPeerSpec, PassManager, PassRegistry,
-    PlacementRecord, RAW_BLOCK_META_MAGIC, RAW_BLOCK_SLOT_MAGIC, ROWWISE_CHEAP_OP_COST,
-    ROWWISE_EXPENSIVE_OP_COST, RawBlockMetaCheckpointHeader, ReshapeDimMapping, TOKEN_WIRE_STRIDE,
-    TurboQuantPreset, TurboQuantSerdeConfig, WarmPrefetchJobTable, WarmPrefetchStatus,
-    analyze_kv_layer_groups, analyze_static_reshape_dim_mapping,
-    annotate_squeeze_unsqueeze_reshapes, anonymize_symbolic_dims, await_hanging_effect_chains,
-    build_orthonormal_hadamard, classify_blend_read_groups, coalesce_exhaustive_gathers_to_split,
+    ChainedBlockHashConfig, CollectiveGraphNodeSpec, ContiguousViewPlan, CoordinatorEventGate,
+    CoordinatorKeyDirectory, DEFAULT_MAX_KERNELS_IN_FUSION_SET, DaxGenerationSlotArena,
+    DaxPutOutcome, DeviceGraphStage, DeviceTargetArch, DynamicAllocRequest, EngineKvFormat,
+    EventIngestOutcome, FULL_ATTENTION_WINDOW, FdpRawBlockSlotManager, GDS_DEFAULT_ALIGN_BYTES,
+    GdsSlabAddressManager, IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind,
+    KvBlockPool, KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry,
+    KvScaleScope, KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy,
+    LayerGroupPayloadSharder, P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable, P2PPeerSpec,
+    PassManager, PassRegistry, PlacementRecord, RAW_BLOCK_META_MAGIC, RAW_BLOCK_SLOT_MAGIC,
+    ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST, RawBlockMetaCheckpointHeader,
+    ReshapeDimMapping, TOKEN_WIRE_STRIDE, TurboQuantPreset, TurboQuantSerdeConfig,
+    WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
+    analyze_static_reshape_dim_mapping, annotate_squeeze_unsqueeze_reshapes,
+    anonymize_symbolic_dims, await_hanging_effect_chains, build_orthonormal_hadamard,
+    classify_blend_read_groups, coalesce_exhaustive_gathers_to_split,
     coalesce_partitioning_slices_to_split, compress_splat_constants,
     compute_cb_group_rope_geometry, compute_ieee_crc32, decode_kv_fs_filename,
     decode_kv_storage_key, decode_raw_block_slot_header, defer_allocs_to_first_use,
     direct_copy_format_supported, downsample_subchunk_swa_block_ids,
     elide_redundant_state_transfers, eliminate_implied_dependencies, encode_kv_fs_filename,
     encode_kv_storage_key, encode_raw_block_meta_checkpoint, encode_raw_block_slot_header,
-    encode_wide_column_row_key, find_squeeze_axis, find_unsqueeze_axis, flatten_elementwise_chains,
-    fold_extend_lifetimes_into_async_kernels, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
-    fuse_reshape_epilogue, fuse_sole_use_prologues, group_p2p_lookup_keys,
-    hash_packed_token_blocks_be, hash_prefix_token_blocks, hoist_exec_invariant_ops,
-    hoist_symbolic_dim_expressions, interleave_chunk_major_object_keys, is_supported_arch_dtype,
-    legalize_rowwise_reduction_launch, longest_full_attention_hit, longest_joint_prefix_hit,
-    longest_sliding_window_hit, map_axis_through_static_reshape, mark_cuda_graph_stable_tensors,
-    merge_adjacent_parallel_loops, merge_duplicate_shape_ops, merge_identical_functions,
-    merge_parallel_matmuls, num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve,
-    plan_cacheblend_token_reorder, plan_concat_in_place, plan_device_graph_collective_partition,
-    plan_dynamic_memory_pool, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
-    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
-    recalculate_subchunk_blocks_to_skip, recognize_composite_activations, reuse_dead_loop_buffers,
-    select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
+    encode_wide_column_row_key, expected_contiguous_shape_from_strides, find_squeeze_axis,
+    find_unsqueeze_axis, flatten_elementwise_chains, fold_extend_lifetimes_into_async_kernels,
+    fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
+    fuse_sole_use_prologues, group_p2p_lookup_keys, hash_packed_token_blocks_be,
+    hash_prefix_token_blocks, hoist_exec_invariant_ops, hoist_symbolic_dim_expressions,
+    interleave_chunk_major_object_keys, is_supported_arch_dtype, legalize_rowwise_reduction_launch,
+    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
+    map_axis_through_static_reshape, mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops,
+    merge_duplicate_shape_ops, merge_identical_functions, merge_parallel_matmuls,
+    num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve, plan_cacheblend_token_reorder,
+    plan_concat_in_place, plan_device_graph_collective_partition, plan_dynamic_memory_pool,
+    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
+    promote_narrow_accumulators, re_rope_key_in_place, recalculate_subchunk_blocks_to_skip,
+    recognize_composite_activations, recover_contiguous_or_dim0_padded_view,
+    reuse_dead_loop_buffers, select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
     sink_split_through_reshape, sink_transpose_through_elementwise_and_broadcast,
     solve_lloyd_max_gaussian, stamp_fused_provenance, swim_reshape_through_slice,
     unfold_chunk_range, unique_blend_token_coverage, unpack_token_ids_be, unpermute_slice,
@@ -3573,4 +3575,51 @@ fn test_turboquant_serde_config_lloyd_max_and_orthonormal_hadamard() {
             assert!((dot - expected).abs() < 1e-5);
         }
     }
+}
+
+#[test]
+fn test_recover_contiguous_or_dim0_padded_view_and_stride_ties() {
+    assert_eq!(
+        expected_contiguous_shape_from_strides(&[16, 4, 1], 64),
+        Some(vec![4, 4, 4])
+    );
+
+    // 1. Transposed HND physical layout `[2, 4, 8, 16, 64]` exposed logically as
+    //    `[2, 4, 16, 8, 64]` with strides `[32768, 8192, 64, 1024, 1]`:
+    let hnd =
+        recover_contiguous_or_dim0_padded_view(&[2, 4, 16, 8, 64], &[32768, 8192, 64, 1024, 1])
+            .expect("valid transposed contiguous view");
+    assert_eq!(
+        hnd,
+        ContiguousViewPlan {
+            permutation: vec![0, 1, 3, 2, 4],
+            permuted_shape: vec![2, 4, 8, 16, 64],
+            permuted_strides: vec![32768, 8192, 1024, 64, 1],
+            is_strictly_contiguous: true,
+            padding_per_block_elems: 0,
+            block_stride_elems: 32768,
+        }
+    );
+
+    // 2. Size-1 dimension tying on stride with neighbor (`[NB=4, NH=1, BS=16, HS=64]` with
+    //    strides `[1024, 64, 64, 1]`) places the size-1 dim innermost among tied dims
+    //    (`permutation = [0, 2, 1, 3]`, `permuted_shape = [4, 16, 1, 64]`):
+    let tied = recover_contiguous_or_dim0_padded_view(&[4, 1, 16, 64], &[1024, 64, 64, 1])
+        .expect("valid tied-stride view");
+    assert_eq!(tied.permutation, vec![0, 2, 1, 3]);
+    assert_eq!(tied.permuted_shape, vec![4, 16, 1, 64]);
+    assert!(tied.is_strictly_contiguous);
+
+    // 3. DeepSeek-V4 style `dim-0`-padded view (`shape = [4, 16, 64]`, `inner_tight = 1024`,
+    //    `strides = [1536, 64, 1]` -> `padding_per_block_elems = 512`):
+    let padded = recover_contiguous_or_dim0_padded_view(&[4, 16, 64], &[1536, 64, 1])
+        .expect("valid dim-0-padded view");
+    assert!(!padded.is_strictly_contiguous);
+    assert_eq!(padded.padding_per_block_elems, 512);
+    assert_eq!(padded.block_stride_elems, 1536);
+
+    // 4. Reject interior-dimension padding (`strides = [2048, 128, 1]` for `[4, 16, 64]`) and
+    //    overlapping outer blocks (`strides = [512, 64, 1]`):
+    assert!(recover_contiguous_or_dim0_padded_view(&[4, 16, 64], &[2048, 128, 1]).is_none());
+    assert!(recover_contiguous_or_dim0_padded_view(&[4, 16, 64], &[512, 64, 1]).is_none());
 }

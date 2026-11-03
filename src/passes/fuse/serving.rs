@@ -10581,3 +10581,109 @@ pub fn build_orthonormal_hadamard(head_dim: usize) -> Option<Vec<f32>> {
     }
     Some(mat)
 }
+
+/// Zero-copy stride-sorted view recovery plan for physical KV-cache layouts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContiguousViewPlan {
+    /// Dimension permutation sorting axes by descending stride (with size-1 dimensions placed
+    /// innermost on stride ties).
+    pub permutation: Vec<usize>,
+    /// Shape after applying `permutation` (or the stride-derived tight shape when strictly
+    /// contiguous).
+    pub permuted_shape: Vec<usize>,
+    /// Strides after applying `permutation`.
+    pub permuted_strides: Vec<usize>,
+    /// True if the permuted view is strictly contiguous with zero block-row padding.
+    pub is_strictly_contiguous: bool,
+    /// Number of padding elements per outer (`dim-0`) block row (`0` when strictly contiguous).
+    pub padding_per_block_elems: usize,
+    /// Stride in elements between consecutive outer (`dim-0`) blocks (`permuted_strides[0]`).
+    pub block_stride_elems: usize,
+}
+
+/// Derives the tightest contiguous shape `[num_elems / strides[0], strides[0] / strides[1], ...]`
+/// from a monotonically non-increasing positive `strides` vector and total element count
+/// `num_elems`.
+pub fn expected_contiguous_shape_from_strides(
+    strides: &[usize],
+    num_elems: usize,
+) -> Option<Vec<usize>> {
+    if strides.is_empty() || strides.contains(&0) {
+        return None;
+    }
+    let mut expected = Vec::with_capacity(strides.len());
+    expected.push(num_elems / strides[0]);
+    for i in 0..(strides.len() - 1) {
+        if strides[i] < strides[i + 1] || !strides[i].is_multiple_of(strides[i + 1]) {
+            return None;
+        }
+        expected.push(strides[i] / strides[i + 1]);
+    }
+    Some(expected)
+}
+
+/// Recovers a zero-copy contiguous or `dim-0`-padded physical view from a logical KV-cache
+/// `shape` and `strides`.
+///
+/// Sorts dimensions by `(strides[i], shape[i] != 1)` in descending order so transposed views
+/// (such as logical `[2, NB, BS, NH, HS]` backed by physical `[2, NB, NH, BS, HS]`) are
+/// restored without copying and size-1 dimensions tying on stride are placed innermost.
+/// Rejects views with interior-dimension padding or overlapping outer blocks (`strides[0] <
+/// prod(shape[1..])`).
+pub fn recover_contiguous_or_dim0_padded_view(
+    shape: &[usize],
+    strides: &[usize],
+) -> Option<ContiguousViewPlan> {
+    let ndim = shape.len();
+    if ndim < 2 || strides.len() != ndim || shape.contains(&0) || strides.contains(&0) {
+        return None;
+    }
+    let mut num_elems = 1usize;
+    for &d in shape {
+        num_elems = num_elems.checked_mul(d)?;
+    }
+
+    let mut permutation: Vec<usize> = (0..ndim).collect();
+    permutation.sort_by(|&a, &b| {
+        let key_a = (strides[a], shape[a] != 1);
+        let key_b = (strides[b], shape[b] != 1);
+        key_b.cmp(&key_a)
+    });
+
+    let mut permuted_shape: Vec<usize> = permutation.iter().map(|&i| shape[i]).collect();
+    let permuted_strides: Vec<usize> = permutation.iter().map(|&i| strides[i]).collect();
+
+    if permuted_strides[ndim - 1] != 1 || permuted_strides[ndim - 2] != permuted_shape[ndim - 1] {
+        return None;
+    }
+
+    let mut inner_tight = 1usize;
+    for i in (1..ndim).rev() {
+        if i < ndim - 1 && permuted_strides[i] != inner_tight {
+            return None;
+        }
+        inner_tight = inner_tight.checked_mul(permuted_shape[i])?;
+    }
+
+    let block_stride_elems = permuted_strides[0];
+    if block_stride_elems < inner_tight {
+        return None;
+    }
+    let padding_per_block_elems = block_stride_elems - inner_tight;
+    let is_strictly_contiguous = padding_per_block_elems == 0;
+    if is_strictly_contiguous
+        && let Some(tight_shape) =
+            expected_contiguous_shape_from_strides(&permuted_strides, num_elems)
+    {
+        permuted_shape = tight_shape;
+    }
+
+    Some(ContiguousViewPlan {
+        permutation,
+        permuted_shape,
+        permuted_strides,
+        is_strictly_contiguous,
+        padding_per_block_elems,
+        block_stride_elems,
+    })
+}
