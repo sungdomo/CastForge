@@ -12,9 +12,10 @@ use castforge::ffi::{
 use castforge::ir::formats::{import_gguf_bytes, import_onnx_json};
 use castforge::ir::{DType, Dim, TensorBacking, TensorEntry, TensorStore, TensorType, parse_mlir};
 use castforge::passes::{
-    AsymK16V8Codec, EngineKvFormat, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvPageSpec,
-    KvScaleScope, PassManager, PassRegistry, analyze_kv_layer_groups, longest_full_attention_hit,
-    longest_joint_prefix_hit, longest_sliding_window_hit, plan_jenga_kv_geometry,
+    AsymK16V8Codec, CacheBlendRopeSpec, EngineKvFormat, KV_ZERO_SCALE_SENTINEL,
+    KvAttentionMaskKind, KvPageSpec, KvScaleScope, PassManager, PassRegistry,
+    analyze_kv_layer_groups, longest_full_attention_hit, longest_joint_prefix_hit,
+    longest_sliding_window_hit, plan_jenga_kv_geometry, re_rope_key_in_place,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -595,6 +596,53 @@ fn test_asym_k16_v8_kv_codec_and_scoped_scales() {
         for (&vo, &vd) in v_orig.iter().zip(v_dec.iter()) {
             assert!(!vd.is_nan());
             assert!((vo - vd).abs() < 0.08, "V drift: {vo} vs {vd}");
+        }
+    }
+}
+
+#[test]
+fn test_cacheblend_delta_re_rope_in_place() {
+    // Verify that rotating unrotated keys K_raw from 0 -> old_pos and then re-RoPEing in-place
+    // from old_pos -> new_pos matches rotating K_raw directly from 0 -> new_pos, for both
+    // NeoX half-split and GPT-J interleaved RoPE, including MLA trailing rope_base_offset!
+    let k_raw: Vec<f32> = (0..48).map(|i| ((i as f32) + 1.0) * 0.125).collect();
+    let zeros = [0i64, 0, 0];
+    let old_pos = [5i64, 6, 7];
+    let new_pos = [42i64, 43, 44];
+
+    for (is_neox, rope_base_offset) in [(true, 0usize), (false, 0usize), (true, 4usize)] {
+        let spec = CacheBlendRopeSpec {
+            num_kv_heads: 2,
+            head_stride: 8,
+            rope_base_offset,
+            rot_dim: 4,
+            rope_theta: 10000.0,
+            is_neox,
+        };
+
+        let mut k_via_delta = k_raw.clone();
+        re_rope_key_in_place(&mut k_via_delta, &zeros, &old_pos, &spec).unwrap();
+        re_rope_key_in_place(&mut k_via_delta, &old_pos, &new_pos, &spec).unwrap();
+
+        let mut k_direct = k_raw.clone();
+        re_rope_key_in_place(&mut k_direct, &zeros, &new_pos, &spec).unwrap();
+
+        for (idx, (&a, &b)) in k_via_delta.iter().zip(k_direct.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "Re-RoPE mismatch at idx={idx} (neox={is_neox}, offset={rope_base_offset}): \
+                 {a} vs {b}"
+            );
+        }
+
+        // For MLA (rope_base_offset = 4), verify the leading 4 latent dims per head were untouched
+        if rope_base_offset == 4 {
+            for t in 0..3 {
+                for h in 0..2 {
+                    let base = t * 16 + h * 8;
+                    assert_eq!(&k_via_delta[base..base + 4], &k_raw[base..base + 4]);
+                }
+            }
         }
     }
 }

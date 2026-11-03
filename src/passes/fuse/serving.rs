@@ -947,3 +947,97 @@ impl AsymK16V8Codec {
         (k_f32, v_f32)
     }
 }
+
+/// Geometry and rotary embedding parameters for CacheBlend in-place delta re-RoPE
+/// (inspired by LMCache `csrc/cuda/pos_kernels.cuh` and `blend_kernels.cuh`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CacheBlendRopeSpec {
+    /// Number of KV heads per token.
+    pub num_kv_heads: usize,
+    /// Element stride between consecutive heads (`== head_size` for contiguous K, or
+    /// `2 * head_size` for packed K/V buffers so only the K half is rotated).
+    pub head_stride: usize,
+    /// Element offset inside each head where RoPE dimensions start (`0` for standard GQA/MHA,
+    /// or `kv_lora_rank` for DeepSeek MLA where decoupled RoPE keys trail the latent vector).
+    pub rope_base_offset: usize,
+    /// Even number of rotary embedding dimensions (`rot_dim <= head_stride - rope_base_offset`).
+    pub rot_dim: usize,
+    /// Base RoPE frequency (`10000.0` for standard LLaMA, `500000.0` for LLaMA-3).
+    pub rope_theta: f32,
+    /// `true` for GPT-NeoX / LLaMA half-split pairing `(i, i + rot_dim/2)`; `false` for
+    /// GPT-J interleaved pairing `(2*i, 2*i + 1)`.
+    pub is_neox: bool,
+}
+
+/// Rotates cached Key vectors `key_buf` in-place from `old_positions` to `new_positions`
+/// using the abelian group property $\mathcal{R}(p_{\text{new}}) = \mathcal{R}(p_{\text{new}} -
+/// p_{\text{old}}) \cdot \mathcal{R}(p_{\text{old}})$.
+///
+/// This enables non-prefix KV-cache reuse (e.g. RAG document chunks spliced at arbitrary prompt
+/// offsets) without recomputing QKV projections.
+pub fn re_rope_key_in_place(
+    key_buf: &mut [f32],
+    old_positions: &[i64],
+    new_positions: &[i64],
+    spec: &CacheBlendRopeSpec,
+) -> Result<()> {
+    let num_tokens = old_positions.len();
+    if new_positions.len() != num_tokens {
+        anyhow::bail!(
+            "re_rope_key_in_place position length mismatch: old={} new={}",
+            old_positions.len(),
+            new_positions.len()
+        );
+    }
+    if spec.rot_dim == 0 || !spec.rot_dim.is_multiple_of(2) {
+        anyhow::bail!(
+            "re_rope_key_in_place requires positive even rot_dim, got {}",
+            spec.rot_dim
+        );
+    }
+    if spec.rope_base_offset + spec.rot_dim > spec.head_stride {
+        anyhow::bail!(
+            "re_rope_key_in_place rope_base_offset ({}) + rot_dim ({}) exceeds head_stride ({})",
+            spec.rope_base_offset,
+            spec.rot_dim,
+            spec.head_stride
+        );
+    }
+    let tok_stride = spec.num_kv_heads.saturating_mul(spec.head_stride);
+    let required = num_tokens.saturating_mul(tok_stride);
+    if key_buf.len() < required {
+        anyhow::bail!(
+            "re_rope_key_in_place buffer too small: len={} < required={required}",
+            key_buf.len()
+        );
+    }
+
+    let half = spec.rot_dim / 2;
+    let inv_freq: Vec<f32> = (0..half)
+        .map(|i| 1.0f32 / spec.rope_theta.powf((2 * i) as f32 / spec.rot_dim as f32))
+        .collect();
+
+    for t in 0..num_tokens {
+        let delta_pos = (new_positions[t] - old_positions[t]) as f32;
+        if delta_pos == 0.0 {
+            continue;
+        }
+        for h in 0..spec.num_kv_heads {
+            let base = t * tok_stride + h * spec.head_stride + spec.rope_base_offset;
+            for (i, &freq) in inv_freq.iter().enumerate() {
+                let angle = delta_pos * freq;
+                let (sin_a, cos_a) = angle.sin_cos();
+                let (idx0, idx1) = if spec.is_neox {
+                    (base + i, base + i + half)
+                } else {
+                    (base + 2 * i, base + 2 * i + 1)
+                };
+                let k0 = key_buf[idx0];
+                let k1 = key_buf[idx1];
+                key_buf[idx0] = k0 * cos_a - k1 * sin_a;
+                key_buf[idx1] = k0 * sin_a + k1 * cos_a;
+            }
+        }
+    }
+    Ok(())
+}
