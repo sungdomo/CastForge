@@ -7809,3 +7809,85 @@ fn test_aesgcm_frame_serde_tenant_isolation_and_fp8_quantization_serde() {
         assert!((orig - dec).abs() <= 4.0, "orig={orig}, dec={dec}");
     }
 }
+
+#[test]
+fn test_hoist_constant_subgraphs_into_parent_hoists_invariant_ops_and_moves_chains_last() {
+    use castforge::passes::hoist_constant_subgraphs_into_parent;
+
+    let src = concat!(
+        "module {\n",
+        "  func.func @sub_layer(\n",
+        "    %w: tensor<4xf32>,\n",
+        "    %ch: !mo.chain,\n",
+        "    %x: tensor<4xf32>\n",
+        "  ) -> (tensor<4xf32>, !mo.chain) attributes {is_subgraph = true} {\n",
+        "    %w_abs = \"mo.abs\"(%w) : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %w_scaled = \"mo.relu\"(%w_abs) : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %y = \"mo.add\"(%x, %w_scaled) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %y, %ch : tensor<4xf32>, !mo.chain\n",
+        "  }\n",
+        "  func.func @main_graph(\n",
+        "    %w_shared: tensor<4xf32>,\n",
+        "    %ch0: !mo.chain,\n",
+        "    %x0: tensor<4xf32>,\n",
+        "    %x1: tensor<4xf32>\n",
+        "  ) -> (tensor<4xf32>, !mo.chain) {\n",
+        "    %y0, %ch1 = \"mo.call\"(%w_shared, %ch0, %x0) {callee = @sub_layer} : ",
+        "(tensor<4xf32>, !mo.chain, tensor<4xf32>) -> (tensor<4xf32>, !mo.chain)\n",
+        "    %y1, %ch2 = \"mo.call\"(%w_shared, %ch1, %x1) {callee = @sub_layer} : ",
+        "(tensor<4xf32>, !mo.chain, tensor<4xf32>) -> (tensor<4xf32>, !mo.chain)\n",
+        "    return %y1, %ch2 : tensor<4xf32>, !mo.chain\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(src).unwrap();
+    // `%w` is passed `%w_shared` at both callsites, so `mo.abs` and `mo.relu` are hoisted into
+    // `@main_graph` before each callsite, `%w` is replaced by the boundary value `%w_scaled`,
+    // and `%ch: !mo.chain` is moved to the trailing argument slot:
+    let hoisted = hoist_constant_subgraphs_into_parent(&mut m);
+    assert_eq!(hoisted, 2);
+
+    let fns = m.functions();
+    let sub_fn = fns[0];
+    let main_fn = fns[1];
+    let sub_blk = m.regions[m.ops[sub_fn].regions[0]].blocks[0];
+    let sub_op_names: Vec<String> = m.blocks[sub_blk]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(sub_op_names, vec!["mo.add", "func.return"]);
+    // Subgraph now has 3 arguments `[%x, %w_scaled, %ch]` with `!mo.chain` moved to the end:
+    let sub_arg_types: Vec<String> = m.blocks[sub_blk]
+        .arguments
+        .iter()
+        .map(|&v| format!("{}", m.values[v].ty))
+        .collect();
+    assert_eq!(
+        sub_arg_types,
+        vec![
+            "tensor<4xf32>".to_string(),
+            "tensor<4xf32>".to_string(),
+            "!mo.chain".to_string()
+        ]
+    );
+
+    let main_blk = m.regions[m.ops[main_fn].regions[0]].blocks[0];
+    let main_op_names: Vec<String> = m.blocks[main_blk]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        main_op_names,
+        vec![
+            "mo.abs",
+            "mo.relu",
+            "mo.call",
+            "mo.abs",
+            "mo.relu",
+            "mo.call",
+            "func.return"
+        ]
+    );
+}

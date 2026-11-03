@@ -26678,3 +26678,377 @@ impl Fp8E4M3QuantSerde {
         sign * (mag / 126.0) * Self::MAX_FINITE_E4M3
     }
 }
+
+fn extract_call_callee_sym(op: &crate::ir::mlir::Operation) -> Option<String> {
+    let full = op.name.full_name();
+    if full != "mo.call" && full != "func.call" && full != "call" {
+        return None;
+    }
+    op.attributes.get("callee").and_then(|attr| match attr {
+        Attribute::String(s) | Attribute::SymbolRef(s) => {
+            Some(s.trim_start_matches('@').to_string())
+        }
+        _ => None,
+    })
+}
+
+fn is_terminator_op_name(full_name: &str) -> bool {
+    matches!(
+        full_name,
+        "func.return" | "return" | "mo.output" | "mo.yield"
+    )
+}
+
+/// Hoists callsite-invariant operations out of subgraphs into their caller call sites when all
+/// call sites pass identical SSA values for the feeding subgraph arguments, then rebinds the
+/// boundary values as new subgraph arguments and moves `!mo.chain` arguments to the trailing
+/// positions.
+///
+/// Processes subgraphs bottom-up (callees before callers) and returns the total number of
+/// subgraph operations hoisted across the module.
+pub fn hoist_constant_subgraphs_into_parent(module: &mut Module) -> usize {
+    use crate::ir::mlir::{Operation, Value, ValueDef};
+
+    let func_ids = module.functions();
+    let mut sym_to_fn: std::collections::HashMap<String, OpId> = std::collections::HashMap::new();
+    let mut entry_points = Vec::new();
+    for &fid in &func_ids {
+        if let Some(sym) = module.ops[fid]
+            .attributes
+            .get("sym_name")
+            .and_then(Attribute::as_str)
+        {
+            sym_to_fn.insert(sym.to_string(), fid);
+            let is_subgraph = matches!(
+                module.ops[fid].attributes.get("is_subgraph"),
+                Some(Attribute::Bool(true))
+            );
+            if !is_subgraph {
+                entry_points.push(fid);
+            }
+        }
+    }
+
+    let mut call_graph: std::collections::HashMap<OpId, Vec<OpId>> =
+        std::collections::HashMap::new();
+    for &fid in &func_ids {
+        let mut callees = Vec::new();
+        for &reg_id in &module.ops[fid].regions {
+            for &bid in &module.regions[reg_id].blocks {
+                for &oid in &module.blocks[bid].ops {
+                    if let Some(callee_sym) = extract_call_callee_sym(&module.ops[oid])
+                        && let Some(&callee_id) = sym_to_fn.get(&callee_sym)
+                        && !callees.contains(&callee_id)
+                    {
+                        callees.push(callee_id);
+                    }
+                }
+            }
+        }
+        call_graph.insert(fid, callees);
+    }
+
+    // Post-order DFS from entry points puts callees before callers:
+    let mut visited = std::collections::HashSet::new();
+    let mut sorted_graphs = Vec::new();
+    fn dfs_sort(
+        node: OpId,
+        call_graph: &std::collections::HashMap<OpId, Vec<OpId>>,
+        visited: &mut std::collections::HashSet<OpId>,
+        out: &mut Vec<OpId>,
+    ) {
+        if !visited.insert(node) {
+            return;
+        }
+        if let Some(callees) = call_graph.get(&node) {
+            for &c in callees {
+                dfs_sort(c, call_graph, visited, out);
+            }
+        }
+        out.push(node);
+    }
+    for &entry in &entry_points {
+        dfs_sort(entry, &call_graph, &mut visited, &mut sorted_graphs);
+    }
+
+    let mut total_hoisted_ops = 0usize;
+
+    for subgraph_id in sorted_graphs {
+        let Some(subgraph_sym) = module.ops[subgraph_id]
+            .attributes
+            .get("sym_name")
+            .and_then(Attribute::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(&sub_reg) = module.ops[subgraph_id].regions.first() else {
+            continue;
+        };
+        let Some(&sub_blk) = module.regions[sub_reg].blocks.first() else {
+            continue;
+        };
+        let sub_args = module.blocks[sub_blk].arguments.clone();
+        let num_args = sub_args.len();
+        if num_args == 0 {
+            continue;
+        }
+
+        // Collect all callsites (block_id, call_op_id) targeting `subgraph_sym`:
+        let mut callsites: Vec<(BlockId, OpId)> = Vec::new();
+        let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+        for bid in block_ids {
+            for &oid in &module.blocks[bid].ops {
+                if extract_call_callee_sym(&module.ops[oid]).as_deref()
+                    == Some(subgraph_sym.as_str())
+                {
+                    callsites.push((bid, oid));
+                }
+            }
+        }
+        if callsites.len() <= 1 {
+            continue;
+        }
+
+        // 1. Compute effective invariant argument mask across callsites:
+        let mut invariant_mask = vec![false; num_args];
+        for (i, inv_slot) in invariant_mask.iter_mut().enumerate() {
+            if callsites
+                .iter()
+                .any(|&(_, cid)| module.ops[cid].operands.len() <= i)
+            {
+                continue;
+            }
+            let first_val = module.ops[callsites[0].1].operands[i];
+            if callsites[1..]
+                .iter()
+                .all(|&(_, cid)| module.ops[cid].operands[i] == first_val)
+            {
+                *inv_slot = true;
+            }
+        }
+        if !invariant_mask.iter().any(|&b| b) {
+            continue;
+        }
+
+        // 2. Dataflow analysis in subgraph body block:
+        let mut const_vals: std::collections::HashSet<ValueId> = std::collections::HashSet::new();
+        for (i, &arg_v) in sub_args.iter().enumerate() {
+            if invariant_mask[i] {
+                const_vals.insert(arg_v);
+            }
+        }
+        let mut const_ops: Vec<OpId> = Vec::new();
+        let mut const_op_set: std::collections::HashSet<OpId> = std::collections::HashSet::new();
+        for &oid in &module.blocks[sub_blk].ops {
+            let op = &module.ops[oid];
+            let full = op.name.full_name();
+            if is_terminator_op_name(&full) {
+                continue;
+            }
+            let is_const = (!op.operands.is_empty() || full == "kgen.param.declare")
+                && op.operands.iter().all(|v| const_vals.contains(v));
+            if is_const {
+                const_ops.push(oid);
+                const_op_set.insert(oid);
+                for &r in &op.results {
+                    const_vals.insert(r);
+                }
+            }
+        }
+        if const_ops.is_empty() {
+            continue;
+        }
+
+        // 3. Determine preserved arguments and boundary values:
+        let mut preserved_args: Vec<bool> = invariant_mask.iter().map(|&inv| !inv).collect();
+        for (i, &arg_v) in sub_args.iter().enumerate() {
+            if !invariant_mask[i] {
+                continue;
+            }
+            let used_by_non_const = module.blocks[sub_blk].ops.iter().any(|&oid| {
+                !const_op_set.contains(&oid) && module.ops[oid].operands.contains(&arg_v)
+            });
+            if used_by_non_const {
+                preserved_args[i] = true;
+            }
+        }
+
+        let mut boundary_values: Vec<ValueId> = Vec::new();
+        for &oid in &const_ops {
+            let results = module.ops[oid].results.clone();
+            for r in results {
+                let used_by_remaining = module.blocks[sub_blk].ops.iter().any(|&user_id| {
+                    !const_op_set.contains(&user_id)
+                        && !is_terminator_op_name(&module.ops[user_id].name.full_name())
+                        && module.ops[user_id].operands.contains(&r)
+                });
+                if used_by_remaining && !boundary_values.contains(&r) {
+                    boundary_values.push(r);
+                }
+            }
+        }
+        if boundary_values.is_empty() {
+            continue;
+        }
+
+        // 4. Hoist `const_ops` into each callsite right before `call_op`:
+        for &(caller_bid, call_id) in &callsites {
+            let call_operands = module.ops[call_id].operands.clone();
+            let mut val_map: std::collections::HashMap<ValueId, ValueId> =
+                std::collections::HashMap::new();
+            for (i, &inv) in invariant_mask.iter().enumerate() {
+                if inv {
+                    val_map.insert(sub_args[i], call_operands[i]);
+                }
+            }
+
+            let mut cloned_ops = Vec::with_capacity(const_ops.len());
+            for &c_oid in &const_ops {
+                let orig = module.ops[c_oid].clone();
+                let new_operands: smallvec::SmallVec<[ValueId; 4]> = orig
+                    .operands
+                    .iter()
+                    .map(|v| val_map.get(v).copied().unwrap_or(*v))
+                    .collect();
+                let mut new_results = smallvec::SmallVec::<[ValueId; 2]>::new();
+                for &old_r in &orig.results {
+                    let ty = module.values[old_r].ty.clone();
+                    let new_r = module.values.insert(Value {
+                        id: ValueId::default(),
+                        ssa_name: None,
+                        ty,
+                        def: ValueDef::BlockArgument {
+                            block: caller_bid,
+                            index: 0,
+                        },
+                    });
+                    module.values[new_r].id = new_r;
+                    val_map.insert(old_r, new_r);
+                    new_results.push(new_r);
+                }
+                let cloned_id = module.ops.insert(Operation {
+                    id: OpId::default(),
+                    name: orig.name,
+                    operands: new_operands,
+                    results: new_results.clone(),
+                    attributes: orig.attributes,
+                    regions: Vec::new(),
+                    custom_syntax: orig.custom_syntax,
+                    location: orig.location,
+                });
+                module.ops[cloned_id].id = cloned_id;
+                for (idx, &nr) in new_results.iter().enumerate() {
+                    module.values[nr].def = ValueDef::OpResult {
+                        op: cloned_id,
+                        index: idx as u32,
+                    };
+                }
+                cloned_ops.push(cloned_id);
+            }
+
+            if let Some(pos) = module.blocks[caller_bid]
+                .ops
+                .iter()
+                .position(|&id| id == call_id)
+            {
+                for (off, cid) in cloned_ops.into_iter().enumerate() {
+                    module.blocks[caller_bid].ops.insert(pos + off, cid);
+                }
+            }
+
+            let mut new_call_operands = smallvec::SmallVec::<[ValueId; 4]>::new();
+            for (i, &keep) in preserved_args.iter().enumerate() {
+                if keep {
+                    new_call_operands.push(call_operands[i]);
+                }
+            }
+            for &bv in &boundary_values {
+                if let Some(&mapped_bv) = val_map.get(&bv) {
+                    new_call_operands.push(mapped_bv);
+                }
+            }
+            module.ops[call_id].operands = new_call_operands;
+        }
+
+        // 5. Update subgraph definition: append boundary args, erase `const_ops`,
+        // and drop unpreserved args:
+        let mut new_sub_args: Vec<ValueId> = sub_args
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &a)| preserved_args[i].then_some(a))
+            .collect();
+        for &bv in &boundary_values {
+            let bv_ty = module.values[bv].ty.clone();
+            let new_arg = module.values.insert(Value {
+                id: ValueId::default(),
+                ssa_name: None,
+                ty: bv_ty,
+                def: ValueDef::BlockArgument {
+                    block: sub_blk,
+                    index: new_sub_args.len() as u32,
+                },
+            });
+            module.values[new_arg].id = new_arg;
+            new_sub_args.push(new_arg);
+            for &oid in &module.blocks[sub_blk].ops {
+                if !const_op_set.contains(&oid) {
+                    for opnd in &mut module.ops[oid].operands {
+                        if *opnd == bv {
+                            *opnd = new_arg;
+                        }
+                    }
+                }
+            }
+        }
+        module.blocks[sub_blk]
+            .ops
+            .retain(|id| !const_op_set.contains(id));
+        for &c_oid in &const_ops {
+            module.ops.remove(c_oid);
+        }
+
+        // 6. Move any `!mo.chain` arguments (and corresponding callsite operands) to the end:
+        let (chain_positions, non_chain_positions): (Vec<usize>, Vec<usize>) = (0..new_sub_args
+            .len())
+            .partition(|&idx| is_chain_type(&module.values[new_sub_args[idx]].ty));
+        if !chain_positions.is_empty() {
+            let reordered_args: Vec<ValueId> = non_chain_positions
+                .iter()
+                .chain(chain_positions.iter())
+                .map(|&idx| new_sub_args[idx])
+                .collect();
+            new_sub_args = reordered_args;
+            for &(_, call_id) in &callsites {
+                let old_opnds = module.ops[call_id].operands.clone();
+                let reordered_opnds: smallvec::SmallVec<[ValueId; 4]> = non_chain_positions
+                    .iter()
+                    .chain(chain_positions.iter())
+                    .map(|&idx| old_opnds[idx])
+                    .collect();
+                module.ops[call_id].operands = reordered_opnds;
+            }
+        }
+
+        for (idx, &arg_v) in new_sub_args.iter().enumerate() {
+            module.values[arg_v].def = ValueDef::BlockArgument {
+                block: sub_blk,
+                index: idx as u32,
+            };
+        }
+        module.blocks[sub_blk].arguments = new_sub_args.clone();
+
+        if let Some(Attribute::Type(Type::Function { inputs, .. })) =
+            module.ops[subgraph_id].attributes.get_mut("function_type")
+        {
+            *inputs = new_sub_args
+                .iter()
+                .map(|&v| module.values[v].ty.clone())
+                .collect();
+        }
+
+        total_hoisted_ops += const_ops.len();
+    }
+
+    total_hoisted_ops
+}
