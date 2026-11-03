@@ -7456,3 +7456,54 @@ fn test_anonymize_dim_names_normalize_all_names_and_semantic_hashing() {
         Some(expected_name.as_str())
     );
 }
+
+#[test]
+fn test_bucket_location_object_codec_partial_batch_and_meta_cache() {
+    use castforge::passes::{
+        BucketLocation, BucketObjectMetaCache, PartialBatchStoreError, decode_bucket_object_name,
+        encode_bucket_object_name,
+    };
+
+    let loc = BucketLocation::parse("hf://buckets/org-team/kv-tier2/prod/v1/")
+        .expect("valid hf bucket URI");
+    assert_eq!(loc.namespace, "org-team");
+    assert_eq!(loc.bucket, "kv-tier2");
+    assert_eq!(loc.prefix, "prod/v1");
+    assert_eq!(loc.handle(), "org-team/kv-tier2");
+
+    let key = "llama3/70b@tp4:chunk#42/0";
+    let encoded = encode_bucket_object_name(key);
+    assert!(encoded.ends_with(".bin"));
+    assert!(!encoded.contains('/'));
+    assert_eq!(
+        loc.remote_object_path(&encoded),
+        format!("prod/v1/{encoded}")
+    );
+    let roundtrip = decode_bucket_object_name(&encoded).expect("decode succeeds");
+    assert_eq!(roundtrip, key);
+
+    let err = PartialBatchStoreError {
+        succeeded_names: vec!["a.bin".to_string(), "c.bin".to_string()],
+        failed_name: "b.bin".to_string(),
+        reason: "HTTP 503".to_string(),
+    };
+    let bitmap = err.build_completion_bitmap(&[
+        "a.bin".to_string(),
+        "b.bin".to_string(),
+        "c.bin".to_string(),
+    ]);
+    assert_eq!(bitmap, vec![true, false, true]);
+
+    let mut cache = BucketObjectMetaCache::new(10.0, 3);
+    cache.put_size("k1.bin", 4096, 100.0);
+    cache.put_size("k2.bin", 8192, 105.0);
+    assert_eq!(cache.get_size("k1.bin", 108.0), Some(4096));
+    // At t = 112.0, `k1.bin` is expired (100 + 10 = 110 < 112), so writing `k3.bin`
+    // triggers the periodic prune on the 3rd write and evicts `k1.bin`:
+    cache.put_size("k3.bin", 16384, 112.0);
+    assert_eq!(cache.len(), 2);
+    assert_eq!(cache.get_size("k1.bin", 112.0), None);
+    assert_eq!(cache.get_size("k2.bin", 112.0), Some(8192));
+    assert!(cache.invalidate("k2.bin"));
+    assert_eq!(cache.get_size("k2.bin", 112.0), None);
+}

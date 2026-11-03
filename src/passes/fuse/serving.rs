@@ -24479,3 +24479,202 @@ pub fn apply_semantic_naming(
 
     Ok(result_map)
 }
+
+/// Parsed object-store bucket URI location (`hf://buckets/<namespace>/<bucket>[/<prefix>]`
+/// or `bucket://<namespace>/<bucket>[/<prefix>]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketLocation {
+    /// Bucket owner namespace.
+    pub namespace: String,
+    /// Bucket identifier.
+    pub bucket: String,
+    /// Normalized subpath prefix (stripped of leading and trailing `'/'`).
+    pub prefix: String,
+}
+
+impl BucketLocation {
+    /// Parses a bucket URI into a [`BucketLocation`].
+    pub fn parse(uri: &str) -> Result<Self, String> {
+        let trimmed = uri.trim();
+        let rest = if let Some(r) = trimmed.strip_prefix("hf://buckets/") {
+            r
+        } else if let Some(r) = trimmed.strip_prefix("bucket://") {
+            r
+        } else {
+            return Err(format!("Unsupported bucket URI scheme: '{uri}'"));
+        };
+        let clean = rest.trim_matches('/');
+        let mut parts = clean.splitn(3, '/');
+        let namespace = parts.next().unwrap_or("").trim();
+        let bucket = parts.next().unwrap_or("").trim();
+        if namespace.is_empty() || bucket.is_empty() {
+            return Err(format!(
+                "Bucket URI must include non-empty namespace and bucket: '{uri}'"
+            ));
+        }
+        let prefix = parts.next().unwrap_or("").trim_matches('/').to_string();
+        Ok(Self {
+            namespace: namespace.to_string(),
+            bucket: bucket.to_string(),
+            prefix,
+        })
+    }
+
+    /// Returns the `<namespace>/<bucket>` handle.
+    #[must_use]
+    pub fn handle(&self) -> String {
+        format!("{}/{}", self.namespace, self.bucket)
+    }
+
+    /// Resolves an encoded object filename into a remote bucket path under `prefix`.
+    #[must_use]
+    pub fn remote_object_path(&self, encoded_name: &str) -> String {
+        let name = encoded_name.trim_start_matches('/');
+        if self.prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}/{name}", self.prefix)
+        }
+    }
+}
+
+/// Encodes an arbitrary object key into a reversible URL-safe filename ending with `.bin`.
+#[must_use]
+pub fn encode_bucket_object_name(key: &str) -> String {
+    let mut out = String::with_capacity(key.len() + 12);
+    for &b in key.as_bytes() {
+        let is_unreserved = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~');
+        if is_unreserved {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out.push_str(".bin");
+    out
+}
+
+/// Decodes a `.bin` bucket object filename produced by [`encode_bucket_object_name`].
+pub fn decode_bucket_object_name(encoded: &str) -> Result<String, String> {
+    let stem = encoded
+        .strip_suffix(".bin")
+        .ok_or_else(|| format!("Bucket object name missing '.bin' suffix: '{encoded}'"))?;
+    let bytes = stem.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err(format!(
+                    "Truncated percent-escape in bucket object name: '{encoded}'"
+                ));
+            }
+            let hex_str = std::str::from_utf8(&bytes[i + 1..i + 3])
+                .map_err(|e| format!("Invalid UTF-8 in percent-escape: {e}"))?;
+            let val = u8::from_str_radix(hex_str, 16)
+                .map_err(|_| format!("Invalid hex digits '%{hex_str}' in bucket object name"))?;
+            decoded.push(val);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(decoded)
+        .map_err(|e| format!("Decoded bucket object key is not valid UTF-8: {e}"))
+}
+
+/// Partial failure descriptor when a multi-file batch upload fails partway through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialBatchStoreError {
+    /// Object names that were durably uploaded before the failure occurred.
+    pub succeeded_names: Vec<String>,
+    /// Object name whose upload failed.
+    pub failed_name: String,
+    /// Diagnostic reason for the failure.
+    pub reason: String,
+}
+
+impl PartialBatchStoreError {
+    /// Builds a per-item completion mask aligned with `requested_names` so L1 callers
+    /// can commit succeeded transfers and fail the remainder.
+    #[must_use]
+    pub fn build_completion_bitmap(&self, requested_names: &[String]) -> Vec<bool> {
+        let succeeded: std::collections::HashSet<&str> =
+            self.succeeded_names.iter().map(String::as_str).collect();
+        requested_names
+            .iter()
+            .map(|n| succeeded.contains(n.as_str()))
+            .collect()
+    }
+}
+
+/// TTL-bounded L2 bucket object size cache with periodic amortization of expired-entry pruning.
+#[derive(Debug, Clone)]
+pub struct BucketObjectMetaCache {
+    ttl_secs: f64,
+    prune_interval: usize,
+    writes_since_prune: usize,
+    entries: std::collections::HashMap<String, (u64, f64)>,
+}
+
+impl BucketObjectMetaCache {
+    /// Creates a new metadata cache with the specified `ttl_secs` and `prune_interval`.
+    #[must_use]
+    pub fn new(ttl_secs: f64, prune_interval: usize) -> Self {
+        Self {
+            ttl_secs: ttl_secs.max(0.0),
+            prune_interval: prune_interval.max(1),
+            writes_since_prune: 0,
+            entries: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Inserts or refreshes `name` with `size_bytes` at `now_secs`, triggering a prune
+    /// sweep every `prune_interval` writes.
+    pub fn put_size(&mut self, name: impl Into<String>, size_bytes: u64, now_secs: f64) {
+        self.entries
+            .insert(name.into(), (size_bytes, now_secs + self.ttl_secs));
+        self.writes_since_prune += 1;
+        if self.writes_since_prune >= self.prune_interval {
+            self.prune_expired(now_secs);
+            self.writes_since_prune = 0;
+        }
+    }
+
+    /// Looks up the cached object size for `name` at `now_secs`, evicting on expiration.
+    pub fn get_size(&mut self, name: &str, now_secs: f64) -> Option<u64> {
+        if let Some(&(size, expires_at)) = self.entries.get(name) {
+            if now_secs <= expires_at {
+                return Some(size);
+            }
+            self.entries.remove(name);
+        }
+        None
+    }
+
+    /// Removes `name` from the metadata cache.
+    pub fn invalidate(&mut self, name: &str) -> bool {
+        self.entries.remove(name).is_some()
+    }
+
+    /// Sweeps all entries whose expiration timestamp is strictly before `now_secs`.
+    pub fn prune_expired(&mut self, now_secs: f64) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|_, &mut (_, expires_at)| now_secs <= expires_at);
+        before.saturating_sub(self.entries.len())
+    }
+
+    /// Returns the current number of cached entries (including not-yet-swept expired entries).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns `true` if no entries are currently stored.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
