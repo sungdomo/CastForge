@@ -12,9 +12,9 @@ use castforge::ffi::{
 use castforge::ir::formats::{import_gguf_bytes, import_onnx_json};
 use castforge::ir::{DType, Dim, TensorBacking, TensorEntry, TensorStore, TensorType, parse_mlir};
 use castforge::passes::{
-    EngineKvFormat, KvAttentionMaskKind, KvPageSpec, PassManager, PassRegistry,
-    analyze_kv_layer_groups, longest_full_attention_hit, longest_joint_prefix_hit,
-    longest_sliding_window_hit, plan_jenga_kv_geometry,
+    AsymK16V8Codec, EngineKvFormat, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvPageSpec,
+    KvScaleScope, PassManager, PassRegistry, analyze_kv_layer_groups, longest_full_attention_hit,
+    longest_joint_prefix_hit, longest_sliding_window_hit, plan_jenga_kv_geometry,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -538,4 +538,63 @@ module @profiler_test {
     let rust_src = backend_reg.generate("rust", &module, &cfg).unwrap();
     assert!(rust_src.contains("// [profile:region(id=0, label=\"stablehlo.add\")]"));
     assert!(rust_src.contains("std::hint::black_box(\"stablehlo.add\")"));
+}
+
+#[test]
+fn test_asym_k16_v8_kv_codec_and_scoped_scales() {
+    // Shape: [num_pages = 2, page_tokens = 4, num_kv_heads = 2, head_dim = 8] -> 128 elems
+    let (num_pages, page_tokens, num_kv_heads, head_dim) = (2, 4, 2, 8);
+    let total = num_pages * page_tokens * num_kv_heads * head_dim;
+
+    let k_orig: Vec<f32> = (0..total).map(|i| ((i as f32) - 64.0) * 0.05).collect();
+    // Make page 0 normal-range and page 1 head 1 all-zero to verify KV_ZERO_SCALE_SENTINEL
+    let mut v_orig: Vec<f32> = (0..total).map(|i| ((i as f32) - 32.0) * 0.1).collect();
+    let head_stride = head_dim;
+    let tok_stride = num_kv_heads * head_stride;
+    let page_stride = page_tokens * tok_stride;
+    for t in 0..page_tokens {
+        for d in 0..head_dim {
+            v_orig[page_stride + t * tok_stride + head_stride + d] = 0.0;
+        }
+    }
+
+    for scope in [
+        KvScaleScope::PerTensor,
+        KvScaleScope::PerLayerHead,
+        KvScaleScope::PerPageHead,
+    ] {
+        let enc = AsymK16V8Codec::encode(
+            &k_orig,
+            &v_orig,
+            num_pages,
+            page_tokens,
+            num_kv_heads,
+            head_dim,
+            scope,
+        )
+        .unwrap();
+
+        match scope {
+            KvScaleScope::PerTensor => assert_eq!(enc.v_scales.len(), 1),
+            KvScaleScope::PerLayerHead => assert_eq!(enc.v_scales.len(), num_kv_heads),
+            KvScaleScope::PerPageHead => {
+                assert_eq!(enc.v_scales.len(), num_pages * num_kv_heads);
+                // Page 1, head 1 was zeroed -> scale must equal KV_ZERO_SCALE_SENTINEL (1.0)
+                assert_eq!(enc.v_scales[3], KV_ZERO_SCALE_SENTINEL);
+            }
+        }
+
+        // Verify ~25% byte reduction compared to 16-bit K+V (512B -> 384B + scale bytes)
+        assert_eq!(enc.uncompressed_fp16_bytes(), 512);
+        assert!(enc.payload_bytes() <= 400);
+
+        let (k_dec, v_dec) = AsymK16V8Codec::decode(&enc);
+        for (&ko, &kd) in k_orig.iter().zip(k_dec.iter()) {
+            assert!((ko - kd).abs() < 5e-3, "K drift: {ko} vs {kd}");
+        }
+        for (&vo, &vd) in v_orig.iter().zip(v_dec.iter()) {
+            assert!(!vd.is_nan());
+            assert!((vo - vd).abs() < 0.08, "V drift: {vo} vs {vd}");
+        }
+    }
 }

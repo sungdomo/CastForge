@@ -731,3 +731,219 @@ impl Pass for LowerTreeAttentionPass {
         })
     }
 }
+
+/// Sentinel scale used when a V tensor, head, or page is identically zero, keeping
+/// `dequant(quant(0)) == 0.0` exact and avoiding `0.0 / 0.0` NaNs.
+pub const KV_ZERO_SCALE_SENTINEL: f32 = 1.0;
+
+/// Quantization scale granularity for the V plane in [`AsymK16V8Codec`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvScaleScope {
+    /// Single FP32 scale across the entire V buffer (`1` scale).
+    PerTensor,
+    /// One FP32 scale per KV head across all pages (`num_kv_heads` scales).
+    PerLayerHead,
+    /// One FP32 scale per `(page, kv_head)` pair (`num_pages * num_kv_heads` scales).
+    PerPageHead,
+}
+
+/// Asymmetric K16/V8 encoded KV-cache payload (inspired by LMCache `asym_k16_v8`).
+///
+/// Keys (`K`) are preserved in 16-bit IEEE-754 half precision (`u16` bits) to protect RoPE phase
+/// and exponential $\text{softmax}(Q K^T / \sqrt{d_k})$ logits, while Values (`V`) are quantized
+/// to 8-bit signed codes (`i8`) with scoped FP32 scales.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EncodedAsymKvPage {
+    pub k_fp16_bits: Vec<u16>,
+    pub v_int8_codes: Vec<i8>,
+    pub v_scales: Vec<f32>,
+    pub scope: KvScaleScope,
+    pub num_pages: usize,
+    pub page_tokens: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+}
+
+impl EncodedAsymKvPage {
+    /// Total compressed byte footprint (`K` in 2B + `V` in 1B + FP32 scale metadata).
+    pub fn payload_bytes(&self) -> usize {
+        self.k_fp16_bits.len() * 2 + self.v_int8_codes.len() + self.v_scales.len() * 4
+    }
+
+    /// Baseline 16-bit (`FP16`/`BF16`) byte footprint for both `K` and `V` (`2B + 2B` per elem).
+    pub fn uncompressed_fp16_bytes(&self) -> usize {
+        (self.k_fp16_bits.len() + self.v_int8_codes.len()) * 2
+    }
+}
+
+/// Asymmetric `K16/V8` KV-cache encoder/decoder with `PerTensor`, `PerLayerHead`, and
+/// `PerPageHead` scale scopes.
+pub struct AsymK16V8Codec;
+
+impl AsymK16V8Codec {
+    const QMAX: f32 = 127.0;
+
+    /// Encodes `k` and `v` buffers of shape `[num_pages, page_tokens, num_kv_heads, head_dim]`
+    /// into an [`EncodedAsymKvPage`].
+    pub fn encode(
+        k: &[f32],
+        v: &[f32],
+        num_pages: usize,
+        page_tokens: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scope: KvScaleScope,
+    ) -> Result<EncodedAsymKvPage> {
+        use crate::ir::f32_to_f16_bits;
+        let expected = num_pages
+            .saturating_mul(page_tokens)
+            .saturating_mul(num_kv_heads)
+            .saturating_mul(head_dim);
+        if expected == 0 || k.len() != expected || v.len() != expected {
+            anyhow::bail!(
+                "AsymK16V8Codec::encode shape mismatch: expected {expected} elems, \
+                 got k={} v={}",
+                k.len(),
+                v.len()
+            );
+        }
+
+        let k_fp16_bits: Vec<u16> = k.iter().map(|&x| f32_to_f16_bits(x)).collect();
+        let v_scales =
+            Self::compute_v_scales(v, num_pages, page_tokens, num_kv_heads, head_dim, scope);
+        let mut v_int8_codes = vec![0i8; expected];
+
+        let head_stride = head_dim;
+        let tok_stride = num_kv_heads * head_stride;
+        let page_stride = page_tokens * tok_stride;
+
+        for p in 0..num_pages {
+            for t in 0..page_tokens {
+                for h in 0..num_kv_heads {
+                    let scale = match scope {
+                        KvScaleScope::PerTensor => v_scales[0],
+                        KvScaleScope::PerLayerHead => v_scales[h],
+                        KvScaleScope::PerPageHead => v_scales[p * num_kv_heads + h],
+                    };
+                    let base = p * page_stride + t * tok_stride + h * head_stride;
+                    for d in 0..head_dim {
+                        let val = v[base + d];
+                        let q = (val / scale).round().clamp(-Self::QMAX, Self::QMAX) as i8;
+                        v_int8_codes[base + d] = q;
+                    }
+                }
+            }
+        }
+
+        Ok(EncodedAsymKvPage {
+            k_fp16_bits,
+            v_int8_codes,
+            v_scales,
+            scope,
+            num_pages,
+            page_tokens,
+            num_kv_heads,
+            head_dim,
+        })
+    }
+
+    /// Computes scoped FP32 quantization scales for `v`, substituting [`KV_ZERO_SCALE_SENTINEL`]
+    /// whenever the maximum absolute value in a scope is `0.0`.
+    pub fn compute_v_scales(
+        v: &[f32],
+        num_pages: usize,
+        page_tokens: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scope: KvScaleScope,
+    ) -> Vec<f32> {
+        let head_stride = head_dim;
+        let tok_stride = num_kv_heads * head_stride;
+        let page_stride = page_tokens * tok_stride;
+
+        match scope {
+            KvScaleScope::PerTensor => {
+                let amax = v.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+                let s = if amax > 0.0 {
+                    amax / Self::QMAX
+                } else {
+                    KV_ZERO_SCALE_SENTINEL
+                };
+                vec![s]
+            }
+            KvScaleScope::PerLayerHead => {
+                let mut scales = vec![KV_ZERO_SCALE_SENTINEL; num_kv_heads];
+                for (h, slot) in scales.iter_mut().enumerate() {
+                    let mut amax = 0.0f32;
+                    for p in 0..num_pages {
+                        for t in 0..page_tokens {
+                            let base = p * page_stride + t * tok_stride + h * head_stride;
+                            for d in 0..head_dim {
+                                amax = amax.max(v[base + d].abs());
+                            }
+                        }
+                    }
+                    *slot = if amax > 0.0 {
+                        amax / Self::QMAX
+                    } else {
+                        KV_ZERO_SCALE_SENTINEL
+                    };
+                }
+                scales
+            }
+            KvScaleScope::PerPageHead => {
+                let mut scales = vec![KV_ZERO_SCALE_SENTINEL; num_pages * num_kv_heads];
+                for p in 0..num_pages {
+                    for h in 0..num_kv_heads {
+                        let mut amax = 0.0f32;
+                        for t in 0..page_tokens {
+                            let base = p * page_stride + t * tok_stride + h * head_stride;
+                            for d in 0..head_dim {
+                                amax = amax.max(v[base + d].abs());
+                            }
+                        }
+                        scales[p * num_kv_heads + h] = if amax > 0.0 {
+                            amax / Self::QMAX
+                        } else {
+                            KV_ZERO_SCALE_SENTINEL
+                        };
+                    }
+                }
+                scales
+            }
+        }
+    }
+
+    /// Decodes an [`EncodedAsymKvPage`] back into `(k_f32, v_f32)`.
+    pub fn decode(encoded: &EncodedAsymKvPage) -> (Vec<f32>, Vec<f32>) {
+        use crate::ir::f16_bits_to_f32;
+        let k_f32: Vec<f32> = encoded
+            .k_fp16_bits
+            .iter()
+            .map(|&bits| f16_bits_to_f32(bits))
+            .collect();
+        let total = encoded.v_int8_codes.len();
+        let mut v_f32 = vec![0.0f32; total];
+
+        let head_stride = encoded.head_dim;
+        let tok_stride = encoded.num_kv_heads * head_stride;
+        let page_stride = encoded.page_tokens * tok_stride;
+
+        for p in 0..encoded.num_pages {
+            for t in 0..encoded.page_tokens {
+                for h in 0..encoded.num_kv_heads {
+                    let scale = match encoded.scope {
+                        KvScaleScope::PerTensor => encoded.v_scales[0],
+                        KvScaleScope::PerLayerHead => encoded.v_scales[h],
+                        KvScaleScope::PerPageHead => encoded.v_scales[p * encoded.num_kv_heads + h],
+                    };
+                    let base = p * page_stride + t * tok_stride + h * head_stride;
+                    for d in 0..encoded.head_dim {
+                        v_f32[base + d] = (encoded.v_int8_codes[base + d] as f32) * scale;
+                    }
+                }
+            }
+        }
+        (k_f32, v_f32)
+    }
+}
