@@ -2,8 +2,8 @@
 
 use super::attention::*;
 use crate::ir::{
-    Attribute, BlockId, DType, Dim, Location, Module, OpId, OpName, Operation, Type, Value,
-    ValueDef, ValueId,
+    Attribute, BlockId, DType, Dim, Location, Module, OpId, OpName, Operation, TensorType, Type,
+    Value, ValueDef, ValueId,
 };
 use crate::passes::{Pass, PassResult};
 use anyhow::Result;
@@ -2918,4 +2918,210 @@ impl KvSaltQuotaRegistry {
             Some(lim) => used_bytes.saturating_sub(lim),
         }
     }
+}
+
+fn is_flattenable_elemwise_op(op: &Operation) -> bool {
+    if op.name.dialect != "stablehlo" || op.results.len() != 1 {
+        return false;
+    }
+    let name = op.name.name.as_str();
+    (op.operands.len() == 1
+        && matches!(
+            name,
+            "tanh"
+                | "abs"
+                | "negate"
+                | "exponential"
+                | "log"
+                | "logistic"
+                | "sqrt"
+                | "rsqrt"
+                | "sine"
+                | "cosine"
+                | "ceil"
+                | "floor"
+        ))
+        || (op.operands.len() == 2
+            && matches!(
+                name,
+                "add" | "subtract" | "multiply" | "divide" | "maximum" | "minimum"
+            ))
+}
+
+/// Flattens connected chains of high-rank (`rank >= 2`) elementwise operations and intervening
+/// `stablehlo.reshape` views to 1D (`tensor<Nxdtype>`), eliminating interior reshapes so
+/// downstream loop fusion can merge the entire elementwise subgraph into a single 1D kernel
+/// (inspired by Modular `FlattenElementwise.cpp`).
+///
+/// Returns the number of high-rank elementwise operations flattened to rank 1.
+pub fn flatten_elementwise_chains(module: &mut Module) -> usize {
+    let mut flattened_count = 0usize;
+
+    for fn_op_id in module.functions() {
+        let Some(&reg_id) = module.ops[fn_op_id].regions.first() else {
+            continue;
+        };
+        let Some(&block_id) = module.regions[reg_id].blocks.first() else {
+            continue;
+        };
+        let orig_ops = module.blocks[block_id].ops.clone();
+
+        for &op_id in &orig_ops {
+            let Some(op) = module.ops.get(op_id).cloned() else {
+                continue;
+            };
+            if !is_flattenable_elemwise_op(&op) {
+                continue;
+            }
+            let res_val = op.results[0];
+            let orig_ty = module.values[res_val].ty.clone();
+            let Some(res_tt) = orig_ty.as_tensor() else {
+                continue;
+            };
+            if res_tt.shape.len() <= 1 {
+                continue;
+            }
+            let Some(num_elems) = res_tt.num_elements() else {
+                continue;
+            };
+            if num_elems <= 0 {
+                continue;
+            }
+
+            // Check that all operands share the same element count `num_elems`
+            let all_same_vol = op.operands.iter().all(|&opnd| {
+                module.values[opnd]
+                    .ty
+                    .as_tensor()
+                    .and_then(|t| t.num_elements())
+                    == Some(num_elems)
+            });
+            if !all_same_vol {
+                continue;
+            }
+
+            // Flatten each operand to `tensor<num_elems x dtype>` right before `op_id`
+            let mut new_operands: SmallVec<[ValueId; 4]> = SmallVec::new();
+            let mut pre_reshapes: Vec<OpId> = Vec::new();
+            for &opnd in &op.operands {
+                let opnd_dt = module.values[opnd]
+                    .ty
+                    .as_tensor()
+                    .map(|t| t.dtype.clone())
+                    .unwrap_or(DType::F32);
+                let flat_in_ty =
+                    Type::Tensor(TensorType::new(vec![Dim::Static(num_elems)], opnd_dt));
+                if module.values[opnd].ty == flat_in_ty {
+                    new_operands.push(opnd);
+                } else {
+                    let r_op = module.add_operation(
+                        block_id,
+                        OpName::new("stablehlo", "reshape"),
+                        smallvec::smallvec![opnd],
+                        vec![(None, flat_in_ty)],
+                        IndexMap::new(),
+                        Vec::new(),
+                        true,
+                        op.location.clone(),
+                    );
+                    // `add_operation` appends to `module.blocks[block_id].ops`; pop and splice
+                    module.blocks[block_id].ops.pop();
+                    pre_reshapes.push(r_op);
+                    new_operands.push(module.ops[r_op].results[0]);
+                }
+            }
+
+            let flat_res_ty = Type::Tensor(TensorType::new(
+                vec![Dim::Static(num_elems)],
+                res_tt.dtype.clone(),
+            ));
+            module.values[res_val].ty = flat_res_ty;
+            if let Some(op_mut) = module.ops.get_mut(op_id) {
+                op_mut.operands = new_operands;
+            }
+
+            // Create exit reshape restoring `orig_ty` and replace downstream uses of `res_val`
+            let exit_r_op = module.add_operation(
+                block_id,
+                OpName::new("stablehlo", "reshape"),
+                smallvec::smallvec![res_val],
+                vec![(None, orig_ty)],
+                IndexMap::new(),
+                Vec::new(),
+                true,
+                op.location.clone(),
+            );
+            module.blocks[block_id].ops.pop();
+            let restored_val = module.ops[exit_r_op].results[0];
+
+            for &other_id in &module.blocks[block_id].ops {
+                if other_id == op_id || other_id == exit_r_op {
+                    continue;
+                }
+                if let Some(other_op) = module.ops.get_mut(other_id) {
+                    for opnd_slot in &mut other_op.operands {
+                        if *opnd_slot == res_val {
+                            *opnd_slot = restored_val;
+                        }
+                    }
+                }
+            }
+
+            // Splice `pre_reshapes` before `op_id` and `exit_r_op` immediately after `op_id`
+            if let Some(pos) = module.blocks[block_id]
+                .ops
+                .iter()
+                .position(|&id| id == op_id)
+            {
+                module.blocks[block_id].ops.insert(pos + 1, exit_r_op);
+                for (offset, r_id) in pre_reshapes.into_iter().enumerate() {
+                    module.blocks[block_id].ops.insert(pos + offset, r_id);
+                }
+            }
+            flattened_count += 1;
+        }
+
+        if flattened_count > 0 {
+            // Fold `reshape(reshape(x))` chains and eliminate identity `reshape(x : T) -> T`
+            loop {
+                let mut changed = false;
+                let cur_ops = module.blocks[block_id].ops.clone();
+                for &r_id in &cur_ops {
+                    let Some(r_op) = module.ops.get(r_id).cloned() else {
+                        continue;
+                    };
+                    if !r_op.is_op("stablehlo", "reshape") || r_op.operands.len() != 1 {
+                        continue;
+                    }
+                    let inp = r_op.operands[0];
+                    let out = r_op.results[0];
+                    if let ValueDef::OpResult { op: prev_id, .. } = module.values[inp].def
+                        && let Some(prev_op) = module.ops.get(prev_id).cloned()
+                        && prev_op.is_op("stablehlo", "reshape")
+                        && prev_op.operands.len() == 1
+                    {
+                        let root_inp = prev_op.operands[0];
+                        if let Some(r_mut) = module.ops.get_mut(r_id) {
+                            r_mut.operands[0] = root_inp;
+                        }
+                        if module.use_count(inp) == 0 {
+                            module.remove_op(block_id, prev_id);
+                        }
+                        changed = true;
+                        break;
+                    }
+                    if module.values[inp].ty == module.values[out].ty {
+                        module.replace_all_uses(out, inp);
+                        module.remove_op(block_id, r_id);
+                        changed = true;
+                        break;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+    }
+    flattened_count
 }

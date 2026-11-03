@@ -19,11 +19,12 @@ use castforge::passes::{
     KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode, KvPageSpec,
     KvSaltQuotaRegistry, KvScaleScope, PassManager, PassRegistry, analyze_kv_layer_groups,
     anonymize_symbolic_dims, compress_splat_constants, direct_copy_format_supported,
-    fuse_locations, fuse_reshape_epilogue, fuse_sole_use_prologues, hash_prefix_token_blocks,
-    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
-    mark_cuda_graph_stable_tensors, merge_identical_functions, plan_cacheblend_retrieve,
-    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
-    promote_narrow_accumulators, re_rope_key_in_place, stamp_fused_provenance,
+    flatten_elementwise_chains, fuse_locations, fuse_reshape_epilogue, fuse_sole_use_prologues,
+    hash_prefix_token_blocks, longest_full_attention_hit, longest_joint_prefix_hit,
+    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_identical_functions,
+    plan_cacheblend_retrieve, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
+    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
+    stamp_fused_provenance,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -1237,4 +1238,34 @@ fn test_kv_salt_quota_registry_allowlist_and_bootstrap_exempt_lenses() {
 
     assert!(reg.delete_quota("tenant_alpha"));
     assert!(!reg.has_quota("tenant_alpha"));
+}
+
+#[test]
+fn test_flatten_elementwise_chains_eliminates_interior_reshapes() {
+    let mlir = concat!(
+        "module @flatten_elemwise {\n",
+        "  func.func @main(%x: tensor<2x4xf32>) -> tensor<4x2xf32> {\n",
+        "    %0 = stablehlo.tanh %x : tensor<2x4xf32>\n",
+        "    %1 = stablehlo.reshape %0 : (tensor<2x4xf32>) -> tensor<4x2xf32>\n",
+        "    %2 = stablehlo.abs %1 : tensor<4x2xf32>\n",
+        "    func.return %2 : tensor<4x2xf32>\n",
+        "  }\n",
+        "}\n",
+    );
+    let mut module = parse_mlir(mlir).unwrap();
+    let input = vec![-0.5, 0.25, -1.0, 0.75, -0.2, 0.4, -0.8, 0.1];
+    let out_before = evaluate_module(&module, std::slice::from_ref(&input)).unwrap();
+
+    // Flatten both `tanh` (`2x4`) and `abs` (`4x2`) to 1D `tensor<8xf32>` and fold the
+    // interior `2x4 -> 4x2` reshape so `tanh` and `abs` become adjacent 1D operations!
+    let flattened = flatten_elementwise_chains(&mut module);
+    assert_eq!(flattened, 2);
+    assert_eq!(flatten_elementwise_chains(&mut module), 0); // idempotent
+
+    let printed = castforge::ir::print_mlir(&module);
+    assert!(printed.contains("stablehlo.tanh"));
+    assert!(printed.contains("tensor<8xf32>"));
+
+    let out_after = evaluate_module(&module, &[input]).unwrap();
+    assert_eq!(out_before, out_after);
 }
