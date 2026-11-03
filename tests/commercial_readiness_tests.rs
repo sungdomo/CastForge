@@ -5510,3 +5510,53 @@ fn test_verify_model_argument_shapes_emits_spec_checks_and_assert() {
         ))
     );
 }
+
+#[test]
+fn test_stage_device_graph_regions_lowers_guards_and_isolates_body() {
+    use castforge::passes::stage_device_graph_regions;
+
+    let mlir = concat!(
+        "module @stage_dg {\n",
+        "  func.func @main(%ch0: tensor<1xi64>, %x: tensor<4xf32>) -> tensor<4xf32> {\n",
+        "    %r0 = mgp.routine.async %x : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %g = mgp.guard %ch0, %r0 : (tensor<1xi64>, tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %st = mgp.device_graph.stable.create %g : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %r1 = mgp.routine.async %st : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %r1 : tensor<4xf32>\n",
+        "  }\n",
+        "}\n",
+    );
+
+    let mut m = parse_mlir(mlir).expect("valid MLIR");
+    // 4 ops staged: `%r0`, lowered `%g` (`mgp.guard` -> `mgp.routine.async`), `%st`, and `%r1`:
+    assert_eq!(stage_device_graph_regions(&mut m), 4);
+
+    let func_id = m.functions()[0];
+    let blk_id = m.regions[m.ops[func_id].regions[0]].blocks[0];
+    let outer_ops = &m.blocks[blk_id].ops;
+    assert_eq!(outer_ops.len(), 2); // `mgp.device_graph.staging` + `func.return`
+    let staging_op = outer_ops[0];
+    assert_eq!(
+        m.ops[staging_op].name.full_name(),
+        "mgp.device_graph.staging"
+    );
+    assert_eq!(m.ops[staging_op].operands.len(), 2); // free inputs: `%x` and `%ch0`
+    assert_eq!(m.ops[staging_op].results.len(), 1); // escaping output: `%r1`
+
+    let inner_blk = m.regions[m.ops[staging_op].regions[0]].blocks[0];
+    let inner_names: Vec<String> = m.blocks[inner_blk]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        inner_names,
+        vec![
+            "mgp.routine.async",
+            "mgp.routine.async",
+            "mgp.device_graph.stable.create",
+            "mgp.routine.async",
+            "mgp.device_graph.staging.yield",
+        ]
+    );
+}

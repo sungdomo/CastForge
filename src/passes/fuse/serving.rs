@@ -18059,3 +18059,218 @@ pub fn verify_model_argument_shapes(module: &mut Module) -> usize {
 
     verified_args
 }
+
+// ============================================================================
+// Batch 21 Step 3: Device-Graph Guard Lowering & Isolated Region Staging
+// ============================================================================
+
+/// Rewrites every `mgp.guard` operation in `module` into a forwarding `mgp.routine.async`
+/// operation with `in_out_signature = ["none", ...]`, `dispatch = "immediate"`,
+/// `can_fuse_into_other = false`, `can_be_fused_into = false`, and `can_duplicate = false`.
+/// Returns the number of lowered guard operations.
+pub fn lower_guards_to_async_routines(module: &mut Module) -> usize {
+    let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+    let mut lowered_count = 0usize;
+
+    for blk_id in block_ids {
+        let ops = module.blocks[blk_id].ops.clone();
+        for &op_id in &ops {
+            if module.ops[op_id].name.full_name() != "mgp.guard" {
+                continue;
+            }
+            let num_opds = module.ops[op_id].operands.len();
+            let sig: Vec<Attribute> = (0..num_opds)
+                .map(|_| Attribute::String("none".to_string()))
+                .collect();
+            module.ops[op_id].name = OpName::new("mgp", "routine.async");
+            module.ops[op_id]
+                .attributes
+                .insert("in_out_signature".to_string(), Attribute::Array(sig));
+            module.ops[op_id].attributes.insert(
+                "dispatch".to_string(),
+                Attribute::String("immediate".to_string()),
+            );
+            module.ops[op_id]
+                .attributes
+                .insert("can_fuse_into_other".to_string(), Attribute::Bool(false));
+            module.ops[op_id]
+                .attributes
+                .insert("can_be_fused_into".to_string(), Attribute::Bool(false));
+            module.ops[op_id]
+                .attributes
+                .insert("can_duplicate".to_string(), Attribute::Bool(false));
+            lowered_count += 1;
+        }
+    }
+
+    lowered_count
+}
+
+/// Lowers `mgp.guard` operations into `mgp.routine.async` and stages all `mgp.routine.async` /
+/// `mogg.routine.async` and `mgp.device_graph.stable.create` operations in each function entry
+/// block into an isolated `mgp.device_graph.staging` region block:
+/// - Collects `free_values` (operands defined outside the staged set) and maps them to the
+///   staging block's arguments.
+/// - Collects `escaping_values` (results of staged ops used by operations outside the staged set)
+///   and yields them via `mgp.device_graph.staging.yield`.
+/// - Inserts `mgp.device_graph.staging` immediately before the block terminator and rewires
+///   external uses of `escaping_values` to the staging operation's results.
+///
+/// Returns the total number of staged operations moved into `mgp.device_graph.staging`.
+pub fn stage_device_graph_regions(module: &mut Module) -> usize {
+    lower_guards_to_async_routines(module);
+    let funcs = module.functions();
+    let mut total_staged = 0usize;
+
+    for func_id in funcs {
+        if module.ops[func_id].regions.is_empty() {
+            continue;
+        }
+        let reg_id = module.ops[func_id].regions[0];
+        if module.regions[reg_id].blocks.is_empty() {
+            continue;
+        }
+        let blk_id = module.regions[reg_id].blocks[0];
+        let orig_ops = module.blocks[blk_id].ops.clone();
+
+        let mut staged_ops: IndexSet<OpId> = IndexSet::new();
+        for &op_id in &orig_ops {
+            let full = module.ops[op_id].name.full_name();
+            if matches!(
+                full.as_str(),
+                "mgp.routine.async" | "mogg.routine.async" | "mgp.device_graph.stable.create"
+            ) {
+                staged_ops.insert(op_id);
+            }
+        }
+        if staged_ops.is_empty() {
+            continue;
+        }
+
+        // Collect `free_values` (operands of staged ops defined outside `staged_ops`).
+        let mut free_values: IndexSet<ValueId> = IndexSet::new();
+        for &op_id in &staged_ops {
+            for &opd in &module.ops[op_id].operands {
+                let is_internal = matches!(
+                    module.values[opd].def,
+                    ValueDef::OpResult { op: def_op, .. } if staged_ops.contains(&def_op)
+                );
+                if !is_internal {
+                    free_values.insert(opd);
+                }
+            }
+        }
+
+        // Collect unique `escaping_values` (results of staged ops used outside `staged_ops`).
+        let mut escaping_values: IndexSet<ValueId> = IndexSet::new();
+        for &op_id in &staged_ops {
+            for &res in &module.ops[op_id].results {
+                let used_outside = orig_ops.iter().any(|&user_id| {
+                    !staged_ops.contains(&user_id) && module.ops[user_id].operands.contains(&res)
+                });
+                if used_outside {
+                    escaping_values.insert(res);
+                }
+            }
+        }
+
+        let loc = module.ops[*staged_ops.first().unwrap()].location.clone();
+        let staging_blk = module.blocks.insert_with_key(|id| crate::ir::Block {
+            id,
+            label: None,
+            arguments: Vec::new(),
+            ops: Vec::new(),
+        });
+
+        let mut free_map: IndexMap<ValueId, ValueId> = IndexMap::new();
+        for (idx, &fv) in free_values.iter().enumerate() {
+            let ty = module.values[fv].ty.clone();
+            let arg_val = module.values.insert_with_key(|id| Value {
+                id,
+                ssa_name: None,
+                ty,
+                def: ValueDef::BlockArgument {
+                    block: staging_blk,
+                    index: idx as u32,
+                },
+            });
+            module.blocks[staging_blk].arguments.push(arg_val);
+            free_map.insert(fv, arg_val);
+        }
+
+        // Move `staged_ops` into `staging_blk` and remap `free_values` to `staging_blk` arguments.
+        for &op_id in &staged_ops {
+            for opd in &mut module.ops[op_id].operands {
+                if let Some(&mapped) = free_map.get(opd) {
+                    *opd = mapped;
+                }
+            }
+            module.blocks[staging_blk].ops.push(op_id);
+        }
+
+        let yield_opds: SmallVec<[ValueId; 4]> = escaping_values.iter().copied().collect();
+        let yield_op = module.ops.insert_with_key(|id| Operation {
+            id,
+            name: OpName::new("mgp", "device_graph.staging.yield"),
+            operands: yield_opds,
+            results: SmallVec::new(),
+            attributes: IndexMap::new(),
+            regions: Vec::new(),
+            custom_syntax: false,
+            location: loc.clone(),
+        });
+        module.blocks[staging_blk].ops.push(yield_op);
+
+        let staging_reg = module.regions.insert_with_key(|id| crate::ir::Region {
+            id,
+            blocks: vec![staging_blk],
+        });
+
+        let staging_opds: SmallVec<[ValueId; 4]> = free_values.iter().copied().collect();
+        let staging_op = module.ops.insert_with_key(|id| Operation {
+            id,
+            name: OpName::new("mgp", "device_graph.staging"),
+            operands: staging_opds,
+            results: SmallVec::new(),
+            attributes: IndexMap::new(),
+            regions: vec![staging_reg],
+            custom_syntax: false,
+            location: loc,
+        });
+
+        let mut escape_remap: IndexMap<ValueId, ValueId> = IndexMap::new();
+        for (idx, &esc_val) in escaping_values.iter().enumerate() {
+            let ty = module.values[esc_val].ty.clone();
+            let res_val = module.values.insert_with_key(|id| Value {
+                id,
+                ssa_name: None,
+                ty,
+                def: ValueDef::OpResult {
+                    op: staging_op,
+                    index: idx as u32,
+                },
+            });
+            module.ops[staging_op].results.push(res_val);
+            escape_remap.insert(esc_val, res_val);
+        }
+
+        // Remove staged ops from outer block, insert `staging_op` before terminator, and rewire
+        // external consumers.
+        module.blocks[blk_id]
+            .ops
+            .retain(|id| !staged_ops.contains(id));
+        for &ext_op in &module.blocks[blk_id].ops {
+            for opd in &mut module.ops[ext_op].operands {
+                if let Some(&new_v) = escape_remap.get(opd) {
+                    *opd = new_v;
+                }
+            }
+        }
+        let insert_pos = module.blocks[blk_id].ops.len().saturating_sub(1);
+        module.blocks[blk_id].ops.insert(insert_pos, staging_op);
+
+        total_staged += staged_ops.len();
+    }
+
+    total_staged
+}
