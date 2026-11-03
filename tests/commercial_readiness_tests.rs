@@ -20,21 +20,21 @@ use castforge::passes::{
     IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
     KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope,
     KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy, LayerGroupPayloadSharder,
-    PassManager, PassRegistry, ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST,
+    PassManager, PassRegistry, ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST, TOKEN_WIRE_STRIDE,
     WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups, anonymize_symbolic_dims,
     compress_splat_constants, decode_kv_fs_filename, decode_kv_storage_key,
     defer_allocs_to_first_use, direct_copy_format_supported, downsample_subchunk_swa_block_ids,
     elide_redundant_state_transfers, encode_kv_fs_filename, encode_kv_storage_key,
     flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
-    fuse_reshape_epilogue, fuse_sole_use_prologues, hash_prefix_token_blocks,
-    hoist_exec_invariant_ops, hoist_symbolic_dim_expressions, is_supported_arch_dtype,
-    legalize_rowwise_reduction_launch, longest_full_attention_hit, longest_joint_prefix_hit,
-    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_duplicate_shape_ops,
-    merge_identical_functions, plan_cacheblend_retrieve, plan_concat_in_place,
-    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
-    promote_narrow_accumulators, re_rope_key_in_place, recalculate_subchunk_blocks_to_skip,
-    reuse_dead_loop_buffers, stamp_fused_provenance, unfold_chunk_range,
-    validate_target_device_dtypes,
+    fuse_reshape_epilogue, fuse_sole_use_prologues, hash_packed_token_blocks_be,
+    hash_prefix_token_blocks, hoist_exec_invariant_ops, hoist_symbolic_dim_expressions,
+    is_supported_arch_dtype, legalize_rowwise_reduction_launch, longest_full_attention_hit,
+    longest_joint_prefix_hit, longest_sliding_window_hit, mark_cuda_graph_stable_tensors,
+    merge_duplicate_shape_ops, merge_identical_functions, num_packed_tokens, pack_token_ids_be,
+    plan_cacheblend_retrieve, plan_concat_in_place, plan_jenga_kv_geometry,
+    plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
+    re_rope_key_in_place, recalculate_subchunk_blocks_to_skip, reuse_dead_loop_buffers,
+    stamp_fused_provenance, unfold_chunk_range, unpack_token_ids_be, validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -2024,4 +2024,29 @@ fn test_subchunk_swa_block_id_downsampling_and_skip_recalculation() {
     // - skipping 7 original blocks = 1 full chunk (2 window blocks) + (3 - 2 = 1 tail skip) = 3
     assert_eq!(recalculate_subchunk_blocks_to_skip(4, 2, 5), 2);
     assert_eq!(recalculate_subchunk_blocks_to_skip(4, 2, 7), 3);
+}
+
+#[test]
+fn test_token_wire_codec_be_and_zero_unpack_chunk_hashing() {
+    assert_eq!(TOKEN_WIRE_STRIDE, 4);
+    let tokens = vec![101u32, 2054, 3099, 4096, 5120, 6144];
+    let packed = pack_token_ids_be(&tokens);
+    assert_eq!(packed.len(), 6 * 4);
+    assert_eq!(num_packed_tokens(&packed), 6);
+    assert_eq!(unpack_token_ids_be(&packed), Some(tokens));
+
+    // Ragged byte slice not divisible by `TOKEN_WIRE_STRIDE` (4) is rejected
+    assert!(unpack_token_ids_be(&packed[..23]).is_none());
+
+    // Zero-unpack chained hashing over 2 chunks of 3 tokens each
+    let h_all = hash_packed_token_blocks_be(&packed, 3, 0);
+    assert_eq!(h_all.len(), 2);
+    assert_ne!(h_all[0], h_all[1]);
+
+    // Modifying a token in chunk 0 cascades to chunk 1's chained hash!
+    let mut modified = packed.clone();
+    modified[3] ^= 1;
+    let h_mod = hash_packed_token_blocks_be(&modified, 3, 0);
+    assert_ne!(h_all[0], h_mod[0]);
+    assert_ne!(h_all[1], h_mod[1]);
 }

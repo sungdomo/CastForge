@@ -5140,3 +5140,61 @@ pub fn recalculate_subchunk_blocks_to_skip(
     let tail_blocks_to_skip = tail_blocks.saturating_sub(dropped_per_chunk);
     full_windows_to_skip * blocks_per_window + tail_blocks_to_skip
 }
+
+/// Bytes per packed wire token ID (big-endian `u32`, matching LMCache `TOKEN_STRIDE = 4`).
+pub const TOKEN_WIRE_STRIDE: usize = 4;
+
+/// Packs `token_ids` into a big-endian `u32` wire byte buffer (`TOKEN_WIRE_STRIDE * len(tokens)`)
+/// so token sequences cross process boundaries via a single `memcpy` and hash without unpacking
+/// (inspired by LMCache `lmcache/v1/multiprocess/token_codec.py` `pack_token_ids`).
+pub fn pack_token_ids_be(token_ids: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(token_ids.len() * TOKEN_WIRE_STRIDE);
+    for &tok in token_ids {
+        out.extend_from_slice(&tok.to_be_bytes());
+    }
+    out
+}
+
+/// Counts the number of whole packed tokens in `packed` (`packed.len() / TOKEN_WIRE_STRIDE`).
+pub fn num_packed_tokens(packed: &[u8]) -> usize {
+    packed.len() / TOKEN_WIRE_STRIDE
+}
+
+/// Unpacks a big-endian `u32` wire buffer back into token IDs, returning `None` if `packed.len()`
+/// is not an exact multiple of [`TOKEN_WIRE_STRIDE`]
+/// (matching LMCache `lmcache/v1/multiprocess/token_codec.py` `unpack_token_ids`).
+pub fn unpack_token_ids_be(packed: &[u8]) -> Option<Vec<u32>> {
+    if !packed.len().is_multiple_of(TOKEN_WIRE_STRIDE) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(packed.len() / TOKEN_WIRE_STRIDE);
+    for &chunk in packed.as_chunks::<TOKEN_WIRE_STRIDE>().0 {
+        out.push(u32::from_be_bytes(chunk));
+    }
+    Some(out)
+}
+
+/// Computes chained prefix-chunk hashes directly over a big-endian packed token wire buffer
+/// without unpacking into `Vec<u32>`, producing hashes identical to hashing `[u32]` chunks
+/// (inspired by LMCache `lmcache/v1/multiprocess/token_codec.py` & `token_hasher.py`).
+pub fn hash_packed_token_blocks_be(packed: &[u8], chunk_tokens: usize, seed: u64) -> Vec<u64> {
+    let stride_bytes = chunk_tokens.saturating_mul(TOKEN_WIRE_STRIDE);
+    if stride_bytes == 0 || packed.len() < stride_bytes {
+        return Vec::new();
+    }
+    let mut hashes = Vec::with_capacity(packed.len() / stride_bytes);
+    let mut parent_hash = seed;
+    for chunk_bytes in packed.chunks_exact(stride_bytes) {
+        let mut h = parent_hash ^ 0x9E37_79B9_7F4A_7C15;
+        for &word in chunk_bytes.as_chunks::<TOKEN_WIRE_STRIDE>().0 {
+            let tok = u32::from_be_bytes(word) as u64;
+            h = h.wrapping_add(tok).wrapping_add(0x9E37_79B9_7F4A_7C15);
+            h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            h ^= h >> 31;
+        }
+        hashes.push(h);
+        parent_hash = h;
+    }
+    hashes
+}
