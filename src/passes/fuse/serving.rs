@@ -1041,3 +1041,86 @@ pub fn re_rope_key_in_place(
     }
     Ok(())
 }
+
+/// Configuration for chained prefix-cache token-block hashing
+/// (inspired by Modular `rust_kv/kv-core/src/hash.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainedBlockHashConfig<'a> {
+    /// Number of tokens per KV-cache page block (`> 0`). Trailing ragged tokens
+    /// (`tokens.len() % block_size`) are dropped so partial blocks never pollute the cache.
+    pub block_size: usize,
+    /// 64-bit domain seed for the hash chain.
+    pub seed: u64,
+    /// Optional model/LoRA-adapter/quantization salt mixed into the chain root.
+    pub salt: &'a [u8],
+    /// Optional parent block hash when continuing a multi-turn or chunked prefix.
+    pub parent_hash: Option<u64>,
+}
+
+impl<'a> Default for ChainedBlockHashConfig<'a> {
+    fn default() -> Self {
+        Self {
+            block_size: 16,
+            seed: 0,
+            salt: b"",
+            parent_hash: None,
+        }
+    }
+}
+
+fn mix64(mut x: u64, k: u64) -> u64 {
+    x ^= k;
+    let wide = (x as u128).wrapping_mul(0x9e3779b97f4a7c15u128);
+    let folded = (wide as u64) ^ ((wide >> 64) as u64);
+    folded.rotate_left(27).wrapping_mul(0x94d049bb133111ebu64)
+}
+
+fn hash_bytes_64(mut state: u64, bytes: &[u8]) -> u64 {
+    let (chunks, rem) = bytes.as_chunks::<8>();
+    for &chunk in chunks {
+        state = mix64(state, u64::from_le_bytes(chunk));
+    }
+    if !rem.is_empty() {
+        let mut tail = [0u8; 8];
+        tail[..rem.len()].copy_from_slice(rem);
+        state = mix64(state, u64::from_le_bytes(tail) ^ (rem.len() as u64));
+    }
+    mix64(state, bytes.len() as u64)
+}
+
+/// Slices `tokens` into full blocks of `cfg.block_size` (dropping any trailing ragged tokens)
+/// and computes a chained 64-bit prefix hash per block:
+///
+/// $$H_k = \text{Hash}(\text{root},\; H_{k-1} \parallel \text{tokens}_k)$$
+///
+/// Each returned hash $H_k$ uniquely identifies the entire token prefix `[0 .. (k + 1) * B)`
+/// under `(seed, salt)`.
+pub fn hash_prefix_token_blocks(
+    tokens: &[i32],
+    cfg: &ChainedBlockHashConfig<'_>,
+) -> Result<Vec<u64>> {
+    if cfg.block_size == 0 {
+        anyhow::bail!("hash_prefix_token_blocks: block_size must be > 0");
+    }
+    let root_key = if cfg.salt.is_empty() {
+        mix64(cfg.seed, 0x517cc1b727220a95)
+    } else {
+        hash_bytes_64(mix64(cfg.seed, 0x517cc1b727220a95), cfg.salt)
+    };
+    let mut prev_hash = cfg.parent_hash.unwrap_or(root_key);
+    let num_full_blocks = tokens.len() / cfg.block_size;
+    let mut out = Vec::with_capacity(num_full_blocks);
+
+    for blk_idx in 0..num_full_blocks {
+        let slice = &tokens[blk_idx * cfg.block_size..(blk_idx + 1) * cfg.block_size];
+        let mut block_state = root_key;
+        for &tok in slice {
+            block_state = mix64(block_state, (tok as u32) as u64);
+        }
+        block_state = mix64(block_state, cfg.block_size as u64);
+        let chained = mix64(mix64(root_key, prev_hash), block_state);
+        out.push(chained);
+        prev_hash = chained;
+    }
+    Ok(out)
+}

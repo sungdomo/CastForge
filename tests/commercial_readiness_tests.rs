@@ -12,10 +12,11 @@ use castforge::ffi::{
 use castforge::ir::formats::{import_gguf_bytes, import_onnx_json};
 use castforge::ir::{DType, Dim, TensorBacking, TensorEntry, TensorStore, TensorType, parse_mlir};
 use castforge::passes::{
-    AsymK16V8Codec, CacheBlendRopeSpec, EngineKvFormat, KV_ZERO_SCALE_SENTINEL,
-    KvAttentionMaskKind, KvPageSpec, KvScaleScope, PassManager, PassRegistry,
-    analyze_kv_layer_groups, longest_full_attention_hit, longest_joint_prefix_hit,
-    longest_sliding_window_hit, plan_jenga_kv_geometry, re_rope_key_in_place,
+    AsymK16V8Codec, CacheBlendRopeSpec, ChainedBlockHashConfig, EngineKvFormat,
+    KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvPageSpec, KvScaleScope, PassManager,
+    PassRegistry, analyze_kv_layer_groups, hash_prefix_token_blocks, longest_full_attention_hit,
+    longest_joint_prefix_hit, longest_sliding_window_hit, plan_jenga_kv_geometry,
+    re_rope_key_in_place,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -645,4 +646,49 @@ fn test_cacheblend_delta_re_rope_in_place() {
             }
         }
     }
+}
+
+#[test]
+fn test_chained_prefix_cache_block_hashing_and_adapter_salt() {
+    // 3 full blocks of 4 + 2 trailing ragged tokens
+    let prompt_a = [10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33, 99, 100];
+    let prompt_b = [10, 11, 12, 13, 20, 21, 22, 23, 40, 41, 42, 43]; // shares first 2 blocks of 4
+
+    let cfg = ChainedBlockHashConfig {
+        block_size: 4,
+        seed: 7,
+        salt: b"llama3-8b:lora_finance_v1",
+        parent_hash: None,
+    };
+
+    let hashes_a = hash_prefix_token_blocks(&prompt_a, &cfg).unwrap();
+    let hashes_b = hash_prefix_token_blocks(&prompt_b, &cfg).unwrap();
+
+    // Trailing 2 ragged tokens in prompt_a are dropped -> 3 full blocks
+    assert_eq!(hashes_a.len(), 3);
+    assert_eq!(hashes_b.len(), 3);
+    // First 2 blocks match identically; 3rd block diverges
+    assert_eq!(hashes_a[0], hashes_b[0]);
+    assert_eq!(hashes_a[1], hashes_b[1]);
+    assert_ne!(hashes_a[2], hashes_b[2]);
+
+    // Resuming from parent_hash = Some(hashes_a[1]) for block 2 must match hashes_a[2]
+    let cfg_resume = ChainedBlockHashConfig {
+        block_size: 4,
+        seed: 7,
+        salt: b"llama3-8b:lora_finance_v1",
+        parent_hash: Some(hashes_a[1]),
+    };
+    let resumed = hash_prefix_token_blocks(&prompt_a[8..12], &cfg_resume).unwrap();
+    assert_eq!(resumed, vec![hashes_a[2]]);
+
+    // Changing the LoRA adapter salt changes every block hash from block 0 onward
+    let cfg_diff_salt = ChainedBlockHashConfig {
+        block_size: 4,
+        seed: 7,
+        salt: b"llama3-8b:lora_medical_v2",
+        parent_hash: None,
+    };
+    let hashes_diff = hash_prefix_token_blocks(&prompt_a, &cfg_diff_salt).unwrap();
+    assert_ne!(hashes_a[0], hashes_diff[0]);
 }
