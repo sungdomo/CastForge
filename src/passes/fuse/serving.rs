@@ -27520,3 +27520,298 @@ pub fn invoke_shape_packing_functions(
 
     Ok(resolved_count)
 }
+
+fn is_supported_triple_dtype(arch: &str, dtype: &crate::ir::mlir::DType) -> bool {
+    use crate::ir::mlir::DType;
+
+    let norm_arch = arch.split('-').next().unwrap_or(arch).trim();
+    if norm_arch != "x86_64" && norm_arch != "aarch64" {
+        return true;
+    }
+    match dtype {
+        DType::BF16 => true,
+        DType::F16 => norm_arch == "x86_64",
+        DType::F8E4M3FN | DType::F8E5M2 => false,
+        _ => true,
+    }
+}
+
+/// Validates that every input block argument and operation result tensor dtype in each function
+/// is supported by the function's target architecture (`device_target_triple` or
+/// `default_target_triple`).
+///
+/// Mirrors CPU sub-32-bit float rules (`bf16` permitted on `x86_64` and `aarch64`, `f16`
+/// permitted on `x86_64` only, `f8*` rejected on both `x86_64` and `aarch64`).
+pub fn validate_device_dtypes(
+    module: &mut Module,
+    default_target_triple: Option<&str>,
+) -> Result<(), String> {
+    let func_ids = module.functions();
+    for fn_id in func_ids {
+        if let Some(triple) = default_target_triple
+            && !triple.is_empty()
+            && !module.ops[fn_id]
+                .attributes
+                .contains_key("device_target_triple")
+        {
+            module.ops[fn_id].attributes.insert(
+                "device_target_triple".to_string(),
+                Attribute::String(triple.to_string()),
+            );
+        }
+
+        let Some(triple_str) = module.ops[fn_id]
+            .attributes
+            .get("device_target_triple")
+            .or_else(|| module.ops[fn_id].attributes.get("target_arch"))
+            .and_then(Attribute::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+
+        let fn_device = module.ops[fn_id]
+            .attributes
+            .get("device")
+            .and_then(Attribute::as_str)
+            .unwrap_or("cpu:0")
+            .to_string();
+
+        let regions = module.ops[fn_id].regions.clone();
+        for reg_id in regions {
+            let blocks = module.regions[reg_id].blocks.clone();
+            for bid in blocks {
+                for &arg_v in &module.blocks[bid].arguments {
+                    if let Some(Type::Tensor(t)) = module.values.get(arg_v).map(|v| &v.ty)
+                        && !is_supported_triple_dtype(&triple_str, &t.dtype)
+                    {
+                        return Err(format!(
+                            "The {} data type is not supported on device '{fn_device}'.",
+                            t.dtype
+                        ));
+                    }
+                }
+                for &oid in &module.blocks[bid].ops {
+                    let op = &module.ops[oid];
+                    let op_dev = op
+                        .attributes
+                        .get("device")
+                        .and_then(Attribute::as_str)
+                        .unwrap_or(fn_device.as_str());
+                    for &res_v in &op.results {
+                        if let Some(Type::Tensor(t)) = module.values.get(res_v).map(|v| &v.ty)
+                            && !is_supported_triple_dtype(&triple_str, &t.dtype)
+                        {
+                            return Err(format!(
+                                "The {} data type is not supported on device '{op_dev}'.",
+                                t.dtype
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Verifies that every function marked `is_device_graph = true` contains no control-flow
+/// operations and that every kernel-backed operation whose registration appears in module-level
+/// `kgen.kernel_decl` / `mogg.kernel.decl` declarations exposes a `build_graph` entry point.
+///
+/// Returns the number of verified kernel-backed operations across device-graph functions.
+pub fn verify_device_graph_kernels(module: &Module) -> Result<usize, String> {
+    let mut registry: std::collections::HashMap<String, (String, bool)> =
+        std::collections::HashMap::new();
+    for op in module.ops.values() {
+        let full = op.name.full_name();
+        if full == "kgen.kernel_decl" || full == "mogg.kernel.decl" {
+            let sym = op
+                .attributes
+                .get("sym_name")
+                .and_then(Attribute::as_str)
+                .unwrap_or("unnamed_kernel")
+                .to_string();
+            let reg_key = op
+                .attributes
+                .get("kernel_name")
+                .and_then(Attribute::as_str)
+                .unwrap_or(sym.as_str())
+                .to_string();
+            let has_build_graph = match op.attributes.get("build_graph") {
+                Some(Attribute::Bool(b)) => *b,
+                Some(Attribute::String(s) | Attribute::SymbolRef(s)) => !s.is_empty(),
+                _ => false,
+            };
+            registry.insert(reg_key, (sym, has_build_graph));
+        }
+    }
+
+    let mut verified_count = 0usize;
+    for fn_id in module.functions() {
+        let is_device_graph = matches!(
+            module.ops[fn_id].attributes.get("is_device_graph"),
+            Some(Attribute::Bool(true))
+        );
+        if !is_device_graph {
+            continue;
+        }
+        for &reg_id in &module.ops[fn_id].regions {
+            for &bid in &module.regions[reg_id].blocks {
+                for &oid in &module.blocks[bid].ops {
+                    let op = &module.ops[oid];
+                    let full = op.name.full_name();
+                    if is_terminator_op_name(&full) {
+                        continue;
+                    }
+                    if matches!(
+                        full.as_str(),
+                        "mo.if" | "mo.while" | "scf.if" | "scf.for" | "scf.while"
+                    ) {
+                        return Err(format!(
+                            "device-graphable mo.graph cannot contain control-flow op \
+                             '{full}' (control flow is not yet supported)"
+                        ));
+                    }
+                    let reg_name = if full == "mo.custom" {
+                        op.attributes
+                            .get("symbol")
+                            .and_then(Attribute::as_str)
+                            .unwrap_or(full.as_str())
+                    } else {
+                        full.as_str()
+                    };
+                    if let Some((kernel_sym, has_build_graph)) = registry.get(reg_name) {
+                        if !*has_build_graph {
+                            return Err(format!(
+                                "op '{full}' is in a device-graphable mo.graph but its kernel \
+                                 registration ('{reg_name}', kernel symbol '{kernel_sym}') \
+                                 does not expose a `build_graph` entry point"
+                            ));
+                        }
+                        verified_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(verified_count)
+}
+
+/// Replaces large static constant operations (`mo.constant`, `arith.constant`,
+/// `stablehlo.constant`) having at least `min_num_elements` (`> 1`) elements with a 1-element
+/// zero constant (`tensor<1xdtype>`) followed by a `mo.static.broadcast_to` operation.
+///
+/// Returns the number of large constants converted into splat broadcasts.
+pub fn splat_large_constants(module: &mut Module, min_num_elements: i64) -> usize {
+    use crate::ir::mlir::{Dim, Location, OpName, Operation, TensorType, Value, ValueDef};
+
+    let threshold = min_num_elements.max(2);
+    let mut splatted = 0usize;
+    let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+    for bid in block_ids {
+        let ops_snapshot = module.blocks[bid].ops.clone();
+        for op_id in ops_snapshot {
+            let Some(op) = module.ops.get(op_id).cloned() else {
+                continue;
+            };
+            let full = op.name.full_name();
+            if !matches!(
+                full.as_str(),
+                "mo.constant" | "arith.constant" | "stablehlo.constant"
+            ) || op.results.len() != 1
+            {
+                continue;
+            }
+            let orig_res = op.results[0];
+            let Some(Type::Tensor(orig_t)) = module.values.get(orig_res).map(|v| v.ty.clone())
+            else {
+                continue;
+            };
+            let Some(num_elems) = orig_t.num_elements() else {
+                continue;
+            };
+            if num_elems < threshold || num_elems <= 1 {
+                continue;
+            }
+
+            let one_elem_ty = Type::Tensor(TensorType {
+                shape: vec![Dim::Static(1)],
+                dtype: orig_t.dtype.clone(),
+                encoding: orig_t.encoding.clone(),
+            });
+            let one_elem_val = module.values.insert(Value {
+                id: ValueId::default(),
+                ssa_name: None,
+                ty: one_elem_ty,
+                def: ValueDef::BlockArgument {
+                    block: bid,
+                    index: 0,
+                },
+            });
+            module.values[one_elem_val].id = one_elem_val;
+
+            let mut const_attrs = indexmap::IndexMap::new();
+            const_attrs.insert("splat_zero".to_string(), Attribute::Bool(true));
+            let new_const_op = module.ops.insert(Operation {
+                id: OpId::default(),
+                name: op.name.clone(),
+                operands: smallvec::SmallVec::new(),
+                results: smallvec::smallvec![one_elem_val],
+                attributes: const_attrs,
+                regions: Vec::new(),
+                custom_syntax: false,
+                location: Location::Unknown,
+            });
+            module.ops[new_const_op].id = new_const_op;
+            module.values[one_elem_val].def = ValueDef::OpResult {
+                op: new_const_op,
+                index: 0,
+            };
+
+            let bcast_val = module.values.insert(Value {
+                id: ValueId::default(),
+                ssa_name: None,
+                ty: Type::Tensor(orig_t),
+                def: ValueDef::BlockArgument {
+                    block: bid,
+                    index: 0,
+                },
+            });
+            module.values[bcast_val].id = bcast_val;
+            let bcast_op = module.ops.insert(Operation {
+                id: OpId::default(),
+                name: OpName::new("mo", "static.broadcast_to"),
+                operands: smallvec::smallvec![one_elem_val],
+                results: smallvec::smallvec![bcast_val],
+                attributes: indexmap::IndexMap::new(),
+                regions: Vec::new(),
+                custom_syntax: false,
+                location: Location::Unknown,
+            });
+            module.ops[bcast_op].id = bcast_op;
+            module.values[bcast_val].def = ValueDef::OpResult {
+                op: bcast_op,
+                index: 0,
+            };
+
+            let all_ops: Vec<OpId> = module.ops.keys().collect();
+            for oid in all_ops {
+                for opnd in &mut module.ops[oid].operands {
+                    if *opnd == orig_res {
+                        *opnd = bcast_val;
+                    }
+                }
+            }
+
+            if let Some(pos) = module.blocks[bid].ops.iter().position(|&id| id == op_id) {
+                module.blocks[bid].ops[pos] = new_const_op;
+                module.blocks[bid].ops.insert(pos + 1, bcast_op);
+            }
+            module.ops.remove(op_id);
+            splatted += 1;
+        }
+    }
+    splatted
+}

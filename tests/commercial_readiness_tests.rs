@@ -7960,3 +7960,59 @@ fn test_hoist_parameter_expressions_and_invoke_shape_packing_functions() {
     assert_eq!(pack_vals, vec![3, 64, 16]);
     assert_eq!(assert_count, 3);
 }
+
+#[test]
+fn test_validate_device_dtypes_verify_device_graph_kernels_and_splat_large_constants() {
+    use castforge::passes::{
+        splat_large_constants, validate_device_dtypes, verify_device_graph_kernels,
+    };
+
+    let src = concat!(
+        "module {\n",
+        "  \"kgen.kernel_decl\"() {sym_name = \"fast_gelu_kern\", ",
+        "kernel_name = \"fast_gelu\", build_graph = true} : () -> ()\n",
+        "  func.func @dev_graph(%x: tensor<16xf16>) -> tensor<16xf16> ",
+        "attributes {is_device_graph = true} {\n",
+        "    %c = \"mo.constant\"() : () -> tensor<16xf16>\n",
+        "    %y = \"mo.custom\"(%x, %c) {symbol = \"fast_gelu\"} : ",
+        "(tensor<16xf16>, tensor<16xf16>) -> tensor<16xf16>\n",
+        "    return %y : tensor<16xf16>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(src).unwrap();
+
+    // 1. `f16` is rejected on `aarch64` CPUs, but permitted on `x86_64`:
+    let err = validate_device_dtypes(&mut m, Some("aarch64-unknown-linux-gnu"))
+        .expect_err("f16 must be rejected on aarch64");
+    assert!(err.contains("f16 data type is not supported"));
+
+    let fn_id = m.functions()[0];
+    m.ops[fn_id].attributes.shift_remove("device_target_triple");
+    validate_device_dtypes(&mut m, Some("x86_64-unknown-linux-gnu"))
+        .expect("f16 is permitted on x86_64");
+
+    // 2. Verify device-graph kernel registration has `build_graph = true`:
+    let verified = verify_device_graph_kernels(&m).expect("kernel has build_graph");
+    assert_eq!(verified, 1);
+
+    // 3. Splat constants with >= 8 elements into `tensor<1xf16>` + `mo.static.broadcast_to`:
+    let splatted = splat_large_constants(&mut m, 8);
+    assert_eq!(splatted, 1);
+
+    let blk = m.regions[m.ops[fn_id].regions[0]].blocks[0];
+    let op_names: Vec<String> = m.blocks[blk]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        op_names,
+        vec![
+            "mo.constant",
+            "mo.static.broadcast_to",
+            "mo.custom",
+            "func.return"
+        ]
+    );
+}
