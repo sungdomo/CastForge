@@ -21201,3 +21201,272 @@ impl DynamicFileStorageAgent {
         })
     }
 }
+
+/// Wraps the body of top-level functions in `castforge.try` / except regions based on their ABI:
+/// - When `"abi" = "runtime"` (`"mogg"` or `"runtime"`): moves every body op except existing
+///   `castforge.try` and the final terminator into a `castforge.try` op's `try` region ending with
+///   `castforge.yield`, populates the `except` region with an `!error` block argument and a
+///   `castforge.raise(%err)` op, and wires `castforge.try` results into the function terminator.
+/// - When `"abi" = "graph"` (`"mgp"` or `"graph"`) and `"throws" = true`: moves the body ops into
+///   the `try` region, and populates the `except` region with one `castforge.async_error(%err)` per
+///   try output followed by `castforge.yield` so async error tokens and placeholder outputs flow to
+///   the terminator.
+///
+/// Returns the number of functions wrapped in a `castforge.try` op.
+pub fn add_try_except_blocks(module: &mut Module) -> usize {
+    use crate::ir::mlir::{Block, OpName, Region};
+
+    let mut wrapped = 0usize;
+    let func_ids = module.functions();
+
+    for func_id in func_ids {
+        let abi = module.ops[func_id]
+            .attributes
+            .get("abi")
+            .and_then(|a| a.as_str())
+            .unwrap_or("")
+            .to_string();
+        let is_runtime_abi = abi == "runtime" || abi == "mogg";
+        let is_graph_abi = abi == "graph" || abi == "mgp";
+        let throws = module.ops[func_id]
+            .attributes
+            .get("throws")
+            .and_then(|a| a.as_bool())
+            .unwrap_or(false);
+
+        if !is_runtime_abi && !(is_graph_abi && throws) {
+            continue;
+        }
+        if module.ops[func_id].regions.is_empty() {
+            continue;
+        }
+        let body_reg = module.ops[func_id].regions[0];
+        if module.regions[body_reg].blocks.is_empty() {
+            continue;
+        }
+        let entry_block = module.regions[body_reg].blocks[0];
+        let block_ops = module.blocks[entry_block].ops.clone();
+        if block_ops.is_empty() {
+            continue;
+        }
+
+        // Skip if already wrapped in `castforge.try`.
+        if block_ops
+            .iter()
+            .any(|&op_id| module.ops[op_id].is_op("castforge", "try"))
+        {
+            continue;
+        }
+
+        let term_id = *block_ops.last().unwrap();
+        let term_operands: SmallVec<[ValueId; 4]> = module.ops[term_id].operands.clone();
+        let term_types: Vec<Type> = term_operands
+            .iter()
+            .map(|&v| module.values[v].ty.clone())
+            .collect();
+        let loc = module.ops[func_id].location.clone();
+
+        // Create `try` and `except` regions and their single blocks.
+        let try_block = module.blocks.insert_with_key(|bid| Block {
+            id: bid,
+            label: None,
+            arguments: Vec::new(),
+            ops: Vec::new(),
+        });
+        let try_region = module.regions.insert_with_key(|rid| Region {
+            id: rid,
+            blocks: vec![try_block],
+        });
+
+        let except_block = module.blocks.insert_with_key(|bid| Block {
+            id: bid,
+            label: None,
+            arguments: Vec::new(),
+            ops: Vec::new(),
+        });
+        let err_val = module.values.insert_with_key(|vid| Value {
+            id: vid,
+            ssa_name: None,
+            ty: Type::Opaque("!castforge.error".to_string()),
+            def: ValueDef::BlockArgument {
+                block: except_block,
+                index: 0,
+            },
+        });
+        module.blocks[except_block].arguments.push(err_val);
+        let except_region = module.regions.insert_with_key(|rid| Region {
+            id: rid,
+            blocks: vec![except_block],
+        });
+
+        // Move non-terminator ops into `try_block` and append `castforge.yield`.
+        let mut moved_ops = Vec::new();
+        for &op_id in &block_ops[..block_ops.len() - 1] {
+            moved_ops.push(op_id);
+        }
+        let try_yield_loc = loc.clone();
+        let try_yield_operands = term_operands.clone();
+        let try_yield_id = module.ops.insert_with_key(|oid| Operation {
+            id: oid,
+            name: OpName::new("castforge", "yield"),
+            operands: try_yield_operands,
+            results: SmallVec::new(),
+            attributes: IndexMap::new(),
+            regions: Vec::new(),
+            custom_syntax: false,
+            location: try_yield_loc,
+        });
+        moved_ops.push(try_yield_id);
+        module.blocks[try_block].ops = moved_ops;
+
+        // Populate `except_block` according to ABI.
+        if is_runtime_abi {
+            let raise_loc = loc.clone();
+            let raise_id = module.ops.insert_with_key(|oid| Operation {
+                id: oid,
+                name: OpName::new("castforge", "raise"),
+                operands: SmallVec::from_slice(&[err_val]),
+                results: SmallVec::new(),
+                attributes: IndexMap::new(),
+                regions: Vec::new(),
+                custom_syntax: false,
+                location: raise_loc,
+            });
+            module.blocks[except_block].ops.push(raise_id);
+        } else {
+            let mut except_yield_vals: SmallVec<[ValueId; 4]> = SmallVec::new();
+            for out_ty in &term_types {
+                let async_err_loc = loc.clone();
+                let async_err_id = module.ops.insert_with_key(|oid| Operation {
+                    id: oid,
+                    name: OpName::new("castforge", "async_error"),
+                    operands: SmallVec::from_slice(&[err_val]),
+                    results: SmallVec::new(),
+                    attributes: IndexMap::new(),
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: async_err_loc,
+                });
+                let res_val = module.values.insert_with_key(|vid| Value {
+                    id: vid,
+                    ssa_name: None,
+                    ty: out_ty.clone(),
+                    def: ValueDef::OpResult {
+                        op: async_err_id,
+                        index: 0,
+                    },
+                });
+                module.ops[async_err_id].results.push(res_val);
+                module.blocks[except_block].ops.push(async_err_id);
+                except_yield_vals.push(res_val);
+            }
+            let except_yield_loc = loc.clone();
+            let except_yield_id = module.ops.insert_with_key(|oid| Operation {
+                id: oid,
+                name: OpName::new("castforge", "yield"),
+                operands: except_yield_vals,
+                results: SmallVec::new(),
+                attributes: IndexMap::new(),
+                regions: Vec::new(),
+                custom_syntax: false,
+                location: except_yield_loc,
+            });
+            module.blocks[except_block].ops.push(except_yield_id);
+        }
+
+        // Create the `castforge.try` op and wire its results into `term_id`.
+        let try_id = module.ops.insert_with_key(|oid| Operation {
+            id: oid,
+            name: OpName::new("castforge", "try"),
+            operands: SmallVec::new(),
+            results: SmallVec::new(),
+            attributes: IndexMap::new(),
+            regions: vec![try_region, except_region],
+            custom_syntax: false,
+            location: loc,
+        });
+        let mut try_results: SmallVec<[ValueId; 4]> = SmallVec::new();
+        for (idx, out_ty) in term_types.into_iter().enumerate() {
+            let v_id = module.values.insert_with_key(|vid| Value {
+                id: vid,
+                ssa_name: None,
+                ty: out_ty,
+                def: ValueDef::OpResult {
+                    op: try_id,
+                    index: idx as u32,
+                },
+            });
+            module.ops[try_id].results.push(v_id);
+            try_results.push(v_id);
+        }
+        module.ops[term_id].operands = try_results;
+        module.blocks[entry_block].ops = vec![try_id, term_id];
+        wrapped += 1;
+    }
+
+    wrapped
+}
+
+/// Resolves `castforge.buffer_constant` (or `mgp.buffer_constant`) ops inside functions carrying a
+/// `"constant_resources"` array attribute by looking up each op's `"value"` attribute in the
+/// function's `"constant_resources"` table, rewriting the op in place to
+/// `castforge.resource_constant` with `"resource_index" = index`, and replacing the function's
+/// `"constant_resources"` entries with unit placeholders (`Attribute::Opaque("unit")`) so
+/// downstream codegen reads only the resource count without retaining large constant attributes.
+pub fn lookup_constant_resources(module: &mut Module) -> Result<usize, String> {
+    use crate::ir::mlir::OpName;
+
+    let mut rewritten = 0usize;
+    let func_ids = module.functions();
+
+    for func_id in func_ids {
+        let resources = match module.ops[func_id].attributes.get("constant_resources") {
+            Some(Attribute::Array(arr)) => arr.clone(),
+            _ => continue,
+        };
+
+        let mut body_ops = Vec::new();
+        let regions = module.ops[func_id].regions.clone();
+        for reg_id in regions {
+            let blocks = module.regions[reg_id].blocks.clone();
+            for blk_id in blocks {
+                body_ops.extend(module.blocks[blk_id].ops.iter().copied());
+            }
+        }
+
+        for op_id in body_ops {
+            let op_name = module.ops[op_id].name.full_name();
+            if op_name != "castforge.buffer_constant" && op_name != "mgp.buffer_constant" {
+                continue;
+            }
+            let val_attr = module.ops[op_id]
+                .attributes
+                .get("value")
+                .cloned()
+                .ok_or_else(|| {
+                    "buffer_constant is missing required 'value' attribute".to_string()
+                })?;
+
+            let resource_idx = resources
+                .iter()
+                .position(|item| item == &val_attr)
+                .ok_or_else(|| "The constant resource can't be found in the kernel".to_string())?;
+
+            module.ops[op_id].name = OpName::new("castforge", "resource_constant");
+            module.ops[op_id].attributes.shift_remove("value");
+            module.ops[op_id].attributes.insert(
+                "resource_index".to_string(),
+                Attribute::Int(resource_idx as i64),
+            );
+            rewritten += 1;
+        }
+
+        let unit_placeholders = vec![Attribute::Opaque("unit".to_string()); resources.len()];
+        module.ops[func_id].attributes.insert(
+            "constant_resources".to_string(),
+            Attribute::Array(unit_placeholders),
+        );
+    }
+
+    Ok(rewritten)
+}

@@ -6410,3 +6410,83 @@ fn test_dynamic_file_storage_agent_l1_pages_and_sharded_atomic_store_plan() {
         .expect("plan 2");
     assert_eq!(plan2.needs_mkdir, None);
 }
+
+#[test]
+fn test_add_try_except_blocks_and_lookup_constant_resources() {
+    use castforge::ir::Attribute;
+    use castforge::passes::{add_try_except_blocks, lookup_constant_resources};
+
+    let mlir_src = r#"
+module {
+  func.func @runtime_kernel(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+    %c0 = "castforge.buffer_constant"() {value = "res_alpha"} : () -> tensor<4xf32>
+    %0 = "stablehlo.add"(%arg0, %c0) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+    return %0 : tensor<4xf32>
+  }
+  func.func @graph_kernel(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+    %c1 = "castforge.buffer_constant"() {value = "res_beta"} : () -> tensor<4xf32>
+    %1 = "stablehlo.multiply"(%arg0, %c1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+    return %1 : tensor<4xf32>
+  }
+}
+"#;
+    let mut m = parse_mlir(mlir_src).expect("valid mlir");
+    let funcs = m.functions();
+    let f_runtime = funcs[0];
+    let f_graph = funcs[1];
+
+    m.ops[f_runtime]
+        .attributes
+        .insert("abi".to_string(), Attribute::String("runtime".to_string()));
+    m.ops[f_runtime].attributes.insert(
+        "constant_resources".to_string(),
+        Attribute::Array(vec![
+            Attribute::String("res_zero".to_string()),
+            Attribute::String("res_alpha".to_string()),
+        ]),
+    );
+
+    m.ops[f_graph]
+        .attributes
+        .insert("abi".to_string(), Attribute::String("graph".to_string()));
+    m.ops[f_graph]
+        .attributes
+        .insert("throws".to_string(), Attribute::Bool(true));
+    m.ops[f_graph].attributes.insert(
+        "constant_resources".to_string(),
+        Attribute::Array(vec![Attribute::String("res_beta".to_string())]),
+    );
+
+    let rewritten = lookup_constant_resources(&mut m).expect("lookup succeeds");
+    assert_eq!(rewritten, 2);
+
+    // Verify constant_resources on f_runtime was replaced by 2 unit placeholders:
+    assert_eq!(
+        m.ops[f_runtime].attributes.get("constant_resources"),
+        Some(&Attribute::Array(vec![
+            Attribute::Opaque("unit".to_string()),
+            Attribute::Opaque("unit".to_string()),
+        ]))
+    );
+
+    let wrapped = add_try_except_blocks(&mut m);
+    assert_eq!(wrapped, 2);
+
+    // Verify runtime_kernel has [castforge.try, func.return] in its entry block, and its except
+    // block contains `castforge.raise`:
+    let rt_entry = m.regions[m.ops[f_runtime].regions[0]].blocks[0];
+    assert_eq!(m.blocks[rt_entry].ops.len(), 2);
+    let rt_try_id = m.blocks[rt_entry].ops[0];
+    assert!(m.ops[rt_try_id].is_op("castforge", "try"));
+    let rt_except_blk = m.regions[m.ops[rt_try_id].regions[1]].blocks[0];
+    let rt_except_op = m.blocks[rt_except_blk].ops[0];
+    assert!(m.ops[rt_except_op].is_op("castforge", "raise"));
+
+    // Verify graph_kernel's except block synthesizes `castforge.async_error` + `castforge.yield`:
+    let gr_entry = m.regions[m.ops[f_graph].regions[0]].blocks[0];
+    let gr_try_id = m.blocks[gr_entry].ops[0];
+    let gr_except_blk = m.regions[m.ops[gr_try_id].regions[1]].blocks[0];
+    assert_eq!(m.blocks[gr_except_blk].ops.len(), 2);
+    assert!(m.ops[m.blocks[gr_except_blk].ops[0]].is_op("castforge", "async_error"));
+    assert!(m.ops[m.blocks[gr_except_blk].ops[1]].is_op("castforge", "yield"));
+}
