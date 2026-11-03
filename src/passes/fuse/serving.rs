@@ -14302,3 +14302,383 @@ impl MultiSerdeGroupSchema {
         })
     }
 }
+
+// ============================================================================
+// Batch 17 Step 3: Mutable Load Parallelizer & Exclusive-Chain Kernel Fuser
+// ============================================================================
+
+/// Returns `true` if `op_name` is a kernel eligible to fuse an `mo.mutable.load` buffer directly.
+#[must_use]
+pub fn is_fusible_mutable_load_kernel(op_name: &str) -> bool {
+    matches!(op_name, "map.iter.elementwise" | "map.iter.opaque")
+}
+
+/// Counts how many operand slots in `block_id` reference `val`.
+fn count_value_uses_in_block(module: &Module, block_id: BlockId, val: ValueId) -> usize {
+    module.blocks[block_id]
+        .ops
+        .iter()
+        .map(|&op_id| {
+            module.ops[op_id]
+                .operands
+                .iter()
+                .filter(|&&opd| opd == val)
+                .count()
+        })
+        .sum()
+}
+
+/// When `kernel_in_chain` depends on `load_out_chain` exclusively through a tree of single-use
+/// `mo.chain.create` operations in `block_id`, rewrites those `mo.chain.create` ops to replace
+/// `load_out_chain` with `load_in_chain` so fusing the load into the kernel will not create a
+/// chain cycle. Returns `true` if an exclusive path existed and was detached.
+pub fn detach_exclusive_chain_path(
+    module: &mut Module,
+    block_id: BlockId,
+    load_out_chain: ValueId,
+    load_in_chain: ValueId,
+    kernel_in_chain: ValueId,
+) -> bool {
+    if kernel_in_chain == load_out_chain {
+        return false;
+    }
+
+    fn analyze_chain_value(
+        module: &Module,
+        block_id: BlockId,
+        v: ValueId,
+        load_out_chain: ValueId,
+        on_path: &mut IndexSet<OpId>,
+        to_rewrite: &mut Vec<OpId>,
+    ) -> Option<bool> {
+        if v == load_out_chain {
+            return Some(true);
+        }
+        let ValueDef::OpResult { op: def_op, .. } = module.values[v].def else {
+            return None;
+        };
+        if module.ops[def_op].name.full_name() != "mo.chain.create" {
+            return None;
+        }
+        let mut subtree_reaches_load = false;
+        let operands = module.ops[def_op].operands.clone();
+        for opd in operands {
+            if opd == load_out_chain {
+                subtree_reaches_load = true;
+                continue;
+            }
+            if let Some(status) =
+                analyze_chain_value(module, block_id, opd, load_out_chain, on_path, to_rewrite)
+            {
+                if !status {
+                    return Some(false);
+                }
+                subtree_reaches_load = true;
+            }
+        }
+        if !subtree_reaches_load {
+            return None;
+        }
+        if count_value_uses_in_block(module, block_id, v) != 1 {
+            return Some(false);
+        }
+        if on_path.insert(def_op) {
+            to_rewrite.push(def_op);
+        }
+        Some(true)
+    }
+
+    let mut on_path = IndexSet::new();
+    let mut to_rewrite = Vec::new();
+    if analyze_chain_value(
+        module,
+        block_id,
+        kernel_in_chain,
+        load_out_chain,
+        &mut on_path,
+        &mut to_rewrite,
+    ) != Some(true)
+    {
+        return false;
+    }
+
+    for op_id in to_rewrite {
+        for opd in &mut module.ops[op_id].operands {
+            if *opd == load_out_chain {
+                *opd = load_in_chain;
+            }
+        }
+    }
+    true
+}
+
+/// Splits each `mo.mutable.load(buf, in_chain) -> (out_tensor, out_chain)` whose `out_tensor` has
+/// $n > 1$ uses in the same block into $n$ parallel `mo.mutable.load` ops (each with a single
+/// tensor use) joined by an `mo.chain.create` over their output chains, unless a consumer kernel
+/// has `hasWriteEffect = true` and also references `buf`. Returns the number of loads split.
+pub fn parallelize_multi_use_mutable_loads(module: &mut Module) -> usize {
+    let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+    let mut split_count = 0usize;
+
+    for block_id in block_ids {
+        let orig_ops = module.blocks[block_id].ops.clone();
+        let mut new_block_ops = Vec::with_capacity(orig_ops.len());
+
+        for op_id in orig_ops {
+            let op = &module.ops[op_id];
+            if op.name.full_name() != "mo.mutable.load"
+                || op.operands.len() < 2
+                || op.results.len() < 2
+            {
+                new_block_ops.push(op_id);
+                continue;
+            }
+            let buf_val = op.operands[0];
+            let in_chain = op.operands[1];
+            let out_tensor = op.results[0];
+            let out_chain = op.results[1];
+            let loc = op.location.clone();
+            let attrs = op.attributes.clone();
+
+            // Collect all (consumer_op_id, operand_index) uses of `out_tensor` in this block.
+            let mut uses: Vec<(OpId, usize)> = Vec::new();
+            let mut blocked_by_writer = false;
+            for &cand_op in &module.blocks[block_id].ops {
+                let cand = &module.ops[cand_op];
+                let writes_same_buf = matches!(
+                    cand.attributes.get("hasWriteEffect"),
+                    Some(Attribute::Bool(true))
+                ) && cand.operands.contains(&buf_val);
+                for (idx, &opd) in cand.operands.iter().enumerate() {
+                    if opd == out_tensor {
+                        if writes_same_buf {
+                            blocked_by_writer = true;
+                        }
+                        uses.push((cand_op, idx));
+                    }
+                }
+            }
+
+            if blocked_by_writer || uses.len() <= 1 {
+                new_block_ops.push(op_id);
+                continue;
+            }
+
+            let tensor_ty = module.values[out_tensor].ty.clone();
+            let chain_ty = module.values[out_chain].ty.clone();
+            let mut new_chains = SmallVec::with_capacity(uses.len());
+
+            for (consumer_op, opd_idx) in uses {
+                let new_load_op = module.ops.insert_with_key(|id| Operation {
+                    id,
+                    name: OpName::new("mo", "mutable.load"),
+                    operands: SmallVec::from_slice(&[buf_val, in_chain]),
+                    results: SmallVec::new(),
+                    attributes: attrs.clone(),
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: loc.clone(),
+                });
+                let new_t = module.values.insert_with_key(|id| Value {
+                    id,
+                    ssa_name: None,
+                    ty: tensor_ty.clone(),
+                    def: ValueDef::OpResult {
+                        op: new_load_op,
+                        index: 0,
+                    },
+                });
+                let new_c = module.values.insert_with_key(|id| Value {
+                    id,
+                    ssa_name: None,
+                    ty: chain_ty.clone(),
+                    def: ValueDef::OpResult {
+                        op: new_load_op,
+                        index: 1,
+                    },
+                });
+                module.ops[new_load_op].results = SmallVec::from_slice(&[new_t, new_c]);
+                module.ops[consumer_op].operands[opd_idx] = new_t;
+                new_block_ops.push(new_load_op);
+                new_chains.push(new_c);
+            }
+
+            let join_op = module.ops.insert_with_key(|id| Operation {
+                id,
+                name: OpName::new("mo", "chain.create"),
+                operands: new_chains,
+                results: SmallVec::new(),
+                attributes: IndexMap::new(),
+                regions: Vec::new(),
+                custom_syntax: false,
+                location: loc,
+            });
+            let joined_chain = module.values.insert_with_key(|id| Value {
+                id,
+                ssa_name: None,
+                ty: chain_ty,
+                def: ValueDef::OpResult {
+                    op: join_op,
+                    index: 0,
+                },
+            });
+            module.ops[join_op].results.push(joined_chain);
+            new_block_ops.push(join_op);
+
+            for &cand_op in &module.blocks[block_id].ops {
+                for opd in &mut module.ops[cand_op].operands {
+                    if *opd == out_chain {
+                        *opd = joined_chain;
+                    }
+                }
+            }
+            split_count += 1;
+        }
+
+        module.blocks[block_id].ops = new_block_ops;
+    }
+
+    split_count
+}
+
+/// Parallelizes multi-use `mo.mutable.load` ops and fuses each single-use `mo.mutable.load` into
+/// its compatible `map.iter.elementwise` or `map.iter.opaque` consumer kernel (detaching exclusive
+/// `mo.chain.create` paths when needed). Returns the number of fused `mo.mutable.load` operations.
+pub fn fuse_mutable_loads_into_kernels(module: &mut Module) -> usize {
+    let _ = parallelize_multi_use_mutable_loads(module);
+    let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+    let mut fused_count = 0usize;
+
+    for block_id in block_ids {
+        let snapshot_ops = module.blocks[block_id].ops.clone();
+        let mut erased_loads: IndexSet<OpId> = IndexSet::new();
+
+        for &load_op in &snapshot_ops {
+            if module.ops[load_op].name.full_name() != "mo.mutable.load"
+                || module.ops[load_op].operands.len() < 2
+                || module.ops[load_op].results.len() < 2
+            {
+                continue;
+            }
+            let buf_val = module.ops[load_op].operands[0];
+            let load_in_chain = module.ops[load_op].operands[1];
+            let out_tensor = module.ops[load_op].results[0];
+            let load_out_chain = module.ops[load_op].results[1];
+
+            // Find single consumer of `out_tensor` in this block.
+            let mut consumer_info: Option<(OpId, usize)> = None;
+            let mut multi_use = false;
+            for &cand_op in &module.blocks[block_id].ops {
+                if erased_loads.contains(&cand_op) {
+                    continue;
+                }
+                for (idx, &opd) in module.ops[cand_op].operands.iter().enumerate() {
+                    if opd == out_tensor {
+                        if consumer_info.is_some() {
+                            multi_use = true;
+                        } else {
+                            consumer_info = Some((cand_op, idx));
+                        }
+                    }
+                }
+            }
+            if multi_use {
+                continue;
+            }
+            let Some((kernel_op, arg_idx)) = consumer_info else {
+                continue;
+            };
+            let kernel_name = module.ops[kernel_op].name.full_name();
+            if !is_fusible_mutable_load_kernel(&kernel_name) {
+                continue;
+            }
+            // In-place `map.iter.opaque` writing the same buffer cannot safely fuse snapshot loads.
+            if kernel_name == "map.iter.opaque" && module.ops[kernel_op].operands.contains(&buf_val)
+            {
+                continue;
+            }
+
+            // Check if the kernel has an existing input chain operand (last operand if chain-typed)
+            // that depends on `load_out_chain`.
+            let chain_ty = module.values[load_out_chain].ty.clone();
+            let existing_chain_opd_idx = module.ops[kernel_op]
+                .operands
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|&(i, &v)| i != arg_idx && module.values[v].ty == chain_ty)
+                .map(|(i, _)| i);
+
+            if let Some(ch_idx) = existing_chain_opd_idx {
+                let kernel_in_chain = module.ops[kernel_op].operands[ch_idx];
+                if kernel_in_chain != load_out_chain {
+                    let _ = detach_exclusive_chain_path(
+                        module,
+                        block_id,
+                        load_out_chain,
+                        load_in_chain,
+                        kernel_in_chain,
+                    );
+                } else {
+                    module.ops[kernel_op].operands[ch_idx] = load_in_chain;
+                }
+            } else {
+                module.ops[kernel_op].operands.push(load_in_chain);
+            }
+
+            // Replace tensor input with direct buffer input.
+            module.ops[kernel_op].operands[arg_idx] = buf_val;
+            module.ops[kernel_op]
+                .attributes
+                .insert("hasReadEffect".to_string(), Attribute::Bool(true));
+            module.ops[kernel_op].attributes.insert(
+                "fusionInfo".to_string(),
+                Attribute::String("MutableLoad".to_string()),
+            );
+
+            // Ensure kernel has an output chain result and replace `load_out_chain` uses with it.
+            let kernel_out_chain = if let Some(&existing_out_ch) = module.ops[kernel_op]
+                .results
+                .iter()
+                .find(|&&r| module.values[r].ty == chain_ty)
+            {
+                existing_out_ch
+            } else {
+                let res_idx = module.ops[kernel_op].results.len() as u32;
+                let new_out_ch = module.values.insert_with_key(|id| Value {
+                    id,
+                    ssa_name: None,
+                    ty: chain_ty,
+                    def: ValueDef::OpResult {
+                        op: kernel_op,
+                        index: res_idx,
+                    },
+                });
+                module.ops[kernel_op].results.push(new_out_ch);
+                new_out_ch
+            };
+
+            for &cand_op in &module.blocks[block_id].ops {
+                if cand_op == kernel_op || cand_op == load_op {
+                    continue;
+                }
+                for opd in &mut module.ops[cand_op].operands {
+                    if *opd == load_out_chain {
+                        *opd = kernel_out_chain;
+                    }
+                }
+            }
+
+            erased_loads.insert(load_op);
+            fused_count += 1;
+        }
+
+        if !erased_loads.is_empty() {
+            module.blocks[block_id]
+                .ops
+                .retain(|op_id| !erased_loads.contains(op_id));
+        }
+    }
+
+    fused_count
+}

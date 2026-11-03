@@ -4527,3 +4527,58 @@ fn test_fp8_e4m3fn_codec_and_multi_serde_group_planner() {
     assert!(schema.plan_group(&[Some(vec![4, 8]), None], "src").is_err());
     assert!(schema.plan_group(&[Some(vec![4, 8])], "layout").is_err());
 }
+
+#[test]
+fn test_parallelize_and_fuse_mutable_loads_with_exclusive_chain_detachment() {
+    use castforge::ir::mlir::Attribute;
+    use castforge::passes::fuse_mutable_loads_into_kernels;
+
+    let mlir_src = concat!(
+        "module @fuse_mutable_loads {\n",
+        "  func.func @main(%buf: tensor<4xf32>, %c0: tensor<1xi64>, %other: tensor<1xi64>)",
+        " -> (tensor<4xf32>, tensor<4xf32>, tensor<1xi64>) {\n",
+        "    %t, %c1 = mo.mutable.load %buf, %c0",
+        " : (tensor<4xf32>, tensor<1xi64>) -> (tensor<4xf32>, tensor<1xi64>)\n",
+        "    %merged = mo.chain.create %other, %c1",
+        " : (tensor<1xi64>, tensor<1xi64>) -> tensor<1xi64>\n",
+        "    %r0, %kc0 = map.iter.elementwise %t, %merged",
+        " : (tensor<4xf32>, tensor<1xi64>) -> (tensor<4xf32>, tensor<1xi64>)\n",
+        "    %r1 = map.iter.elementwise %t : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %r0, %r1, %kc0 : tensor<4xf32>, tensor<4xf32>, tensor<1xi64>\n",
+        "  }\n",
+        "}\n",
+    );
+
+    let mut module = parse_mlir(mlir_src).expect("valid MLIR");
+    let fused = fuse_mutable_loads_into_kernels(&mut module);
+    assert_eq!(fused, 2);
+
+    // Verify all `mo.mutable.load` ops were fused into the two `map.iter.elementwise` kernels:
+    let func_id = module.functions()[0];
+    let blk_id = module.regions[module.ops[func_id].regions[0]].blocks[0];
+    let block = &module.blocks[blk_id];
+    let remaining_loads = block
+        .ops
+        .iter()
+        .filter(|&&op_id| module.ops[op_id].name.full_name() == "mo.mutable.load")
+        .count();
+    assert_eq!(remaining_loads, 0);
+
+    let kernels: Vec<_> = block
+        .ops
+        .iter()
+        .copied()
+        .filter(|&op_id| module.ops[op_id].name.full_name() == "map.iter.elementwise")
+        .collect();
+    assert_eq!(kernels.len(), 2);
+    for k_id in kernels {
+        assert_eq!(
+            module.ops[k_id].attributes.get("hasReadEffect"),
+            Some(&Attribute::Bool(true))
+        );
+        assert_eq!(
+            module.ops[k_id].attributes.get("fusionInfo"),
+            Some(&Attribute::String("MutableLoad".to_string()))
+        );
+    }
+}
