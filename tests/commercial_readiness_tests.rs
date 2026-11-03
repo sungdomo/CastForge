@@ -14,8 +14,8 @@ use castforge::ir::{
     DType, Dim, Location, TensorBacking, TensorEntry, TensorStore, TensorType, parse_mlir,
 };
 use castforge::passes::{
-    AsymK16V8Codec, CBChunkMatch, CBGroupSpec, CacheBlendRopeSpec, CacheGenCdfCodec,
-    ChainedBlockHashConfig, DEFAULT_MAX_KERNELS_IN_FUSION_SET, EngineKvFormat,
+    ArcKvEvictionPolicy, AsymK16V8Codec, CBChunkMatch, CBGroupSpec, CacheBlendRopeSpec,
+    CacheGenCdfCodec, ChainedBlockHashConfig, DEFAULT_MAX_KERNELS_IN_FUSION_SET, EngineKvFormat,
     KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode, KvPageSpec,
     KvScaleScope, PassManager, PassRegistry, analyze_kv_layer_groups, anonymize_symbolic_dims,
     compress_splat_constants, direct_copy_format_supported, fuse_locations, fuse_reshape_epilogue,
@@ -1181,4 +1181,31 @@ fn test_promote_narrow_accumulators_and_epilogue_downcast_codegen() {
         .generate("cuda", &module, &TargetConfig::default())
         .unwrap();
     assert!(cuda_src.contains("Mixed-precision accumulator (f32, epilogue downcast -> bf16)"));
+}
+
+#[test]
+fn test_arc_kv_eviction_policy_ghost_adaptation_and_scan_resistance() {
+    let mut arc = ArcKvEvictionPolicy::new();
+    // Admit request chain [100, 101, 102, 103] -> processed in reverse so 103 is at T1 LRU head
+    arc.on_keys_created(&[100, 101, 102, 103]);
+    assert_eq!(arc.t1_len(), 4);
+    assert_eq!(arc.t2_len(), 0);
+
+    // Touch shared root prefix [100, 101] -> promoted to frequent list `T2`!
+    arc.on_keys_touched(&[100, 101]);
+    assert_eq!(arc.t1_len(), 2); // [103, 102] remain in T1
+    assert_eq!(arc.t2_len(), 2); // [101, 100] in T2
+
+    // Evict 50% (2 keys) -> since |T1| >= int(p=0), victims come from T1 in suffix-first order!
+    let victims = arc.select_and_evict_victims(0.5);
+    assert_eq!(victims, vec![103, 102]);
+    assert_eq!(arc.t1_len(), 0);
+    assert_eq!(arc.t2_len(), 2); // Frequent prefix [100, 101] survived the eviction!
+    assert_eq!(arc.b1_len(), 2); // [103, 102] recorded in ghost list B1
+
+    // Recreate ghost key 103 from B1 -> grows `target_t1_size` (`p > 0`) and promotes 103 to T2
+    arc.on_keys_created(&[103]);
+    assert!(arc.target_t1_size() >= 1.0);
+    assert_eq!(arc.b1_len(), 1);
+    assert_eq!(arc.t2_len(), 3);
 }

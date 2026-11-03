@@ -2707,3 +2707,148 @@ pub fn promote_narrow_accumulators(module: &mut Module) -> usize {
     }
     promoted
 }
+
+/// Adaptive Replacement Cache (ARC) KV eviction policy with `T1` (recent), `T2` (frequent),
+/// and `B1`/`B2` ghost-history feedback (inspired by LMCache
+/// `lmcache/v1/distributed/eviction_policy/arc.py`).
+#[derive(Debug, Clone, Default)]
+pub struct ArcKvEvictionPolicy {
+    t1: IndexMap<u64, ()>,
+    t2: IndexMap<u64, ()>,
+    b1: IndexMap<u64, ()>,
+    b2: IndexMap<u64, ()>,
+    target_t1_size: f64,
+    capacity: usize,
+}
+
+impl ArcKvEvictionPolicy {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn resident_len(&self) -> usize {
+        self.t1.len() + self.t2.len()
+    }
+
+    pub fn t1_len(&self) -> usize {
+        self.t1.len()
+    }
+
+    pub fn t2_len(&self) -> usize {
+        self.t2.len()
+    }
+
+    pub fn b1_len(&self) -> usize {
+        self.b1.len()
+    }
+
+    pub fn b2_len(&self) -> usize {
+        self.b2.len()
+    }
+
+    pub fn target_t1_size(&self) -> f64 {
+        self.target_t1_size
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn adaptation_delta(hit_len: usize, other_len: usize) -> f64 {
+        (other_len as f64 / hit_len.max(1) as f64).max(1.0)
+    }
+
+    fn trim_ghost_lists(&mut self) {
+        if self.capacity == 0 {
+            return;
+        }
+        while self.b1.len() > self.capacity {
+            self.b1.shift_remove_index(0);
+        }
+        while self.b2.len() > self.capacity {
+            self.b2.shift_remove_index(0);
+        }
+        while self.b1.len() + self.b2.len() > 2 * self.capacity {
+            if !self.b2.is_empty() {
+                self.b2.shift_remove_index(0);
+            } else if !self.b1.is_empty() {
+                self.b1.shift_remove_index(0);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Admits newly created KV block keys in reverse request order (so later suffix chunks stay
+    /// closer to the LRU head) and applies `B1`/`B2` ghost-history feedback to `target_t1_size`.
+    pub fn on_keys_created(&mut self, keys: &[u64]) {
+        for &key in keys.iter().rev() {
+            if self.t1.shift_remove(&key).is_some() || self.t2.shift_remove(&key).is_some() {
+                self.t2.insert(key, ());
+            } else if self.b1.contains_key(&key) {
+                let delta = Self::adaptation_delta(self.b1.len(), self.b2.len());
+                self.target_t1_size = (self.target_t1_size + delta).min(self.capacity as f64);
+                self.b1.shift_remove(&key);
+                self.t2.insert(key, ());
+            } else if self.b2.contains_key(&key) {
+                let delta = Self::adaptation_delta(self.b2.len(), self.b1.len());
+                self.target_t1_size = (self.target_t1_size - delta).max(0.0);
+                self.b2.shift_remove(&key);
+                self.t2.insert(key, ());
+            } else {
+                self.t1.insert(key, ());
+            }
+            self.capacity = self.capacity.max(self.resident_len());
+            self.trim_ghost_lists();
+        }
+    }
+
+    /// Promotes touched resident keys from `T1` to the MRU tail of `T2`, or refreshes their
+    /// recency in `T2`.
+    pub fn on_keys_touched(&mut self, keys: &[u64]) {
+        for &key in keys.iter().rev() {
+            if self.t1.shift_remove(&key).is_some() || self.t2.shift_remove(&key).is_some() {
+                self.t2.insert(key, ());
+            }
+        }
+    }
+
+    /// Selects and evicts `expected_ratio` of resident keys into ghost history (`B1` or `B2`)
+    /// using LMCache's request-independent adaptive boundary rule (`|T1| >= int(p)`).
+    pub fn select_and_evict_victims(&mut self, expected_ratio: f64) -> Vec<u64> {
+        let resident = self.resident_len();
+        if resident == 0 {
+            return Vec::new();
+        }
+        let ratio = expected_ratio.clamp(0.0, 1.0);
+        if ratio <= 0.0 {
+            return Vec::new();
+        }
+        let target_count = ((resident as f64 * ratio) as usize).max(1);
+        self.capacity = self.capacity.max(resident);
+        self.target_t1_size = self.target_t1_size.min(self.capacity as f64);
+
+        let mut victims = Vec::with_capacity(target_count);
+        while victims.len() < target_count {
+            let prefer_t1 = self.t1.len() >= (self.target_t1_size as usize);
+            if prefer_t1 && let Some((k, _)) = self.t1.shift_remove_index(0) {
+                self.b1.insert(k, ());
+                victims.push(k);
+                continue;
+            }
+            if let Some((k, _)) = self.t2.shift_remove_index(0) {
+                self.b2.insert(k, ());
+                victims.push(k);
+                continue;
+            }
+            if let Some((k, _)) = self.t1.shift_remove_index(0) {
+                self.b1.insert(k, ());
+                victims.push(k);
+                continue;
+            }
+            break;
+        }
+        self.trim_ghost_lists();
+        victims
+    }
+}
