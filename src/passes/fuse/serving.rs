@@ -5648,3 +5648,188 @@ pub fn eliminate_implied_dependencies(dag_edges: &[Vec<usize>]) -> (Vec<Vec<usiz
 
     (reduced, eliminated_count)
 }
+
+fn extract_int_list_attr(op: &Operation, key: &str) -> Option<Vec<i64>> {
+    match op.attributes.get(key)? {
+        Attribute::DenseIntArray(v) => Some(v.clone()),
+        Attribute::Array(items) => items
+            .iter()
+            .map(|a| match a {
+                Attribute::Int(i) => Some(*i),
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    }
+}
+
+/// Coalesces groups of `stablehlo.slice` operations that partition a single static axis of a
+/// common input tensor with unit stride (`step == 1`) into a unified split specification
+/// (inspired by Modular
+/// `GraphCompiler/include/GraphCompiler/MOGGDialect/Support/SplitSlicePatterns.h`
+/// `SliceToSplitPattern`).
+///
+/// Verifies that:
+/// 1. At least 2 `stablehlo.slice` ops consume the same input tensor `X`,
+/// 2. All slices slice along the same single static dimension `slice_dim` with unit step,
+/// 3. Sorted by `start_indices[slice_dim]`, the slices are non-overlapping and contiguous from `0`
+///    to `X.shape[slice_dim]` ("Union of slices must cover all of the input"),
+///
+/// Stamps `castforge.coalesced_split_axis`, `castforge.coalesced_split_sizes`, and
+/// `castforge.coalesced_split_index` onto each slice and fuses their provenance onto the primary
+/// slice via [`stamp_fused_provenance`]. Returns the number of partitioning slice groups coalesced.
+pub fn coalesce_partitioning_slices_to_split(module: &mut Module) -> usize {
+    let mut coalesced_groups = 0usize;
+    let block_ids: Vec<_> = module.blocks.keys().collect();
+
+    for block_id in block_ids {
+        let op_ids = module.blocks[block_id].ops.clone();
+        let mut by_input: IndexMap<ValueId, Vec<OpId>> = IndexMap::new();
+
+        for &op_id in &op_ids {
+            if let Some(op) = module.ops.get(op_id)
+                && op.is_op("stablehlo", "slice")
+                && op.operands.len() == 1
+                && op.results.len() == 1
+            {
+                by_input.entry(op.operands[0]).or_default().push(op_id);
+            }
+        }
+
+        for (in_val, slice_ops) in by_input {
+            if slice_ops.len() < 2 {
+                continue;
+            }
+            let Some(in_info) = module.values.get(in_val) else {
+                continue;
+            };
+            let Type::Tensor(ref in_tt) = in_info.ty else {
+                continue;
+            };
+            let rank = in_tt.shape.len();
+            if rank == 0 {
+                continue;
+            }
+
+            let mut slice_dim_opt: Option<usize> = None;
+            // (op_id, start, size, loc)
+            let mut intervals: Vec<(OpId, i64, i64, Location)> =
+                Vec::with_capacity(slice_ops.len());
+            let mut valid = true;
+
+            for &s_id in &slice_ops {
+                let Some(s_op) = module.ops.get(s_id) else {
+                    valid = false;
+                    break;
+                };
+                if let Some(strides) = extract_int_list_attr(s_op, "strides")
+                    && strides.iter().any(|&st| st != 1)
+                {
+                    valid = false;
+                    break;
+                }
+                let Some(starts) = extract_int_list_attr(s_op, "start_indices") else {
+                    valid = false;
+                    break;
+                };
+                if starts.len() != rank {
+                    valid = false;
+                    break;
+                }
+                let res_val = s_op.results[0];
+                let Some(res_info) = module.values.get(res_val) else {
+                    valid = false;
+                    break;
+                };
+                let Type::Tensor(ref res_tt) = res_info.ty else {
+                    valid = false;
+                    break;
+                };
+                if res_tt.shape.len() != rank {
+                    valid = false;
+                    break;
+                }
+
+                let mut diff_dims = Vec::new();
+                for d in 0..rank {
+                    if in_tt.shape[d] != res_tt.shape[d] || starts[d] != 0 {
+                        diff_dims.push(d);
+                    }
+                }
+                if diff_dims.len() != 1 {
+                    valid = false;
+                    break;
+                }
+                let d = diff_dims[0];
+                if let Some(prev_d) = slice_dim_opt
+                    && prev_d != d
+                {
+                    valid = false;
+                    break;
+                }
+                slice_dim_opt = Some(d);
+
+                let Dim::Static(slice_len) = res_tt.shape[d] else {
+                    valid = false;
+                    break;
+                };
+                if starts[d] < 0 || slice_len <= 0 {
+                    valid = false;
+                    break;
+                }
+                intervals.push((s_id, starts[d], slice_len, s_op.location.clone()));
+            }
+
+            let Some(slice_dim) = slice_dim_opt else {
+                continue;
+            };
+            let Dim::Static(input_dim_len) = in_tt.shape[slice_dim] else {
+                continue;
+            };
+            if !valid || input_dim_len <= 0 {
+                continue;
+            }
+
+            intervals.sort_by_key(|entry| entry.1);
+
+            // Verify contiguous non-overlapping coverage from `0` to `input_dim_len`.
+            let mut cursor = 0i64;
+            for &(_, start, len, _) in &intervals {
+                if start != cursor {
+                    valid = false;
+                    break;
+                }
+                cursor += len;
+            }
+            if !valid || cursor != input_dim_len {
+                continue;
+            }
+
+            let split_sizes: Vec<i64> = intervals.iter().map(|e| e.2).collect();
+            let all_locs: Vec<Location> = intervals.iter().map(|e| e.3.clone()).collect();
+
+            for (idx, &(s_id, _, _, _)) in intervals.iter().enumerate() {
+                if let Some(op_mut) = module.ops.get_mut(s_id) {
+                    op_mut.attributes.insert(
+                        "castforge.coalesced_split_axis".to_string(),
+                        Attribute::Int(slice_dim as i64),
+                    );
+                    op_mut.attributes.insert(
+                        "castforge.coalesced_split_sizes".to_string(),
+                        Attribute::DenseIntArray(split_sizes.clone()),
+                    );
+                    op_mut.attributes.insert(
+                        "castforge.coalesced_split_index".to_string(),
+                        Attribute::Int(idx as i64),
+                    );
+                    if idx == 0 {
+                        stamp_fused_provenance(op_mut, &all_locs);
+                    }
+                }
+            }
+            coalesced_groups += 1;
+        }
+    }
+
+    coalesced_groups
+}

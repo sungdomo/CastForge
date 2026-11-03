@@ -23,11 +23,12 @@ use castforge::passes::{
     LayerGroupPayloadSharder, PassManager, PassRegistry, ROWWISE_CHEAP_OP_COST,
     ROWWISE_EXPENSIVE_OP_COST, TOKEN_WIRE_STRIDE, WarmPrefetchJobTable, WarmPrefetchStatus,
     analyze_kv_layer_groups, anonymize_symbolic_dims, await_hanging_effect_chains,
-    compress_splat_constants, decode_kv_fs_filename, decode_kv_storage_key,
-    defer_allocs_to_first_use, direct_copy_format_supported, downsample_subchunk_swa_block_ids,
-    elide_redundant_state_transfers, eliminate_implied_dependencies, encode_kv_fs_filename,
-    encode_kv_storage_key, flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps,
-    fuse_locations, fuse_reshape_epilogue, fuse_sole_use_prologues, hash_packed_token_blocks_be,
+    coalesce_partitioning_slices_to_split, compress_splat_constants, decode_kv_fs_filename,
+    decode_kv_storage_key, defer_allocs_to_first_use, direct_copy_format_supported,
+    downsample_subchunk_swa_block_ids, elide_redundant_state_transfers,
+    eliminate_implied_dependencies, encode_kv_fs_filename, encode_kv_storage_key,
+    flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
+    fuse_reshape_epilogue, fuse_sole_use_prologues, hash_packed_token_blocks_be,
     hash_prefix_token_blocks, hoist_exec_invariant_ops, hoist_symbolic_dim_expressions,
     is_supported_arch_dtype, legalize_rowwise_reduction_launch, longest_full_attention_hit,
     longest_joint_prefix_hit, longest_sliding_window_hit, mark_cuda_graph_stable_tensors,
@@ -2257,4 +2258,67 @@ fn test_eliminate_implied_dependencies_transitive_reduction_and_cycle_safety() {
     let cyclic = vec![vec![1], vec![0]];
     let (_, cyc_elim) = eliminate_implied_dependencies(&cyclic);
     assert_eq!(cyc_elim, 2);
+}
+
+#[test]
+fn test_coalesce_partitioning_slices_to_split_contiguity_and_ordering() {
+    use castforge::ir::Attribute;
+
+    // `%x` has shape `tensor<4x16xf32>`. Three out-of-order slices along dim 1:
+    // - `%s_mid`: [0..4, 4..12] (size 8, start 4)
+    // - `%s_hi`:  [0..4, 12..16] (size 4, start 12)
+    // - `%s_lo`:  [0..4, 0..4] (size 4, start 0)
+    // Together they partition dim 1 (`4 + 8 + 4 = 16`)!
+    let mlir = r#"
+module @slice_to_split {
+  func.func @main(%x: tensor<4x16xf32>) -> tensor<4x4xf32> {
+    %s_mid = stablehlo.slice %x
+      {start_indices = [0, 4], limit_indices = [4, 12], strides = [1, 1]}
+      : (tensor<4x16xf32>) -> tensor<4x8xf32>
+    %s_hi = stablehlo.slice %x
+      {start_indices = [0, 12], limit_indices = [4, 16], strides = [1, 1]}
+      : (tensor<4x16xf32>) -> tensor<4x4xf32>
+    %s_lo = stablehlo.slice %x
+      {start_indices = [0, 0], limit_indices = [4, 4], strides = [1, 1]}
+      : (tensor<4x16xf32>) -> tensor<4x4xf32>
+    %out = stablehlo.add %s_lo, %s_hi : tensor<4x4xf32>
+    return %out : tensor<4x4xf32>
+  }
+}
+"#;
+    let mut module = parse_mlir(mlir).expect("valid MLIR");
+    let groups = coalesce_partitioning_slices_to_split(&mut module);
+    assert_eq!(groups, 1);
+
+    let func_id = module.functions()[0];
+    let func_block = module.regions[module.ops[func_id].regions[0]].blocks[0];
+    let ops = &module.blocks[func_block].ops;
+
+    // `%s_lo` (`ops[2]`) has `start = 0` -> sorted split index 0, sizes `[4, 8, 4]`
+    // `%s_mid` (`ops[0]`) has `start = 4` -> sorted split index 1
+    // `%s_hi` (`ops[1]`) has `start = 12` -> sorted split index 2
+    assert_eq!(
+        module.ops[ops[2]]
+            .attributes
+            .get("castforge.coalesced_split_index"),
+        Some(&Attribute::Int(0))
+    );
+    assert_eq!(
+        module.ops[ops[0]]
+            .attributes
+            .get("castforge.coalesced_split_index"),
+        Some(&Attribute::Int(1))
+    );
+    assert_eq!(
+        module.ops[ops[1]]
+            .attributes
+            .get("castforge.coalesced_split_index"),
+        Some(&Attribute::Int(2))
+    );
+    assert_eq!(
+        module.ops[ops[2]]
+            .attributes
+            .get("castforge.coalesced_split_sizes"),
+        Some(&Attribute::DenseIntArray(vec![4, 8, 4]))
+    );
 }
