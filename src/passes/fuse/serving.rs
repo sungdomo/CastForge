@@ -14848,3 +14848,207 @@ pub fn infer_and_propagate_tensor_layouts(
 
     Ok(inferred)
 }
+
+// ============================================================================
+// Batch 17 Step 5: Bottom-Up Call-Graph Slot-Index Globalizer
+// ============================================================================
+
+/// Extracts a non-negative integer attribute (handling both `Attribute::Int` and typed integer
+/// `Attribute::Opaque` such as `"4 : i64"`).
+fn extract_u64_attr(attr: &Attribute) -> Option<u64> {
+    match attr {
+        Attribute::Int(n) if *n >= 0 => Some(*n as u64),
+        Attribute::Opaque(s) | Attribute::String(s) => s
+            .split(':')
+            .next()
+            .and_then(|head| head.trim().parse::<u64>().ok()),
+        _ => None,
+    }
+}
+/// Extracts a clean symbol name (stripping any leading `'@'`) from an attribute value.
+fn extract_symbol_attr(attr: &Attribute) -> Option<String> {
+    match attr {
+        Attribute::String(s) | Attribute::SymbolRef(s) => {
+            Some(s.trim_start_matches('@').to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Traverses the module's function/model call graph in bottom-up post-order, computing each
+/// model's local slot usage from its `mgp.context.create` `"num_slots"` attribute and assigning
+/// cumulative subgraph slot offsets to every `mgp.call` / `func.call` site (`"slot_offset"`,
+/// `"is_globalized_index" = true`, and a preceding `index.constant` operand). Returns the
+/// globalized slot count per function symbol.
+pub fn globalize_call_graph_slot_indices(
+    module: &mut Module,
+) -> Result<IndexMap<String, u64>, String> {
+    let func_ids = module.functions();
+    if func_ids.len() <= 1 {
+        let mut single = IndexMap::new();
+        if let Some(&f_id) = func_ids.first()
+            && let Some(sym) = module.ops[f_id]
+                .attributes
+                .get("sym_name")
+                .and_then(extract_symbol_attr)
+        {
+            single.insert(sym, 0);
+        }
+        return Ok(single);
+    }
+
+    let mut sym_to_func: IndexMap<String, OpId> = IndexMap::new();
+    let mut local_slots: IndexMap<String, u64> = IndexMap::new();
+    let mut ctx_create_op: IndexMap<String, OpId> = IndexMap::new();
+    let mut callsites_by_caller: IndexMap<String, Vec<(BlockId, OpId, String)>> = IndexMap::new();
+
+    for &f_id in &func_ids {
+        let Some(sym) = module.ops[f_id]
+            .attributes
+            .get("sym_name")
+            .and_then(extract_symbol_attr)
+        else {
+            continue;
+        };
+        sym_to_func.insert(sym.clone(), f_id);
+        let mut found_ctx: Option<(OpId, u64)> = None;
+        let mut calls: Vec<(BlockId, OpId, String)> = Vec::new();
+
+        for &reg_id in &module.ops[f_id].regions {
+            let blocks = module.regions[reg_id].blocks.clone();
+            for blk_id in blocks {
+                for &op_id in &module.blocks[blk_id].ops {
+                    let op = &module.ops[op_id];
+                    let full = op.name.full_name();
+                    if full == "mgp.context.create" {
+                        let slots = op
+                            .attributes
+                            .get("num_slots")
+                            .and_then(extract_u64_attr)
+                            .unwrap_or(0);
+                        found_ctx = Some((op_id, slots));
+                    } else if (full == "mgp.call" || full == "func.call")
+                        && let Some(callee) = op
+                            .attributes
+                            .get("callee")
+                            .or_else(|| op.attributes.get("fn"))
+                            .and_then(extract_symbol_attr)
+                    {
+                        calls.push((blk_id, op_id, callee));
+                    }
+                }
+            }
+        }
+
+        let Some((c_op, slots)) = found_ctx else {
+            return Err(format!(
+                "globalize_call_graph_slot_indices: unable to find mgp.context.create in '@{sym}'"
+            ));
+        };
+        local_slots.insert(sym.clone(), slots);
+        ctx_create_op.insert(sym.clone(), c_op);
+        callsites_by_caller.insert(sym, calls);
+    }
+
+    // Build bottom-up post-order over the call graph (detecting cycles).
+    fn dfs_postorder(
+        sym: &str,
+        callsites: &IndexMap<String, Vec<(BlockId, OpId, String)>>,
+        state: &mut IndexMap<String, u8>,
+        order: &mut Vec<String>,
+    ) -> Result<(), String> {
+        match state.get(sym).copied() {
+            Some(2) => return Ok(()),
+            Some(1) => {
+                return Err(format!(
+                    "globalize_call_graph_slot_indices: cycle in call graph at '@{sym}'"
+                ));
+            }
+            _ => {}
+        }
+        state.insert(sym.to_string(), 1);
+        if let Some(edges) = callsites.get(sym) {
+            for (_, _, callee) in edges {
+                if callsites.contains_key(callee) {
+                    dfs_postorder(callee, callsites, state, order)?;
+                }
+            }
+        }
+        state.insert(sym.to_string(), 2);
+        order.push(sym.to_string());
+        Ok(())
+    }
+
+    let mut visit_state: IndexMap<String, u8> = IndexMap::new();
+    let mut bottom_up_order: Vec<String> = Vec::new();
+    let all_syms: Vec<String> = sym_to_func.keys().cloned().collect();
+    for sym in &all_syms {
+        dfs_postorder(
+            sym,
+            &callsites_by_caller,
+            &mut visit_state,
+            &mut bottom_up_order,
+        )?;
+    }
+
+    let mut total_slots: IndexMap<String, u64> = local_slots.clone();
+
+    for sym in bottom_up_order {
+        let mut running_slots = local_slots[&sym];
+        let edges = callsites_by_caller.get(&sym).cloned().unwrap_or_default();
+        for (blk_id, call_op_id, callee) in edges {
+            let callee_slots = total_slots.get(&callee).copied().unwrap_or(0);
+            let offset = running_slots;
+            running_slots = running_slots.saturating_add(callee_slots);
+
+            let loc = module.ops[call_op_id].location.clone();
+            let mut const_attrs = IndexMap::new();
+            const_attrs.insert("value".to_string(), Attribute::Int(offset as i64));
+            let const_op = module.ops.insert_with_key(|id| Operation {
+                id,
+                name: OpName::new("index", "constant"),
+                operands: SmallVec::new(),
+                results: SmallVec::new(),
+                attributes: const_attrs,
+                regions: Vec::new(),
+                custom_syntax: false,
+                location: loc,
+            });
+            let idx_val = module.values.insert_with_key(|id| Value {
+                id,
+                ssa_name: None,
+                ty: Type::Scalar(DType::I64),
+                def: ValueDef::OpResult {
+                    op: const_op,
+                    index: 0,
+                },
+            });
+            module.ops[const_op].results.push(idx_val);
+
+            if let Some(pos) = module.blocks[blk_id]
+                .ops
+                .iter()
+                .position(|&id| id == call_op_id)
+            {
+                module.blocks[blk_id].ops.insert(pos, const_op);
+            }
+            module.ops[call_op_id].operands.push(idx_val);
+            module.ops[call_op_id]
+                .attributes
+                .insert("slot_offset".to_string(), Attribute::Int(offset as i64));
+            module.ops[call_op_id]
+                .attributes
+                .insert("is_globalized_index".to_string(), Attribute::Bool(true));
+        }
+
+        total_slots.insert(sym.clone(), running_slots);
+        if let Some(&c_op) = ctx_create_op.get(&sym) {
+            module.ops[c_op].attributes.insert(
+                "globalized_num_slots".to_string(),
+                Attribute::Int(running_slots as i64),
+            );
+        }
+    }
+
+    Ok(total_slots)
+}

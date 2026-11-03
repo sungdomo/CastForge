@@ -4630,3 +4630,55 @@ fn test_infer_and_propagate_tensor_layouts_and_conflict_detection() {
     let err = infer_and_propagate_tensor_layouts(&mut m_conflict).unwrap_err();
     assert!(err.contains("already constrained 'FCRS'"));
 }
+
+#[test]
+fn test_globalize_call_graph_slot_indices_bottom_up() {
+    use castforge::ir::mlir::Attribute;
+    use castforge::passes::globalize_call_graph_slot_indices;
+
+    // Call hierarchy:
+    //   @entry (local slots = 4)
+    //     -> calls @mid (local slots = 3, calls @leaf with local slots = 5 => total @mid = 8)
+    //        at offset 4
+    //     -> calls @leaf (total @leaf = 5) at offset 4 + 8 = 12
+    //   => total @entry = 17
+    let mlir = concat!(
+        "module @slot_globalize {\n",
+        "  func.func @entry(%x: tensor<4xf32>) -> tensor<4xf32> {\n",
+        "    %ctx0 = mgp.context.create {num_slots = 4 : i64} : () -> tensor<1xi64>\n",
+        "    %a = mgp.call %x {callee = \"@mid\"} : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %b = mgp.call %a {callee = \"@leaf\"} : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %b : tensor<4xf32>\n",
+        "  }\n",
+        "  func.func @mid(%x: tensor<4xf32>) -> tensor<4xf32> {\n",
+        "    %ctx1 = mgp.context.create {num_slots = 3 : i64} : () -> tensor<1xi64>\n",
+        "    %y = mgp.call %x {callee = \"@leaf\"} : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %y : tensor<4xf32>\n",
+        "  }\n",
+        "  func.func @leaf(%x: tensor<4xf32>) -> tensor<4xf32> {\n",
+        "    %ctx2 = mgp.context.create {num_slots = 5 : i64} : () -> tensor<1xi64>\n",
+        "    return %x : tensor<4xf32>\n",
+        "  }\n",
+        "}\n",
+    );
+
+    let mut m = parse_mlir(mlir).expect("valid MLIR");
+    let totals = globalize_call_graph_slot_indices(&mut m).expect("valid call graph");
+    assert_eq!(totals.get("leaf"), Some(&5));
+    assert_eq!(totals.get("mid"), Some(&8));
+    assert_eq!(totals.get("entry"), Some(&17));
+
+    // Check @entry's two `mgp.call` ops received `slot_offset = 4` and `slot_offset = 12`:
+    let entry_func = m.functions()[0];
+    let entry_blk = m.regions[m.ops[entry_func].regions[0]].blocks[0];
+    let call_offsets: Vec<i64> = m.blocks[entry_blk]
+        .ops
+        .iter()
+        .filter(|&&op_id| m.ops[op_id].name.full_name() == "mgp.call")
+        .filter_map(|&op_id| match m.ops[op_id].attributes.get("slot_offset") {
+            Some(Attribute::Int(v)) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(call_offsets, vec![4, 12]);
+}
