@@ -23392,3 +23392,453 @@ pub fn conform_call_operands(module: &mut Module) -> Result<usize, String> {
 
     Ok(conformed_calls)
 }
+
+/// Outlines each `castforge.routine` (`mogg.routine`) body into a module-level `func.func` stub
+/// (labeled with `"abi" = "runtime"`) while keeping the `routine` container at the call site:
+/// - Any `castforge.buffer.constant` (`mogg.buffer.constant`) ops inside the routine body are moved
+///   to the rebuilt routine body at the call site, and their uses inside the outlined stub are
+///   replaced by trailing `!castforge.pointer` block arguments.
+/// - Rebuilds the routine's body as those hoisted buffer constants followed by a single
+///   `castforge.call` forwarding fresh block arguments plus the constant pointers to the new stub.
+pub fn outline_routines(module: &mut Module) -> usize {
+    use crate::ir::mlir::{Block, OpName, Region};
+    use std::collections::{HashMap, HashSet};
+
+    let Some(root_reg) = module.regions.get(module.root_region) else {
+        return 0;
+    };
+    let Some(&root_blk) = root_reg.blocks.first() else {
+        return 0;
+    };
+
+    let mut used_syms: HashSet<String> = HashSet::new();
+    for &op_id in &module.blocks[root_blk].ops {
+        if let Some(s) = module.ops[op_id]
+            .attributes
+            .get("sym_name")
+            .and_then(|a| a.as_str())
+        {
+            used_syms.insert(s.to_string());
+        }
+    }
+
+    let mut outlined = 0usize;
+    let func_ids = module.functions();
+    let mut new_stubs: Vec<OpId> = Vec::new();
+
+    for func_id in func_ids {
+        let regions = module.ops[func_id].regions.clone();
+        for reg_id in regions {
+            let blocks = module.regions[reg_id].blocks.clone();
+            for blk_id in blocks {
+                let ops = module.blocks[blk_id].ops.clone();
+                for op_id in ops {
+                    let full = module.ops[op_id].name.full_name();
+                    if full != "castforge.routine" && full != "mogg.routine" {
+                        continue;
+                    }
+                    if module.ops[op_id].regions.is_empty() {
+                        continue;
+                    }
+                    let body_reg = module.ops[op_id].regions[0];
+                    if module.regions[body_reg].blocks.is_empty() {
+                        continue;
+                    }
+                    let body_blk = module.regions[body_reg].blocks[0];
+                    let body_ops = module.blocks[body_blk].ops.clone();
+                    let orig_args = module.blocks[body_blk].arguments.clone();
+                    let arg_types: Vec<Type> = orig_args
+                        .iter()
+                        .map(|&v| module.values[v].ty.clone())
+                        .collect();
+                    let loc = module.ops[op_id].location.clone();
+                    let ptr_ty = Type::Opaque("!castforge.pointer".to_string());
+
+                    // Partition `buffer.constant` ops from the rest of the routine body.
+                    let mut const_ops: Vec<OpId> = Vec::new();
+                    let mut stub_ops: Vec<OpId> = Vec::new();
+                    let mut const_val_to_arg: HashMap<ValueId, ValueId> = HashMap::new();
+
+                    for &b_op in &body_ops {
+                        let b_name = module.ops[b_op].name.full_name();
+                        if (b_name == "castforge.buffer.constant"
+                            || b_name == "mogg.buffer.constant")
+                            && let Some(&c_res) = module.ops[b_op].results.first()
+                        {
+                            let new_idx = module.blocks[body_blk].arguments.len() as u32;
+                            let trailing_arg = module.values.insert_with_key(|vid| Value {
+                                id: vid,
+                                ssa_name: None,
+                                ty: ptr_ty.clone(),
+                                def: ValueDef::BlockArgument {
+                                    block: body_blk,
+                                    index: new_idx,
+                                },
+                            });
+                            module.blocks[body_blk].arguments.push(trailing_arg);
+                            const_val_to_arg.insert(c_res, trailing_arg);
+                            const_ops.push(b_op);
+                        } else {
+                            stub_ops.push(b_op);
+                        }
+                    }
+
+                    // Rewrite uses of hoisted constant values inside `stub_ops` to trailing args.
+                    for &s_op in &stub_ops {
+                        for opd in module.ops[s_op].operands.iter_mut() {
+                            if let Some(&rep) = const_val_to_arg.get(opd) {
+                                *opd = rep;
+                            }
+                        }
+                    }
+
+                    // Check if stub_ops ends with a terminator (`mogg.output`, `castforge.output`,
+                    // or `func.return`), or cap it with `castforge.output`.
+                    let mut stub_res_types: Vec<Type> = Vec::new();
+                    let has_terminator = stub_ops.last().is_some_and(|&last_op| {
+                        let n = module.ops[last_op].name.full_name();
+                        n == "mogg.output" || n == "castforge.output" || n == "func.return"
+                    });
+                    if has_terminator {
+                        let term = *stub_ops.last().unwrap();
+                        stub_res_types = module.ops[term]
+                            .operands
+                            .iter()
+                            .map(|&v| module.values[v].ty.clone())
+                            .collect();
+                    } else {
+                        let out_loc = loc.clone();
+                        let out_op = module.ops.insert_with_key(|oid| Operation {
+                            id: oid,
+                            name: OpName::new("castforge", "output"),
+                            operands: SmallVec::new(),
+                            results: SmallVec::new(),
+                            attributes: IndexMap::new(),
+                            regions: Vec::new(),
+                            custom_syntax: false,
+                            location: out_loc,
+                        });
+                        stub_ops.push(out_op);
+                    }
+                    module.blocks[body_blk].ops = stub_ops;
+
+                    let stub_arg_types: Vec<Type> = module.blocks[body_blk]
+                        .arguments
+                        .iter()
+                        .map(|&v| module.values[v].ty.clone())
+                        .collect();
+
+                    let fusion_info = module.ops[op_id]
+                        .attributes
+                        .get("fusion_info")
+                        .and_then(|a| a.as_str())
+                        .unwrap_or("routine")
+                        .to_string();
+                    let base_sym = format!("__{}", fusion_info.trim_start_matches('_'));
+                    let mut stub_sym = base_sym.clone();
+                    let mut suffix = 0usize;
+                    while used_syms.contains(&stub_sym) {
+                        suffix += 1;
+                        stub_sym = format!("{base_sym}_{suffix}");
+                    }
+                    used_syms.insert(stub_sym.clone());
+
+                    let device_label = module.ops[op_id]
+                        .attributes
+                        .get("device_ref")
+                        .and_then(|a| a.as_str())
+                        .map(|s| s.split_once(':').map(|(l, _)| l).unwrap_or(s).to_string())
+                        .unwrap_or_else(|| "cpu".to_string());
+
+                    let stub_loc = loc.clone();
+                    let stub_fn_ty = Type::Function {
+                        inputs: stub_arg_types,
+                        results: stub_res_types.clone(),
+                    };
+                    let stub_id = module.ops.insert_with_key(|oid| Operation {
+                        id: oid,
+                        name: OpName::new("func", "func"),
+                        operands: SmallVec::new(),
+                        results: SmallVec::new(),
+                        attributes: {
+                            let mut a = IndexMap::new();
+                            a.insert("sym_name".to_string(), Attribute::String(stub_sym.clone()));
+                            a.insert("function_type".to_string(), Attribute::Type(stub_fn_ty));
+                            a.insert("fusion_info".to_string(), Attribute::String(fusion_info));
+                            a.insert("abi".to_string(), Attribute::String("runtime".to_string()));
+                            a.insert("device".to_string(), Attribute::String(device_label));
+                            a.insert(
+                                "constant_resources".to_string(),
+                                Attribute::Array(Vec::new()),
+                            );
+                            a
+                        },
+                        regions: vec![body_reg],
+                        custom_syntax: true,
+                        location: stub_loc,
+                    });
+                    new_stubs.push(stub_id);
+
+                    // Rebuild the `routine` body with fresh block args, hoisted constants, and
+                    // a single `castforge.call` to `stub_sym`.
+                    let call_blk = module.blocks.insert_with_key(|bid| Block {
+                        id: bid,
+                        label: None,
+                        arguments: Vec::new(),
+                        ops: Vec::new(),
+                    });
+                    let mut forwarded: SmallVec<[ValueId; 4]> = SmallVec::new();
+                    for (idx, ty) in arg_types.into_iter().enumerate() {
+                        let av = module.values.insert_with_key(|vid| Value {
+                            id: vid,
+                            ssa_name: None,
+                            ty,
+                            def: ValueDef::BlockArgument {
+                                block: call_blk,
+                                index: idx as u32,
+                            },
+                        });
+                        module.blocks[call_blk].arguments.push(av);
+                        forwarded.push(av);
+                    }
+                    let mut call_blk_ops: Vec<OpId> = Vec::new();
+                    for c_op in const_ops {
+                        call_blk_ops.push(c_op);
+                        if let Some(&c_res) = module.ops[c_op].results.first() {
+                            forwarded.push(c_res);
+                        }
+                    }
+                    let call_loc = loc.clone();
+                    let call_id = module.ops.insert_with_key(|oid| Operation {
+                        id: oid,
+                        name: OpName::new("castforge", "call"),
+                        operands: forwarded,
+                        results: SmallVec::new(),
+                        attributes: {
+                            let mut a = IndexMap::new();
+                            a.insert("callee".to_string(), Attribute::SymbolRef(stub_sym));
+                            a
+                        },
+                        regions: Vec::new(),
+                        custom_syntax: false,
+                        location: call_loc,
+                    });
+                    for (r_idx, r_ty) in stub_res_types.into_iter().enumerate() {
+                        let rv = module.values.insert_with_key(|vid| Value {
+                            id: vid,
+                            ssa_name: None,
+                            ty: r_ty,
+                            def: ValueDef::OpResult {
+                                op: call_id,
+                                index: r_idx as u32,
+                            },
+                        });
+                        module.ops[call_id].results.push(rv);
+                    }
+                    call_blk_ops.push(call_id);
+                    module.blocks[call_blk].ops = call_blk_ops;
+
+                    let call_reg = module.regions.insert_with_key(|rid| Region {
+                        id: rid,
+                        blocks: vec![call_blk],
+                    });
+                    module.ops[op_id].regions = vec![call_reg];
+                    outlined += 1;
+                }
+            }
+        }
+    }
+
+    module.blocks[root_blk].ops.extend(new_stubs);
+    outlined
+}
+
+/// Outlines each `castforge.routine.async` (`mogg.routine.async`) op into a module-level
+/// `func.func` stub (`"abi" = "graph"`) named `__<callees>_async` (or `__primitive_<N>_async` when
+/// the region contains no inner calls), and replaces the `routine.async` op at the call site with a
+/// `castforge.compiled_call` (`"callee_symbol" = @<stub_name>`) forwarding its operands, fusion
+/// info, dispatch kind, constant resources, and device reference.
+pub fn outline_async_routines(module: &mut Module) -> usize {
+    use crate::ir::mlir::OpName;
+    use std::collections::HashSet;
+
+    let Some(root_reg) = module.regions.get(module.root_region) else {
+        return 0;
+    };
+    let Some(&root_blk) = root_reg.blocks.first() else {
+        return 0;
+    };
+
+    let mut used_syms: HashSet<String> = HashSet::new();
+    for &op_id in &module.blocks[root_blk].ops {
+        if let Some(s) = module.ops[op_id]
+            .attributes
+            .get("sym_name")
+            .and_then(|a| a.as_str())
+        {
+            used_syms.insert(s.to_string());
+        }
+    }
+
+    let mut stub_number = 0usize;
+    let mut outlined = 0usize;
+    let func_ids = module.functions();
+    let mut new_stubs: Vec<OpId> = Vec::new();
+
+    for func_id in func_ids {
+        let regions = module.ops[func_id].regions.clone();
+        for reg_id in regions {
+            let blocks = module.regions[reg_id].blocks.clone();
+            for blk_id in blocks {
+                let orig_ops = module.blocks[blk_id].ops.clone();
+                let mut updated_ops: Vec<OpId> = Vec::with_capacity(orig_ops.len());
+
+                for &op_id in &orig_ops {
+                    let full = module.ops[op_id].name.full_name();
+                    if full != "castforge.routine.async" && full != "mogg.routine.async" {
+                        updated_ops.push(op_id);
+                        continue;
+                    }
+                    if module.ops[op_id].regions.is_empty() {
+                        updated_ops.push(op_id);
+                        continue;
+                    }
+                    let body_reg = module.ops[op_id].regions[0];
+                    if module.regions[body_reg].blocks.is_empty() {
+                        updated_ops.push(op_id);
+                        continue;
+                    }
+                    let body_blk = module.regions[body_reg].blocks[0];
+
+                    // Collect callees inside `body_blk` in call order.
+                    let mut callees: Vec<String> = Vec::new();
+                    for &b_op in &module.blocks[body_blk].ops {
+                        if let Some(c) = module.ops[b_op]
+                            .attributes
+                            .get("callee")
+                            .or_else(|| module.ops[b_op].attributes.get("callee_symbol"))
+                            .and_then(|a| a.as_str())
+                        {
+                            callees.push(
+                                c.trim_start_matches('@')
+                                    .trim_start_matches('_')
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    let base_part = if callees.is_empty() {
+                        format!("primitive_{stub_number}")
+                    } else {
+                        callees.join("_")
+                    };
+                    stub_number += 1;
+                    let base_sym = format!("__{base_part}_async");
+                    let mut stub_sym = base_sym.clone();
+                    let mut suffix = 0usize;
+                    while used_syms.contains(&stub_sym) {
+                        suffix += 1;
+                        stub_sym = format!("{base_sym}_{suffix}");
+                    }
+                    used_syms.insert(stub_sym.clone());
+
+                    let arg_tys: Vec<Type> = module.blocks[body_blk]
+                        .arguments
+                        .iter()
+                        .map(|&v| module.values[v].ty.clone())
+                        .collect();
+                    let res_tys: Vec<Type> = module.ops[op_id]
+                        .results
+                        .iter()
+                        .map(|&v| module.values[v].ty.clone())
+                        .collect();
+
+                    let fusion_info = module.ops[op_id]
+                        .attributes
+                        .get("fusion_info")
+                        .or_else(|| module.ops[op_id].attributes.get("summary"))
+                        .and_then(|a| a.as_str())
+                        .unwrap_or(&stub_sym)
+                        .to_string();
+                    let dispatch_attr = module.ops[op_id].attributes.get("dispatch").cloned();
+                    let const_res_attr = module.ops[op_id]
+                        .attributes
+                        .get("constant_resources")
+                        .cloned()
+                        .unwrap_or_else(|| Attribute::Array(Vec::new()));
+                    let dev_ref = module.ops[op_id]
+                        .attributes
+                        .get("device_ref")
+                        .and_then(|a| a.as_str())
+                        .unwrap_or("cpu:0")
+                        .to_string();
+                    let dev_label = dev_ref
+                        .split_once(':')
+                        .map(|(l, _)| l)
+                        .unwrap_or(&dev_ref)
+                        .to_string();
+                    let loc = module.ops[op_id].location.clone();
+
+                    let stub_loc = loc.clone();
+                    let stub_fn_ty = Type::Function {
+                        inputs: arg_tys,
+                        results: res_tys.clone(),
+                    };
+                    let mut stub_attrs = IndexMap::new();
+                    stub_attrs.insert("sym_name".to_string(), Attribute::String(stub_sym.clone()));
+                    stub_attrs.insert("function_type".to_string(), Attribute::Type(stub_fn_ty));
+                    stub_attrs.insert(
+                        "fusion_info".to_string(),
+                        Attribute::String(fusion_info.clone()),
+                    );
+                    if let Some(d) = dispatch_attr.clone() {
+                        stub_attrs.insert("dispatch".to_string(), d);
+                    }
+                    stub_attrs.insert("constant_resources".to_string(), const_res_attr.clone());
+                    stub_attrs.insert("abi".to_string(), Attribute::String("graph".to_string()));
+                    stub_attrs.insert("device".to_string(), Attribute::String(dev_label));
+
+                    let stub_id = module.ops.insert_with_key(|oid| Operation {
+                        id: oid,
+                        name: OpName::new("func", "func"),
+                        operands: SmallVec::new(),
+                        results: SmallVec::new(),
+                        attributes: stub_attrs,
+                        regions: vec![body_reg],
+                        custom_syntax: true,
+                        location: stub_loc,
+                    });
+                    new_stubs.push(stub_id);
+
+                    // Replace `routine.async` in-place with `castforge.compiled_call`.
+                    module.ops[op_id].name = OpName::new("castforge", "compiled_call");
+                    module.ops[op_id].regions.clear();
+                    module.ops[op_id]
+                        .attributes
+                        .insert("callee_symbol".to_string(), Attribute::SymbolRef(stub_sym));
+                    module.ops[op_id]
+                        .attributes
+                        .insert("fusion_info".to_string(), Attribute::String(fusion_info));
+                    module.ops[op_id]
+                        .attributes
+                        .insert("constant_resources".to_string(), const_res_attr);
+                    module.ops[op_id]
+                        .attributes
+                        .insert("device_ref".to_string(), Attribute::String(dev_ref));
+                    updated_ops.push(op_id);
+                    outlined += 1;
+                }
+
+                module.blocks[blk_id].ops = updated_ops;
+            }
+        }
+    }
+
+    // Insert new async stubs at the start of the module root block.
+    if !new_stubs.is_empty() {
+        let mut combined = new_stubs;
+        combined.extend(module.blocks[root_blk].ops.iter().copied());
+        module.blocks[root_blk].ops = combined;
+    }
+
+    outlined
+}

@@ -7134,3 +7134,161 @@ fn test_conform_call_operands_scalar_variadic_trait_and_unfused_epilogue_bypass(
             .any(|&id| m.ops[id].is_op("castforge", "scalar.create"))
     );
 }
+
+#[test]
+fn test_outline_routines_and_outline_async_routines() {
+    use castforge::ir::{
+        Attribute, Block, DType, Dim, Location, OpName, Operation, Region, TensorType, Type, Value,
+        ValueDef,
+    };
+    use castforge::passes::{outline_async_routines, outline_routines};
+    use indexmap::IndexMap;
+    use smallvec::SmallVec;
+
+    let mlir_src = concat!(
+        "module {\n",
+        "  func.func @main(%x: tensor<4xf32>) -> tensor<4xf32> {\n",
+        "    %r = \"castforge.routine\"(%x) {fusion_info = \"relu_add\", device_ref = \"gpu:0\"}",
+        " : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %a = \"castforge.routine.async\"(%r)",
+        " {summary = \"async_norm\", dispatch = \"deferred\", device_ref = \"gpu:0\"}",
+        " : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %a : tensor<4xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(mlir_src).expect("valid mlir");
+    let main_id = m.functions()[0];
+    let main_blk = m.regions[m.ops[main_id].regions[0]].blocks[0];
+    let routine_op = m.blocks[main_blk].ops[0];
+    let async_op = m.blocks[main_blk].ops[1];
+    let f32_ty = Type::Tensor(TensorType::new(vec![Dim::Static(4)], DType::F32));
+
+    // Populate `routine` body with block arg `%in0`, a `castforge.buffer.constant`, and an add op:
+    let r_blk = m.blocks.insert_with_key(|id| Block {
+        id,
+        label: None,
+        arguments: Vec::new(),
+        ops: Vec::new(),
+    });
+    let r_arg = m.values.insert_with_key(|id| Value {
+        id,
+        ssa_name: None,
+        ty: f32_ty.clone(),
+        def: ValueDef::BlockArgument {
+            block: r_blk,
+            index: 0,
+        },
+    });
+    m.blocks[r_blk].arguments.push(r_arg);
+    let buf_cst = m.ops.insert_with_key(|id| Operation {
+        id,
+        name: OpName::new("castforge", "buffer.constant"),
+        operands: SmallVec::new(),
+        results: SmallVec::new(),
+        attributes: IndexMap::new(),
+        regions: Vec::new(),
+        custom_syntax: false,
+        location: Location::Unknown,
+    });
+    let cst_val = m.values.insert_with_key(|id| Value {
+        id,
+        ssa_name: None,
+        ty: f32_ty.clone(),
+        def: ValueDef::OpResult {
+            op: buf_cst,
+            index: 0,
+        },
+    });
+    m.ops[buf_cst].results.push(cst_val);
+    let add_op = m.ops.insert_with_key(|id| Operation {
+        id,
+        name: OpName::new("stablehlo", "add"),
+        operands: SmallVec::from_slice(&[r_arg, cst_val]),
+        results: SmallVec::new(),
+        attributes: IndexMap::new(),
+        regions: Vec::new(),
+        custom_syntax: false,
+        location: Location::Unknown,
+    });
+    let add_val = m.values.insert_with_key(|id| Value {
+        id,
+        ssa_name: None,
+        ty: f32_ty.clone(),
+        def: ValueDef::OpResult {
+            op: add_op,
+            index: 0,
+        },
+    });
+    m.ops[add_op].results.push(add_val);
+    m.blocks[r_blk].ops = vec![buf_cst, add_op];
+    let r_reg = m.regions.insert_with_key(|id| Region {
+        id,
+        blocks: vec![r_blk],
+    });
+    m.ops[routine_op].regions = vec![r_reg];
+
+    // Populate `routine.async` body with a call to `@__relu_add`:
+    let a_blk = m.blocks.insert_with_key(|id| Block {
+        id,
+        label: None,
+        arguments: Vec::new(),
+        ops: Vec::new(),
+    });
+    let a_arg = m.values.insert_with_key(|id| Value {
+        id,
+        ssa_name: None,
+        ty: f32_ty,
+        def: ValueDef::BlockArgument {
+            block: a_blk,
+            index: 0,
+        },
+    });
+    m.blocks[a_blk].arguments.push(a_arg);
+    let inner_call = m.ops.insert_with_key(|id| Operation {
+        id,
+        name: OpName::new("castforge", "call"),
+        operands: SmallVec::from_slice(&[a_arg]),
+        results: SmallVec::new(),
+        attributes: {
+            let mut a = IndexMap::new();
+            a.insert(
+                "callee".to_string(),
+                Attribute::SymbolRef("__relu_add".to_string()),
+            );
+            a
+        },
+        regions: Vec::new(),
+        custom_syntax: false,
+        location: Location::Unknown,
+    });
+    m.blocks[a_blk].ops = vec![inner_call];
+    let a_reg = m.regions.insert_with_key(|id| Region {
+        id,
+        blocks: vec![a_blk],
+    });
+    m.ops[async_op].regions = vec![a_reg];
+
+    let r_outlined = outline_routines(&mut m);
+    assert_eq!(r_outlined, 1);
+
+    // Verify `routine_op` kept `buf_cst` at the call site and calls `@__relu_add`:
+    let new_r_blk = m.regions[m.ops[routine_op].regions[0]].blocks[0];
+    assert_eq!(m.blocks[new_r_blk].ops.len(), 2);
+    assert!(m.ops[m.blocks[new_r_blk].ops[0]].is_op("castforge", "buffer.constant"));
+    assert!(m.ops[m.blocks[new_r_blk].ops[1]].is_op("castforge", "call"));
+
+    let a_outlined = outline_async_routines(&mut m);
+    assert_eq!(a_outlined, 1);
+
+    // Verify `async_op` became `castforge.compiled_call` targeting `@__relu_add_async`:
+    assert!(m.ops[async_op].is_op("castforge", "compiled_call"));
+    assert_eq!(
+        m.ops[async_op]
+            .attributes
+            .get("callee_symbol")
+            .and_then(|a| a.as_str()),
+        Some("__relu_add_async")
+    );
+    assert_eq!(m.functions().len(), 3);
+}
