@@ -2,8 +2,8 @@
 
 use super::attention::*;
 use crate::ir::{
-    Attribute, BlockId, Dim, Location, Module, OpId, OpName, Operation, Type, Value, ValueDef,
-    ValueId,
+    Attribute, BlockId, DType, Dim, Location, Module, OpId, OpName, Operation, Type, Value,
+    ValueDef, ValueId,
 };
 use crate::passes::{Pass, PassResult};
 use anyhow::Result;
@@ -2610,4 +2610,100 @@ pub fn plan_cacheblend_retrieve(
         });
     }
     steps
+}
+
+fn is_narrow_float_dtype(dt: &DType) -> bool {
+    matches!(
+        dt,
+        DType::F16 | DType::BF16 | DType::F8E4M3FN | DType::F8E5M2
+    )
+}
+
+/// Ensures accumulating operations (`dot_general`, `convolution`, `reduce`, and fused GEMM
+/// composites) with narrow floating-point operands or outputs (`f16`, `bf16`, `f8E4M3FN`,
+/// `f8E5M2`) accumulate in `f32` before downcasting on epilogue store (inspired by Modular
+/// `AllocateAccumulatingBuffers.cpp`).
+///
+/// Stamps `castforge.accumulator_dtype = "f32"` (and `castforge.epilogue_downcast = "<dtype>"`
+/// when the output tensor is narrow) and returns the number of accumulating ops promoted.
+pub fn promote_narrow_accumulators(module: &mut Module) -> usize {
+    let mut promoted = 0usize;
+
+    for fn_op_id in module.functions() {
+        let Some(&reg_id) = module.ops[fn_op_id].regions.first() else {
+            continue;
+        };
+        let Some(&block_id) = module.regions[reg_id].blocks.first() else {
+            continue;
+        };
+        let ops = module.blocks[block_id].ops.clone();
+
+        for op_id in ops {
+            let Some(op) = module.ops.get(op_id) else {
+                continue;
+            };
+            if op.attributes.contains_key("castforge.accumulator_dtype") {
+                continue;
+            }
+            let is_accum_op = op.is_op("stablehlo", "dot_general")
+                || op.is_op("stablehlo", "convolution")
+                || op.is_op("stablehlo", "reduce")
+                || (op.is_op("stablehlo", "composite")
+                    && op
+                        .attributes
+                        .get("name")
+                        .and_then(|a| a.as_str())
+                        .is_some_and(|n| {
+                            matches!(
+                                n,
+                                "castforge.fused_matmul_epilogue"
+                                    | "castforge.fused_dequant_matmul"
+                                    | "castforge.fused_qmatmul"
+                            )
+                        }));
+            if !is_accum_op {
+                continue;
+            }
+
+            let has_narrow_input = op.operands.iter().any(|&v| {
+                module
+                    .values
+                    .get(v)
+                    .and_then(|val| val.ty.as_tensor())
+                    .is_some_and(|t| is_narrow_float_dtype(&t.dtype))
+            });
+            let narrow_output_dt = op.results.first().and_then(|&r| {
+                module
+                    .values
+                    .get(r)
+                    .and_then(|val| val.ty.as_tensor())
+                    .and_then(|t| {
+                        if is_narrow_float_dtype(&t.dtype) {
+                            Some(t.dtype.to_string())
+                        } else {
+                            None
+                        }
+                    })
+            });
+
+            if !has_narrow_input && narrow_output_dt.is_none() {
+                continue;
+            }
+
+            if let Some(op_mut) = module.ops.get_mut(op_id) {
+                op_mut.attributes.insert(
+                    "castforge.accumulator_dtype".to_string(),
+                    Attribute::String("f32".to_string()),
+                );
+                if let Some(down_dt) = narrow_output_dt {
+                    op_mut.attributes.insert(
+                        "castforge.epilogue_downcast".to_string(),
+                        Attribute::String(down_dt),
+                    );
+                }
+                promoted += 1;
+            }
+        }
+    }
+    promoted
 }

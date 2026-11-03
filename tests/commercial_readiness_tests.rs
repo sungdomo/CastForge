@@ -22,8 +22,8 @@ use castforge::passes::{
     fuse_sole_use_prologues, hash_prefix_token_blocks, longest_full_attention_hit,
     longest_joint_prefix_hit, longest_sliding_window_hit, mark_cuda_graph_stable_tensors,
     merge_identical_functions, plan_cacheblend_retrieve, plan_jenga_kv_geometry,
-    plan_kernel_sequence_fusion, plan_kv_dma_transfer, re_rope_key_in_place,
-    stamp_fused_provenance,
+    plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
+    re_rope_key_in_place, stamp_fused_provenance,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -1154,4 +1154,31 @@ fn test_cacheblend_batched_retrieve_plan_waves_and_staging() {
     assert_eq!(steps[1].scatters.len(), 1);
     assert_eq!(steps[1].scatters[0].slot_idx, 0);
     assert_eq!(steps[1].scatters[0].n_tok, 6);
+}
+
+#[test]
+fn test_promote_narrow_accumulators_and_epilogue_downcast_codegen() {
+    let mlir = concat!(
+        "module @narrow_accum {\n",
+        "  func.func @main(%x: tensor<4x4xbf16>, %w: tensor<4x4xbf16>) -> tensor<4x4xbf16> {\n",
+        "    %0 = stablehlo.dot_general %x, %w ",
+        ": (tensor<4x4xbf16>, tensor<4x4xbf16>) -> tensor<4x4xbf16>\n",
+        "    func.return %0 : tensor<4x4xbf16>\n",
+        "  }\n",
+        "}\n",
+    );
+    let mut module = parse_mlir(mlir).unwrap();
+    let promoted = promote_narrow_accumulators(&mut module);
+    assert_eq!(promoted, 1);
+    assert_eq!(promote_narrow_accumulators(&mut module), 0); // idempotent
+
+    let printed = castforge::ir::print_mlir(&module);
+    assert!(printed.contains("castforge.accumulator_dtype = \"f32\""));
+    assert!(printed.contains("castforge.epilogue_downcast = \"bf16\""));
+
+    let backend_reg = BackendRegistry::with_builtin_backends();
+    let cuda_src = backend_reg
+        .generate("cuda", &module, &TargetConfig::default())
+        .unwrap();
+    assert!(cuda_src.contains("Mixed-precision accumulator (f32, epilogue downcast -> bf16)"));
 }

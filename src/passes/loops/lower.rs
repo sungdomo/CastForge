@@ -134,6 +134,20 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
             {
                 body.push(LoopStmt::Comment(format!("Provenance: {prov}")));
             }
+            if let Some(acc_dt) = op
+                .attributes
+                .get("castforge.accumulator_dtype")
+                .and_then(|a| a.as_str())
+            {
+                let down = op
+                    .attributes
+                    .get("castforge.epilogue_downcast")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("none");
+                body.push(LoopStmt::Comment(format!(
+                    "Mixed-precision accumulator ({acc_dt}, epilogue downcast -> {down})"
+                )));
+            }
 
             let is_profiled = op
                 .attributes
