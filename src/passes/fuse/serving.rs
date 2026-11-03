@@ -28720,3 +28720,376 @@ pub fn loop_invariant_view_motion(module: &mut Module) -> (usize, usize) {
 
     (hoisted_stride_ops, erased_transforms)
 }
+
+/// Stages device-graph execution inside functions/models annotated with
+/// `is_device_graph = true`:
+/// 1. Rewrites each `mgp.guard` into a forwarding `mogg.routine.async` region whose body drops
+///    the leading ordering chain argument and yields the remaining forwarded arguments via
+///    `mogg.output`.
+/// 2. Collects all `mogg.routine.async` and `mgp.device_graph.stable.create` operations in block
+///    order and moves them into a single isolated `mgp.device_graph.staging` region just before
+///    the terminator, capturing free outside operands as staging inputs and yielding values with
+///    escaping uses via `mgp.device_graph.staging.yield`.
+///
+/// Returns `(lowered_guards, staged_ops_count)`.
+pub fn stage_device_graphs(module: &mut Module) -> (usize, usize) {
+    use crate::ir::mlir::{Location, OpName, Operation, Value, ValueDef};
+
+    let mut lowered_guards = 0usize;
+    let mut staged_ops_count = 0usize;
+
+    let fn_ids = module.functions();
+    for fn_id in fn_ids {
+        let is_device_graph = matches!(
+            module.ops[fn_id].attributes.get("is_device_graph"),
+            Some(Attribute::Bool(true))
+        );
+        if !is_device_graph {
+            continue;
+        }
+        let Some(&fn_reg) = module.ops[fn_id].regions.first() else {
+            continue;
+        };
+        let Some(&exec_blk) = module.regions[fn_reg].blocks.first() else {
+            continue;
+        };
+
+        // Step 1: Lower `mgp.guard` ops in `exec_blk` into forwarding `mogg.routine.async` ops:
+        let initial_ops = module.blocks[exec_blk].ops.clone();
+        for op_id in initial_ops {
+            let Some(guard_op) = module.ops.get(op_id).cloned() else {
+                continue;
+            };
+            if guard_op.name.full_name() != "mgp.guard" {
+                continue;
+            }
+            let body_blk = module.create_block(None);
+            let mut forwarded_args = smallvec::SmallVec::<[ValueId; 4]>::new();
+            for (i, &opnd) in guard_op.operands.iter().enumerate() {
+                let opnd_ty = module.values[opnd].ty.clone();
+                let arg_v = module.add_block_argument(body_blk, None, opnd_ty);
+                if i > 0 {
+                    forwarded_args.push(arg_v);
+                }
+            }
+            module.add_operation(
+                body_blk,
+                OpName::new("mogg", "output"),
+                forwarded_args,
+                vec![],
+                indexmap::IndexMap::new(),
+                vec![],
+                false,
+                Location::Unknown,
+            );
+            let body_reg = module.create_region(vec![body_blk]);
+
+            let mut attrs = guard_op.attributes.clone();
+            attrs.insert(
+                "dispatch".to_string(),
+                Attribute::String("Immediate".to_string()),
+            );
+            attrs.insert("can_fuse_into_other".to_string(), Attribute::Bool(false));
+            attrs.insert("can_be_fused_into".to_string(), Attribute::Bool(false));
+            attrs.insert("can_duplicate".to_string(), Attribute::Bool(false));
+
+            module.ops[op_id].name = OpName::new("mogg", "routine.async");
+            module.ops[op_id].attributes = attrs;
+            module.ops[op_id].regions = vec![body_reg];
+            lowered_guards += 1;
+        }
+
+        // Step 2: Collect all `mogg.routine.async` and `mgp.device_graph.stable.create` ops:
+        let current_ops = module.blocks[exec_blk].ops.clone();
+        let mut staged_ops = Vec::new();
+        let mut staged_set = std::collections::HashSet::new();
+        for &op_id in &current_ops {
+            let full = module.ops[op_id].name.full_name();
+            if full == "mogg.routine.async" || full == "mgp.device_graph.stable.create" {
+                staged_ops.push(op_id);
+                staged_set.insert(op_id);
+            }
+        }
+        if staged_ops.is_empty() {
+            continue;
+        }
+        staged_ops_count += staged_ops.len();
+
+        // Collect deduplicated free inputs defined outside `staged_set`:
+        let mut free_inputs = Vec::new();
+        let mut seen_inputs = std::collections::HashSet::new();
+        for &sop_id in &staged_ops {
+            for &opnd in &module.ops[sop_id].operands {
+                let def_inside = match module.values[opnd].def {
+                    ValueDef::OpResult { op, .. } => staged_set.contains(&op),
+                    ValueDef::BlockArgument { .. } => false,
+                };
+                if !def_inside && seen_inputs.insert(opnd) {
+                    free_inputs.push(opnd);
+                }
+            }
+        }
+
+        // Collect escaping uses (`(user_op, operand_idx, produced_val)`) outside `staged_set`:
+        let mut escaping_uses = Vec::new();
+        for &sop_id in &staged_ops {
+            let results = module.ops[sop_id].results.clone();
+            for res_v in results {
+                for &other_id in &current_ops {
+                    if staged_set.contains(&other_id) {
+                        continue;
+                    }
+                    for (opnd_idx, &u_val) in module.ops[other_id].operands.iter().enumerate() {
+                        if u_val == res_v {
+                            escaping_uses.push((other_id, opnd_idx, res_v));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Create staging region & block:
+        let staging_blk = module.create_block(None);
+        let mut free_map = std::collections::HashMap::new();
+        for &inp in &free_inputs {
+            let ty = module.values[inp].ty.clone();
+            let barg = module.add_block_argument(staging_blk, None, ty);
+            free_map.insert(inp, barg);
+        }
+
+        // Move `staged_ops` from `exec_blk` into `staging_blk` and remap free operands:
+        module.blocks[exec_blk]
+            .ops
+            .retain(|id| !staged_set.contains(id));
+        for &sop_id in &staged_ops {
+            for opnd in &mut module.ops[sop_id].operands {
+                if let Some(&mapped) = free_map.get(opnd) {
+                    *opnd = mapped;
+                }
+            }
+            module.blocks[staging_blk].ops.push(sop_id);
+        }
+
+        let yield_operands: smallvec::SmallVec<[ValueId; 4]> =
+            escaping_uses.iter().map(|&(_, _, v)| v).collect();
+        module.add_operation(
+            staging_blk,
+            OpName::new("mgp", "device_graph.staging.yield"),
+            yield_operands,
+            vec![],
+            indexmap::IndexMap::new(),
+            vec![],
+            false,
+            Location::Unknown,
+        );
+        let staging_reg = module.create_region(vec![staging_blk]);
+
+        let mut staging_results = smallvec::SmallVec::<[ValueId; 2]>::new();
+        for (idx, &(_, _, prod_v)) in escaping_uses.iter().enumerate() {
+            let ty = module.values[prod_v].ty.clone();
+            let s_res = module.values.insert(Value {
+                id: ValueId::default(),
+                ssa_name: None,
+                ty,
+                def: ValueDef::BlockArgument {
+                    block: exec_blk,
+                    index: idx as u32,
+                },
+            });
+            module.values[s_res].id = s_res;
+            staging_results.push(s_res);
+        }
+
+        let staging_op = module.ops.insert(Operation {
+            id: OpId::default(),
+            name: OpName::new("mgp", "device_graph.staging"),
+            operands: free_inputs.into_iter().collect(),
+            results: staging_results.clone(),
+            attributes: indexmap::IndexMap::new(),
+            regions: vec![staging_reg],
+            custom_syntax: false,
+            location: Location::Unknown,
+        });
+        module.ops[staging_op].id = staging_op;
+        for (idx, &s_res) in staging_results.iter().enumerate() {
+            module.values[s_res].def = ValueDef::OpResult {
+                op: staging_op,
+                index: idx as u32,
+            };
+        }
+
+        // Insert `staging_op` right before the terminator in `exec_blk`:
+        let insert_idx = module.blocks[exec_blk].ops.len().saturating_sub(1);
+        module.blocks[exec_blk].ops.insert(insert_idx, staging_op);
+
+        // Rewire escaping uses to the corresponding `staging_op` results:
+        for ((user_op, opnd_idx, _), new_res) in escaping_uses.into_iter().zip(staging_results) {
+            module.ops[user_op].operands[opnd_idx] = new_res;
+        }
+    }
+
+    (lowered_guards, staged_ops_count)
+}
+
+/// Raises lowered `mgp.buffer_to_index(mgp.resource.constant {resource_slot = i})` sequences back
+/// into `index.constant {value = c}` inside single-caller MGP-ABI kernel stubs (`abi = "mgp"`),
+/// looking up the 64-bit integer slot `i` from the sole `mogg.compiled_call` caller's
+/// `constant_resources` attribute.
+///
+/// Returns the number of `mgp.buffer_to_index` operations raised back to `index.constant`.
+pub fn raise_back_index_constants(module: &mut Module) -> usize {
+    use crate::ir::mlir::{DType, Location, OpName, Operation, Value, ValueDef};
+
+    // 1. Collect all `mogg.compiled_call` callers per callee symbol:
+    let mut symbol_callers: std::collections::HashMap<String, Vec<OpId>> =
+        std::collections::HashMap::new();
+    for (op_id, op) in &module.ops {
+        if op.name.full_name() == "mogg.compiled_call" {
+            let callee = op
+                .attributes
+                .get("callee")
+                .or_else(|| op.attributes.get("callee_symbol"))
+                .and_then(|a| match a {
+                    Attribute::SymbolRef(s) | Attribute::String(s) => {
+                        Some(s.trim_start_matches('@').to_string())
+                    }
+                    _ => None,
+                });
+            if let Some(sym) = callee {
+                symbol_callers.entry(sym).or_default().push(op_id);
+            }
+        }
+    }
+
+    let mut raised = 0usize;
+    let fn_ids = module.functions();
+    for fn_id in fn_ids {
+        let is_mgp_abi = matches!(
+            module.ops[fn_id].attributes.get("abi"),
+            Some(Attribute::String(s)) if s.eq_ignore_ascii_case("mgp")
+        );
+        if !is_mgp_abi {
+            continue;
+        }
+        let Some(sym_name) = module.ops[fn_id]
+            .attributes
+            .get("sym_name")
+            .and_then(Attribute::as_str)
+            .map(ToOwned::to_owned)
+        else {
+            continue;
+        };
+        let Some(callers) = symbol_callers.get(&sym_name) else {
+            continue;
+        };
+        // Only single-caller kernel stubs can safely inline their caller's constant resource:
+        if callers.len() != 1 {
+            continue;
+        }
+        let caller_id = callers[0];
+        let resource_values: Vec<Option<i64>> =
+            match module.ops[caller_id].attributes.get("constant_resources") {
+                Some(Attribute::DenseIntArray(vals)) => vals.iter().copied().map(Some).collect(),
+                Some(Attribute::Array(items)) => items
+                    .iter()
+                    .map(|item| match item {
+                        Attribute::Int(v) => Some(*v),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => continue,
+            };
+
+        let regions = module.ops[fn_id].regions.clone();
+        for rid in regions {
+            let blocks = module.regions[rid].blocks.clone();
+            for bid in blocks {
+                let ops_snapshot = module.blocks[bid].ops.clone();
+                for op_id in ops_snapshot {
+                    let Some(b2i_op) = module.ops.get(op_id).cloned() else {
+                        continue;
+                    };
+                    if b2i_op.name.full_name() != "mgp.buffer_to_index"
+                        || b2i_op.operands.is_empty()
+                        || b2i_op.results.is_empty()
+                    {
+                        continue;
+                    }
+                    let buf_val = b2i_op.operands[0];
+                    let Some(ValueDef::OpResult { op: res_op_id, .. }) =
+                        module.values.get(buf_val).map(|v| v.def)
+                    else {
+                        continue;
+                    };
+                    let Some(res_op) = module.ops.get(res_op_id).cloned() else {
+                        continue;
+                    };
+                    if res_op.name.full_name() != "mgp.resource.constant" {
+                        continue;
+                    }
+                    let Some(slot_idx) =
+                        res_op
+                            .attributes
+                            .get("resource_slot")
+                            .and_then(|a| match a {
+                                Attribute::Int(v) => Some(*v),
+                                Attribute::Opaque(raw) => raw
+                                    .split(':')
+                                    .next()
+                                    .and_then(|s| s.trim().parse::<i64>().ok()),
+                                _ => None,
+                            })
+                    else {
+                        continue;
+                    };
+                    if slot_idx < 0 {
+                        continue;
+                    }
+                    let Some(Some(const_val)) = resource_values.get(slot_idx as usize).copied()
+                    else {
+                        continue;
+                    };
+
+                    // Create `index.constant {value = const_val}` and replace uses of `b2i_op`:
+                    let old_res = b2i_op.results[0];
+                    let idx_res = module.values.insert(Value {
+                        id: ValueId::default(),
+                        ssa_name: None,
+                        ty: Type::Scalar(DType::Index),
+                        def: ValueDef::BlockArgument {
+                            block: bid,
+                            index: 0,
+                        },
+                    });
+                    module.values[idx_res].id = idx_res;
+                    let mut attrs = indexmap::IndexMap::new();
+                    attrs.insert("value".to_string(), Attribute::Int(const_val));
+                    let idx_const_op = module.ops.insert(Operation {
+                        id: OpId::default(),
+                        name: OpName::new("index", "constant"),
+                        operands: smallvec::SmallVec::new(),
+                        results: smallvec::smallvec![idx_res],
+                        attributes: attrs,
+                        regions: Vec::new(),
+                        custom_syntax: false,
+                        location: Location::Unknown,
+                    });
+                    module.ops[idx_const_op].id = idx_const_op;
+                    module.values[idx_res].def = ValueDef::OpResult {
+                        op: idx_const_op,
+                        index: 0,
+                    };
+
+                    if let Some(pos) = module.blocks[bid].ops.iter().position(|&id| id == op_id) {
+                        module.blocks[bid].ops[pos] = idx_const_op;
+                    }
+                    module.replace_all_uses(old_res, idx_res);
+                    module.ops.remove(op_id);
+                    raised += 1;
+                }
+            }
+        }
+    }
+
+    raised
+}

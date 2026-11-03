@@ -8349,3 +8349,90 @@ fn test_loop_invariant_view_motion_hoists_load_views_and_preserves_store_transfo
     // `map.load` now indexes at `reshaped_idx` directly:
     assert_eq!(m.ops[load_op].operands[1], reshaped_idx);
 }
+
+#[test]
+fn test_stage_device_graphs_and_raise_back_index_constants() {
+    use castforge::ir::Attribute;
+    use castforge::passes::{raise_back_index_constants, stage_device_graphs};
+
+    let src = concat!(
+        "module {\n",
+        "  func.func @kernel_single_caller(%buf: !mo.buffer) -> index",
+        " attributes {abi = \"mgp\"} {\n",
+        "    %rc = \"mgp.resource.constant\"() {resource_slot = 1 : i64} : () -> !mo.buffer\n",
+        "    %idx = \"mgp.buffer_to_index\"(%rc) : (!mo.buffer) -> index\n",
+        "    return %idx : index\n",
+        "  }\n",
+        "  func.func @kernel_multi_caller(%buf: !mo.buffer) -> index",
+        " attributes {abi = \"mgp\"} {\n",
+        "    %rc = \"mgp.resource.constant\"() {resource_slot = 0 : i64} : () -> !mo.buffer\n",
+        "    %idx = \"mgp.buffer_to_index\"(%rc) : (!mo.buffer) -> index\n",
+        "    return %idx : index\n",
+        "  }\n",
+        "  func.func @device_graph_model(\n",
+        "    %x: tensor<4xf32>,\n",
+        "    %ch0: !mo.chain\n",
+        "  ) -> (tensor<4xf32>, !mo.chain) attributes {is_device_graph = true} {\n",
+        "    %s = \"mgp.device_graph.stable.create\"(%x) : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %g = \"mgp.guard\"(%ch0, %s) : (!mo.chain, tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %y, %ch1 = \"mogg.routine.async\"(%g, %ch0)",
+        " : (tensor<4xf32>, !mo.chain) -> (tensor<4xf32>, !mo.chain)\n",
+        "    \"mogg.compiled_call\"(%y) {callee = @kernel_single_caller,",
+        " constant_resources = array<i64: 10, 42>} : (tensor<4xf32>) -> ()\n",
+        "    \"mogg.compiled_call\"(%y) {callee = @kernel_multi_caller,",
+        " constant_resources = array<i64: 7>} : (tensor<4xf32>) -> ()\n",
+        "    \"mogg.compiled_call\"(%y) {callee = @kernel_multi_caller,",
+        " constant_resources = array<i64: 9>} : (tensor<4xf32>) -> ()\n",
+        "    return %y, %ch1 : tensor<4xf32>, !mo.chain\n",
+        "  }\n",
+        "}\n"
+    );
+
+    let mut m = parse_mlir(src).unwrap();
+
+    // 1. `raise_back_index_constants` raises `mgp.buffer_to_index` in `@kernel_single_caller`
+    // to `index.constant {value = 42}` while leaving `@kernel_multi_caller` untouched:
+    let raised = raise_back_index_constants(&mut m);
+    assert_eq!(raised, 1);
+
+    let fns = m.functions();
+    let single_blk = m.regions[m.ops[fns[0]].regions[0]].blocks[0];
+    let single_ops: Vec<String> = m.blocks[single_blk]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        single_ops,
+        vec!["mgp.resource.constant", "index.constant", "func.return"]
+    );
+    let idx_const_id = m.blocks[single_blk].ops[1];
+    assert_eq!(
+        m.ops[idx_const_id].attributes.get("value"),
+        Some(&Attribute::Int(42))
+    );
+
+    // 2. `stage_device_graphs` lowers `mgp.guard` to `mogg.routine.async` and stages all 3
+    // device-graph ops (`stable.create`, lowered `guard`, `routine.async`) into a single
+    // `mgp.device_graph.staging` region:
+    let (lowered_guards, staged_ops) = stage_device_graphs(&mut m);
+    assert_eq!(lowered_guards, 1);
+    assert_eq!(staged_ops, 3);
+
+    let model_blk = m.regions[m.ops[fns[2]].regions[0]].blocks[0];
+    let model_op_names: Vec<String> = m.blocks[model_blk]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        model_op_names,
+        vec![
+            "mogg.compiled_call",
+            "mogg.compiled_call",
+            "mogg.compiled_call",
+            "mgp.device_graph.staging",
+            "func.return"
+        ]
+    );
+}
