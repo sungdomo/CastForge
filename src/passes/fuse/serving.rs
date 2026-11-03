@@ -8183,3 +8183,179 @@ pub fn sink_transpose_through_elementwise_and_broadcast(module: &mut Module) -> 
 
     sunk_count
 }
+
+/// Object-group role in a hybrid CacheBlend registration
+/// (inspired by LMCache `lmcache/v1/multiprocess/modules/blend/read_set.py`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendObjectGroupKind {
+    /// Full-attention KV object group read by both the prefix and non-prefix blend legs.
+    Attention,
+    /// Connector-private auxiliary object group read alongside attention on the blend leg.
+    Aux,
+    /// Recurrent/SSM state object group read only on the contiguous prefix leg.
+    Recurrent,
+}
+
+/// Per-leg object-group read routing for CacheBlend hybrid lookups
+/// (inspired by LMCache `lmcache/v1/multiprocess/modules/blend/read_set.py` `_BlendReadGroups`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlendReadGroupSet {
+    /// Ascending group IDs read by the relocatable blend leg (`attention + aux`).
+    pub blend_gids: Vec<usize>,
+    /// Ascending group IDs read by the contiguous prefix leg (`attention + recurrent`).
+    pub prefix_gids: Vec<usize>,
+    /// Ascending group IDs holding recurrent state alone.
+    pub recurrent_gids: Vec<usize>,
+    /// The single full-attention object group ID.
+    pub attn_gid: usize,
+}
+
+/// Classifies a registration's `num_object_groups` and `group_kinds` into per-leg read sets
+/// (inspired by LMCache `lmcache/v1/multiprocess/modules/blend/read_set.py`
+/// `_classify_cb_read_groups`).
+///
+/// Single-group (`<= 1`) fused layouts map both legs to group `0`. Multi-group layouts must
+/// contain exactly one [`BlendObjectGroupKind::Attention`] group and at most one
+/// [`BlendObjectGroupKind::Aux`] group.
+pub fn classify_blend_read_groups(
+    num_object_groups: usize,
+    group_kinds: &[BlendObjectGroupKind],
+) -> Option<BlendReadGroupSet> {
+    if num_object_groups <= 1 {
+        return Some(BlendReadGroupSet {
+            blend_gids: vec![0],
+            prefix_gids: vec![0],
+            recurrent_gids: Vec::new(),
+            attn_gid: 0,
+        });
+    }
+    if group_kinds.len() != num_object_groups {
+        return None;
+    }
+    let mut attn = Vec::new();
+    let mut aux = Vec::new();
+    let mut recurrent = Vec::new();
+    for (idx, &kind) in group_kinds.iter().enumerate() {
+        match kind {
+            BlendObjectGroupKind::Attention => attn.push(idx),
+            BlendObjectGroupKind::Aux => aux.push(idx),
+            BlendObjectGroupKind::Recurrent => recurrent.push(idx),
+        }
+    }
+    if attn.len() != 1 || aux.len() > 1 {
+        return None;
+    }
+    let attn_gid = attn[0];
+    let mut blend_gids = attn.clone();
+    blend_gids.extend_from_slice(&aux);
+    blend_gids.sort_unstable();
+
+    let mut prefix_gids = attn;
+    prefix_gids.extend_from_slice(&recurrent);
+    prefix_gids.sort_unstable();
+
+    Some(BlendReadGroupSet {
+        blend_gids,
+        prefix_gids,
+        recurrent_gids: recurrent,
+        attn_gid,
+    })
+}
+
+/// Interleaves per-group expanded object keys into a chunk-major key sequence with uniform stride
+/// `per_group_keys.len() * expansion` per chunk so prefix bitmaps stay leading-ones-aligned
+/// (inspired by LMCache `lmcache/v1/multiprocess/modules/blend/read_set.py`
+/// `_cb_chunk_major_object_keys`).
+pub fn interleave_chunk_major_object_keys<T: Clone>(
+    per_group_keys: &[Vec<T>],
+    num_chunks: usize,
+) -> Option<Vec<T>> {
+    if per_group_keys.is_empty() || num_chunks == 0 {
+        return Some(Vec::new());
+    }
+    let first_len = per_group_keys[0].len();
+    if first_len == 0 || !first_len.is_multiple_of(num_chunks) {
+        return None;
+    }
+    if per_group_keys.iter().any(|g| g.len() != first_len) {
+        return None;
+    }
+    let expansion = first_len / num_chunks;
+    let mut out = Vec::with_capacity(per_group_keys.len() * first_len);
+    for chunk_idx in 0..num_chunks {
+        let start = chunk_idx * expansion;
+        let end = start + expansion;
+        for group_keys in per_group_keys {
+            out.extend_from_slice(&group_keys[start..end]);
+        }
+    }
+    Some(out)
+}
+
+/// Resolved per-group RoPE geometry for CacheBlend in-place key rotation
+/// (inspired by LMCache `lmcache/v1/multiprocess/modules/blend/rope.py`
+/// `_cb_group_rope_geometry`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CBGroupRopeGeometry {
+    /// Whether K and V are fused-packed into a doubled `2 * head_size` per-head stride.
+    pub fused_packed: bool,
+    /// Element stride per head (`2 * head_size` when `fused_packed`, `hidden_dim` for MLA, else
+    /// `head_size`).
+    pub per_head_elems: usize,
+    /// Number of heads rotated across the row (`1` for MLA latents).
+    pub num_heads: usize,
+    /// Starting element offset of the rotated slice within each head (`> 0` for MLA).
+    pub rot_offset: usize,
+}
+
+/// Computes the per-group CacheBlend RoPE geometry across split K/V, fused-packed K/V, and
+/// Multi-head Latent Attention (MLA `[content | rope]`) layouts
+/// (inspired by LMCache `lmcache/v1/multiprocess/modules/blend/rope.py`
+/// `_cb_group_rope_geometry`).
+#[allow(clippy::too_many_arguments)]
+pub fn compute_cb_group_rope_geometry(
+    tokens_per_block: usize,
+    slots_per_block: usize,
+    kv_size: usize,
+    hidden_dim: usize,
+    head_size: usize,
+    is_fused_format: bool,
+    declared_hs: Option<usize>,
+    rot_window: Option<(usize, usize)>,
+) -> Option<CBGroupRopeGeometry> {
+    if tokens_per_block == 0
+        || tokens_per_block != slots_per_block
+        || hidden_dim == 0
+        || head_size == 0
+    {
+        return None;
+    }
+    if let Some((rot_offset, rot_width)) = rot_window
+        && rot_offset > 0
+    {
+        if kv_size != 1 || rot_width == 0 || rot_offset + rot_width != hidden_dim {
+            return None;
+        }
+        return Some(CBGroupRopeGeometry {
+            fused_packed: false,
+            per_head_elems: hidden_dim,
+            num_heads: 1,
+            rot_offset,
+        });
+    }
+    if !matches!(kv_size, 1 | 2) {
+        return None;
+    }
+    let fused_packed = is_fused_format && declared_hs.is_none_or(|hs| hs == 2 * head_size);
+    let per_head_elems = head_size * if fused_packed { 2 } else { 1 };
+    let num_heads = hidden_dim / per_head_elems;
+    if num_heads == 0 || num_heads * per_head_elems != hidden_dim {
+        return None;
+    }
+    Some(CBGroupRopeGeometry {
+        fused_packed,
+        per_head_elems,
+        num_heads,
+        rot_offset: 0,
+    })
+}

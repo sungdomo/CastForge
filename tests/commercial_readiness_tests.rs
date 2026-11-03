@@ -14,11 +14,12 @@ use castforge::ir::{
     DType, Dim, Location, TensorBacking, TensorEntry, TensorStore, TensorType, parse_mlir,
 };
 use castforge::passes::{
-    ArcKvEvictionPolicy, AsymK16V8Codec, BLEND_REORDER_LMIN, BlendMatchSpan,
-    BlendTokenRangeMatcher, CBChunkMatch, CBGroupSpec, CacheBlendRopeSpec, CacheEventBatchSpec,
-    CacheEventTier, CacheGenCdfCodec, ChainedBlockHashConfig, CoordinatorEventGate,
-    DEFAULT_MAX_KERNELS_IN_FUSION_SET, DeviceTargetArch, DynamicAllocRequest, EngineKvFormat,
-    EventIngestOutcome, FULL_ATTENTION_WINDOW, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
+    ArcKvEvictionPolicy, AsymK16V8Codec, BLEND_REORDER_LMIN, BlendMatchSpan, BlendObjectGroupKind,
+    BlendReadGroupSet, BlendTokenRangeMatcher, CBChunkMatch, CBGroupRopeGeometry, CBGroupSpec,
+    CacheBlendRopeSpec, CacheEventBatchSpec, CacheEventTier, CacheGenCdfCodec,
+    ChainedBlockHashConfig, CoordinatorEventGate, DEFAULT_MAX_KERNELS_IN_FUSION_SET,
+    DeviceTargetArch, DynamicAllocRequest, EngineKvFormat, EventIngestOutcome,
+    FULL_ATTENTION_WINDOW, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
     IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
     KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope,
     KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy, LayerGroupPayloadSharder,
@@ -26,8 +27,9 @@ use castforge::passes::{
     ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST, ReshapeDimMapping, TOKEN_WIRE_STRIDE,
     WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
     analyze_static_reshape_dim_mapping, annotate_squeeze_unsqueeze_reshapes,
-    anonymize_symbolic_dims, await_hanging_effect_chains, coalesce_exhaustive_gathers_to_split,
-    coalesce_partitioning_slices_to_split, compress_splat_constants, decode_kv_fs_filename,
+    anonymize_symbolic_dims, await_hanging_effect_chains, classify_blend_read_groups,
+    coalesce_exhaustive_gathers_to_split, coalesce_partitioning_slices_to_split,
+    compress_splat_constants, compute_cb_group_rope_geometry, decode_kv_fs_filename,
     decode_kv_storage_key, defer_allocs_to_first_use, direct_copy_format_supported,
     downsample_subchunk_swa_block_ids, elide_redundant_state_transfers,
     eliminate_implied_dependencies, encode_kv_fs_filename, encode_kv_storage_key,
@@ -35,17 +37,17 @@ use castforge::passes::{
     fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
     fuse_sole_use_prologues, group_p2p_lookup_keys, hash_packed_token_blocks_be,
     hash_prefix_token_blocks, hoist_exec_invariant_ops, hoist_symbolic_dim_expressions,
-    is_supported_arch_dtype, legalize_rowwise_reduction_launch, longest_full_attention_hit,
-    longest_joint_prefix_hit, longest_sliding_window_hit, map_axis_through_static_reshape,
-    mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops, merge_duplicate_shape_ops,
-    merge_identical_functions, merge_parallel_matmuls, num_packed_tokens, pack_token_ids_be,
-    plan_cacheblend_retrieve, plan_cacheblend_token_reorder, plan_concat_in_place,
-    plan_dynamic_memory_pool, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
-    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
-    recalculate_subchunk_blocks_to_skip, recognize_composite_activations, reuse_dead_loop_buffers,
-    sink_transpose_through_elementwise_and_broadcast, stamp_fused_provenance, unfold_chunk_range,
-    unique_blend_token_coverage, unpack_token_ids_be, unpermute_slice,
-    validate_target_device_dtypes,
+    interleave_chunk_major_object_keys, is_supported_arch_dtype, legalize_rowwise_reduction_launch,
+    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
+    map_axis_through_static_reshape, mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops,
+    merge_duplicate_shape_ops, merge_identical_functions, merge_parallel_matmuls,
+    num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve, plan_cacheblend_token_reorder,
+    plan_concat_in_place, plan_dynamic_memory_pool, plan_jenga_kv_geometry,
+    plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
+    re_rope_key_in_place, recalculate_subchunk_blocks_to_skip, recognize_composite_activations,
+    reuse_dead_loop_buffers, sink_transpose_through_elementwise_and_broadcast,
+    stamp_fused_provenance, unfold_chunk_range, unique_blend_token_coverage, unpack_token_ids_be,
+    unpermute_slice, validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -2958,5 +2960,93 @@ module @sink_transpose_bcast {
     assert_eq!(
         bc_mod.ops[b_ops[1]].attributes.get("permutation"),
         Some(&Attribute::DenseIntArray(vec![0, 1, 3, 2]))
+    );
+}
+
+#[test]
+fn test_classify_blend_read_groups_and_cb_group_rope_geometry() {
+    // 1. Single-group fused layout maps both prefix and blend legs to group 0:
+    assert_eq!(
+        classify_blend_read_groups(1, &[]),
+        Some(BlendReadGroupSet {
+            blend_gids: vec![0],
+            prefix_gids: vec![0],
+            recurrent_gids: vec![],
+            attn_gid: 0,
+        })
+    );
+
+    // 2. Multi-group hybrid layout (Recurrent=0, Attention=1, Aux=2):
+    let kinds = [
+        BlendObjectGroupKind::Recurrent,
+        BlendObjectGroupKind::Attention,
+        BlendObjectGroupKind::Aux,
+    ];
+    assert_eq!(
+        classify_blend_read_groups(3, &kinds),
+        Some(BlendReadGroupSet {
+            blend_gids: vec![1, 2],
+            prefix_gids: vec![0, 1],
+            recurrent_gids: vec![0],
+            attn_gid: 1,
+        })
+    );
+    // Rejects multiple attention groups or >1 aux group:
+    assert!(
+        classify_blend_read_groups(
+            2,
+            &[
+                BlendObjectGroupKind::Attention,
+                BlendObjectGroupKind::Attention
+            ]
+        )
+        .is_none()
+    );
+
+    // 3. Chunk-major key interleaving (`expansion = 2` keys per chunk across 2 groups):
+    let g0 = vec!["c0_g0_a", "c0_g0_b", "c1_g0_a", "c1_g0_b"];
+    let g1 = vec!["c0_g1_a", "c0_g1_b", "c1_g1_a", "c1_g1_b"];
+    assert_eq!(
+        interleave_chunk_major_object_keys(&[g0, g1], 2),
+        Some(vec![
+            "c0_g0_a", "c0_g0_b", "c0_g1_a", "c0_g1_b", "c1_g0_a", "c1_g0_b", "c1_g1_a", "c1_g1_b"
+        ])
+    );
+
+    // 4. RoPE geometry: split K/V, fused-packed K/V, and MLA `[content | rope]`:
+    assert_eq!(
+        compute_cb_group_rope_geometry(16, 16, 2, 1024, 128, false, None, None),
+        Some(CBGroupRopeGeometry {
+            fused_packed: false,
+            per_head_elems: 128,
+            num_heads: 8,
+            rot_offset: 0,
+        })
+    );
+    assert_eq!(
+        compute_cb_group_rope_geometry(16, 16, 1, 2048, 128, true, Some(256), None),
+        Some(CBGroupRopeGeometry {
+            fused_packed: true,
+            per_head_elems: 256,
+            num_heads: 8,
+            rot_offset: 0,
+        })
+    );
+    // MLA latent (`kv_size = 1`, `hidden_dim = 576 = 512 content + 64 rope`):
+    assert_eq!(
+        compute_cb_group_rope_geometry(16, 16, 1, 576, 64, false, None, Some((512, 64))),
+        Some(CBGroupRopeGeometry {
+            fused_packed: false,
+            per_head_elems: 576,
+            num_heads: 1,
+            rot_offset: 512,
+        })
+    );
+    // Rejects MLA window when `kv_size != 1` or window does not end the row:
+    assert!(
+        compute_cb_group_rope_geometry(16, 16, 2, 576, 64, false, None, Some((512, 64))).is_none()
+    );
+    assert!(
+        compute_cb_group_rope_geometry(16, 16, 1, 576, 64, false, None, Some((500, 64))).is_none()
     );
 }
