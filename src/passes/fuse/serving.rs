@@ -29375,3 +29375,392 @@ pub fn fixup_overhanging_chains(module: &mut Module) -> usize {
 
     synchronized_ops
 }
+
+/// Maximum number of tensors permitted in a single inline tensor transfer envelope.
+pub const MAX_INLINE_TENSOR_COUNT: usize = 65_536;
+
+/// Maximum rank permitted for an inline transfer tensor.
+pub const MAX_INLINE_TENSOR_RANK: usize = 16;
+
+/// Maximum raw byte length (`2 GiB`) for a single inline transfer tensor.
+pub const MAX_SINGLE_TENSOR_WIRE_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// Maximum cumulative raw byte length (`16 GiB`) across all tensors in an inline transfer
+/// envelope.
+pub const MAX_TOTAL_TENSOR_WIRE_BYTES: usize = 16 * 1024 * 1024 * 1024;
+
+/// Maximum number of KV groups permitted in a grouped inline tensor transfer envelope.
+pub const MAX_INLINE_TENSOR_GROUP_COUNT: usize = 64;
+
+/// Maximum metadata wire overhead (`1024` bytes) budgeted per tensor frame.
+pub const MAX_METADATA_BYTES_PER_TENSOR: usize = 1024;
+
+const SUPPORTED_INLINE_TENSOR_DTYPES: &[(&str, usize)] = &[
+    ("uint8", 1),
+    ("int8", 1),
+    ("int16", 2),
+    ("uint16", 2),
+    ("float16", 2),
+    ("bfloat16", 2),
+    ("float8_e4m3fn", 1),
+    ("float8_e5m2", 1),
+    ("int32", 4),
+    ("uint32", 4),
+    ("float32", 4),
+    ("int64", 8),
+    ("uint64", 8),
+    ("float64", 8),
+    ("bool", 1),
+];
+
+/// Returns the element byte size for a canonical or `torch.`-prefixed inline tensor dtype name.
+#[must_use]
+pub fn inline_tensor_dtype_itemsize(dtype: &str) -> Option<usize> {
+    let stripped = dtype.strip_prefix("torch.").unwrap_or(dtype);
+    SUPPORTED_INLINE_TENSOR_DTYPES
+        .iter()
+        .find_map(|&(name, sz)| (name == stripped).then_some(sz))
+}
+
+/// Typed metadata and raw payload bytes for a single contiguous CPU tensor in an inline transfer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineTensorFrame {
+    /// Canonical dtype string (`"float16"`, `"bfloat16"`, `"float32"`, `"uint8"`, etc.).
+    pub dtype: String,
+    /// Tensor dimensions (`rank <= 16`).
+    pub shape: Vec<usize>,
+    /// Raw contiguous little-endian tensor bytes (`<= 2 GiB`).
+    pub data: Vec<u8>,
+}
+
+/// One KV group's sparse chunk indices and corresponding contiguous CPU tensor frames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineTensorGroup {
+    /// Strictly increasing chunk indices (`0 <= idx < num_chunks`), one per tensor frame.
+    pub chunk_indices: Vec<usize>,
+    /// Contiguous CPU tensor frames for each chunk index in `chunk_indices`.
+    pub tensors: Vec<InlineTensorFrame>,
+}
+
+/// Validates that `indices` has length `num_tensors`, is strictly increasing, and (when
+/// `num_chunks` is `Some(limit)`) every index is `< limit`.
+pub fn validate_grouped_chunk_indices(
+    gid: usize,
+    indices: &[usize],
+    num_tensors: usize,
+    num_chunks: Option<usize>,
+) -> Result<(), String> {
+    if indices.len() != num_tensors {
+        return Err(format!(
+            "Inline tensor group {gid} has {} chunk indices for {num_tensors} tensors",
+            indices.len()
+        ));
+    }
+    if indices.windows(2).any(|w| w[1] <= w[0]) {
+        return Err(format!(
+            "Inline tensor group {gid} chunk indices are not strictly increasing"
+        ));
+    }
+    if let Some(&last) = indices.last()
+        && let Some(limit) = num_chunks
+        && last >= limit
+    {
+        return Err(format!(
+            "Inline tensor group {gid} chunk index out of range (chunks={limit})"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_and_write_frames(
+    frames: &[InlineTensorFrame],
+    total_bytes: &mut usize,
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    out.extend_from_slice(&(frames.len() as u32).to_be_bytes());
+    for frame in frames {
+        let dtype_norm = frame.dtype.strip_prefix("torch.").unwrap_or(&frame.dtype);
+        let Some(itemsize) = inline_tensor_dtype_itemsize(dtype_norm) else {
+            return Err(format!("Unsupported inline tensor dtype: {}", frame.dtype));
+        };
+        if frame.shape.len() > MAX_INLINE_TENSOR_RANK {
+            return Err("Inline tensor rank exceeds 16".to_string());
+        }
+        let elem_count: usize = frame.shape.iter().copied().product();
+        let expected_bytes = elem_count.saturating_mul(itemsize);
+        if frame.data.len() != expected_bytes {
+            return Err(format!(
+                "Inline tensor byte length mismatch: expected {expected_bytes}, got {}",
+                frame.data.len()
+            ));
+        }
+        if frame.data.len() > MAX_SINGLE_TENSOR_WIRE_BYTES {
+            return Err("Inline tensor exceeds 2 GiB".to_string());
+        }
+        *total_bytes = total_bytes.saturating_add(frame.data.len());
+        if *total_bytes > MAX_TOTAL_TENSOR_WIRE_BYTES {
+            return Err("Inline tensor payload exceeds 16 GiB".to_string());
+        }
+        let dt_bytes = dtype_norm.as_bytes();
+        out.extend_from_slice(&(dt_bytes.len() as u16).to_be_bytes());
+        out.extend_from_slice(dt_bytes);
+        out.push(frame.shape.len() as u8);
+        for &dim in &frame.shape {
+            out.extend_from_slice(&(dim as u64).to_be_bytes());
+        }
+        out.extend_from_slice(&(frame.data.len() as u64).to_be_bytes());
+        out.extend_from_slice(&frame.data);
+    }
+    Ok(())
+}
+
+fn read_and_validate_frames(
+    payload: &[u8],
+    cursor: &mut usize,
+    expected_shape: &[usize],
+    expected_dtype: &str,
+    expected_count: Option<usize>,
+    total_bytes: &mut usize,
+) -> Result<Vec<InlineTensorFrame>, String> {
+    if *cursor + 4 > payload.len() {
+        return Err("Unexpected EOF reading inline tensor frame count".to_string());
+    }
+    let count = u32::from_be_bytes(payload[*cursor..*cursor + 4].try_into().unwrap()) as usize;
+    *cursor += 4;
+    if count > MAX_INLINE_TENSOR_COUNT {
+        return Err("Inline tensor count exceeds 65536".to_string());
+    }
+    if let Some(exp_cnt) = expected_count
+        && count != exp_cnt
+    {
+        return Err(format!(
+            "Inline tensor count mismatch: expected {exp_cnt}, got {count}"
+        ));
+    }
+
+    let exp_dtype_norm = expected_dtype
+        .strip_prefix("torch.")
+        .unwrap_or(expected_dtype);
+    let Some(exp_itemsize) = inline_tensor_dtype_itemsize(exp_dtype_norm) else {
+        return Err(format!("Unsupported inline tensor dtype: {expected_dtype}"));
+    };
+    let expected_tensor_bytes = expected_shape
+        .iter()
+        .copied()
+        .product::<usize>()
+        .saturating_mul(exp_itemsize);
+
+    let mut frames = Vec::with_capacity(count);
+    for _ in 0..count {
+        if *cursor + 2 > payload.len() {
+            return Err("Unexpected EOF reading inline tensor dtype length".to_string());
+        }
+        let dt_len = u16::from_be_bytes(payload[*cursor..*cursor + 2].try_into().unwrap()) as usize;
+        *cursor += 2;
+        if *cursor + dt_len > payload.len() {
+            return Err("Unexpected EOF reading inline tensor dtype".to_string());
+        }
+        let dtype_str = std::str::from_utf8(&payload[*cursor..*cursor + dt_len])
+            .map_err(|e| format!("Invalid UTF-8 in inline tensor dtype: {e}"))?
+            .to_string();
+        *cursor += dt_len;
+
+        if inline_tensor_dtype_itemsize(&dtype_str).is_none() {
+            return Err(format!("Unsupported inline tensor dtype: {dtype_str}"));
+        }
+        if dtype_str != exp_dtype_norm {
+            return Err(format!(
+                "Inline tensor dtype mismatch: expected {exp_dtype_norm}, got {dtype_str}"
+            ));
+        }
+
+        if *cursor >= payload.len() {
+            return Err("Unexpected EOF reading inline tensor rank".to_string());
+        }
+        let rank = payload[*cursor] as usize;
+        *cursor += 1;
+        if rank > MAX_INLINE_TENSOR_RANK {
+            return Err("Inline tensor rank exceeds 16".to_string());
+        }
+        if *cursor + rank * 8 > payload.len() {
+            return Err("Unexpected EOF reading inline tensor shape".to_string());
+        }
+        let mut shape = Vec::with_capacity(rank);
+        for _ in 0..rank {
+            let d = u64::from_be_bytes(payload[*cursor..*cursor + 8].try_into().unwrap()) as usize;
+            *cursor += 8;
+            shape.push(d);
+        }
+        if shape != expected_shape {
+            return Err(format!(
+                "Inline tensor shape mismatch: expected {expected_shape:?}, got {shape:?}"
+            ));
+        }
+
+        if *cursor + 8 > payload.len() {
+            return Err("Unexpected EOF reading inline tensor data length".to_string());
+        }
+        let data_len =
+            u64::from_be_bytes(payload[*cursor..*cursor + 8].try_into().unwrap()) as usize;
+        *cursor += 8;
+        if data_len != expected_tensor_bytes {
+            return Err(format!(
+                "Inline tensor byte length mismatch: expected \
+                 {expected_tensor_bytes}, got {data_len}"
+            ));
+        }
+        if *cursor + data_len > payload.len() {
+            return Err("Unexpected EOF reading inline tensor data".to_string());
+        }
+        let data = payload[*cursor..*cursor + data_len].to_vec();
+        *cursor += data_len;
+
+        *total_bytes = total_bytes.saturating_add(data_len);
+        if *total_bytes > MAX_TOTAL_TENSOR_WIRE_BYTES {
+            return Err("Inline tensor payload exceeds 16 GiB".to_string());
+        }
+        frames.push(InlineTensorFrame {
+            dtype: dtype_str,
+            shape,
+            data,
+        });
+    }
+    Ok(frames)
+}
+
+/// Encodes a flat collection of CPU tensor frames into a versioned (`version = 1`, tag `0x54`)
+/// wire envelope, enforcing per-tensor (`2 GiB`), cumulative (`16 GiB`), rank (`<= 16`), and
+/// count (`<= 65536`) limits.
+pub fn encode_inline_tensor_envelope(tensors: &[InlineTensorFrame]) -> Result<Vec<u8>, String> {
+    if tensors.len() > MAX_INLINE_TENSOR_COUNT {
+        return Err("Inline tensor count exceeds 65536".to_string());
+    }
+    let mut out = Vec::new();
+    out.push(0x54); // 'T' = flat TensorEnvelope
+    out.push(1); // version = 1
+    let mut total_bytes = 0usize;
+    validate_and_write_frames(tensors, &mut total_bytes, &mut out)?;
+    Ok(out)
+}
+
+/// Decodes and validates a flat inline tensor wire envelope against `expected_shape`,
+/// `expected_dtype`, and `expected_count`. Rejects grouped envelopes (`0x47`) so neither envelope
+/// kind decodes as the other.
+pub fn decode_inline_tensor_envelope(
+    payload: &[u8],
+    expected_shape: &[usize],
+    expected_dtype: &str,
+    expected_count: usize,
+) -> Result<Vec<InlineTensorFrame>, String> {
+    if expected_count > MAX_INLINE_TENSOR_COUNT {
+        return Err("Expected tensor count must be between 0 and 65536".to_string());
+    }
+    let max_envelope_bytes = MAX_TOTAL_TENSOR_WIRE_BYTES
+        .saturating_add(MAX_METADATA_BYTES_PER_TENSOR.saturating_mul(expected_count));
+    if payload.len() > max_envelope_bytes {
+        return Err("Inline tensor envelope exceeds the wire-format limit".to_string());
+    }
+    if payload.len() < 2 || payload[0] != 0x54 || payload[1] != 1 {
+        return Err("Invalid or mismatched TensorEnvelope header".to_string());
+    }
+    let mut cursor = 2usize;
+    let mut total_bytes = 0usize;
+    read_and_validate_frames(
+        payload,
+        &mut cursor,
+        expected_shape,
+        expected_dtype,
+        Some(expected_count),
+        &mut total_bytes,
+    )
+}
+
+/// Encodes a group-major collection of hybrid-KV CPU tensor groups into a versioned
+/// (`version = 1`, tag `0x47`) wire envelope, enforcing group count (`<= 64`), strictly increasing
+/// chunk indices per group, and cumulative byte/count limits.
+pub fn encode_grouped_tensor_envelope(groups: &[InlineTensorGroup]) -> Result<Vec<u8>, String> {
+    if groups.len() > MAX_INLINE_TENSOR_GROUP_COUNT {
+        return Err("Inline tensor group count exceeds 64".to_string());
+    }
+    let total_tensors: usize = groups.iter().map(|g| g.tensors.len()).sum();
+    if total_tensors > MAX_INLINE_TENSOR_COUNT {
+        return Err("Inline tensor count exceeds 65536".to_string());
+    }
+    let mut out = Vec::new();
+    out.push(0x47); // 'G' = GroupedTensorEnvelope
+    out.push(1); // version = 1
+    out.extend_from_slice(&(groups.len() as u16).to_be_bytes());
+    let mut total_bytes = 0usize;
+    for (gid, group) in groups.iter().enumerate() {
+        validate_grouped_chunk_indices(gid, &group.chunk_indices, group.tensors.len(), None)?;
+        out.extend_from_slice(&(group.chunk_indices.len() as u32).to_be_bytes());
+        for &cidx in &group.chunk_indices {
+            out.extend_from_slice(&(cidx as u64).to_be_bytes());
+        }
+        validate_and_write_frames(&group.tensors, &mut total_bytes, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// Decodes and validates a group-major inline tensor wire envelope against per-group
+/// `(expected_shape, expected_dtype, num_chunks)` specifications.
+pub fn decode_grouped_tensor_envelope(
+    payload: &[u8],
+    expected: &[(Vec<usize>, String, usize)],
+) -> Result<Vec<InlineTensorGroup>, String> {
+    if expected.len() > MAX_INLINE_TENSOR_GROUP_COUNT {
+        return Err("Expected group count must be between 0 and 64".to_string());
+    }
+    let expected_total: usize = expected.iter().map(|(_, _, c)| *c).sum();
+    if expected_total > MAX_INLINE_TENSOR_COUNT {
+        return Err("Expected tensor count must be between 0 and 65536".to_string());
+    }
+    let max_envelope_bytes = MAX_TOTAL_TENSOR_WIRE_BYTES
+        .saturating_add(MAX_METADATA_BYTES_PER_TENSOR.saturating_mul(expected_total));
+    if payload.len() > max_envelope_bytes {
+        return Err("Inline tensor envelope exceeds the wire-format limit".to_string());
+    }
+    if payload.len() < 4 || payload[0] != 0x47 || payload[1] != 1 {
+        return Err("Invalid or mismatched GroupedTensorEnvelope header".to_string());
+    }
+    let group_count = u16::from_be_bytes(payload[2..4].try_into().unwrap()) as usize;
+    if group_count != expected.len() {
+        return Err(format!(
+            "Inline tensor group count mismatch: expected {}, got {group_count}",
+            expected.len()
+        ));
+    }
+    let mut cursor = 4usize;
+    let mut total_bytes = 0usize;
+    let mut groups = Vec::with_capacity(group_count);
+    for (gid, (exp_shape, exp_dtype, num_chunks)) in expected.iter().enumerate() {
+        if cursor + 4 > payload.len() {
+            return Err("Unexpected EOF reading group chunk index count".to_string());
+        }
+        let idx_len = u32::from_be_bytes(payload[cursor..cursor + 4].try_into().unwrap()) as usize;
+        cursor += 4;
+        if cursor + idx_len * 8 > payload.len() {
+            return Err("Unexpected EOF reading group chunk indices".to_string());
+        }
+        let mut chunk_indices = Vec::with_capacity(idx_len);
+        for _ in 0..idx_len {
+            let cidx = u64::from_be_bytes(payload[cursor..cursor + 8].try_into().unwrap()) as usize;
+            cursor += 8;
+            chunk_indices.push(cidx);
+        }
+        let tensors = read_and_validate_frames(
+            payload,
+            &mut cursor,
+            exp_shape,
+            exp_dtype,
+            None,
+            &mut total_bytes,
+        )?;
+        validate_grouped_chunk_indices(gid, &chunk_indices, tensors.len(), Some(*num_chunks))?;
+        groups.push(InlineTensorGroup {
+            chunk_indices,
+            tensors,
+        });
+    }
+    Ok(groups)
+}

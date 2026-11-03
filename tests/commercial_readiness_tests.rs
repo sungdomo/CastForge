@@ -8494,3 +8494,59 @@ fn test_verify_model_arguments_and_fixup_overhanging_chains() {
     assert_eq!(m.ops[chain_create_id].operands.len(), 3);
     assert_eq!(m.ops[ret_id].operands[0], m.ops[chain_create_id].results[0]);
 }
+
+#[test]
+fn test_inline_tensor_and_grouped_tensor_wire_envelopes() {
+    use castforge::passes::{
+        InlineTensorFrame, InlineTensorGroup, decode_grouped_tensor_envelope,
+        decode_inline_tensor_envelope, encode_grouped_tensor_envelope,
+        encode_inline_tensor_envelope, inline_tensor_dtype_itemsize,
+        validate_grouped_chunk_indices,
+    };
+
+    assert_eq!(inline_tensor_dtype_itemsize("torch.bfloat16"), Some(2));
+    assert_eq!(inline_tensor_dtype_itemsize("float8_e4m3fn"), Some(1));
+    assert_eq!(inline_tensor_dtype_itemsize("complex128"), None);
+
+    let f0 = InlineTensorFrame {
+        dtype: "float16".to_string(),
+        shape: vec![2, 2],
+        data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+    };
+    let f1 = InlineTensorFrame {
+        dtype: "torch.float16".to_string(),
+        shape: vec![2, 2],
+        data: vec![9, 10, 11, 12, 13, 14, 15, 16],
+    };
+
+    let flat_wire =
+        encode_inline_tensor_envelope(&[f0.clone(), f1.clone()]).expect("flat encode succeeds");
+    let decoded_flat =
+        decode_inline_tensor_envelope(&flat_wire, &[2, 2], "float16", 2).expect("flat decode");
+    assert_eq!(decoded_flat.len(), 2);
+    assert_eq!(decoded_flat[1].dtype, "float16");
+    assert_eq!(decoded_flat[1].data, f1.data);
+
+    // Disjoint envelope tags: flat wire must not decode as grouped and vice versa:
+    let expected_spec = vec![(vec![2usize, 2], "float16".to_string(), 4usize)];
+    assert!(decode_grouped_tensor_envelope(&flat_wire, &expected_spec).is_err());
+
+    // Grouped envelope with sparse strictly-increasing chunk indices `[1, 3]` (out of 4 chunks):
+    let grp = InlineTensorGroup {
+        chunk_indices: vec![1, 3],
+        tensors: vec![f0.clone(), f1],
+    };
+    let grp_wire = encode_grouped_tensor_envelope(std::slice::from_ref(&grp))
+        .expect("grouped encode succeeds");
+    assert!(decode_inline_tensor_envelope(&grp_wire, &[2, 2], "float16", 2).is_err());
+
+    let decoded_grp =
+        decode_grouped_tensor_envelope(&grp_wire, &expected_spec).expect("grouped decode succeeds");
+    assert_eq!(decoded_grp.len(), 1);
+    assert_eq!(decoded_grp[0].chunk_indices, vec![1, 3]);
+    assert_eq!(decoded_grp[0].tensors.len(), 2);
+
+    // Non-monotonic chunk indices `[2, 2]` and out-of-range chunk index `4 >= 4` must fail:
+    assert!(validate_grouped_chunk_indices(0, &[2, 2], 2, Some(4)).is_err());
+    assert!(validate_grouped_chunk_indices(0, &[1, 4], 2, Some(4)).is_err());
+}
