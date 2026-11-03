@@ -4682,3 +4682,72 @@ fn test_globalize_call_graph_slot_indices_bottom_up() {
         .collect();
     assert_eq!(call_offsets, vec![4, 12]);
 }
+
+#[test]
+fn test_store_policy_planner_and_binary_trace_stream_codec() {
+    use castforge::passes::{
+        L2AdapterSpec, StorePolicyKind, TRACE_FORMAT_VERSION, TRACE_MAGIC, TRACE_SCHEMA_VERSION,
+        TraceHeader, TraceRecord, decode_trace_stream, encode_trace_stream,
+        plan_l1_l2_store_policy,
+    };
+
+    let adapters = vec![
+        L2AdapterSpec {
+            index: 0,
+            name: "nvme".to_string(),
+            writable: true,
+        },
+        L2AdapterSpec {
+            index: 1,
+            name: "readonly-archive".to_string(),
+            writable: false,
+        },
+    ];
+    let keys = vec!["k0".to_string(), "k1".to_string()];
+    let default_plan =
+        plan_l1_l2_store_policy(StorePolicyKind::DefaultKeepL1, &keys, &adapters, &keys);
+    assert_eq!(default_plan.targets_by_adapter.len(), 1);
+    assert_eq!(default_plan.targets_by_adapter[&0], keys);
+    assert!(default_plan.l1_deletions.is_empty());
+
+    let skip_l1_plan =
+        plan_l1_l2_store_policy(StorePolicyKind::BufferOnlySkipL1, &keys, &adapters, &keys);
+    assert_eq!(skip_l1_plan.l1_deletions, keys);
+
+    // Binary trace stream roundtrip & partial tail handling:
+    let hdr = TraceHeader {
+        magic: TRACE_MAGIC,
+        format_version: TRACE_FORMAT_VERSION,
+        level: "storage".to_string(),
+        trace_schema_version: TRACE_SCHEMA_VERSION,
+        t_mono_start_ns: 1_000,
+        t_wall_start_ns: 2_000,
+        sm_config_digest: "deadbeef".to_string(),
+    };
+    let recs = vec![
+        TraceRecord {
+            t_mono_ns: 100,
+            t_wall_ns: 2100,
+            qualname: "StorageManager.reserve_write".to_string(),
+            args_json: "{\"keys\":2}".to_string(),
+        },
+        TraceRecord {
+            t_mono_ns: 250,
+            t_wall_ns: 2250,
+            qualname: "StorageManager.commit_write".to_string(),
+            args_json: "{\"ok\":true}".to_string(),
+        },
+    ];
+    let mut encoded = encode_trace_stream(&hdr, &recs);
+    let (dec_hdr, dec_recs, truncated) = decode_trace_stream(&encoded).expect("valid trace");
+    assert_eq!(dec_hdr, hdr);
+    assert_eq!(dec_recs, recs);
+    assert!(!truncated);
+
+    // Simulate SIGKILL truncating a 3rd trailing frame mid-body:
+    encoded.extend_from_slice(&100u32.to_be_bytes());
+    encoded.extend_from_slice(&[1, 2, 3]);
+    let (_, dec_recs2, truncated2) = decode_trace_stream(&encoded).expect("graceful tail");
+    assert_eq!(dec_recs2, recs);
+    assert!(truncated2);
+}

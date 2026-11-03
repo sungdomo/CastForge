@@ -15052,3 +15052,250 @@ pub fn globalize_call_graph_slot_indices(
 
     Ok(total_slots)
 }
+
+// ============================================================================
+// Batch 18 Step 1: L1/L2 Store Policy Planner & Binary Trace Stream Codec
+// ============================================================================
+
+/// Magic bytes at the start of every binary observability trace stream.
+pub const TRACE_MAGIC: [u8; 4] = *b"LMCT";
+
+/// On-wire framing layout version for binary observability traces.
+pub const TRACE_FORMAT_VERSION: u32 = 1;
+
+/// Storage API trace schema version enforced for `"storage"` level traces.
+pub const TRACE_SCHEMA_VERSION: u32 = 2;
+
+/// Descriptor for an available L2 storage adapter in the store controller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L2AdapterSpec {
+    /// Zero-based adapter index.
+    pub index: usize,
+    /// Human-readable adapter backend label.
+    pub name: String,
+    /// Whether this adapter accepts new writes.
+    pub writable: bool,
+}
+
+/// Policy governing which L2 adapters receive newly written L1 keys and whether L1 retains or
+/// deletes those keys after a successful L2 store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorePolicyKind {
+    /// Replicate all keys to every writable L2 adapter and keep all keys in L1.
+    DefaultKeepL1,
+    /// Replicate all keys to every writable L2 adapter and immediately delete them from L1
+    /// (`"skip_l1"` pure write-buffer mode).
+    BufferOnlySkipL1,
+}
+
+/// Output plan from [`plan_l1_l2_store_policy`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorePolicyPlan {
+    /// Mapping from L2 adapter index to the ordered list of object keys to persist.
+    pub targets_by_adapter: IndexMap<usize, Vec<String>>,
+    /// Object keys to delete from L1 once L2 persistence succeeds.
+    pub l1_deletions: Vec<String>,
+}
+
+/// Computes the L2 adapter target assignment and post-store L1 deletion list for `keys` under
+/// `policy`.
+#[must_use]
+pub fn plan_l1_l2_store_policy(
+    policy: StorePolicyKind,
+    keys: &[String],
+    adapters: &[L2AdapterSpec],
+    stored_to_l2_keys: &[String],
+) -> StorePolicyPlan {
+    let mut targets_by_adapter = IndexMap::new();
+    for ad in adapters {
+        if ad.writable {
+            targets_by_adapter.insert(ad.index, keys.to_vec());
+        }
+    }
+    let l1_deletions = match policy {
+        StorePolicyKind::DefaultKeepL1 => Vec::new(),
+        StorePolicyKind::BufferOnlySkipL1 => stored_to_l2_keys.to_vec(),
+    };
+    StorePolicyPlan {
+        targets_by_adapter,
+        l1_deletions,
+    }
+}
+
+/// File-level metadata header frame at the start of a binary trace stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceHeader {
+    /// Always [`TRACE_MAGIC`] (`b"LMCT"`).
+    pub magic: [u8; 4],
+    /// Wire framing format version (`1`).
+    pub format_version: u32,
+    /// Trace level (`"storage"` or `"events"`).
+    pub level: String,
+    /// Storage trace schema version (`2` for `"storage"` traces).
+    pub trace_schema_version: u32,
+    /// Monotonic clock start timestamp in nanoseconds.
+    pub t_mono_start_ns: u64,
+    /// Wall-clock start timestamp in nanoseconds.
+    pub t_wall_start_ns: u64,
+    /// SHA-256 hex digest of the storage manager configuration.
+    pub sm_config_digest: String,
+}
+
+/// One captured operation call record in a binary trace stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceRecord {
+    /// Monotonic nanoseconds elapsed since [`TraceHeader::t_mono_start_ns`].
+    pub t_mono_ns: u64,
+    /// Wall-clock nanoseconds when the event was published.
+    pub t_wall_ns: u64,
+    /// Fully qualified call-site name.
+    pub qualname: String,
+    /// JSON-serialized call arguments.
+    pub args_json: String,
+}
+
+fn push_len_prefixed_str(buf: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+fn read_len_prefixed_str(frame: &[u8], cursor: &mut usize) -> Result<String, String> {
+    if *cursor + 4 > frame.len() {
+        return Err("truncated string length in trace frame".to_string());
+    }
+    let len = u32::from_be_bytes(frame[*cursor..*cursor + 4].try_into().unwrap()) as usize;
+    *cursor += 4;
+    if *cursor + len > frame.len() {
+        return Err("truncated string payload in trace frame".to_string());
+    }
+    let s = std::str::from_utf8(&frame[*cursor..*cursor + len])
+        .map_err(|e| format!("invalid UTF-8 in trace frame: {e}"))?
+        .to_string();
+    *cursor += len;
+    Ok(s)
+}
+
+fn append_length_prefixed_frame(stream: &mut Vec<u8>, payload: &[u8]) {
+    stream.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    stream.extend_from_slice(payload);
+}
+
+/// Encodes `header` and `records` into a 4-byte big-endian length-prefixed binary trace stream.
+#[must_use]
+pub fn encode_trace_stream(header: &TraceHeader, records: &[TraceRecord]) -> Vec<u8> {
+    let mut stream = Vec::new();
+    let mut hdr_buf = Vec::new();
+    hdr_buf.extend_from_slice(&header.magic);
+    hdr_buf.extend_from_slice(&header.format_version.to_be_bytes());
+    push_len_prefixed_str(&mut hdr_buf, &header.level);
+    hdr_buf.extend_from_slice(&header.trace_schema_version.to_be_bytes());
+    hdr_buf.extend_from_slice(&header.t_mono_start_ns.to_be_bytes());
+    hdr_buf.extend_from_slice(&header.t_wall_start_ns.to_be_bytes());
+    push_len_prefixed_str(&mut hdr_buf, &header.sm_config_digest);
+    append_length_prefixed_frame(&mut stream, &hdr_buf);
+
+    for rec in records {
+        let mut rec_buf = Vec::new();
+        rec_buf.extend_from_slice(&rec.t_mono_ns.to_be_bytes());
+        rec_buf.extend_from_slice(&rec.t_wall_ns.to_be_bytes());
+        push_len_prefixed_str(&mut rec_buf, &rec.qualname);
+        push_len_prefixed_str(&mut rec_buf, &rec.args_json);
+        append_length_prefixed_frame(&mut stream, &rec_buf);
+    }
+    stream
+}
+
+/// Decodes a binary trace stream into `(TraceHeader, Vec<TraceRecord>, had_truncated_tail)`.
+/// Enforces strict header validation (`TRACE_MAGIC`, `TRACE_FORMAT_VERSION`, and
+/// `TRACE_SCHEMA_VERSION` when `level == "storage"`), and cleanly stops with
+/// `had_truncated_tail = true` if a trailing record frame was truncated mid-write.
+pub fn decode_trace_stream(stream: &[u8]) -> Result<(TraceHeader, Vec<TraceRecord>, bool), String> {
+    if stream.len() < 4 {
+        return Err("trace stream is empty or has truncated header length prefix".to_string());
+    }
+    let hdr_len = u32::from_be_bytes(stream[0..4].try_into().unwrap()) as usize;
+    if stream.len() < 4 + hdr_len {
+        return Err("trace stream has truncated header frame body".to_string());
+    }
+    let hdr_frame = &stream[4..4 + hdr_len];
+    if hdr_frame.len() < 8 {
+        return Err("trace header frame too short".to_string());
+    }
+    let magic: [u8; 4] = hdr_frame[0..4].try_into().unwrap();
+    if magic != TRACE_MAGIC {
+        return Err(format!("trace header bad magic: {magic:?}"));
+    }
+    let format_version = u32::from_be_bytes(hdr_frame[4..8].try_into().unwrap());
+    if format_version != TRACE_FORMAT_VERSION {
+        return Err(format!(
+            "unsupported trace format_version {format_version} (expected {TRACE_FORMAT_VERSION})"
+        ));
+    }
+    let mut hc = 8usize;
+    let level = read_len_prefixed_str(hdr_frame, &mut hc)?;
+    if hc + 20 > hdr_frame.len() {
+        return Err("trace header truncated numeric fields".to_string());
+    }
+    let trace_schema_version = u32::from_be_bytes(hdr_frame[hc..hc + 4].try_into().unwrap());
+    hc += 4;
+    if level == "storage" && trace_schema_version != TRACE_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported storage trace_schema_version {trace_schema_version}"
+        ));
+    }
+    let t_mono_start_ns = u64::from_be_bytes(hdr_frame[hc..hc + 8].try_into().unwrap());
+    hc += 8;
+    let t_wall_start_ns = u64::from_be_bytes(hdr_frame[hc..hc + 8].try_into().unwrap());
+    hc += 8;
+    let sm_config_digest = read_len_prefixed_str(hdr_frame, &mut hc)?;
+
+    let header = TraceHeader {
+        magic,
+        format_version,
+        level,
+        trace_schema_version,
+        t_mono_start_ns,
+        t_wall_start_ns,
+        sm_config_digest,
+    };
+
+    let mut pos = 4 + hdr_len;
+    let mut records = Vec::new();
+    let mut had_truncated_tail = false;
+
+    while pos < stream.len() {
+        if pos + 4 > stream.len() {
+            had_truncated_tail = true;
+            break;
+        }
+        let rec_len = u32::from_be_bytes(stream[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if pos + rec_len > stream.len() {
+            had_truncated_tail = true;
+            break;
+        }
+        let rec_frame = &stream[pos..pos + rec_len];
+        pos += rec_len;
+        if rec_frame.len() < 16 {
+            continue;
+        }
+        let t_mono_ns = u64::from_be_bytes(rec_frame[0..8].try_into().unwrap());
+        let t_wall_ns = u64::from_be_bytes(rec_frame[8..16].try_into().unwrap());
+        let mut rc = 16usize;
+        let Ok(qualname) = read_len_prefixed_str(rec_frame, &mut rc) else {
+            continue;
+        };
+        let Ok(args_json) = read_len_prefixed_str(rec_frame, &mut rc) else {
+            continue;
+        };
+        records.push(TraceRecord {
+            t_mono_ns,
+            t_wall_ns,
+            qualname,
+            args_json,
+        });
+    }
+
+    Ok((header, records, had_truncated_tail))
+}
