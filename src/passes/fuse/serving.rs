@@ -11211,3 +11211,249 @@ pub fn fuse_horizontal_shared_input_ops(module: &mut Module) -> usize {
 
     fused_pairs
 }
+
+/// Hoists callsite-invariant operations out of non-entry callee subgraphs (`func.func`) into
+/// their caller block before the earliest `func.call` call site.
+///
+/// A subgraph parameter is callsite-invariant when every call site passes the exact same SSA
+/// value. Forward `ConstLattice` propagation marks pure operations inside the callee that depend
+/// only on callsite-invariant parameters (or constants), moves them before the earliest call site
+/// in the caller, passes their boundary values into the callee as new parameters, and prunes dead
+/// invariant parameters. Returns the number of operations hoisted out of callees.
+pub fn hoist_callsite_invariant_subgraph_ops(module: &mut Module) -> usize {
+    let mut total_hoisted = 0usize;
+    let fn_ids = module.functions();
+
+    // Map symbol name -> (fn_op_id, entry_block_id) for non-entry functions.
+    let mut callees: IndexMap<String, (OpId, BlockId)> = IndexMap::new();
+    for &fn_id in &fn_ids {
+        let Some(op) = module.ops.get(fn_id) else {
+            continue;
+        };
+        let Some(sym) = op
+            .attributes
+            .get("sym_name")
+            .and_then(|a| a.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if matches!(sym.as_str(), "main" | "forward") {
+            continue;
+        }
+        let Some(&reg_id) = op.regions.first() else {
+            continue;
+        };
+        let Some(reg) = module.regions.get(reg_id) else {
+            continue;
+        };
+        if reg.blocks.len() != 1 {
+            continue;
+        }
+        callees.insert(sym, (fn_id, reg.blocks[0]));
+    }
+
+    let all_blocks: Vec<BlockId> = module.blocks.keys().collect();
+    for (sym, (_fn_id, callee_blk)) in callees {
+        // Collect all `func.call` sites targeting `sym`.
+        let mut callsites: Vec<(BlockId, OpId)> = Vec::new();
+        for &blk_id in &all_blocks {
+            if blk_id == callee_blk {
+                continue;
+            }
+            for &op_id in &module.blocks[blk_id].ops {
+                if let Some(op) = module.ops.get(op_id)
+                    && op.is_op("func", "call")
+                    && op
+                        .attributes
+                        .get("callee")
+                        .and_then(|a| a.as_str())
+                        .is_some_and(|c| c == sym)
+                {
+                    callsites.push((blk_id, op_id));
+                }
+            }
+        }
+        if callsites.is_empty() {
+            continue;
+        }
+        let caller_blk = callsites[0].0;
+        if callsites.iter().any(|&(b, _)| b != caller_blk) {
+            continue;
+        }
+
+        let callee_args = module.blocks[callee_blk].arguments.clone();
+        if callee_args.is_empty() {
+            continue;
+        }
+        if callsites
+            .iter()
+            .any(|&(_, cid)| module.ops[cid].operands.len() != callee_args.len())
+        {
+            continue;
+        }
+
+        // Identify callsite-invariant parameters: every callsite passes the same caller `ValueId`.
+        let mut invariant_arg_to_caller: IndexMap<ValueId, ValueId> = IndexMap::new();
+        for (arg_idx, &callee_arg) in callee_args.iter().enumerate() {
+            let first_val = module.ops[callsites[0].1].operands[arg_idx];
+            if callsites
+                .iter()
+                .all(|&(_, cid)| module.ops[cid].operands[arg_idx] == first_val)
+            {
+                invariant_arg_to_caller.insert(callee_arg, first_val);
+            }
+        }
+        if invariant_arg_to_caller.is_empty() {
+            continue;
+        }
+
+        // Forward `ConstLattice` propagation through `callee_blk`.
+        let mut const_vals: IndexSet<ValueId> = invariant_arg_to_caller.keys().copied().collect();
+        let mut hoisted_ops: Vec<OpId> = Vec::new();
+        let mut hoisted_set: IndexSet<OpId> = IndexSet::new();
+        let callee_ops = module.blocks[callee_blk].ops.clone();
+
+        for &op_id in &callee_ops {
+            let Some(op) = module.ops.get(op_id) else {
+                continue;
+            };
+            if op.is_op("func", "return") || op.is_op("func", "call") || !op.regions.is_empty() {
+                continue;
+            }
+            let is_pure_like = op.is_pure() || op.name.dialect == "mo";
+            if !is_pure_like {
+                continue;
+            }
+            if op.operands.iter().all(|v| const_vals.contains(v)) {
+                hoisted_ops.push(op_id);
+                hoisted_set.insert(op_id);
+                for &r in &op.results {
+                    const_vals.insert(r);
+                }
+            }
+        }
+        if hoisted_ops.is_empty() {
+            continue;
+        }
+
+        // Find boundary values produced by `hoisted_ops` that feed non-hoisted ops in `callee_blk`.
+        let mut boundary_vals: Vec<ValueId> = Vec::new();
+        for &op_id in &hoisted_ops {
+            let results = module.ops[op_id].results.clone();
+            for res_v in results {
+                let used_by_remaining = callee_ops.iter().any(|&other_id| {
+                    !hoisted_set.contains(&other_id)
+                        && module.ops[other_id].operands.contains(&res_v)
+                });
+                if used_by_remaining && !boundary_vals.contains(&res_v) {
+                    boundary_vals.push(res_v);
+                }
+            }
+        }
+
+        // Move `hoisted_ops` into `caller_blk` immediately before `callsites[0].1` and rewire
+        // their invariant parameter operands to the caller's SSA values.
+        for &h_id in &hoisted_ops {
+            if let Some(h_op) = module.ops.get_mut(h_id) {
+                for opd in &mut h_op.operands {
+                    if let Some(&caller_v) = invariant_arg_to_caller.get(opd) {
+                        *opd = caller_v;
+                    }
+                }
+            }
+        }
+        let first_call_id = callsites[0].1;
+        if let Some(pos) = module.blocks[caller_blk]
+            .ops
+            .iter()
+            .position(|&id| id == first_call_id)
+        {
+            for (offset, &h_id) in hoisted_ops.iter().enumerate() {
+                module.blocks[caller_blk].ops.insert(pos + offset, h_id);
+            }
+        }
+        module.blocks[callee_blk]
+            .ops
+            .retain(|id| !hoisted_set.contains(id));
+
+        // Create new callee block arguments for each boundary value and pass them at every call.
+        for &b_val in &boundary_vals {
+            let b_ty = module.values[b_val].ty.clone();
+            let new_arg_idx = module.blocks[callee_blk].arguments.len() as u32;
+            let new_arg_val = module.values.insert_with_key(|vid| Value {
+                id: vid,
+                ssa_name: None,
+                ty: b_ty,
+                def: ValueDef::BlockArgument {
+                    block: callee_blk,
+                    index: new_arg_idx,
+                },
+            });
+            module.blocks[callee_blk].arguments.push(new_arg_val);
+
+            for &rem_id in &module.blocks[callee_blk].ops {
+                if let Some(rem_op) = module.ops.get_mut(rem_id) {
+                    for opd in &mut rem_op.operands {
+                        if *opd == b_val {
+                            *opd = new_arg_val;
+                        }
+                    }
+                }
+            }
+            for &(_, call_id) in &callsites {
+                if let Some(call_op) = module.ops.get_mut(call_id) {
+                    call_op.operands.push(b_val);
+                }
+            }
+        }
+
+        // Prune dead original parameters from `callee_blk` and all its call sites.
+        let mut used_in_callee: IndexSet<ValueId> = IndexSet::new();
+        for &rem_id in &module.blocks[callee_blk].ops {
+            if let Some(rem_op) = module.ops.get(rem_id) {
+                for &v in &rem_op.operands {
+                    used_in_callee.insert(v);
+                }
+            }
+        }
+        let cur_args = module.blocks[callee_blk].arguments.clone();
+        let keep_mask: Vec<bool> = cur_args
+            .iter()
+            .map(|a| used_in_callee.contains(a))
+            .collect();
+        if keep_mask.iter().any(|&k| !k) {
+            let mut new_args = Vec::new();
+            for (idx, &arg_v) in cur_args.iter().enumerate() {
+                if keep_mask[idx] {
+                    let new_idx = new_args.len() as u32;
+                    if let Some(v_mut) = module.values.get_mut(arg_v) {
+                        v_mut.def = ValueDef::BlockArgument {
+                            block: callee_blk,
+                            index: new_idx,
+                        };
+                    }
+                    new_args.push(arg_v);
+                } else {
+                    module.values.remove(arg_v);
+                }
+            }
+            module.blocks[callee_blk].arguments = new_args;
+            for &(_, call_id) in &callsites {
+                if let Some(call_op) = module.ops.get_mut(call_id) {
+                    let old_opds = call_op.operands.clone();
+                    call_op.operands.clear();
+                    for (idx, opd) in old_opds.into_iter().enumerate() {
+                        if keep_mask[idx] {
+                            call_op.operands.push(opd);
+                        }
+                    }
+                }
+            }
+        }
+
+        total_hoisted += hoisted_ops.len();
+    }
+
+    total_hoisted
+}

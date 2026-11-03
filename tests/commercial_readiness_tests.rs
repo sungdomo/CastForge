@@ -43,16 +43,16 @@ use castforge::passes::{
     find_unsqueeze_axis, flatten_elementwise_chains, fold_extend_lifetimes_into_async_kernels,
     fold_unfold_hybrid_prefix_bitmaps, fuse_horizontal_shared_input_ops, fuse_locations,
     fuse_reshape_epilogue, fuse_sole_use_prologues, group_p2p_lookup_keys,
-    hash_packed_token_blocks_be, hash_prefix_token_blocks, hoist_exec_invariant_ops,
-    hoist_symbolic_dim_expressions, interleave_chunk_major_object_keys, is_supported_arch_dtype,
-    legalize_rowwise_reduction_launch, longest_full_attention_hit, longest_joint_prefix_hit,
-    longest_sliding_window_hit, map_axis_through_static_reshape, mark_cuda_graph_stable_tensors,
-    merge_adjacent_parallel_loops, merge_duplicate_shape_ops, merge_identical_functions,
-    merge_parallel_matmuls, num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve,
-    plan_cacheblend_token_reorder, plan_concat_in_place, plan_device_graph_collective_partition,
-    plan_dynamic_memory_pool, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
-    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
-    recalculate_subchunk_blocks_to_skip, recognize_composite_activations,
+    hash_packed_token_blocks_be, hash_prefix_token_blocks, hoist_callsite_invariant_subgraph_ops,
+    hoist_exec_invariant_ops, hoist_symbolic_dim_expressions, interleave_chunk_major_object_keys,
+    is_supported_arch_dtype, legalize_rowwise_reduction_launch, longest_full_attention_hit,
+    longest_joint_prefix_hit, longest_sliding_window_hit, map_axis_through_static_reshape,
+    mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops, merge_duplicate_shape_ops,
+    merge_identical_functions, merge_parallel_matmuls, num_packed_tokens, pack_token_ids_be,
+    plan_cacheblend_retrieve, plan_cacheblend_token_reorder, plan_concat_in_place,
+    plan_device_graph_collective_partition, plan_dynamic_memory_pool, plan_jenga_kv_geometry,
+    plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
+    re_rope_key_in_place, recalculate_subchunk_blocks_to_skip, recognize_composite_activations,
     recover_contiguous_or_dim0_padded_view, reuse_dead_loop_buffers,
     select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
     sink_split_through_reshape, sink_transpose_through_elementwise_and_broadcast,
@@ -3786,4 +3786,52 @@ module @horizontal_fuse_blocked {
 "#;
     let mut m2 = parse_mlir(mlir_blocked).expect("valid MLIR");
     assert_eq!(fuse_horizontal_shared_input_ops(&mut m2), 0);
+}
+
+#[test]
+fn test_hoist_callsite_invariant_subgraph_ops() {
+    // Subgraph `@sub` is called twice from `@main` with the same weight `%w` as argument 0 and
+    // varying activations `%x1`, `%x2` as argument 1.
+    // Inside `@sub`, `%w_exp = stablehlo.exponential %arg0` and `%w_tan = stablehlo.tanh %w_exp`
+    // depend only on callsite-invariant `%arg0`, so both ops are hoisted into `@main` before the
+    // first `func.call @sub`, `%arg0` is pruned, and `%w_tan` is passed into `@sub`!
+    let mlir = r#"
+module @hoist_subgraph_invariant {
+  func.func @sub(%w: tensor<4xf32>, %x: tensor<4xf32>) -> tensor<4xf32> {
+    %w_exp = stablehlo.exponential %w : tensor<4xf32>
+    %w_tan = stablehlo.tanh %w_exp : tensor<4xf32>
+    %y = stablehlo.add %x, %w_tan : tensor<4xf32>
+    return %y : tensor<4xf32>
+  }
+  func.func @main(%w: tensor<4xf32>, %x1: tensor<4xf32>, %x2: tensor<4xf32>) -> tensor<4xf32> {
+    %r1 = func.call @sub(%w, %x1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+    %r2 = func.call @sub(%w, %x2) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+    %out = stablehlo.add %r1, %r2 : tensor<4xf32>
+    return %out : tensor<4xf32>
+  }
+}
+"#;
+    let mut m = parse_mlir(mlir).expect("valid MLIR");
+    assert_eq!(hoist_callsite_invariant_subgraph_ops(&mut m), 2);
+
+    let fns = m.functions();
+    let sub_fn = fns[0];
+    let main_fn = fns[1];
+    let sub_blk = m.regions[m.ops[sub_fn].regions[0]].blocks[0];
+    let main_blk = m.regions[m.ops[main_fn].regions[0]].blocks[0];
+
+    // `@sub` now has only `stablehlo.add` and `func.return` (2 ops instead of 4), and 2 args
+    // (`%x` and the hoisted boundary value `%w_tan`):
+    assert_eq!(m.blocks[sub_blk].ops.len(), 2);
+    assert!(m.ops[m.blocks[sub_blk].ops[0]].is_op("stablehlo", "add"));
+    assert_eq!(m.blocks[sub_blk].arguments.len(), 2);
+
+    // `@main` now begins with the 2 hoisted ops (`stablehlo.exponential` and `stablehlo.tanh`)
+    // before the 2 `func.call` ops:
+    let main_ops = &m.blocks[main_blk].ops;
+    assert_eq!(main_ops.len(), 6);
+    assert!(m.ops[main_ops[0]].is_op("stablehlo", "exponential"));
+    assert!(m.ops[main_ops[1]].is_op("stablehlo", "tanh"));
+    assert!(m.ops[main_ops[2]].is_op("func", "call"));
+    assert!(m.ops[main_ops[3]].is_op("func", "call"));
 }
