@@ -6966,3 +6966,81 @@ fn test_outline_models_to_callables_splits_init_exec_and_propagates_prefixes() {
     assert!(m.ops[top_ops[4]].is_op("mef", "model"));
     assert!(m.ops[call_sub].is_op("grt", "invoke"));
 }
+
+#[test]
+fn test_asym_k16_v8_multi_serde_storage_only_and_split_tier_v_only() {
+    use castforge::passes::{
+        ASYM_K16_V8_ESTIMATE_ALLOWANCE_BYTES, AsymK16V8MultiSerde, AsymK16V8SerdeMode, KvScaleScope,
+    };
+
+    let k_data = vec![0.5f32, -1.0, 2.0, -0.25, 1.5, -2.5, 0.0, 3.0];
+    let v_data = vec![0.25f32, -0.5, 1.0, -1.25, 0.75, -0.75, 0.0, 1.27];
+
+    // 1. StorageOnlyDequant mode:
+    let storage_serde = AsymK16V8MultiSerde::new(
+        AsymK16V8SerdeMode::StorageOnlyDequant,
+        KvScaleScope::PerTensor,
+        1,
+    );
+    assert_eq!(storage_serde.group_size(), 2);
+    assert_eq!(
+        storage_serde
+            .estimate_serialized_size(Some(8), Some(8))
+            .expect("estimate ok"),
+        ASYM_K16_V8_ESTIMATE_ALLOWANCE_BYTES + 16 + 8 + 4
+    );
+    assert!(
+        storage_serde
+            .estimate_serialized_size(None, Some(8))
+            .is_err()
+    );
+
+    let blob_kv = storage_serde
+        .serialize(Some(&k_data), Some(&v_data), 1, 2, 2, 2)
+        .expect("serialize (K, V)");
+    let (k_dec, v_dec) = storage_serde
+        .deserialize(&blob_kv, true, true)
+        .expect("deserialize (K, V)");
+    let k_unwrapped = k_dec.expect("K present");
+    let v_unwrapped = v_dec.expect("V present");
+    assert_eq!(k_unwrapped, k_data);
+    for (orig, rec) in v_data.iter().zip(v_unwrapped.iter()) {
+        assert!((orig - rec).abs() <= 0.02);
+    }
+
+    // Selective V-only read from a full (K, V) blob skips K:
+    let (k_skip, v_only) = storage_serde
+        .deserialize(&blob_kv, false, true)
+        .expect("selective V-only read");
+    assert!(k_skip.is_none());
+    assert!(v_only.is_some());
+
+    // 2. SplitTierVOnly mode: K must be None on serialize, and k_payload_len == 0:
+    let v_only_serde = AsymK16V8MultiSerde::new(
+        AsymK16V8SerdeMode::SplitTierVOnly,
+        KvScaleScope::PerTensor,
+        2,
+    );
+    assert!(
+        v_only_serde
+            .serialize(Some(&k_data), Some(&v_data), 1, 2, 2, 2)
+            .is_err()
+    );
+    // Rejects decoding a full (K, V) blob in SplitTierVOnly mode:
+    assert!(v_only_serde.deserialize(&blob_kv, false, true).is_err());
+
+    assert_eq!(
+        v_only_serde
+            .estimate_serialized_size(None, Some(8))
+            .expect("split-tier estimate"),
+        ASYM_K16_V8_ESTIMATE_ALLOWANCE_BYTES + 8 + 4
+    );
+    let blob_v = v_only_serde
+        .serialize(None, Some(&v_data), 1, 2, 2, 2)
+        .expect("serialize (None, V)");
+    let (k_out_vmode, v_out_vmode) = v_only_serde
+        .deserialize(&blob_v, true, true)
+        .expect("deserialize split-tier");
+    assert!(k_out_vmode.is_none());
+    assert_eq!(v_out_vmode.expect("V present").len(), 8);
+}

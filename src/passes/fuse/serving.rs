@@ -22664,3 +22664,319 @@ pub fn outline_models_to_callables(module: &mut Module) -> Result<usize, String>
 
     Ok(outlined_count)
 }
+
+/// Magic 4-byte signature (`"AKV8"`) for self-describing asymmetric K16/V8 multi-serde wire blobs.
+pub const ASYM_K16_V8_BLOB_MAGIC: [u8; 4] = *b"AKV8";
+
+/// Fixed 32-byte wire header size for [`AsymK16V8MultiSerde`].
+pub const ASYM_K16_V8_HEADER_BYTES: usize = 32;
+
+/// Header allowance (`1024` bytes) added by [`AsymK16V8MultiSerde::estimate_serialized_size`].
+pub const ASYM_K16_V8_ESTIMATE_ALLOWANCE_BYTES: usize = 1024;
+
+/// Operating mode for [`AsymK16V8MultiSerde`]:
+/// - `StorageOnlyDequant`: both `K` (16-bit half precision) and `V` (8-bit quantized + scales)
+///   are serialized into a self-contained blob (`k_payload_len > 0`).
+/// - `SplitTierVOnly`: `K` remains in L1 host RAM (`slot 0` must be `None` on serialize and is a
+///   no-op on deserialize), while only quantized `V` and its scales flow to L2
+///   (`k_payload_len == 0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsymK16V8SerdeMode {
+    StorageOnlyDequant,
+    SplitTierVOnly,
+}
+
+/// Multi-output asymmetric `K16/V8` serializer and deserializer supporting both self-contained
+/// `(K, V)` storage-only-dequant blobs and split-tier `(None, V)` V-only blobs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AsymK16V8MultiSerde {
+    mode: AsymK16V8SerdeMode,
+    scope: KvScaleScope,
+    k_dtype_tag: u8,
+}
+
+impl AsymK16V8MultiSerde {
+    /// Creates a new [`AsymK16V8MultiSerde`] with the given mode, scale scope, and K dtype tag
+    /// (`1` for FP16, `2` for BF16).
+    #[must_use]
+    pub const fn new(mode: AsymK16V8SerdeMode, scope: KvScaleScope, k_dtype_tag: u8) -> Self {
+        Self {
+            mode,
+            scope,
+            k_dtype_tag,
+        }
+    }
+
+    /// Fixed tuple arity (`group_size == 2`: `slot 0 = K`, `slot 1 = V`).
+    #[must_use]
+    pub const fn group_size(&self) -> usize {
+        2
+    }
+
+    /// Returns the configured [`AsymK16V8SerdeMode`].
+    #[must_use]
+    pub const fn mode(&self) -> AsymK16V8SerdeMode {
+        self.mode
+    }
+
+    /// Returns the configured [`KvScaleScope`].
+    #[must_use]
+    pub const fn scale_scope(&self) -> KvScaleScope {
+        self.scope
+    }
+
+    /// Estimates the upper-bound serialized byte size for `(k_numel, v_numel)` under the active
+    /// mode and scale scope. Rejects `PerLayerHead` / `PerPageHead` when only flat element counts
+    /// are available (matching the layout-only estimator contract).
+    pub fn estimate_serialized_size(
+        &self,
+        k_numel: Option<usize>,
+        v_numel: Option<usize>,
+    ) -> Result<usize, String> {
+        let scales_bytes = match self.scope {
+            KvScaleScope::PerTensor => 4usize,
+            KvScaleScope::PerLayerHead | KvScaleScope::PerPageHead => {
+                return Err(
+                    "estimate_serialized_size requires PerTensor scope when head/page metadata \
+                     is absent"
+                        .to_string(),
+                );
+            }
+        };
+
+        match self.mode {
+            AsymK16V8SerdeMode::StorageOnlyDequant => {
+                let (Some(k_n), Some(v_n)) = (k_numel, v_numel) else {
+                    return Err(
+                        "StorageOnlyDequant estimate_serialized_size requires both K and V layouts"
+                            .to_string(),
+                    );
+                };
+                Ok(ASYM_K16_V8_ESTIMATE_ALLOWANCE_BYTES + k_n * 2 + v_n + scales_bytes)
+            }
+            AsymK16V8SerdeMode::SplitTierVOnly => {
+                if k_numel.is_some() {
+                    return Err(
+                        "SplitTierVOnly estimate_serialized_size requires K layout to be None"
+                            .to_string(),
+                    );
+                }
+                let Some(v_n) = v_numel else {
+                    return Err(
+                        "SplitTierVOnly estimate_serialized_size requires V layout".to_string()
+                    );
+                };
+                Ok(ASYM_K16_V8_ESTIMATE_ALLOWANCE_BYTES + v_n + scales_bytes)
+            }
+        }
+    }
+
+    /// Serializes `(k_opt, v_opt)` of shape `[num_pages, page_tokens, num_kv_heads, head_dim]`
+    /// into a self-describing wire byte vector.
+    pub fn serialize(
+        &self,
+        k_opt: Option<&[f32]>,
+        v_opt: Option<&[f32]>,
+        num_pages: usize,
+        page_tokens: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Vec<u8>, String> {
+        use crate::ir::f32_to_f16_bits;
+
+        let expected = num_pages
+            .saturating_mul(page_tokens)
+            .saturating_mul(num_kv_heads)
+            .saturating_mul(head_dim);
+        if expected == 0 {
+            return Err("AsymK16V8MultiSerde: tensor shape has 0 elements".to_string());
+        }
+
+        let v_slice = v_opt.ok_or_else(|| "AsymK16V8MultiSerde: V slot is required".to_string())?;
+        if v_slice.len() != expected {
+            return Err(format!(
+                "AsymK16V8MultiSerde: V length {} != expected {expected}",
+                v_slice.len()
+            ));
+        }
+
+        let k_bytes: Vec<u8> = match (self.mode, k_opt) {
+            (AsymK16V8SerdeMode::StorageOnlyDequant, Some(k_slice)) => {
+                if k_slice.len() != expected {
+                    return Err(format!(
+                        "AsymK16V8MultiSerde: K length {} != expected {expected}",
+                        k_slice.len()
+                    ));
+                }
+                let mut out = Vec::with_capacity(expected * 2);
+                for &x in k_slice {
+                    out.extend_from_slice(&f32_to_f16_bits(x).to_le_bytes());
+                }
+                out
+            }
+            (AsymK16V8SerdeMode::StorageOnlyDequant, None) => {
+                return Err(
+                    "AsymK16V8MultiSerde (StorageOnlyDequant): both K and V must be provided"
+                        .to_string(),
+                );
+            }
+            (AsymK16V8SerdeMode::SplitTierVOnly, Some(_)) => {
+                return Err("AsymK16V8MultiSerde (SplitTierVOnly): K slot must be None".to_string());
+            }
+            (AsymK16V8SerdeMode::SplitTierVOnly, None) => Vec::new(),
+        };
+
+        let dummy_k = vec![0.0f32; expected];
+        let enc = AsymK16V8Codec::encode(
+            &dummy_k,
+            v_slice,
+            num_pages,
+            page_tokens,
+            num_kv_heads,
+            head_dim,
+            self.scope,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let v_payload_len = enc.v_int8_codes.len();
+        let scale_payload_len = enc.v_scales.len() * 4;
+        let k_payload_len = k_bytes.len();
+
+        let scope_tag: u8 = match self.scope {
+            KvScaleScope::PerTensor => 0,
+            KvScaleScope::PerLayerHead => 1,
+            KvScaleScope::PerPageHead => 2,
+        };
+        let mode_tag: u8 = match self.mode {
+            AsymK16V8SerdeMode::StorageOnlyDequant => 0,
+            AsymK16V8SerdeMode::SplitTierVOnly => 1,
+        };
+
+        let mut blob = Vec::with_capacity(
+            ASYM_K16_V8_HEADER_BYTES + k_payload_len + v_payload_len + scale_payload_len,
+        );
+        blob.extend_from_slice(&ASYM_K16_V8_BLOB_MAGIC);
+        blob.push(mode_tag);
+        blob.push(scope_tag);
+        blob.push(self.k_dtype_tag);
+        blob.push(0u8); // reserved
+        blob.extend_from_slice(&(num_pages as u32).to_le_bytes());
+        blob.extend_from_slice(&(page_tokens as u32).to_le_bytes());
+        blob.extend_from_slice(&(num_kv_heads as u32).to_le_bytes());
+        blob.extend_from_slice(&(head_dim as u32).to_le_bytes());
+        blob.extend_from_slice(&(k_payload_len as u32).to_le_bytes());
+        blob.extend_from_slice(&(v_payload_len as u32).to_le_bytes());
+        debug_assert_eq!(blob.len(), ASYM_K16_V8_HEADER_BYTES);
+
+        blob.extend_from_slice(&k_bytes);
+        for &code in &enc.v_int8_codes {
+            blob.push(code as u8);
+        }
+        for &sc in &enc.v_scales {
+            blob.extend_from_slice(&sc.to_bits().to_le_bytes());
+        }
+        Ok(blob)
+    }
+
+    /// Deserializes `blob` according to `(want_k, want_v)`:
+    /// - In `StorageOnlyDequant` mode, either slot may be `false` to skip materializing that
+    ///   output (`(true, false)` for K-only read, `(false, true)` for V-only read).
+    /// - In `SplitTierVOnly` mode, rejects blobs with `k_payload_len > 0` and always returns `None`
+    ///   for K (leaving the caller's L1 K buffer untouched) while dequantizing `V` when `want_v` is
+    ///   `true`.
+    #[allow(clippy::type_complexity)]
+    pub fn deserialize(
+        &self,
+        blob: &[u8],
+        want_k: bool,
+        want_v: bool,
+    ) -> Result<(Option<Vec<f32>>, Option<Vec<f32>>), String> {
+        use crate::ir::f16_bits_to_f32;
+
+        if blob.len() < ASYM_K16_V8_HEADER_BYTES {
+            return Err("AsymK16V8MultiSerde: blob shorter than 32-byte header".to_string());
+        }
+        if blob[0..4] != ASYM_K16_V8_BLOB_MAGIC {
+            return Err("AsymK16V8MultiSerde: invalid magic header".to_string());
+        }
+        let scope = match blob[5] {
+            0 => KvScaleScope::PerTensor,
+            1 => KvScaleScope::PerLayerHead,
+            2 => KvScaleScope::PerPageHead,
+            other => return Err(format!("AsymK16V8MultiSerde: unknown scope tag {other}")),
+        };
+        let num_pages = u32::from_le_bytes(blob[8..12].try_into().unwrap()) as usize;
+        let page_tokens = u32::from_le_bytes(blob[12..16].try_into().unwrap()) as usize;
+        let num_kv_heads = u32::from_le_bytes(blob[16..20].try_into().unwrap()) as usize;
+        let head_dim = u32::from_le_bytes(blob[20..24].try_into().unwrap()) as usize;
+        let k_payload_len = u32::from_le_bytes(blob[24..28].try_into().unwrap()) as usize;
+        let v_payload_len = u32::from_le_bytes(blob[28..32].try_into().unwrap()) as usize;
+
+        if self.mode == AsymK16V8SerdeMode::SplitTierVOnly && k_payload_len != 0 {
+            return Err(format!(
+                "AsymK16V8MultiSerde (SplitTierVOnly): blob has k_payload_len={k_payload_len} \
+                 (>0); use StorageOnlyDequant mode to decode"
+            ));
+        }
+        if self.mode == AsymK16V8SerdeMode::StorageOnlyDequant && k_payload_len == 0 && want_k {
+            return Err(
+                "AsymK16V8MultiSerde (StorageOnlyDequant): blob has k_payload_len=0".to_string(),
+            );
+        }
+
+        let num_scales = match scope {
+            KvScaleScope::PerTensor => 1,
+            KvScaleScope::PerLayerHead => num_kv_heads,
+            KvScaleScope::PerPageHead => num_pages * num_kv_heads,
+        };
+        let scale_payload_len = num_scales * 4;
+        let expected_total =
+            ASYM_K16_V8_HEADER_BYTES + k_payload_len + v_payload_len + scale_payload_len;
+        if blob.len() < expected_total {
+            return Err(format!(
+                "AsymK16V8MultiSerde: truncated blob ({} < {expected_total})",
+                blob.len()
+            ));
+        }
+
+        let k_off = ASYM_K16_V8_HEADER_BYTES;
+        let v_off = k_off + k_payload_len;
+        let s_off = v_off + v_payload_len;
+
+        let k_out = if self.mode == AsymK16V8SerdeMode::StorageOnlyDequant && want_k {
+            let mut k_vec = Vec::with_capacity(k_payload_len / 2);
+            for &chunk in blob[k_off..v_off].as_chunks::<2>().0 {
+                let bits = u16::from_le_bytes(chunk);
+                k_vec.push(f16_bits_to_f32(bits));
+            }
+            Some(k_vec)
+        } else {
+            None
+        };
+
+        let v_out = if want_v {
+            let v_codes: Vec<i8> = blob[v_off..s_off].iter().map(|&b| b as i8).collect();
+            let mut scales = Vec::with_capacity(num_scales);
+            for &chunk in blob[s_off..s_off + scale_payload_len].as_chunks::<4>().0 {
+                let bits = u32::from_le_bytes(chunk);
+                scales.push(f32::from_bits(bits));
+            }
+            let dummy_page = EncodedAsymKvPage {
+                k_fp16_bits: Vec::new(),
+                v_int8_codes: v_codes,
+                v_scales: scales,
+                scope,
+                num_pages,
+                page_tokens,
+                num_kv_heads,
+                head_dim,
+            };
+            let (_, v_f32) = AsymK16V8Codec::decode(&dummy_page);
+            Some(v_f32)
+        } else {
+            None
+        };
+
+        Ok((k_out, v_out))
+    }
+}
