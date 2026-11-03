@@ -14099,3 +14099,206 @@ impl BlendContentFingerprintIndex {
         }
     }
 }
+
+// ============================================================================
+// Batch 17 Step 2: FP8 E4M3FN Quantization Codec & Multi-Output Serde Group Planner
+// ============================================================================
+
+/// Maximum finite positive value representable in `float8_e4m3fn` (`(1 + 6/8) * 2^8 = 448.0`).
+pub const FP8_E4M3FN_MAX_FINITE: f32 = 448.0;
+
+/// Canonical NaN bit-pattern for `float8_e4m3fn` (`s=0, exp=0b1111, mant=0b111`).
+pub const FP8_E4M3FN_NAN: u8 = 0x7F;
+
+/// Converts an `f32` scalar to an 8-bit `float8_e4m3fn` byte (1 sign bit, 4-bit exponent with
+/// bias 7, 3-bit mantissa, finite-only with `exp=15, mant=7` reserved for NaN and saturating
+/// finite magnitudes above `448.0` to `±448.0`).
+#[must_use]
+pub fn f32_to_fp8_e4m3fn(v: f32) -> u8 {
+    if v.is_nan() {
+        return FP8_E4M3FN_NAN;
+    }
+    let sign = if v.is_sign_negative() { 0x80u8 } else { 0x00u8 };
+    let abs_v = v.abs();
+    if abs_v == 0.0 {
+        return sign;
+    }
+    if abs_v >= FP8_E4M3FN_MAX_FINITE {
+        return sign | 0x7E;
+    }
+    // Subnormal range: exp_unbiased = -6, step = 2^-9 = 1/512.
+    let min_normal = 1.0f32 / 64.0f32; // 2^-6
+    if abs_v < min_normal {
+        let scaled = abs_v * 512.0f32;
+        let floor = scaled.floor();
+        let diff = scaled - floor;
+        let mut mant = floor as u8;
+        if diff > 0.5 || (diff == 0.5 && (mant & 1) == 1) {
+            mant += 1;
+        }
+        return sign | mant;
+    }
+    let exp_unbiased = abs_v.log2().floor() as i32;
+    let exp_biased = (exp_unbiased + 7) as u8;
+    let norm = abs_v / (2.0f32).powi(exp_unbiased) - 1.0f32;
+    let scaled_m = norm * 8.0f32;
+    let floor_m = scaled_m.floor();
+    let diff_m = scaled_m - floor_m;
+    let mut mant = floor_m as u8;
+    if diff_m > 0.5 || (diff_m == 0.5 && (mant & 1) == 1) {
+        mant += 1;
+    }
+    let (mut e, mut m) = (exp_biased, mant);
+    if m == 8 {
+        m = 0;
+        e += 1;
+    }
+    if e > 15 || (e == 15 && m >= 7) {
+        return sign | 0x7E;
+    }
+    sign | (e << 3) | m
+}
+
+/// Converts an 8-bit `float8_e4m3fn` byte back into an `f32` scalar.
+#[must_use]
+pub fn fp8_e4m3fn_to_f32(b: u8) -> f32 {
+    let sign = if (b & 0x80) != 0 { -1.0f32 } else { 1.0f32 };
+    let exp = (b >> 3) & 0x0F;
+    let mant = b & 0x07;
+    if exp == 0x0F && mant == 0x07 {
+        return f32::NAN;
+    }
+    if exp == 0 {
+        if mant == 0 {
+            return if sign < 0.0 { -0.0 } else { 0.0 };
+        }
+        return sign * (f32::from(mant) / 512.0f32);
+    }
+    let scale = (2.0f32).powi(i32::from(exp) - 7);
+    sign * (1.0f32 + f32::from(mant) / 8.0f32) * scale
+}
+
+/// Quantizes an `f32` slice into a contiguous 1-byte-per-element `float8_e4m3fn` buffer.
+#[must_use]
+pub fn quantize_f32_slice_to_fp8_e4m3fn(src: &[f32]) -> Vec<u8> {
+    src.iter().copied().map(f32_to_fp8_e4m3fn).collect()
+}
+
+/// Dequantizes a contiguous `float8_e4m3fn` byte slice into `f32` elements.
+#[must_use]
+pub fn dequantize_fp8_e4m3fn_slice_to_f32(src: &[u8]) -> Vec<f32> {
+    src.iter().copied().map(fp8_e4m3fn_to_f32).collect()
+}
+
+/// Returns the deterministic serialized byte size for FP8 quantization (`1` byte per element
+/// summed across all tensor `shapes`, with no safety-margin inflation).
+#[must_use]
+pub fn estimate_fp8_serialized_size(shapes: &[Vec<usize>]) -> usize {
+    shapes
+        .iter()
+        .map(|shape| {
+            if shape.is_empty() {
+                0
+            } else {
+                shape
+                    .iter()
+                    .copied()
+                    .fold(1usize, |acc, d| acc.saturating_mul(d))
+            }
+        })
+        .sum()
+}
+
+/// Per-slot specification in a multi-output KV serde group (e.g., `slot 0 = K`, `slot 1 = V`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiSerdeSlotSpec {
+    /// Human-readable slot role (such as `"K"` or `"V"`).
+    pub name: String,
+    /// Bytes per element for this slot's serialized format (`1` for FP8, `2` for BF16/FP16).
+    pub bytes_per_element: usize,
+    /// Whether this slot may be `None` (absent) during tier-split serialization.
+    pub allow_absent: bool,
+}
+
+/// Schema for a fixed-length multi-output KV serde group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiSerdeGroupSchema {
+    /// Ordered slot specifications defining `group_size = slots.len()`.
+    pub slots: Vec<MultiSerdeSlotSpec>,
+}
+
+/// Planned byte-slice layout for a concrete multi-output KV serde group invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiSerdeGroupPlan {
+    /// Per-slot `(byte_offset, byte_len)` for present slots, or `None` when the slot is absent.
+    pub slot_ranges: Vec<Option<(usize, usize)>>,
+    /// Total contiguous bytes required in the serialized buffer.
+    pub total_bytes: usize,
+}
+
+/// Validates that a multi-serde tuple of length `actual_len` matches `expected_len` for `role`
+/// (`"src"`, `"dst"`, or `"layout"`).
+pub fn validate_multi_serde_group_arity(
+    actual_len: usize,
+    expected_len: usize,
+    role: &str,
+) -> Result<(), String> {
+    if actual_len != expected_len {
+        return Err(format!(
+            "MultiSerde {role} group length {actual_len} does not match expected {expected_len}"
+        ));
+    }
+    Ok(())
+}
+
+impl MultiSerdeGroupSchema {
+    /// Fixed input/output tuple arity (`group_size`) expected by this schema.
+    #[must_use]
+    pub fn group_size(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Validates `layout_shapes` (where `None` denotes an absent slot and `Some(shape)` provides
+    /// that slot's tensor dimensions) and plans contiguous `(offset, byte_len)` ranges.
+    pub fn plan_group(
+        &self,
+        layout_shapes: &[Option<Vec<usize>>],
+        role: &str,
+    ) -> Result<MultiSerdeGroupPlan, String> {
+        validate_multi_serde_group_arity(layout_shapes.len(), self.group_size(), role)?;
+        let mut slot_ranges = Vec::with_capacity(self.slots.len());
+        let mut offset = 0usize;
+
+        for (idx, (spec, maybe_shape)) in self.slots.iter().zip(layout_shapes.iter()).enumerate() {
+            match maybe_shape {
+                None => {
+                    if !spec.allow_absent {
+                        return Err(format!(
+                            "MultiSerde {role} slot {idx} ('{}') is required and cannot be absent",
+                            spec.name
+                        ));
+                    }
+                    slot_ranges.push(None);
+                }
+                Some(shape) => {
+                    let numel = if shape.is_empty() {
+                        0
+                    } else {
+                        shape
+                            .iter()
+                            .copied()
+                            .fold(1usize, |acc, d| acc.saturating_mul(d))
+                    };
+                    let byte_len = numel.saturating_mul(spec.bytes_per_element);
+                    slot_ranges.push(Some((offset, byte_len)));
+                    offset = offset.saturating_add(byte_len);
+                }
+            }
+        }
+
+        Ok(MultiSerdeGroupPlan {
+            slot_ranges,
+            total_bytes: offset,
+        })
+    }
+}

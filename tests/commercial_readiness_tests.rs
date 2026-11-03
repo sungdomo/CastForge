@@ -4458,10 +4458,72 @@ fn test_blend_content_fingerprint_index_and_rolling_hash_windows() {
 
     // Removing `ns-alpha`'s claim on `ch1` keeps `ch1` alive for `ns-beta`, while `remove_chunk`
     // drops `ch2` completely:
+    idx.remove_claim(&[10, 20, 30, 80], &ch1, "ns-alpha");
     idx.remove_claim(&[10, 20, 30, 40], &ch1, "ns-alpha");
     idx.remove_chunk(&[50, 60, 70, 80], &ch2);
     assert_eq!(idx.stats().num_contents, 1);
     assert_eq!(idx.stats().num_chunks, 1);
     assert_eq!(idx.stats().num_claims, 1);
     assert_eq!(idx.stats().num_namespaces, 1);
+}
+
+#[test]
+fn test_fp8_e4m3fn_codec_and_multi_serde_group_planner() {
+    use castforge::passes::{
+        FP8_E4M3FN_MAX_FINITE, FP8_E4M3FN_NAN, MultiSerdeGroupSchema, MultiSerdeSlotSpec,
+        dequantize_fp8_e4m3fn_slice_to_f32, estimate_fp8_serialized_size, f32_to_fp8_e4m3fn,
+        fp8_e4m3fn_to_f32, quantize_f32_slice_to_fp8_e4m3fn,
+    };
+
+    // 1. Exact values & edge cases in float8_e4m3fn:
+    assert_eq!(f32_to_fp8_e4m3fn(0.0), 0x00);
+    assert_eq!(f32_to_fp8_e4m3fn(-0.0), 0x80);
+    assert_eq!(f32_to_fp8_e4m3fn(f32::NAN), FP8_E4M3FN_NAN);
+    assert!(fp8_e4m3fn_to_f32(FP8_E4M3FN_NAN).is_nan());
+    assert_eq!(f32_to_fp8_e4m3fn(1000.0), 0x7E);
+    assert_eq!(fp8_e4m3fn_to_f32(0x7E), FP8_E4M3FN_MAX_FINITE);
+    assert_eq!(f32_to_fp8_e4m3fn(-1000.0), 0xFE);
+    assert_eq!(fp8_e4m3fn_to_f32(0xFE), -FP8_E4M3FN_MAX_FINITE);
+
+    let samples = [0.0f32, 0.125, -0.5, 1.0, 1.5, -3.5, 16.0, 448.0];
+    let q = quantize_f32_slice_to_fp8_e4m3fn(&samples);
+    let dq = dequantize_fp8_e4m3fn_slice_to_f32(&q);
+    assert_eq!(dq, samples);
+
+    // 2. Deterministic 1-byte-per-element size estimator:
+    let shapes = vec![vec![2, 16, 8], vec![2, 16, 8]];
+    assert_eq!(estimate_fp8_serialized_size(&shapes), 512);
+
+    // 3. Multi-output serde group schema (slot 0 = K in BF16 optional, slot 1 = V in FP8 required):
+    let schema = MultiSerdeGroupSchema {
+        slots: vec![
+            MultiSerdeSlotSpec {
+                name: "K".to_string(),
+                bytes_per_element: 2,
+                allow_absent: true,
+            },
+            MultiSerdeSlotSpec {
+                name: "V".to_string(),
+                bytes_per_element: 1,
+                allow_absent: false,
+            },
+        ],
+    };
+    assert_eq!(schema.group_size(), 2);
+
+    // Both K and V present:
+    let full_plan = schema
+        .plan_group(&[Some(vec![4, 8]), Some(vec![4, 8])], "src")
+        .unwrap();
+    assert_eq!(full_plan.slot_ranges, vec![Some((0, 64)), Some((64, 32))]);
+    assert_eq!(full_plan.total_bytes, 96);
+
+    // Tier-split placement (K absent in L1, V in L2):
+    let split_plan = schema.plan_group(&[None, Some(vec![4, 8])], "src").unwrap();
+    assert_eq!(split_plan.slot_ranges, vec![None, Some((0, 32))]);
+    assert_eq!(split_plan.total_bytes, 32);
+
+    // Missing required slot V or wrong group arity fails cleanly:
+    assert!(schema.plan_group(&[Some(vec![4, 8]), None], "src").is_err());
+    assert!(schema.plan_group(&[Some(vec![4, 8])], "layout").is_err());
 }
