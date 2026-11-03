@@ -7044,3 +7044,93 @@ fn test_asym_k16_v8_multi_serde_storage_only_and_split_tier_v_only() {
     assert!(k_out_vmode.is_none());
     assert_eq!(v_out_vmode.expect("V present").len(), 8);
 }
+
+#[test]
+fn test_conform_call_operands_scalar_variadic_trait_and_unfused_epilogue_bypass() {
+    use castforge::ir::{Attribute, Location, OpName, Operation};
+    use castforge::passes::conform_call_operands;
+    use indexmap::IndexMap;
+    use smallvec::SmallVec;
+
+    let mlir_src = concat!(
+        "module {\n",
+        "  func.func @kernel_stub(%x: tensor<4xf32>, %y: tensor<4xf32>, %s: tensor<1xi64>)",
+        " -> tensor<4xf32> {\n",
+        "    %mut_in = \"castforge.tensor.create\"(%x) {mut = true}",
+        " : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %ep = \"castforge.tensor.create.epilogue\"(%y) {recomputes_value = false}",
+        " : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %res = \"castforge.call.opaque\"(%mut_in, %x, %s, %ep)",
+        " {callee = @my_kernel, has_epilogue_fusion = false}",
+        " : (tensor<4xf32>, tensor<4xf32>, tensor<1xi64>, tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %res : tensor<4xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(mlir_src).expect("valid mlir");
+    let root_blk = m.regions[m.root_region].blocks[0];
+    let func_id = m.functions()[0];
+    m.ops[func_id].attributes.insert(
+        "device_ref".to_string(),
+        Attribute::String("gpu:0".to_string()),
+    );
+
+    // Insert top-level `castforge.kernel.decl` with `supports_unfused_execute = true` and
+    // param_specs = ["trait:TileTensorable", "variadic:plain", "scalar", "tensor"]:
+    let decl_id = m.ops.insert_with_key(|id| Operation {
+        id,
+        name: OpName::new("castforge", "kernel.decl"),
+        operands: SmallVec::new(),
+        results: SmallVec::new(),
+        attributes: {
+            let mut a = IndexMap::new();
+            a.insert(
+                "sym_name".to_string(),
+                Attribute::String("my_kernel".to_string()),
+            );
+            a.insert(
+                "supports_unfused_execute".to_string(),
+                Attribute::Bool(true),
+            );
+            a.insert(
+                "param_specs".to_string(),
+                Attribute::Array(vec![
+                    Attribute::String("trait:TileTensorable".to_string()),
+                    Attribute::String("variadic:plain".to_string()),
+                    Attribute::String("scalar".to_string()),
+                    Attribute::String("tensor".to_string()),
+                ]),
+            );
+            a
+        },
+        regions: Vec::new(),
+        custom_syntax: false,
+        location: Location::Unknown,
+    });
+    m.blocks[root_blk].ops.insert(0, decl_id);
+
+    let conformed = conform_call_operands(&mut m).expect("conform succeeds");
+    assert_eq!(conformed, 1);
+
+    let blk_id = m.regions[m.ops[func_id].regions[0]].blocks[0];
+    let ops = &m.blocks[blk_id].ops;
+    // The pass-through `tensor.create.epilogue` was bypassed and erased, and the call is preceded
+    // by: original `tensor.create(mut=true)`, cloned `tensor.create(mut=false)`,
+    // `trait.create`, `tuple.create`, and `scalar.create`:
+    assert!(
+        !ops.iter()
+            .any(|&id| m.ops[id].is_op("castforge", "tensor.create.epilogue"))
+    );
+    assert!(
+        ops.iter()
+            .any(|&id| m.ops[id].is_op("castforge", "trait.create"))
+    );
+    assert!(
+        ops.iter()
+            .any(|&id| m.ops[id].is_op("castforge", "tuple.create"))
+    );
+    assert!(
+        ops.iter()
+            .any(|&id| m.ops[id].is_op("castforge", "scalar.create"))
+    );
+}

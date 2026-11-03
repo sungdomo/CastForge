@@ -22980,3 +22980,415 @@ impl AsymK16V8MultiSerde {
         Ok((k_out, v_out))
     }
 }
+
+/// Conforms `castforge.call.opaque` (`mogg.call.opaque`) and `castforge.call.shape`
+/// (`mogg.call.shape`) operands against their declared `castforge.kernel.decl` /
+/// `mogg.kernel.decl` or `castforge.shape_func.decl` / `mogg.shape_func.decl` signatures:
+/// 1. When a kernel decl sets `"supports_unfused_execute" == true`, the call has
+///    `"has_epilogue_fusion" != true`, and every output operand is produced by a single-use,
+///    non-recomputing `castforge.tensor.create.epilogue` (`mogg.tensor.create.epilogue`), bypasses
+///    the pass-through epilogue to its first capture operand and erases the dead epilogue op.
+/// 2. Reconciles mutable `castforge.tensor.create` (`mogg.tensor.create` with `"mut" == true`)
+///    producers backing read-only `"tensor"` / `"trait:..."` inputs by cloning an immutable
+///    producer (`"mut" = false`).
+/// 3. Wraps `"scalar"` operands in `castforge.scalar.create`, non-fused `"trait:<contract>"`
+///    operands in `castforge.trait.create` (stamped with `"device"` and `"contract"`), and
+///    consecutive `"variadic:<abi>"` (`"plain"`, `"stable"`, `"fused_input"`, `"fused_output"`,
+///    `"tensor_tuple"`) runs in `castforge.tuple.create` with `"abi"`.
+///
+/// Returns the number of calls whose operand lists were conformed.
+pub fn conform_call_operands(module: &mut Module) -> Result<usize, String> {
+    use crate::ir::mlir::OpName;
+    use std::collections::HashMap;
+
+    let Some(root_reg) = module.regions.get(module.root_region) else {
+        return Ok(0);
+    };
+    let Some(&root_blk) = root_reg.blocks.first() else {
+        return Ok(0);
+    };
+
+    // Collect top-level kernel declarations and shape function declarations.
+    // Decl entry: (param_specs, supports_unfused_execute, is_shape_decl)
+    type DeclInfo = (Vec<String>, bool, bool);
+    let mut decls: HashMap<String, DeclInfo> = HashMap::new();
+    for &op_id in &module.blocks[root_blk].ops {
+        let full = module.ops[op_id].name.full_name();
+        let is_kernel_decl = full == "castforge.kernel.decl" || full == "mogg.kernel.decl";
+        let is_shape_decl = full == "castforge.shape_func.decl" || full == "mogg.shape_func.decl";
+        if !is_kernel_decl && !is_shape_decl {
+            continue;
+        }
+        let Some(sym) = module.ops[op_id]
+            .attributes
+            .get("sym_name")
+            .and_then(|a| a.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let specs: Vec<String> = match module.ops[op_id].attributes.get("param_specs") {
+            Some(Attribute::Array(arr)) => arr
+                .iter()
+                .filter_map(|a| a.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let supports_unfused = module.ops[op_id]
+            .attributes
+            .get("supports_unfused_execute")
+            .and_then(|a| a.as_bool())
+            .unwrap_or(false);
+        decls.insert(sym, (specs, supports_unfused, is_shape_decl));
+    }
+
+    let mut conformed_calls = 0usize;
+    let func_ids = module.functions();
+
+    for func_id in func_ids {
+        let device_label = module.ops[func_id]
+            .attributes
+            .get("device_ref")
+            .or_else(|| module.ops[func_id].attributes.get("mo.device_ref"))
+            .and_then(|a| a.as_str())
+            .map(|s| s.split_once(':').map(|(l, _)| l).unwrap_or(s).to_string())
+            .unwrap_or_else(|| "cpu".to_string());
+
+        let regions = module.ops[func_id].regions.clone();
+        for reg_id in regions {
+            let blocks = module.regions[reg_id].blocks.clone();
+            for blk_id in blocks {
+                let orig_ops = module.blocks[blk_id].ops.clone();
+                let mut use_counts: HashMap<ValueId, usize> = HashMap::new();
+                for &oid in &orig_ops {
+                    for &v in &module.ops[oid].operands {
+                        *use_counts.entry(v).or_insert(0) += 1;
+                    }
+                }
+
+                let mut new_ops: Vec<OpId> = Vec::with_capacity(orig_ops.len() + 8);
+                let mut dead_epilogues: std::collections::HashSet<OpId> =
+                    std::collections::HashSet::new();
+
+                for &op_id in &orig_ops {
+                    let full = module.ops[op_id].name.full_name();
+                    let is_opaque_call =
+                        full == "castforge.call.opaque" || full == "mogg.call.opaque";
+                    let is_shape_call = full == "castforge.call.shape" || full == "mogg.call.shape";
+                    if !is_opaque_call && !is_shape_call {
+                        new_ops.push(op_id);
+                        continue;
+                    }
+
+                    let callee = module.ops[op_id]
+                        .attributes
+                        .get("callee")
+                        .and_then(|a| a.as_str())
+                        .ok_or_else(|| format!("{full} missing 'callee' attribute"))?
+                        .trim_start_matches('@')
+                        .to_string();
+
+                    let Some((param_specs, supports_unfused, _)) = decls.get(&callee).cloned()
+                    else {
+                        return Err(format!("ConformCallOperands: no decl named '{callee}'"));
+                    };
+
+                    let mut call_operands: Vec<ValueId> =
+                        module.ops[op_id].operands.iter().copied().collect();
+                    let mut changed = false;
+
+                    // 1. Check pass-through epilogue bypass for unfused `call.opaque`.
+                    let has_epilogue_fusion = module.ops[op_id]
+                        .attributes
+                        .get("has_epilogue_fusion")
+                        .and_then(|a| a.as_bool())
+                        .unwrap_or(false);
+                    if is_opaque_call && supports_unfused && !has_epilogue_fusion {
+                        let mut epilogue_rewrites: Vec<(usize, OpId, ValueId)> = Vec::new();
+                        let mut all_valid = true;
+                        for (idx, &opd_v) in call_operands.iter().enumerate() {
+                            if let ValueDef::OpResult { op: prod_op, .. } = module.values[opd_v].def
+                            {
+                                let p_name = module.ops[prod_op].name.full_name();
+                                if p_name == "castforge.tensor.create.epilogue"
+                                    || p_name == "mogg.tensor.create.epilogue"
+                                {
+                                    let recomputes = module.ops[prod_op]
+                                        .attributes
+                                        .get("recomputes_value")
+                                        .and_then(|a| a.as_bool())
+                                        .unwrap_or(false);
+                                    let single_use =
+                                        use_counts.get(&opd_v).copied().unwrap_or(0) == 1;
+                                    if !recomputes
+                                        && single_use
+                                        && let Some(&cap0) = module.ops[prod_op].operands.first()
+                                    {
+                                        epilogue_rewrites.push((idx, prod_op, cap0));
+                                    } else {
+                                        all_valid = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if all_valid && !epilogue_rewrites.is_empty() {
+                            for (idx, ep_op, cap0) in epilogue_rewrites {
+                                call_operands[idx] = cap0;
+                                dead_epilogues.insert(ep_op);
+                            }
+                            changed = true;
+                        }
+                    }
+
+                    // 2. Pack operands according to `param_specs`.
+                    let loc = module.ops[op_id].location.clone();
+                    let mut packed: SmallVec<[ValueId; 4]> = SmallVec::new();
+                    let mut i = 0usize;
+                    let mut spec_idx = 0usize;
+
+                    while i < call_operands.len() {
+                        let spec = param_specs
+                            .get(spec_idx)
+                            .map(String::as_str)
+                            .unwrap_or("tensor");
+                        let opd = call_operands[i];
+
+                        // Mut-to-immut reconciliation for read-only kernel inputs:
+                        let reconciled_opd = if is_opaque_call && spec != "mut_tensor" {
+                            if let ValueDef::OpResult { op: prod_op, .. } = module.values[opd].def {
+                                let p_name = module.ops[prod_op].name.full_name();
+                                let is_mut = module.ops[prod_op]
+                                    .attributes
+                                    .get("mut")
+                                    .and_then(|a| a.as_bool())
+                                    .unwrap_or(false);
+                                if (p_name == "castforge.tensor.create"
+                                    || p_name == "mogg.tensor.create")
+                                    && is_mut
+                                {
+                                    let p_opds = module.ops[prod_op].operands.clone();
+                                    let mut p_attrs = module.ops[prod_op].attributes.clone();
+                                    p_attrs.insert("mut".to_string(), Attribute::Bool(false));
+                                    let p_ty = module.values[opd].ty.clone();
+                                    let immut_loc = loc.clone();
+                                    let immut_op = module.ops.insert_with_key(|oid| Operation {
+                                        id: oid,
+                                        name: OpName::new("castforge", "tensor.create"),
+                                        operands: p_opds,
+                                        results: SmallVec::new(),
+                                        attributes: p_attrs,
+                                        regions: Vec::new(),
+                                        custom_syntax: false,
+                                        location: immut_loc,
+                                    });
+                                    let immut_val = module.values.insert_with_key(|vid| Value {
+                                        id: vid,
+                                        ssa_name: None,
+                                        ty: p_ty,
+                                        def: ValueDef::OpResult {
+                                            op: immut_op,
+                                            index: 0,
+                                        },
+                                    });
+                                    module.ops[immut_op].results.push(immut_val);
+                                    new_ops.push(immut_op);
+                                    changed = true;
+                                    immut_val
+                                } else {
+                                    opd
+                                }
+                            } else {
+                                opd
+                            }
+                        } else {
+                            opd
+                        };
+
+                        if spec == "scalar" {
+                            let s_loc = loc.clone();
+                            let s_ty = module.values[reconciled_opd].ty.clone();
+                            let sc_op = module.ops.insert_with_key(|oid| Operation {
+                                id: oid,
+                                name: OpName::new("castforge", "scalar.create"),
+                                operands: SmallVec::from_slice(&[reconciled_opd]),
+                                results: SmallVec::new(),
+                                attributes: IndexMap::new(),
+                                regions: Vec::new(),
+                                custom_syntax: false,
+                                location: s_loc,
+                            });
+                            let sc_val = module.values.insert_with_key(|vid| Value {
+                                id: vid,
+                                ssa_name: None,
+                                ty: s_ty,
+                                def: ValueDef::OpResult {
+                                    op: sc_op,
+                                    index: 0,
+                                },
+                            });
+                            module.ops[sc_op].results.push(sc_val);
+                            new_ops.push(sc_op);
+                            packed.push(sc_val);
+                            changed = true;
+                            i += 1;
+                            spec_idx += 1;
+                            continue;
+                        }
+
+                        if let Some(contract) = spec.strip_prefix("trait:") {
+                            let t_loc = loc.clone();
+                            let t_ty = module.values[reconciled_opd].ty.clone();
+                            let dev_str = device_label.clone();
+                            let contract_str = contract.to_string();
+                            let tr_op = module.ops.insert_with_key(|oid| Operation {
+                                id: oid,
+                                name: OpName::new("castforge", "trait.create"),
+                                operands: SmallVec::from_slice(&[reconciled_opd]),
+                                results: SmallVec::new(),
+                                attributes: {
+                                    let mut a = IndexMap::new();
+                                    a.insert("device".to_string(), Attribute::String(dev_str));
+                                    a.insert(
+                                        "contract".to_string(),
+                                        Attribute::String(contract_str),
+                                    );
+                                    a
+                                },
+                                regions: Vec::new(),
+                                custom_syntax: false,
+                                location: t_loc,
+                            });
+                            let tr_val = module.values.insert_with_key(|vid| Value {
+                                id: vid,
+                                ssa_name: None,
+                                ty: t_ty,
+                                def: ValueDef::OpResult {
+                                    op: tr_op,
+                                    index: 0,
+                                },
+                            });
+                            module.ops[tr_op].results.push(tr_val);
+                            new_ops.push(tr_op);
+                            packed.push(tr_val);
+                            changed = true;
+                            i += 1;
+                            spec_idx += 1;
+                            continue;
+                        }
+
+                        if let Some(abi_str) = spec.strip_prefix("variadic:") {
+                            // Consume consecutive operands matching this variadic slot.
+                            let remaining_specs = param_specs.len().saturating_sub(spec_idx + 1);
+                            let run_end = call_operands
+                                .len()
+                                .saturating_sub(remaining_specs)
+                                .max(i + 1);
+                            let mut run: SmallVec<[ValueId; 4]> = SmallVec::new();
+                            let mut elem_tys: Vec<Type> = Vec::new();
+                            while i < run_end && i < call_operands.len() {
+                                let mut elem_v = call_operands[i];
+                                let elem_ty = module.values[elem_v].ty.clone();
+                                if abi_str == "tensor_tuple" {
+                                    let tr_loc = loc.clone();
+                                    let dev_s = device_label.clone();
+                                    let tr_ty = elem_ty.clone();
+                                    let tr_op = module.ops.insert_with_key(|oid| Operation {
+                                        id: oid,
+                                        name: OpName::new("castforge", "trait.create"),
+                                        operands: SmallVec::from_slice(&[elem_v]),
+                                        results: SmallVec::new(),
+                                        attributes: {
+                                            let mut a = IndexMap::new();
+                                            a.insert(
+                                                "device".to_string(),
+                                                Attribute::String(dev_s),
+                                            );
+                                            a.insert(
+                                                "contract".to_string(),
+                                                Attribute::String("TileTensorable".to_string()),
+                                            );
+                                            a
+                                        },
+                                        regions: Vec::new(),
+                                        custom_syntax: false,
+                                        location: tr_loc,
+                                    });
+                                    let wrapped_v = module.values.insert_with_key(|vid| Value {
+                                        id: vid,
+                                        ssa_name: None,
+                                        ty: tr_ty,
+                                        def: ValueDef::OpResult {
+                                            op: tr_op,
+                                            index: 0,
+                                        },
+                                    });
+                                    module.ops[tr_op].results.push(wrapped_v);
+                                    new_ops.push(tr_op);
+                                    elem_v = wrapped_v;
+                                }
+                                run.push(elem_v);
+                                elem_tys.push(elem_ty);
+                                i += 1;
+                            }
+                            let tup_loc = loc.clone();
+                            let abi_owned = abi_str.to_string();
+                            let tup_op = module.ops.insert_with_key(|oid| Operation {
+                                id: oid,
+                                name: OpName::new("castforge", "tuple.create"),
+                                operands: run,
+                                results: SmallVec::new(),
+                                attributes: {
+                                    let mut a = IndexMap::new();
+                                    a.insert("abi".to_string(), Attribute::String(abi_owned));
+                                    a
+                                },
+                                regions: Vec::new(),
+                                custom_syntax: false,
+                                location: tup_loc,
+                            });
+                            let tup_val = module.values.insert_with_key(|vid| Value {
+                                id: vid,
+                                ssa_name: None,
+                                ty: Type::Tuple(elem_tys),
+                                def: ValueDef::OpResult {
+                                    op: tup_op,
+                                    index: 0,
+                                },
+                            });
+                            module.ops[tup_op].results.push(tup_val);
+                            new_ops.push(tup_op);
+                            packed.push(tup_val);
+                            changed = true;
+                            spec_idx += 1;
+                            continue;
+                        }
+
+                        packed.push(reconciled_opd);
+                        i += 1;
+                        spec_idx += 1;
+                    }
+
+                    if changed {
+                        module.ops[op_id].operands = packed;
+                        module.ops[op_id]
+                            .attributes
+                            .shift_remove("has_same_variadic_operand_size");
+                        conformed_calls += 1;
+                    }
+                    new_ops.push(op_id);
+                }
+
+                if !dead_epilogues.is_empty() {
+                    new_ops.retain(|id| !dead_epilogues.contains(id));
+                    for dead_id in dead_epilogues {
+                        module.ops.remove(dead_id);
+                    }
+                }
+                module.blocks[blk_id].ops = new_ops;
+            }
+        }
+    }
+
+    Ok(conformed_calls)
+}
