@@ -14,28 +14,29 @@ use castforge::ir::{
     DType, Dim, Location, TensorBacking, TensorEntry, TensorStore, TensorType, parse_mlir,
 };
 use castforge::passes::{
-    ArcKvEvictionPolicy, AsymK16V8Codec, BlendMatchSpan, BlendTokenRangeMatcher, CBChunkMatch,
-    CBGroupSpec, CacheBlendRopeSpec, CacheGenCdfCodec, ChainedBlockHashConfig,
-    DEFAULT_MAX_KERNELS_IN_FUSION_SET, DeviceTargetArch, DynamicAllocRequest, EngineKvFormat,
-    FULL_ATTENTION_WINDOW, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
-    IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
-    KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope,
-    KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy, LayerGroupPayloadSharder,
-    P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable, P2PPeerSpec, PassManager, PassRegistry,
-    ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST, TOKEN_WIRE_STRIDE, WarmPrefetchJobTable,
-    WarmPrefetchStatus, analyze_kv_layer_groups, annotate_squeeze_unsqueeze_reshapes,
-    anonymize_symbolic_dims, await_hanging_effect_chains, coalesce_partitioning_slices_to_split,
-    compress_splat_constants, decode_kv_fs_filename, decode_kv_storage_key,
-    defer_allocs_to_first_use, direct_copy_format_supported, downsample_subchunk_swa_block_ids,
-    elide_redundant_state_transfers, eliminate_implied_dependencies, encode_kv_fs_filename,
-    encode_kv_storage_key, encode_wide_column_row_key, find_squeeze_axis, find_unsqueeze_axis,
-    flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
-    fuse_reshape_epilogue, fuse_sole_use_prologues, group_p2p_lookup_keys,
-    hash_packed_token_blocks_be, hash_prefix_token_blocks, hoist_exec_invariant_ops,
-    hoist_symbolic_dim_expressions, is_supported_arch_dtype, legalize_rowwise_reduction_launch,
-    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
-    mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops, merge_duplicate_shape_ops,
-    merge_identical_functions, num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve,
+    ArcKvEvictionPolicy, AsymK16V8Codec, BLEND_REORDER_LMIN, BlendMatchSpan,
+    BlendTokenRangeMatcher, CBChunkMatch, CBGroupSpec, CacheBlendRopeSpec, CacheGenCdfCodec,
+    ChainedBlockHashConfig, DEFAULT_MAX_KERNELS_IN_FUSION_SET, DeviceTargetArch,
+    DynamicAllocRequest, EngineKvFormat, FULL_ATTENTION_WINDOW, GDS_DEFAULT_ALIGN_BYTES,
+    GdsSlabAddressManager, IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind,
+    KvBlockPool, KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry,
+    KvScaleScope, KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy,
+    LayerGroupPayloadSharder, P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable, P2PPeerSpec,
+    PassManager, PassRegistry, ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST, TOKEN_WIRE_STRIDE,
+    WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
+    annotate_squeeze_unsqueeze_reshapes, anonymize_symbolic_dims, await_hanging_effect_chains,
+    coalesce_partitioning_slices_to_split, compress_splat_constants, decode_kv_fs_filename,
+    decode_kv_storage_key, defer_allocs_to_first_use, direct_copy_format_supported,
+    downsample_subchunk_swa_block_ids, elide_redundant_state_transfers,
+    eliminate_implied_dependencies, encode_kv_fs_filename, encode_kv_storage_key,
+    encode_wide_column_row_key, find_squeeze_axis, find_unsqueeze_axis, flatten_elementwise_chains,
+    fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
+    fuse_sole_use_prologues, group_p2p_lookup_keys, hash_packed_token_blocks_be,
+    hash_prefix_token_blocks, hoist_exec_invariant_ops, hoist_symbolic_dim_expressions,
+    is_supported_arch_dtype, legalize_rowwise_reduction_launch, longest_full_attention_hit,
+    longest_joint_prefix_hit, longest_sliding_window_hit, mark_cuda_graph_stable_tensors,
+    merge_adjacent_parallel_loops, merge_duplicate_shape_ops, merge_identical_functions,
+    num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve, plan_cacheblend_token_reorder,
     plan_concat_in_place, plan_dynamic_memory_pool, plan_jenga_kv_geometry,
     plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
     re_rope_key_in_place, recalculate_subchunk_blocks_to_skip, reuse_dead_loop_buffers,
@@ -2520,4 +2521,47 @@ fn test_blend_token_range_matcher_sliding_window_and_coverage() {
     let after_evict = matcher.match_sub_sequence(&query);
     assert_eq!(after_evict.len(), 1);
     assert_eq!(after_evict[0].chunk_hash, 0x1111);
+}
+
+#[test]
+fn test_plan_cacheblend_token_reorder_glued_pieces_and_pinned_tail() {
+    // System prefix (4 tokens): `[1, 2, 3, 4]`
+    // Document A (16 tokens): `[100..116]`
+    // Glue separator (2 tokens): `[999, 998]`
+    // Document B (16 tokens): `[200..216]`
+    // Tail question (16 tokens = `BLEND_REORDER_LMIN`): `[500..516]`
+    let prefix: Vec<u32> = vec![1, 2, 3, 4];
+    let doc_a: Vec<u32> = (100..116).collect();
+    let sep: Vec<u32> = vec![999, 998];
+    let doc_b: Vec<u32> = (200..216).collect();
+    let tail_q: Vec<u32> = (500..500 + BLEND_REORDER_LMIN as u32).collect();
+
+    // Cached candidate H has `[prefix, doc_a, sep, doc_b]`:
+    let mut cand_h = Vec::new();
+    cand_h.extend_from_slice(&prefix);
+    cand_h.extend_from_slice(&doc_a);
+    cand_h.extend_from_slice(&sep);
+    cand_h.extend_from_slice(&doc_b);
+
+    // Incoming prompt P has `[prefix, doc_b, sep, doc_a, tail_q]` (documents swapped!):
+    let mut prompt_p = Vec::new();
+    prompt_p.extend_from_slice(&prefix);
+    prompt_p.extend_from_slice(&doc_b);
+    prompt_p.extend_from_slice(&sep);
+    prompt_p.extend_from_slice(&doc_a);
+    prompt_p.extend_from_slice(&tail_q);
+
+    // Reorder P with `chunk_size = 8`, `baseline_chunks = 1`, `keep_prefix = 4`:
+    let perm = plan_cacheblend_token_reorder(&prompt_p, &[cand_h.clone()], 8, 1, 4)
+        .expect("should find a valid token reorder plan");
+    assert_eq!(perm.len(), prompt_p.len());
+
+    let reordered: Vec<u32> = perm.iter().map(|&idx| prompt_p[idx]).collect();
+    // Reordered prompt starts with exact copy of `cand_h` (`[prefix, doc_a, sep, doc_b]` = 38
+    // tokens) and keeps `tail_q` pinned at the very end!
+    assert_eq!(&reordered[..cand_h.len()], cand_h.as_slice());
+    assert_eq!(
+        &reordered[reordered.len() - BLEND_REORDER_LMIN..],
+        tail_q.as_slice()
+    );
 }

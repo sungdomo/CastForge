@@ -6351,3 +6351,239 @@ pub fn unique_blend_token_coverage(spans: &[BlendMatchSpan]) -> usize {
     }
     coverage
 }
+
+/// Shortest contiguous run of incoming prompt tokens copied as a piece during CacheBlend prompt
+/// reordering; the last `BLEND_REORDER_LMIN` tokens of the prompt are also pinned at the tail
+/// (inspired by LMCache `lmcache/v1/multiprocess/modules/blend/reorder.py` `LMIN`).
+pub const BLEND_REORDER_LMIN: usize = 16;
+
+/// Maximum short separator run copied between two matched pieces during CacheBlend prompt
+/// reordering (inspired by LMCache `lmcache/v1/multiprocess/modules/blend/reorder.py` `GLUE`).
+pub const BLEND_REORDER_GLUE: usize = 3;
+
+struct BlendReorderCopier<'a> {
+    prompt: &'a [u32],
+    window_hashes: Vec<u64>,
+    sorted_indices: Vec<usize>,
+}
+
+impl<'a> BlendReorderCopier<'a> {
+    fn new(prompt: &'a [u32]) -> Self {
+        let m = prompt.len().saturating_sub(BLEND_REORDER_LMIN - 1);
+        let mut window_hashes = Vec::with_capacity(m);
+        for i in 0..m {
+            let mut h = 0u64;
+            for &tok in &prompt[i..i + BLEND_REORDER_LMIN] {
+                h = h.wrapping_mul(BLEND_HASH_BASE).wrapping_add(u64::from(tok));
+            }
+            window_hashes.push(h);
+        }
+        let mut sorted_indices: Vec<usize> = (0..m).collect();
+        sorted_indices.sort_by_key(|&idx| (window_hashes[idx], idx));
+        Self {
+            prompt,
+            window_hashes,
+            sorted_indices,
+        }
+    }
+
+    fn starts(&self, cand: &[u32], k: usize) -> Vec<usize> {
+        if k + BLEND_REORDER_LMIN > cand.len() || self.sorted_indices.is_empty() {
+            return Vec::new();
+        }
+        let mut key = 0u64;
+        for &tok in &cand[k..k + BLEND_REORDER_LMIN] {
+            key = key
+                .wrapping_mul(BLEND_HASH_BASE)
+                .wrapping_add(u64::from(tok));
+        }
+        let lo = self
+            .sorted_indices
+            .partition_point(|&idx| self.window_hashes[idx] < key);
+        let hi = self
+            .sorted_indices
+            .partition_point(|&idx| self.window_hashes[idx] <= key);
+        let mut res = self.sorted_indices[lo..hi].to_vec();
+        res.sort_unstable();
+        res
+    }
+
+    fn longest(&self, cand: &[u32], k: usize, used: &[bool]) -> Option<(usize, usize)> {
+        let mut best: Option<(usize, usize)> = None;
+        for i in self.starts(cand, k) {
+            if used[i] {
+                continue;
+            }
+            let max_n = (self.prompt.len() - i).min(cand.len() - k);
+            if let Some((_, best_len)) = best
+                && max_n <= best_len
+            {
+                break;
+            }
+            let mut m = max_n;
+            for off in 0..max_n {
+                if self.prompt[i + off] != cand[k + off] || used[i + off] {
+                    m = off;
+                    break;
+                }
+            }
+            if m >= BLEND_REORDER_LMIN && best.is_none_or(|(_, bl)| m > bl) {
+                best = Some((i, m));
+            }
+        }
+        best
+    }
+
+    fn glue(
+        &self,
+        cand: &[u32],
+        k: usize,
+        used: &mut [bool],
+        pieces: &[(usize, usize)],
+    ) -> Option<((usize, usize), (usize, usize))> {
+        let prompt_len = self.prompt.len();
+        for gl in 1..=BLEND_REORDER_GLUE {
+            if k + gl >= cand.len() {
+                break;
+            }
+            if self.starts(cand, k + gl).is_empty() {
+                continue;
+            }
+            let mut cands: Vec<usize> = (0..prompt_len)
+                .filter(|&i| {
+                    i + gl <= prompt_len
+                        && !used[i..i + gl].iter().any(|&u| u)
+                        && self.prompt[i..i + gl] == cand[k..k + gl]
+                })
+                .collect();
+            cands.sort_by_key(|&i| {
+                let adj = (i > 0 && used[i - 1]) || (i + gl < prompt_len && used[i + gl]);
+                (!adj, i)
+            });
+            for i in cands {
+                for u in &mut used[i..i + gl] {
+                    *u = true;
+                }
+                let nxt = self.longest(cand, k + gl, used);
+                for u in &mut used[i..i + gl] {
+                    *u = false;
+                }
+                if let Some((nxt_st, nxt_len)) = nxt {
+                    let max_end = pieces
+                        .iter()
+                        .map(|&(_, j)| j)
+                        .chain(std::iter::once(nxt_st + nxt_len))
+                        .max()
+                        .unwrap_or(0);
+                    if i + gl <= max_end {
+                        return Some(((i, i + gl), (nxt_st, nxt_len)));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn copy(&self, cand: &[u32], keep_prefix: usize) -> Vec<(usize, usize)> {
+        let mut used = vec![false; self.prompt.len()];
+        let kp = keep_prefix.min(self.prompt.len());
+        for u in &mut used[..kp] {
+            *u = true;
+        }
+        let tail_start = self.prompt.len().saturating_sub(BLEND_REORDER_LMIN);
+        for u in &mut used[tail_start..] {
+            *u = true;
+        }
+        let mut pieces = if kp > 0 { vec![(0, kp)] } else { Vec::new() };
+        let mut k = kp;
+        while k < cand.len() {
+            let piece = if let Some(p) = self.longest(cand, k, &used) {
+                p
+            } else if let Some(((gi, gj), nxt)) = self.glue(cand, k, &mut used, &pieces) {
+                pieces.push((gi, gj));
+                for u in &mut used[gi..gj] {
+                    *u = true;
+                }
+                k += gj - gi;
+                nxt
+            } else {
+                break;
+            };
+            let (i, m) = piece;
+            pieces.push((i, i + m));
+            for u in &mut used[i..i + m] {
+                *u = true;
+            }
+            k += m;
+        }
+        pieces
+    }
+}
+
+/// Plans a permutation of incoming `prompt` token indices so that `prompt` begins with the
+/// longest possible exact-prefix reconstruction of one of `candidates` (followed by all remaining
+/// tokens of `prompt` in original order), keeping the first `keep_prefix` tokens in place and
+/// pinning the final [`BLEND_REORDER_LMIN`] tokens at the tail (inspired by LMCache
+/// `lmcache/v1/multiprocess/modules/blend/reorder.py` `plan`).
+#[must_use]
+pub fn plan_cacheblend_token_reorder(
+    prompt: &[u32],
+    candidates: &[Vec<u32>],
+    chunk_size: usize,
+    baseline_chunks: usize,
+    keep_prefix: usize,
+) -> Option<Vec<usize>> {
+    if chunk_size == 0 || prompt.len() < BLEND_REORDER_LMIN || candidates.is_empty() {
+        return None;
+    }
+    let copier = BlendReorderCopier::new(prompt);
+    let kp = keep_prefix.min(prompt.len());
+    let mut seen: std::collections::HashSet<&[u32]> = std::collections::HashSet::new();
+    type ReorderCandidate<'a> = ((usize, usize, isize), Vec<(usize, usize)>, &'a [u32]);
+    let mut best: Option<ReorderCandidate<'_>> = None;
+
+    for cand in candidates {
+        if cand.len() < kp || seen.contains(cand.as_slice()) || cand[..kp] != prompt[..kp] {
+            continue;
+        }
+        seen.insert(cand.as_slice());
+        let pieces = copier.copy(cand, kp);
+        let k: usize = pieces.iter().map(|&(i, j)| j - i).sum();
+        let score = (k / chunk_size, k, -(pieces.len() as isize));
+        if best.as_ref().is_none_or(|(b_score, _, _)| score > *b_score) {
+            best = Some((score, pieces, cand.as_slice()));
+        }
+    }
+
+    let ((whole_chunks, k, _), pieces, cand) = best?;
+    if whole_chunks <= baseline_chunks {
+        return None;
+    }
+
+    let mut used = vec![false; prompt.len()];
+    let mut perm = Vec::with_capacity(prompt.len());
+    for &(i, j) in &pieces {
+        perm.extend(i..j);
+        for u in &mut used[i..j] {
+            *u = true;
+        }
+    }
+    if k < cand.len() {
+        let max_j = pieces.iter().map(|&(_, j)| j).max().unwrap_or(0);
+        for i in 0..max_j.min(prompt.len()) {
+            let adj = (i > 0 && used[i - 1]) || (i + 1 < prompt.len() && used[i + 1]);
+            if !used[i] && prompt[i] == cand[k] && adj {
+                perm.push(i);
+                used[i] = true;
+                break;
+            }
+        }
+    }
+    for (i, &is_used) in used.iter().enumerate() {
+        if !is_used {
+            perm.push(i);
+        }
+    }
+    let is_identity = perm.iter().enumerate().all(|(idx, &p)| idx == p);
+    if is_identity { None } else { Some(perm) }
+}
