@@ -15,33 +15,33 @@ use castforge::ir::{
 };
 use castforge::passes::{
     ArcKvEvictionPolicy, AsymK16V8Codec, BLEND_REORDER_LMIN, BlendMatchSpan,
-    BlendTokenRangeMatcher, CBChunkMatch, CBGroupSpec, CacheBlendRopeSpec, CacheGenCdfCodec,
-    ChainedBlockHashConfig, DEFAULT_MAX_KERNELS_IN_FUSION_SET, DeviceTargetArch,
-    DynamicAllocRequest, EngineKvFormat, FULL_ATTENTION_WINDOW, GDS_DEFAULT_ALIGN_BYTES,
-    GdsSlabAddressManager, IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind,
-    KvBlockPool, KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry,
-    KvScaleScope, KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy,
-    LayerGroupPayloadSharder, P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable, P2PPeerSpec,
-    PassManager, PassRegistry, ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST, TOKEN_WIRE_STRIDE,
-    WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
-    annotate_squeeze_unsqueeze_reshapes, anonymize_symbolic_dims, await_hanging_effect_chains,
-    coalesce_partitioning_slices_to_split, compress_splat_constants, decode_kv_fs_filename,
-    decode_kv_storage_key, defer_allocs_to_first_use, direct_copy_format_supported,
-    downsample_subchunk_swa_block_ids, elide_redundant_state_transfers,
-    eliminate_implied_dependencies, encode_kv_fs_filename, encode_kv_storage_key,
-    encode_wide_column_row_key, find_squeeze_axis, find_unsqueeze_axis, flatten_elementwise_chains,
-    fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
-    fuse_sole_use_prologues, group_p2p_lookup_keys, hash_packed_token_blocks_be,
-    hash_prefix_token_blocks, hoist_exec_invariant_ops, hoist_symbolic_dim_expressions,
-    is_supported_arch_dtype, legalize_rowwise_reduction_launch, longest_full_attention_hit,
-    longest_joint_prefix_hit, longest_sliding_window_hit, mark_cuda_graph_stable_tensors,
-    merge_adjacent_parallel_loops, merge_duplicate_shape_ops, merge_identical_functions,
-    num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve, plan_cacheblend_token_reorder,
-    plan_concat_in_place, plan_dynamic_memory_pool, plan_jenga_kv_geometry,
-    plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
-    re_rope_key_in_place, recalculate_subchunk_blocks_to_skip, reuse_dead_loop_buffers,
-    stamp_fused_provenance, unfold_chunk_range, unique_blend_token_coverage, unpack_token_ids_be,
-    validate_target_device_dtypes,
+    BlendTokenRangeMatcher, CBChunkMatch, CBGroupSpec, CacheBlendRopeSpec, CacheEventBatchSpec,
+    CacheEventTier, CacheGenCdfCodec, ChainedBlockHashConfig, CoordinatorEventGate,
+    DEFAULT_MAX_KERNELS_IN_FUSION_SET, DeviceTargetArch, DynamicAllocRequest, EngineKvFormat,
+    EventIngestOutcome, FULL_ATTENTION_WINDOW, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
+    IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
+    KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope,
+    KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy, LayerGroupPayloadSharder,
+    P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable, P2PPeerSpec, PassManager, PassRegistry,
+    ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST, TOKEN_WIRE_STRIDE, WarmPrefetchJobTable,
+    WarmPrefetchStatus, analyze_kv_layer_groups, annotate_squeeze_unsqueeze_reshapes,
+    anonymize_symbolic_dims, await_hanging_effect_chains, coalesce_partitioning_slices_to_split,
+    compress_splat_constants, decode_kv_fs_filename, decode_kv_storage_key,
+    defer_allocs_to_first_use, direct_copy_format_supported, downsample_subchunk_swa_block_ids,
+    elide_redundant_state_transfers, eliminate_implied_dependencies, encode_kv_fs_filename,
+    encode_kv_storage_key, encode_wide_column_row_key, find_squeeze_axis, find_unsqueeze_axis,
+    flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
+    fuse_reshape_epilogue, fuse_sole_use_prologues, group_p2p_lookup_keys,
+    hash_packed_token_blocks_be, hash_prefix_token_blocks, hoist_exec_invariant_ops,
+    hoist_symbolic_dim_expressions, is_supported_arch_dtype, legalize_rowwise_reduction_launch,
+    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
+    mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops, merge_duplicate_shape_ops,
+    merge_identical_functions, num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve,
+    plan_cacheblend_token_reorder, plan_concat_in_place, plan_dynamic_memory_pool,
+    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
+    promote_narrow_accumulators, re_rope_key_in_place, recalculate_subchunk_blocks_to_skip,
+    reuse_dead_loop_buffers, stamp_fused_provenance, unfold_chunk_range,
+    unique_blend_token_coverage, unpack_token_ids_be, validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -2564,4 +2564,71 @@ fn test_plan_cacheblend_token_reorder_glued_pieces_and_pinned_tail() {
         &reordered[reordered.len() - BLEND_REORDER_LMIN..],
         tail_q.as_slice()
     );
+}
+
+#[test]
+fn test_coordinator_event_gate_incarnation_fencing_dedup_and_gaps() {
+    let mut gate = CoordinatorEventGate::new();
+
+    // 1. First batch (`seq = 1`, `incarnation = 10`) is admitted cleanly:
+    let b1 = CacheEventBatchSpec {
+        instance_id: "worker-1".to_string(),
+        incarnation: 10,
+        seq: 1,
+        dropped_events: 0,
+        tier: CacheEventTier::L1,
+    };
+    assert_eq!(gate.ingest(&b1), EventIngestOutcome::Admitted);
+    // Re-offering `seq = 1` is rejected as `Duplicate`:
+    assert_eq!(gate.ingest(&b1), EventIngestOutcome::Duplicate);
+    // Older incarnation (`9 < 10`) is rejected as `StaleIncarnation`:
+    let stale = CacheEventBatchSpec {
+        incarnation: 9,
+        seq: 2,
+        ..b1.clone()
+    };
+    assert_eq!(gate.ingest(&stale), EventIngestOutcome::StaleIncarnation);
+
+    // 2. Jumping to `seq = 4` (skipping 2 and 3) with `dropped_events = 5` detects gap & loss:
+    let b4 = CacheEventBatchSpec {
+        seq: 4,
+        dropped_events: 5,
+        ..b1.clone()
+    };
+    assert_eq!(gate.ingest(&b4), EventIngestOutcome::Admitted);
+    let c = gate.cursor("worker-1").expect("cursor exists");
+    assert!(c.gap_detected);
+    assert_eq!(c.missing_batches, 2);
+    assert_eq!(c.events_dropped, 5);
+
+    // 3. Newer incarnation (`11 > 10`) fences `worker-1` and resets its cursor:
+    let b_restart = CacheEventBatchSpec {
+        incarnation: 11,
+        seq: 1,
+        dropped_events: 0,
+        ..b1.clone()
+    };
+    assert_eq!(gate.ingest(&b_restart), EventIngestOutcome::Admitted);
+    assert_eq!(gate.fenced_instances(), &["worker-1".to_string()]);
+    assert!(!gate.cursor("worker-1").unwrap().gap_detected);
+
+    // 4. `drop_instance("worker-1")` fences L1 batches at incarnation 11, while L2 passes through:
+    gate.drop_instance("worker-1");
+    let b_l1_after_drop = CacheEventBatchSpec {
+        incarnation: 11,
+        seq: 2,
+        tier: CacheEventTier::L1,
+        ..b1.clone()
+    };
+    assert_eq!(
+        gate.ingest(&b_l1_after_drop),
+        EventIngestOutcome::StaleIncarnation
+    );
+    let b_l2_after_drop = CacheEventBatchSpec {
+        incarnation: 11,
+        seq: 2,
+        tier: CacheEventTier::L2,
+        ..b1
+    };
+    assert_eq!(gate.ingest(&b_l2_after_drop), EventIngestOutcome::Admitted);
 }

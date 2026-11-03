@@ -6587,3 +6587,180 @@ pub fn plan_cacheblend_token_reorder(
     let is_identity = perm.iter().enumerate().all(|(idx, &p)| idx == p);
     if is_identity { None } else { Some(perm) }
 }
+
+/// Storage tier reported by a cache event batch (inspired by LMCache
+/// `lmcache/v1/distributed/api.py` `Tier`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheEventTier {
+    /// Volatile host/device L1 cache tier (tied to emitter incarnation).
+    L1,
+    /// Persistent L2 storage tier (survives emitter restarts).
+    L2,
+}
+
+/// Metadata header of an emitter's cache event batch offered to [`CoordinatorEventGate`]
+/// (inspired by LMCache `lmcache/v1/mp_coordinator/api.py` `CacheEventBatch`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheEventBatchSpec {
+    /// Unique identifier of the emitting worker instance.
+    pub instance_id: String,
+    /// Monotonically increasing process incarnation of the emitter.
+    pub incarnation: u64,
+    /// 1-based sequence number of the batch within `incarnation`.
+    pub seq: u64,
+    /// Cumulative number of events dropped by the emitter prior to transmission.
+    pub dropped_events: u64,
+    /// Cache tier affected by this batch.
+    pub tier: CacheEventTier,
+}
+
+/// Admission outcome returned by [`CoordinatorEventGate::ingest`] (inspired by LMCache
+/// `lmcache/v1/mp_coordinator/ingest/event_gate.py` `IngestResult`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventIngestOutcome {
+    /// Batch was admitted and forwarded to downstream state views.
+    Admitted,
+    /// Batch was dropped because its `seq` was already processed for the current incarnation.
+    Duplicate,
+    /// Batch was dropped because its `incarnation` was older than the active or departed cursor.
+    StaleIncarnation,
+}
+
+/// Per-emitter stream cursor state maintained by [`CoordinatorEventGate`] (inspired by LMCache
+/// `lmcache/v1/mp_coordinator/ingest/event_gate.py` `_StreamCursor`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamCursorState {
+    /// Emitter incarnation tracked by this cursor.
+    pub incarnation: u64,
+    /// Highest `seq` admitted from `incarnation`.
+    pub last_seq: u64,
+    /// Whether sequence gaps or emitter-side dropped events were detected on this stream.
+    pub gap_detected: bool,
+    /// Last reported cumulative `dropped_events` (`None` when a stream joined mid-flight at
+    /// `seq > 1` before its first baseline report).
+    pub last_dropped_events: Option<u64>,
+    /// Number of skipped `seq` batches observed since the gate began tracking this stream.
+    pub missing_batches: u64,
+    /// Total emitter-dropped events observed on this stream.
+    pub events_dropped: u64,
+}
+
+/// Ordering, sequence-deduplication, gap-detection, and incarnation-fencing gate for distributed
+/// cache event streams (inspired by LMCache `lmcache/v1/mp_coordinator/ingest/event_gate.py`
+/// `EventGate`).
+#[derive(Debug, Clone, Default)]
+pub struct CoordinatorEventGate {
+    cursors: IndexMap<String, StreamCursorState>,
+    departed: IndexMap<String, u64>,
+    fenced_instances: Vec<String>,
+    /// Total batches admitted across all emitters.
+    pub batches_applied: u64,
+    /// Total duplicate batches dropped across all emitters.
+    pub batches_duplicate: u64,
+    /// Total stale-incarnation batches dropped across all emitters.
+    pub batches_stale: u64,
+    /// Total skipped batch sequence numbers across tracked emitters.
+    pub batches_missing: u64,
+    /// Total emitter-dropped events reported across all emitters.
+    pub events_dropped: u64,
+}
+
+impl CoordinatorEventGate {
+    /// Creates an empty [`CoordinatorEventGate`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Offers `batch` to the gate, enforcing incarnation fencing, sequence deduplication, and
+    /// loss/gap accounting.
+    pub fn ingest(&mut self, batch: &CacheEventBatchSpec) -> EventIngestOutcome {
+        if let Some(&dep_inc) = self.departed.get(&batch.instance_id) {
+            if batch.incarnation > dep_inc {
+                self.departed.swap_remove(&batch.instance_id);
+            } else if batch.tier == CacheEventTier::L1 {
+                self.batches_stale += 1;
+                return EventIngestOutcome::StaleIncarnation;
+            }
+        }
+
+        let tracked = self.cursors.contains_key(&batch.instance_id);
+        if let Some(existing) = self.cursors.get(&batch.instance_id) {
+            if batch.incarnation < existing.incarnation {
+                self.batches_stale += 1;
+                return EventIngestOutcome::StaleIncarnation;
+            }
+            if batch.incarnation > existing.incarnation {
+                self.fenced_instances.push(batch.instance_id.clone());
+                self.cursors.swap_remove(&batch.instance_id);
+            } else if batch.seq <= existing.last_seq {
+                self.batches_duplicate += 1;
+                return EventIngestOutcome::Duplicate;
+            }
+        }
+
+        let cursor = self
+            .cursors
+            .entry(batch.instance_id.clone())
+            .or_insert_with(|| StreamCursorState {
+                incarnation: batch.incarnation,
+                last_seq: 0,
+                gap_detected: false,
+                last_dropped_events: if tracked || batch.seq == 1 {
+                    Some(0)
+                } else {
+                    None
+                },
+                missing_batches: 0,
+                events_dropped: 0,
+            });
+
+        if batch.seq > cursor.last_seq + 1 {
+            let skipped = batch.seq - cursor.last_seq - 1;
+            cursor.gap_detected = true;
+            if tracked {
+                cursor.missing_batches += skipped;
+                self.batches_missing += skipped;
+            }
+        }
+        if let Some(last_dropped) = cursor.last_dropped_events
+            && batch.dropped_events > last_dropped
+        {
+            let dropped = batch.dropped_events - last_dropped;
+            cursor.gap_detected = true;
+            cursor.events_dropped += dropped;
+            self.events_dropped += dropped;
+        }
+        cursor.last_dropped_events = Some(batch.dropped_events);
+        cursor.last_seq = batch.seq;
+        self.batches_applied += 1;
+        EventIngestOutcome::Admitted
+    }
+
+    /// Fences `instance_id` and records its departed incarnation so stale L1 batches are rejected
+    /// while L2 batches or newer incarnations can still proceed.
+    pub fn drop_instance(&mut self, instance_id: &str) {
+        self.fenced_instances.push(instance_id.to_string());
+        if let Some(cursor) = self.cursors.swap_remove(instance_id) {
+            self.departed
+                .insert(instance_id.to_string(), cursor.incarnation);
+        }
+    }
+
+    /// Clears the departed fence record for `instance_id` after explicit re-registration.
+    pub fn readmit_instance(&mut self, instance_id: &str) {
+        self.departed.swap_remove(instance_id);
+    }
+
+    /// Returns the active cursor for `instance_id`, if any.
+    #[must_use]
+    pub fn cursor(&self, instance_id: &str) -> Option<&StreamCursorState> {
+        self.cursors.get(instance_id)
+    }
+
+    /// Returns the ordered list of instance IDs fenced due to incarnation restarts or drops.
+    #[must_use]
+    pub fn fenced_instances(&self) -> &[String] {
+        &self.fenced_instances
+    }
+}
