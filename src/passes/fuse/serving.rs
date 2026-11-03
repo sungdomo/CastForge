@@ -18919,3 +18919,506 @@ pub fn reconcile_and_resolve_device_graph_builder_casts(
 
     Ok(resolved_count)
 }
+
+// ============================================================================
+// Batch 22 Step 1: Raw-Block Storage Engine Layout, FDP Placement-Affinity
+// Slot Allocator, and Dual-Container CRC32 Checkpoint Recovery
+// ============================================================================
+
+/// Validated device layout and checkpoint geometry for a raw-block L2 KV-cache
+/// storage engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawBlockLayoutConfig {
+    /// Device path identifier.
+    pub device_path: String,
+    /// Effective device capacity in bytes.
+    pub capacity_bytes: u64,
+    /// Block alignment in bytes (must be a power of two).
+    pub block_align: u64,
+    /// Per-slot header bytes (>= 24 and a multiple of `block_align`).
+    pub header_bytes: u64,
+    /// Total bytes per slot (`>= header_bytes + 1` and a multiple of `block_align`).
+    pub slot_bytes: u64,
+    /// Total metadata checkpoint region bytes at the start of the device.
+    pub meta_total_bytes: u64,
+    /// 8-byte ASCII magic identifying metadata checkpoint headers.
+    pub meta_magic: [u8; 8],
+    /// Metadata format version (`> 0`).
+    pub meta_version: u32,
+    /// Byte size of each of the two mirrored metadata containers.
+    pub meta_container_bytes: u64,
+    /// Byte offset where data slots begin.
+    pub data_base_offset: u64,
+    /// Maximum number of data slots fitting in `capacity_bytes - data_base_offset`.
+    pub max_slots: usize,
+}
+
+impl RawBlockLayoutConfig {
+    /// Validates raw-block layout parameters and computes mirrored metadata
+    /// container geometry and data slot capacity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        device_path: &str,
+        requested_capacity_bytes: u64,
+        device_capacity_bytes: u64,
+        block_align: u64,
+        header_bytes: u64,
+        slot_bytes: u64,
+        meta_total_bytes: u64,
+        meta_magic: [u8; 8],
+        meta_version: u32,
+    ) -> Result<Self, String> {
+        if device_path.is_empty() {
+            return Err("raw-block engine requires a non-empty device_path".to_string());
+        }
+        if block_align == 0 || !block_align.is_power_of_two() {
+            return Err(format!(
+                "block_align must be a power of 2, got {block_align}"
+            ));
+        }
+        if header_bytes < 24 {
+            return Err("header_bytes must be >= 24".to_string());
+        }
+        if !header_bytes.is_multiple_of(block_align) {
+            return Err("header_bytes must be a multiple of block_align".to_string());
+        }
+        if slot_bytes <= header_bytes {
+            return Err("slot_bytes must be >= header_bytes + 1".to_string());
+        }
+        if !slot_bytes.is_multiple_of(block_align) {
+            return Err("slot_bytes must be a multiple of block_align".to_string());
+        }
+        if meta_total_bytes <= block_align {
+            return Err("meta_total_bytes must provide room for metadata header".to_string());
+        }
+        if !meta_total_bytes.is_multiple_of(block_align) {
+            return Err("meta_total_bytes must be a multiple of block_align".to_string());
+        }
+        if !meta_magic.is_ascii() {
+            return Err("meta_magic must be ASCII bytes".to_string());
+        }
+        if meta_version == 0 {
+            return Err("meta_version must be > 0".to_string());
+        }
+        let meta_container_bytes = ((meta_total_bytes / 2) / block_align) * block_align;
+        if meta_container_bytes <= block_align {
+            return Err(
+                "meta_total_bytes must provide room for at least two metadata copies".to_string(),
+            );
+        }
+        let effective_capacity = if requested_capacity_bytes > 0 {
+            requested_capacity_bytes.min(device_capacity_bytes)
+        } else {
+            device_capacity_bytes
+        };
+        if meta_total_bytes >= effective_capacity {
+            return Err("metadata region exceeds usable device capacity".to_string());
+        }
+        let data_base_offset = meta_total_bytes;
+        let data_bytes = effective_capacity - data_base_offset;
+        let max_slots = (data_bytes / slot_bytes) as usize;
+        if max_slots == 0 {
+            return Err("raw block capacity too small for slot size after metadata".to_string());
+        }
+        Ok(Self {
+            device_path: device_path.to_string(),
+            capacity_bytes: effective_capacity,
+            block_align,
+            header_bytes,
+            slot_bytes,
+            meta_total_bytes,
+            meta_magic,
+            meta_version,
+            meta_container_bytes,
+            data_base_offset,
+            max_slots,
+        })
+    }
+
+    /// Returns the byte offsets of the two mirrored metadata containers.
+    #[must_use]
+    pub fn metadata_container_offsets(&self) -> [u64; 2] {
+        [0, self.meta_container_bytes]
+    }
+
+    /// Returns the usable payload capacity inside one metadata checkpoint container.
+    #[must_use]
+    pub fn meta_payload_capacity(&self) -> usize {
+        (self.meta_container_bytes - self.block_align) as usize
+    }
+
+    /// Returns whether a logical payload of `payload_len` bytes fits in a single
+    /// data slot under optional direct-I/O alignment rounding.
+    #[must_use]
+    pub fn payload_fits_slot(&self, payload_len: u64, requires_transfer_alignment: bool) -> bool {
+        let payload_capacity = self.slot_bytes - self.header_bytes;
+        if payload_len > payload_capacity {
+            return false;
+        }
+        if requires_transfer_alignment {
+            let aligned = payload_len.div_ceil(self.block_align) * self.block_align;
+            return aligned <= payload_capacity;
+        }
+        true
+    }
+}
+
+/// Maximum byte size (1 GiB) of a single fixed buffer region registered with
+/// kernel zero-copy I/O.
+pub const MAX_FIXED_BUFFER_REGION_BYTES: usize = 1 << 30;
+
+/// Splits a contiguous stable memory range `(base_ptr, total_size)` into
+/// `(region_ptr, region_size)` slices bounded by [`MAX_FIXED_BUFFER_REGION_BYTES`]
+/// for zero-copy kernel buffer registration.
+pub fn partition_fixed_buffer_registration_ranges(
+    base_ptr: usize,
+    total_size: usize,
+) -> Result<Vec<(usize, usize)>, String> {
+    if base_ptr == 0 {
+        return Err("fixed-buffer range pointer must be > 0".to_string());
+    }
+    if total_size == 0 {
+        return Err("fixed-buffer range size must be > 0".to_string());
+    }
+    let mut ranges = Vec::new();
+    let mut next_ptr = base_ptr;
+    let mut remaining = total_size;
+    while remaining > 0 {
+        let region_size = remaining.min(MAX_FIXED_BUFFER_REGION_BYTES);
+        ranges.push((next_ptr, region_size));
+        next_ptr = next_ptr
+            .checked_add(region_size)
+            .ok_or_else(|| "fixed-buffer range pointer overflow".to_string())?;
+        remaining -= region_size;
+    }
+    Ok(ranges)
+}
+
+/// Partitions `0..item_count` into at most `num_ranges` contiguous `[start, end)`
+/// recovery intervals for parallel POSIX slot-header verification.
+#[must_use]
+pub fn build_recovery_item_ranges(item_count: usize, num_ranges: usize) -> Vec<(usize, usize)> {
+    if item_count == 0 {
+        return Vec::new();
+    }
+    let workers = num_ranges.max(1);
+    let range_size = item_count.div_ceil(workers).max(1);
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    while start < item_count {
+        let end = (start + range_size).min(item_count);
+        out.push((start, end));
+        start = end;
+    }
+    out
+}
+
+/// Computes the standard IEEE 802.3 CRC32 checksum of `data`.
+#[must_use]
+pub fn compute_crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
+/// 32-byte binary header for a mirrored raw-block metadata checkpoint container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawBlockMetaHeader {
+    /// 8-byte ASCII magic.
+    pub magic: [u8; 8],
+    /// Metadata schema version.
+    pub version: u32,
+    /// Monotonically increasing checkpoint sequence number.
+    pub seq: u64,
+    /// Unpadded payload length in bytes.
+    pub payload_len: u64,
+    /// IEEE CRC32 checksum of the unpadded payload bytes.
+    pub crc32: u32,
+}
+
+impl RawBlockMetaHeader {
+    /// Serializes the metadata checkpoint header into 32 little-endian bytes.
+    #[must_use]
+    pub fn encode(&self) -> [u8; 32] {
+        let mut buf = [0u8; 32];
+        buf[0..8].copy_from_slice(&self.magic);
+        buf[8..12].copy_from_slice(&self.version.to_le_bytes());
+        buf[12..20].copy_from_slice(&self.seq.to_le_bytes());
+        buf[20..28].copy_from_slice(&self.payload_len.to_le_bytes());
+        buf[28..32].copy_from_slice(&self.crc32.to_le_bytes());
+        buf
+    }
+
+    /// Decodes and validates a 32-byte metadata checkpoint header against
+    /// `expected_magic`, `expected_version`, and `max_payload_bytes`.
+    #[must_use]
+    pub fn decode(
+        buf: &[u8],
+        expected_magic: &[u8; 8],
+        expected_version: u32,
+        max_payload_bytes: usize,
+    ) -> Option<Self> {
+        if buf.len() < 32 {
+            return None;
+        }
+        let magic: [u8; 8] = buf[0..8].try_into().ok()?;
+        let version = u32::from_le_bytes(buf[8..12].try_into().ok()?);
+        let seq = u64::from_le_bytes(buf[12..20].try_into().ok()?);
+        let payload_len = u64::from_le_bytes(buf[20..28].try_into().ok()?);
+        let crc32 = u32::from_le_bytes(buf[28..32].try_into().ok()?);
+        if &magic != expected_magic || version != expected_version {
+            return None;
+        }
+        if payload_len == 0 || payload_len > max_payload_bytes as u64 {
+            return None;
+        }
+        Some(Self {
+            magic,
+            version,
+            seq,
+            payload_len,
+            crc32,
+        })
+    }
+}
+
+/// Selects the valid checkpoint container with the highest sequence number
+/// whose payload passes IEEE CRC32 verification.
+#[must_use]
+pub fn select_latest_valid_checkpoint(
+    containers: &[(&[u8], &[u8])],
+    expected_magic: &[u8; 8],
+    expected_version: u32,
+    max_payload_bytes: usize,
+) -> Option<(RawBlockMetaHeader, Vec<u8>)> {
+    let mut best: Option<(RawBlockMetaHeader, Vec<u8>)> = None;
+    for &(header_block, payload_region) in containers {
+        let Some(hdr) = RawBlockMetaHeader::decode(
+            header_block,
+            expected_magic,
+            expected_version,
+            max_payload_bytes,
+        ) else {
+            continue;
+        };
+        let plen = hdr.payload_len as usize;
+        if payload_region.len() < plen {
+            continue;
+        }
+        let payload = &payload_region[..plen];
+        if compute_crc32_ieee(payload) != hdr.crc32 {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(b_hdr, _)| hdr.seq > b_hdr.seq) {
+            best = Some((hdr, payload.to_vec()));
+        }
+    }
+    best
+}
+
+/// FDP placement-affinity-aware slot allocator and crash-recovery slot
+/// rebuilder for a raw-block storage engine.
+#[derive(Debug, Clone)]
+pub struct RawBlockSlotAllocator {
+    fdp_slot_affinity_enabled: bool,
+    data_base_offset: u64,
+    slot_bytes: u64,
+    max_slots: usize,
+    next_slot: usize,
+    free_slots: Vec<usize>,
+    free_slots_by_placement_id: std::collections::BTreeMap<u32, Vec<usize>>,
+    slot_placement_ids: std::collections::BTreeMap<usize, u32>,
+    /// Number of allocations satisfied from the matching FDP placement pool.
+    pub fdp_slot_affinity_hit_count: usize,
+    /// Number of FDP-tagged allocations satisfied by falling back to another free slot.
+    pub fdp_slot_affinity_fallback_count: usize,
+}
+
+impl RawBlockSlotAllocator {
+    /// Creates a new slot allocator for the given raw-block layout.
+    #[must_use]
+    pub fn new(layout: &RawBlockLayoutConfig, fdp_slot_affinity_enabled: bool) -> Self {
+        Self {
+            fdp_slot_affinity_enabled,
+            data_base_offset: layout.data_base_offset,
+            slot_bytes: layout.slot_bytes,
+            max_slots: layout.max_slots,
+            next_slot: 0,
+            free_slots: Vec::new(),
+            free_slots_by_placement_id: std::collections::BTreeMap::new(),
+            slot_placement_ids: std::collections::BTreeMap::new(),
+            fdp_slot_affinity_hit_count: 0,
+            fdp_slot_affinity_fallback_count: 0,
+        }
+    }
+
+    /// Converts a slot index to its device byte offset.
+    #[must_use]
+    pub fn slot_to_offset(&self, slot: usize) -> u64 {
+        self.data_base_offset + (slot as u64) * self.slot_bytes
+    }
+
+    /// Converts a device byte offset to its slot index.
+    #[must_use]
+    pub fn offset_to_slot(&self, offset: u64) -> usize {
+        ((offset - self.data_base_offset) / self.slot_bytes) as usize
+    }
+
+    /// Returns the number of currently available free slots in the recycle pool.
+    #[must_use]
+    pub fn free_slot_count(&self) -> usize {
+        self.free_slots.len()
+    }
+
+    /// Allocates a slot byte offset, preferring a recycled slot with matching
+    /// `placement_id` when FDP slot affinity is enabled.
+    pub fn allocate_slot(&mut self, placement_id: Option<u32>) -> Result<u64, String> {
+        if placement_id == Some(0) {
+            return Err("explicit placement_id 0 is rejected".to_string());
+        }
+        if self.fdp_slot_affinity_enabled
+            && let Some(pid) = placement_id
+            && let Some(pool) = self.free_slots_by_placement_id.get_mut(&pid)
+            && let Some(slot) = pool.pop()
+        {
+            if pool.is_empty() {
+                self.free_slots_by_placement_id.remove(&pid);
+            }
+            self.free_slots.retain(|&s| s != slot);
+            self.fdp_slot_affinity_hit_count += 1;
+            self.set_slot_placement_id(slot, placement_id);
+            return Ok(self.slot_to_offset(slot));
+        }
+
+        if let Some(slot) = self.free_slots.pop() {
+            self.remove_slot_from_affinity_pool(slot);
+            if self.fdp_slot_affinity_enabled && placement_id.is_some() {
+                self.fdp_slot_affinity_fallback_count += 1;
+            }
+            self.set_slot_placement_id(slot, placement_id);
+            return Ok(self.slot_to_offset(slot));
+        }
+
+        if self.next_slot < self.max_slots {
+            let slot = self.next_slot;
+            self.next_slot += 1;
+            self.set_slot_placement_id(slot, placement_id);
+            return Ok(self.slot_to_offset(slot));
+        }
+        Err("no free slots available".to_string())
+    }
+
+    /// Recycles a slot identified by its byte offset back into the free pool.
+    pub fn free_slot_by_offset(&mut self, offset: u64) {
+        if offset < self.data_base_offset {
+            return;
+        }
+        let slot = self.offset_to_slot(offset);
+        self.append_free_slot(slot);
+    }
+
+    /// Rebuilds the free slot list from `0..next_slot` excluding `committed_offsets`
+    /// so uncommitted crash-time in-flight reservations are reclaimed.
+    pub fn rebuild_from_committed_offsets(
+        &mut self,
+        next_slot: usize,
+        committed_offsets: &[u64],
+    ) -> Result<(), String> {
+        if next_slot > self.max_slots {
+            return Err(format!(
+                "checkpoint next_slot {next_slot} exceeds max_slots {}",
+                self.max_slots
+            ));
+        }
+        self.next_slot = next_slot;
+        self.free_slots.clear();
+        self.free_slots_by_placement_id.clear();
+        self.slot_placement_ids.clear();
+
+        let used: std::collections::BTreeSet<usize> = committed_offsets
+            .iter()
+            .filter(|&&off| off >= self.data_base_offset)
+            .map(|&off| self.offset_to_slot(off))
+            .collect();
+        for slot in 0..next_slot {
+            if !used.contains(&slot) {
+                self.free_slots.push(slot);
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates recovered checkpoint entries `(key, offset, expected_identity, expected_size)`
+    /// against `on_disk_headers` `(slot_identity, payload_len)`, recycling stale
+    /// slots and returning the list of dropped keys.
+    pub fn validate_recovered_entries(
+        &mut self,
+        entries: &[(String, u64, u64, u64)],
+        on_disk_headers: &[Option<(u64, u64)>],
+    ) -> Vec<String> {
+        let mut dropped = Vec::new();
+        for ((key, offset, expected_id, expected_size), hdr_opt) in
+            entries.iter().zip(on_disk_headers.iter())
+        {
+            let stale = match hdr_opt {
+                Some((disk_id, disk_len)) => {
+                    *disk_id != *expected_id || *disk_len != *expected_size
+                }
+                None => true,
+            };
+            if stale {
+                self.free_slot_by_offset(*offset);
+                dropped.push(key.clone());
+            }
+        }
+        dropped
+    }
+
+    fn append_free_slot(&mut self, slot: usize) {
+        if slot >= self.max_slots || self.free_slots.contains(&slot) {
+            return;
+        }
+        self.free_slots.push(slot);
+        if self.fdp_slot_affinity_enabled
+            && let Some(&pid) = self.slot_placement_ids.get(&slot)
+        {
+            let pool = self.free_slots_by_placement_id.entry(pid).or_default();
+            if !pool.contains(&slot) {
+                pool.push(slot);
+            }
+        }
+    }
+
+    fn remove_slot_from_affinity_pool(&mut self, slot: usize) {
+        let Some(&pid) = self.slot_placement_ids.get(&slot) else {
+            return;
+        };
+        if let Some(pool) = self.free_slots_by_placement_id.get_mut(&pid) {
+            pool.retain(|&s| s != slot);
+            if pool.is_empty() {
+                self.free_slots_by_placement_id.remove(&pid);
+            }
+        }
+    }
+
+    fn set_slot_placement_id(&mut self, slot: usize, placement_id: Option<u32>) {
+        if !self.fdp_slot_affinity_enabled {
+            self.slot_placement_ids.remove(&slot);
+            return;
+        }
+        if let Some(pid) = placement_id {
+            self.slot_placement_ids.insert(slot, pid);
+        } else {
+            self.slot_placement_ids.remove(&slot);
+        }
+    }
+}

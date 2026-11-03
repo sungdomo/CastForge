@@ -5709,3 +5709,127 @@ fn test_reconcile_and_resolve_device_graph_builder_casts_and_shape_only_check() 
         .expect_err("unaudited op should fail");
     assert!(err.contains("unaudited op 'mgp.routine.async'"));
 }
+
+#[test]
+fn test_raw_block_layout_fdp_slot_allocator_and_crc32_checkpoint_recovery() {
+    use castforge::passes::{
+        MAX_FIXED_BUFFER_REGION_BYTES, RawBlockLayoutConfig, RawBlockMetaHeader,
+        RawBlockSlotAllocator, build_recovery_item_ranges, compute_crc32_ieee,
+        partition_fixed_buffer_registration_ranges, select_latest_valid_checkpoint,
+    };
+
+    let layout = RawBlockLayoutConfig::new(
+        "/dev/nvme0n1",
+        0,
+        1024 * 1024,
+        4096,
+        4096,
+        65536,
+        65536,
+        *b"CFGIDX01",
+        1,
+    )
+    .expect("valid layout");
+    assert_eq!(layout.meta_container_bytes, 32768);
+    assert_eq!(layout.metadata_container_offsets(), [0, 32768]);
+    assert_eq!(layout.data_base_offset, 65536);
+    assert_eq!(layout.max_slots, 15);
+    assert!(layout.payload_fits_slot(60000, true));
+    assert!(!layout.payload_fits_slot(61441, true));
+
+    // Fixed-buffer registration chunking & parallel recovery work ranges:
+    let reg_ranges = partition_fixed_buffer_registration_ranges(
+        0x1000_0000,
+        2 * MAX_FIXED_BUFFER_REGION_BYTES + 4096,
+    )
+    .expect("valid fixed buffer range");
+    assert_eq!(
+        reg_ranges,
+        vec![
+            (0x1000_0000, MAX_FIXED_BUFFER_REGION_BYTES),
+            (
+                0x1000_0000 + MAX_FIXED_BUFFER_REGION_BYTES,
+                MAX_FIXED_BUFFER_REGION_BYTES
+            ),
+            (0x1000_0000 + 2 * MAX_FIXED_BUFFER_REGION_BYTES, 4096),
+        ]
+    );
+    assert_eq!(
+        build_recovery_item_ranges(10, 3),
+        vec![(0, 4), (4, 8), (8, 10)]
+    );
+
+    // Dual-container CRC32 checkpoint selection:
+    let payload_v1 = br#"{"version":1,"next_slot":2}"#;
+    let hdr_v1 = RawBlockMetaHeader {
+        magic: *b"CFGIDX01",
+        version: 1,
+        seq: 4,
+        payload_len: payload_v1.len() as u64,
+        crc32: compute_crc32_ieee(payload_v1),
+    }
+    .encode();
+
+    let payload_v2 = br#"{"version":1,"next_slot":3}"#;
+    let hdr_v2 = RawBlockMetaHeader {
+        magic: *b"CFGIDX01",
+        version: 1,
+        seq: 5,
+        payload_len: payload_v2.len() as u64,
+        crc32: compute_crc32_ieee(payload_v2),
+    }
+    .encode();
+
+    let (chosen_hdr, chosen_payload) = select_latest_valid_checkpoint(
+        &[(&hdr_v1, payload_v1), (&hdr_v2, payload_v2)],
+        b"CFGIDX01",
+        1,
+        layout.meta_payload_capacity(),
+    )
+    .expect("valid checkpoint");
+    assert_eq!(chosen_hdr.seq, 5);
+    assert_eq!(chosen_payload, payload_v2);
+
+    // If seq 5 is corrupted, fallback to seq 4:
+    let mut corrupted_v2 = payload_v2.to_vec();
+    corrupted_v2[0] ^= 0xFF;
+    let (fallback_hdr, _) = select_latest_valid_checkpoint(
+        &[(&hdr_v1, payload_v1), (&hdr_v2, &corrupted_v2)],
+        b"CFGIDX01",
+        1,
+        layout.meta_payload_capacity(),
+    )
+    .expect("fallback checkpoint");
+    assert_eq!(fallback_hdr.seq, 4);
+
+    // FDP placement-affinity slot allocation & crash-recovery validation:
+    let mut alloc = RawBlockSlotAllocator::new(&layout, true);
+    assert!(alloc.allocate_slot(Some(0)).is_err());
+    let off0 = alloc.allocate_slot(Some(1)).expect("slot 0");
+    let off1 = alloc.allocate_slot(Some(2)).expect("slot 1");
+    assert_eq!(off0, 65536);
+    assert_eq!(off1, 65536 + 65536);
+
+    // Free both and re-allocate for placement_id = 1 (hit) then placement_id = 3 (fallback):
+    alloc.free_slot_by_offset(off0);
+    alloc.free_slot_by_offset(off1);
+    let reused_p1 = alloc.allocate_slot(Some(1)).expect("affinity hit");
+    assert_eq!(reused_p1, off0);
+    assert_eq!(alloc.fdp_slot_affinity_hit_count, 1);
+
+    let fallback_p3 = alloc.allocate_slot(Some(3)).expect("affinity fallback");
+    assert_eq!(fallback_p3, off1);
+    assert_eq!(alloc.fdp_slot_affinity_fallback_count, 1);
+
+    // Rebuild from committed offsets (next_slot = 3, slot 0 committed -> slots 1, 2 free)
+    // and validate on-disk headers:
+    alloc
+        .rebuild_from_committed_offsets(3, &[off0])
+        .expect("rebuild succeeds");
+    assert_eq!(alloc.free_slot_count(), 2);
+
+    let dropped = alloc
+        .validate_recovered_entries(&[("k0".to_string(), off0, 100, 4096)], &[Some((999, 4096))]);
+    assert_eq!(dropped, vec!["k0".to_string()]);
+    assert_eq!(alloc.free_slot_count(), 3);
+}
