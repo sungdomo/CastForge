@@ -7423,3 +7423,347 @@ pub fn coalesce_exhaustive_gathers_to_split(module: &mut Module) -> usize {
 
     coalesced
 }
+
+fn def_op_of(module: &Module, val: ValueId) -> Option<&Operation> {
+    let v_info = module.values.get(val)?;
+    let ValueDef::OpResult { op, .. } = v_info.def else {
+        return None;
+    };
+    module.ops.get(op)
+}
+
+fn match_splat_f64(module: &Module, mut val: ValueId) -> Option<f64> {
+    for _ in 0..3 {
+        let op = def_op_of(module, val)?;
+        if matches!(
+            op.name.to_string().as_str(),
+            "stablehlo.broadcast_in_dim" | "mo.static.broadcast_to" | "mo.broadcast_to"
+        ) && !op.operands.is_empty()
+        {
+            val = op.operands[0];
+            continue;
+        }
+        if matches!(
+            op.name.to_string().as_str(),
+            "stablehlo.constant" | "arith.constant" | "mo.constant"
+        ) {
+            return op.attributes.get("value")?.as_splat_f64();
+        }
+        break;
+    }
+    None
+}
+
+fn is_splat_approx(module: &Module, val: ValueId, target: f64, tol: f64) -> bool {
+    match_splat_f64(module, val).is_some_and(|v| (v - target).abs() <= tol)
+}
+
+fn is_binary_op(module: &Module, val: ValueId, names: &[&str]) -> Option<(ValueId, ValueId, OpId)> {
+    let op = def_op_of(module, val)?;
+    if op.operands.len() == 2 && names.contains(&op.name.to_string().as_str()) {
+        Some((op.operands[0], op.operands[1], op.id))
+    } else {
+        None
+    }
+}
+
+fn is_unary_op(module: &Module, val: ValueId, names: &[&str]) -> Option<(ValueId, OpId)> {
+    let op = def_op_of(module, val)?;
+    if op.operands.len() == 1 && names.contains(&op.name.to_string().as_str()) {
+        Some((op.operands[0], op.id))
+    } else {
+        None
+    }
+}
+
+fn match_comm_const_other(
+    module: &Module,
+    lhs: ValueId,
+    rhs: ValueId,
+    target: f64,
+    tol: f64,
+) -> Option<(ValueId, ValueId)> {
+    if is_splat_approx(module, lhs, target, tol) {
+        Some((rhs, lhs))
+    } else if is_splat_approx(module, rhs, target, tol) {
+        Some((lhs, rhs))
+    } else {
+        None
+    }
+}
+
+const ADD_OPS: &[&str] = &["stablehlo.add", "mo.add", "arith.addf"];
+const MUL_OPS: &[&str] = &["stablehlo.multiply", "mo.mul", "arith.mulf"];
+const DIV_OPS: &[&str] = &["stablehlo.divide", "mo.div", "arith.divf"];
+const NEG_OPS: &[&str] = &["stablehlo.negate", "mo.negative", "arith.negf"];
+const EXP_OPS: &[&str] = &["stablehlo.exponential", "mo.exp", "math.exp"];
+const SIGMOID_OPS: &[&str] = &["mo.sigmoid", "stablehlo.logistic"];
+const ERF_OPS: &[&str] = &["stablehlo.erf", "mo.erf", "onnx.Erf", "math.erf"];
+const TANH_OPS: &[&str] = &["stablehlo.tanh", "mo.tanh", "math.tanh"];
+const POW_OPS: &[&str] = &["stablehlo.power", "mo.pow", "math.powf"];
+
+fn match_exp_to_sigmoid(module: &Module, op: &Operation) -> Option<(ValueId, Vec<OpId>)> {
+    if op.operands.len() != 2 || !DIV_OPS.contains(&op.name.to_string().as_str()) {
+        return None;
+    }
+    let num = op.operands[0];
+    let den = op.operands[1];
+    if !is_splat_approx(module, num, 1.0, 1e-5) {
+        return None;
+    }
+    let (add_l, add_r, add_id) = is_binary_op(module, den, ADD_OPS)?;
+    let (exp_val, _) = match_comm_const_other(module, add_l, add_r, 1.0, 1e-5)?;
+    let (neg_val, exp_id) = is_unary_op(module, exp_val, EXP_OPS)?;
+    let (x_val, neg_id) = is_unary_op(module, neg_val, NEG_OPS)?;
+    Some((x_val, vec![add_id, exp_id, neg_id]))
+}
+
+fn match_sigmoid_mul_to_silu(module: &Module, op: &Operation) -> Option<(ValueId, Vec<OpId>)> {
+    if op.operands.len() != 2 || !MUL_OPS.contains(&op.name.to_string().as_str()) {
+        return None;
+    }
+    for (cand_sig, cand_x) in [
+        (op.operands[0], op.operands[1]),
+        (op.operands[1], op.operands[0]),
+    ] {
+        if let Some((sig_in, sig_id)) = is_unary_op(module, cand_sig, SIGMOID_OPS)
+            && sig_in == cand_x
+        {
+            return Some((cand_x, vec![sig_id]));
+        }
+    }
+    None
+}
+
+fn match_sigmoid_mul_to_gelu_quick(
+    module: &Module,
+    op: &Operation,
+) -> Option<(ValueId, Vec<OpId>)> {
+    if op.operands.len() != 2 || !MUL_OPS.contains(&op.name.to_string().as_str()) {
+        return None;
+    }
+    for (cand_sig, cand_x) in [
+        (op.operands[0], op.operands[1]),
+        (op.operands[1], op.operands[0]),
+    ] {
+        if let Some((sig_in, sig_id)) = is_unary_op(module, cand_sig, SIGMOID_OPS)
+            && let Some((mul_l, mul_r, inner_mul_id)) = is_binary_op(module, sig_in, MUL_OPS)
+            && let Some((inner_x, _)) = match_comm_const_other(module, mul_l, mul_r, 1.702, 1e-3)
+            && inner_x == cand_x
+        {
+            return Some((cand_x, vec![sig_id, inner_mul_id]));
+        }
+    }
+    None
+}
+
+fn match_erf_to_gelu(module: &Module, op: &Operation) -> Option<(ValueId, Vec<OpId>)> {
+    const SQRT2: f64 = std::f64::consts::SQRT_2;
+    const INV_SQRT2: f64 = std::f64::consts::FRAC_1_SQRT_2;
+
+    if op.operands.len() != 2 || !MUL_OPS.contains(&op.name.to_string().as_str()) {
+        return None;
+    }
+    for (half_side, erf_side) in [
+        (op.operands[0], op.operands[1]),
+        (op.operands[1], op.operands[0]),
+    ] {
+        let Some((hl, hr, half_mul_id)) = is_binary_op(module, half_side, MUL_OPS) else {
+            continue;
+        };
+        let Some((x_half, _)) = match_comm_const_other(module, hl, hr, 0.5, 1e-5) else {
+            continue;
+        };
+        let Some((al, ar, add_id)) = is_binary_op(module, erf_side, ADD_OPS) else {
+            continue;
+        };
+        let Some((erf_val, _)) = match_comm_const_other(module, al, ar, 1.0, 1e-5) else {
+            continue;
+        };
+        let Some((erf_arg, erf_id)) = is_unary_op(module, erf_val, ERF_OPS) else {
+            continue;
+        };
+
+        // Match either `x / sqrt(2)` or `x * (1 / sqrt(2))`.
+        if let Some((dl, dr, scale_id)) = is_binary_op(module, erf_arg, DIV_OPS)
+            && dl == x_half
+            && is_splat_approx(module, dr, SQRT2, 1e-4)
+        {
+            return Some((x_half, vec![half_mul_id, add_id, erf_id, scale_id]));
+        }
+        if let Some((ml, mr, scale_id)) = is_binary_op(module, erf_arg, MUL_OPS)
+            && let Some((x_erf, _)) = match_comm_const_other(module, ml, mr, INV_SQRT2, 1e-4)
+            && x_erf == x_half
+        {
+            return Some((x_half, vec![half_mul_id, add_id, erf_id, scale_id]));
+        }
+    }
+    None
+}
+
+fn match_cube_of(module: &Module, val: ValueId, x: ValueId) -> Option<Vec<OpId>> {
+    if let Some((pl, pr, pow_id)) = is_binary_op(module, val, POW_OPS)
+        && pl == x
+        && is_splat_approx(module, pr, 3.0, 1e-5)
+    {
+        return Some(vec![pow_id]);
+    }
+    let (cl, cr, cube_id) = is_binary_op(module, val, MUL_OPS)?;
+    for (sq_cand, other) in [(cl, cr), (cr, cl)] {
+        if other == x
+            && let Some((sl, sr, sq_id)) = is_binary_op(module, sq_cand, MUL_OPS)
+            && sl == x
+            && sr == x
+        {
+            return Some(vec![cube_id, sq_id]);
+        }
+    }
+    None
+}
+
+fn match_tanh_to_gelu_tanh(module: &Module, op: &Operation) -> Option<(ValueId, Vec<OpId>)> {
+    // sqrt(2 / pi) = 0.7978845608028654
+    const SQRT_2_OVER_PI: f64 = 0.797_884_560_802_865_4;
+    const COEFF: f64 = 0.044715;
+
+    if op.operands.len() != 2 || !MUL_OPS.contains(&op.name.to_string().as_str()) {
+        return None;
+    }
+    for (half_side, tanh_side) in [
+        (op.operands[0], op.operands[1]),
+        (op.operands[1], op.operands[0]),
+    ] {
+        let Some((hl, hr, half_mul_id)) = is_binary_op(module, half_side, MUL_OPS) else {
+            continue;
+        };
+        let Some((x_half, _)) = match_comm_const_other(module, hl, hr, 0.5, 1e-5) else {
+            continue;
+        };
+        let Some((al, ar, outer_add_id)) = is_binary_op(module, tanh_side, ADD_OPS) else {
+            continue;
+        };
+        let Some((tanh_val, _)) = match_comm_const_other(module, al, ar, 1.0, 1e-5) else {
+            continue;
+        };
+        let Some((tanh_arg, tanh_id)) = is_unary_op(module, tanh_val, TANH_OPS) else {
+            continue;
+        };
+        let Some((sl, sr, scale_mul_id)) = is_binary_op(module, tanh_arg, MUL_OPS) else {
+            continue;
+        };
+        let Some((poly_val, _)) = match_comm_const_other(module, sl, sr, SQRT_2_OVER_PI, 1e-4)
+        else {
+            continue;
+        };
+        let Some((pl, pr, poly_add_id)) = is_binary_op(module, poly_val, ADD_OPS) else {
+            continue;
+        };
+        for (cand_x, cand_term) in [(pl, pr), (pr, pl)] {
+            if cand_x != x_half {
+                continue;
+            }
+            let Some((tl, tr, term_mul_id)) = is_binary_op(module, cand_term, MUL_OPS) else {
+                continue;
+            };
+            let Some((cube_val, _)) = match_comm_const_other(module, tl, tr, COEFF, 1e-5) else {
+                continue;
+            };
+            if let Some(mut cube_ids) = match_cube_of(module, cube_val, x_half) {
+                let mut dead = vec![
+                    half_mul_id,
+                    outer_add_id,
+                    tanh_id,
+                    scale_mul_id,
+                    poly_add_id,
+                    term_mul_id,
+                ];
+                dead.append(&mut cube_ids);
+                return Some((x_half, dead));
+            }
+        }
+    }
+    None
+}
+
+/// Recognizes decomposed arithmetic subgraphs for `sigmoid`, `silu`, `gelu_quick`, `gelu`, and
+/// `gelu_tanh` and folds each root operation into its canonical `mo.<activation>` operator while
+/// pruning dead intermediate arithmetic nodes.
+///
+/// Patterns recognized:
+/// - `1 / (1 + exp(-x))` -> `mo.sigmoid(x)`
+/// - `x * sigmoid(x)` -> `mo.silu(x)`
+/// - `x * sigmoid(1.702 * x)` -> `mo.gelu_quick(x)`
+/// - `0.5 * x * (1 + erf(x / sqrt(2)))` -> `mo.gelu(x)`
+/// - `0.5 * x * (1 + tanh(0.79788456 * (x + 0.044715 * x^3)))` -> `mo.gelu_tanh(x)`
+///
+/// Returns the number of composite activations recognized and folded.
+pub fn recognize_composite_activations(module: &mut Module) -> usize {
+    let mut folded = 0usize;
+    let block_ids: Vec<_> = module.blocks.keys().collect();
+
+    for block_id in block_ids {
+        let op_ids = module.blocks[block_id].ops.clone();
+        let mut candidate_dead: std::collections::HashSet<OpId> = std::collections::HashSet::new();
+
+        for &op_id in &op_ids {
+            let Some(op) = module.ops.get(op_id).cloned() else {
+                continue;
+            };
+            let matched: Option<(&str, ValueId, Vec<OpId>)> =
+                if let Some((x, dead)) = match_exp_to_sigmoid(module, &op) {
+                    Some(("sigmoid", x, dead))
+                } else if let Some((x, dead)) = match_sigmoid_mul_to_silu(module, &op) {
+                    Some(("silu", x, dead))
+                } else if let Some((x, dead)) = match_sigmoid_mul_to_gelu_quick(module, &op) {
+                    Some(("gelu_quick", x, dead))
+                } else if let Some((x, dead)) = match_erf_to_gelu(module, &op) {
+                    Some(("gelu", x, dead))
+                } else if let Some((x, dead)) = match_tanh_to_gelu_tanh(module, &op) {
+                    Some(("gelu_tanh", x, dead))
+                } else {
+                    None
+                };
+
+            let Some((act_name, x_val, dead_ids)) = matched else {
+                continue;
+            };
+
+            let mut locs = vec![op.location.clone()];
+            for &d_id in &dead_ids {
+                if let Some(d_op) = module.ops.get(d_id) {
+                    locs.push(d_op.location.clone());
+                }
+                candidate_dead.insert(d_id);
+            }
+
+            if let Some(op_mut) = module.ops.get_mut(op_id) {
+                op_mut.name = OpName::new("mo", act_name);
+                op_mut.operands = smallvec::smallvec![x_val];
+                op_mut.attributes.insert(
+                    "castforge.composite_activation".to_string(),
+                    Attribute::String(act_name.to_string()),
+                );
+                stamp_fused_provenance(op_mut, &locs);
+            }
+            folded += 1;
+        }
+
+        if !candidate_dead.is_empty() {
+            // Sweep dead intermediate ops in reverse topological order.
+            for &op_id in op_ids.iter().rev() {
+                if !candidate_dead.contains(&op_id) {
+                    continue;
+                }
+                let is_unused = module
+                    .ops
+                    .get(op_id)
+                    .is_some_and(|op| op.results.iter().all(|&r| module.use_count(r) == 0));
+                if is_unused {
+                    module.remove_op(block_id, op_id);
+                }
+            }
+        }
+    }
+
+    folded
+}

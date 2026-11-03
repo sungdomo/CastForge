@@ -42,8 +42,8 @@ use castforge::passes::{
     plan_cacheblend_retrieve, plan_cacheblend_token_reorder, plan_concat_in_place,
     plan_dynamic_memory_pool, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
     plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
-    recalculate_subchunk_blocks_to_skip, reuse_dead_loop_buffers, stamp_fused_provenance,
-    unfold_chunk_range, unique_blend_token_coverage, unpack_token_ids_be,
+    recalculate_subchunk_blocks_to_skip, recognize_composite_activations, reuse_dead_loop_buffers,
+    stamp_fused_provenance, unfold_chunk_range, unique_blend_token_coverage, unpack_token_ids_be,
     validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
@@ -2786,4 +2786,97 @@ module @partial_gathers {
 "#;
     let mut partial_mod = parse_mlir(partial_mlir).expect("valid MLIR");
     assert_eq!(coalesce_exhaustive_gathers_to_split(&mut partial_mod), 0);
+}
+
+#[test]
+fn test_recognize_composite_activations_sigmoid_silu_gelu_variants() {
+    // 1. Decomposed `x * (1 / (1 + exp(-x)))` folds `1 / (1 + exp(-x))` -> `mo.sigmoid`
+    //    and then `x * mo.sigmoid(x)` -> `mo.silu(x)` in a single pass!
+    let silu_mlir = r#"
+module @decomposed_silu {
+  func.func @main(%x: tensor<4xf32>) -> tensor<4xf32> {
+    %one = stablehlo.constant dense<1.0> : tensor<4xf32>
+    %neg = stablehlo.negate %x : tensor<4xf32>
+    %exp = stablehlo.exponential %neg : tensor<4xf32>
+    %den = stablehlo.add %one, %exp : tensor<4xf32>
+    %sig = stablehlo.divide %one, %den : tensor<4xf32>
+    %silu = stablehlo.multiply %x, %sig : tensor<4xf32>
+    return %silu : tensor<4xf32>
+  }
+}
+"#;
+    let mut silu_mod = parse_mlir(silu_mlir).expect("valid MLIR");
+    assert_eq!(recognize_composite_activations(&mut silu_mod), 2);
+    let func_id = silu_mod.functions()[0];
+    let blk_id = silu_mod.regions[silu_mod.ops[func_id].regions[0]].blocks[0];
+    let ops = &silu_mod.blocks[blk_id].ops;
+    assert!(ops.iter().any(|&id| silu_mod.ops[id].is_op("mo", "silu")));
+    assert!(
+        !ops.iter()
+            .any(|&id| silu_mod.ops[id].is_op("mo", "sigmoid"))
+    );
+
+    // 2. Quick-GELU (`x * sigmoid(1.702 * x)`) and Erf-GELU (`0.5 * x * (1 + erf(x / sqrt(2)))`):
+    let gelu_mlir = r#"
+module @decomposed_gelus {
+  func.func @main(%x: tensor<4xf32>) -> tensor<4xf32> {
+    %c1702 = stablehlo.constant dense<1.702> : tensor<4xf32>
+    %half = stablehlo.constant dense<0.5> : tensor<4xf32>
+    %one = stablehlo.constant dense<1.0> : tensor<4xf32>
+    %sqrt2 = stablehlo.constant dense<1.41421356> : tensor<4xf32>
+    %scaled_q = stablehlo.multiply %c1702, %x : tensor<4xf32>
+    %sig_q = stablehlo.logistic %scaled_q : tensor<4xf32>
+    %qgelu = stablehlo.multiply %x, %sig_q : tensor<4xf32>
+    %hx = stablehlo.multiply %half, %qgelu : tensor<4xf32>
+    %div_s2 = stablehlo.divide %qgelu, %sqrt2 : tensor<4xf32>
+    %erf_v = stablehlo.erf %div_s2 : tensor<4xf32>
+    %one_p = stablehlo.add %one, %erf_v : tensor<4xf32>
+    %gelu = stablehlo.multiply %hx, %one_p : tensor<4xf32>
+    return %gelu : tensor<4xf32>
+  }
+}
+"#;
+    let mut gelu_mod = parse_mlir(gelu_mlir).expect("valid MLIR");
+    assert_eq!(recognize_composite_activations(&mut gelu_mod), 2);
+    let g_func = gelu_mod.functions()[0];
+    let g_blk = gelu_mod.regions[gelu_mod.ops[g_func].regions[0]].blocks[0];
+    let g_ops = &gelu_mod.blocks[g_blk].ops;
+    assert!(
+        g_ops
+            .iter()
+            .any(|&id| gelu_mod.ops[id].is_op("mo", "gelu_quick"))
+    );
+    assert!(g_ops.iter().any(|&id| gelu_mod.ops[id].is_op("mo", "gelu")));
+
+    // 3. Tanh-GELU (`0.5 * x * (1 + tanh(0.79788456 * (x + 0.044715 * (x * x * x))))`):
+    let tanh_gelu_mlir = r#"
+module @decomposed_gelu_tanh {
+  func.func @main(%x: tensor<4xf32>) -> tensor<4xf32> {
+    %half = stablehlo.constant dense<0.5> : tensor<4xf32>
+    %one = stablehlo.constant dense<1.0> : tensor<4xf32>
+    %c044 = stablehlo.constant dense<0.044715> : tensor<4xf32>
+    %c797 = stablehlo.constant dense<0.79788456> : tensor<4xf32>
+    %hx = stablehlo.multiply %half, %x : tensor<4xf32>
+    %x2 = stablehlo.multiply %x, %x : tensor<4xf32>
+    %x3 = stablehlo.multiply %x2, %x : tensor<4xf32>
+    %term = stablehlo.multiply %c044, %x3 : tensor<4xf32>
+    %poly = stablehlo.add %x, %term : tensor<4xf32>
+    %targ = stablehlo.multiply %c797, %poly : tensor<4xf32>
+    %th = stablehlo.tanh %targ : tensor<4xf32>
+    %one_p = stablehlo.add %one, %th : tensor<4xf32>
+    %gtanh = stablehlo.multiply %hx, %one_p : tensor<4xf32>
+    return %gtanh : tensor<4xf32>
+  }
+}
+"#;
+    let mut gt_mod = parse_mlir(tanh_gelu_mlir).expect("valid MLIR");
+    assert_eq!(recognize_composite_activations(&mut gt_mod), 1);
+    let gt_func = gt_mod.functions()[0];
+    let gt_blk = gt_mod.regions[gt_mod.ops[gt_func].regions[0]].blocks[0];
+    let gt_ops = &gt_mod.blocks[gt_blk].ops;
+    assert!(
+        gt_ops
+            .iter()
+            .any(|&id| gt_mod.ops[id].is_op("mo", "gelu_tanh"))
+    );
 }
