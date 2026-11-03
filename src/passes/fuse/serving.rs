@@ -12012,3 +12012,239 @@ pub fn elide_redundant_mutable_buffer_ops(module: &mut Module) -> usize {
 
     total_elided
 }
+
+fn ops_match_ignoring_device(a: &Operation, b: &Operation) -> bool {
+    if a.name != b.name
+        || a.operands.len() != b.operands.len()
+        || a.results.len() != b.results.len()
+    {
+        return false;
+    }
+    let filtered = |attrs: &IndexMap<String, Attribute>| -> IndexMap<String, Attribute> {
+        attrs
+            .iter()
+            .filter(|(k, _)| k.as_str() != "castforge.device")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    };
+    filtered(&a.attributes) == filtered(&b.attributes)
+}
+
+/// Coalesces $N \ge 2$ structurally identical, distinct sole-use consumers of an
+/// `mo.tensor.unbundle` (or `mo.unbundle`) operation into a single `mo.parallel` launch.
+///
+/// Verifies that:
+/// 1. Every result `unbundle#i` (`i = 0..N`) has exactly 1 use (`consumers[i]`), and all
+///    `consumers` are distinct pure tensor operations in the same block.
+/// 2. All `consumers` match structurally (`ops_match_ignoring_device`) and reference `unbundle#i`
+///    at the exact same driving operand index `driving_idx`.
+/// 3. For every non-driving operand index `k != driving_idx`, the per-launch operands have
+///    matching tensor shapes and dtypes and are not a single shared outer value across all
+///    launches.
+///
+/// Returns the number of `mo.parallel` launches created.
+pub fn coalesce_unbundle_consumers_to_parallel(module: &mut Module) -> usize {
+    let mut created = 0usize;
+    let block_ids: Vec<_> = module.blocks.keys().collect();
+
+    for block_id in block_ids {
+        let mut single_user: IndexMap<ValueId, (OpId, usize)> = IndexMap::new();
+        for &op_id in &module.blocks[block_id].ops {
+            if let Some(op) = module.ops.get(op_id) {
+                for &v in &op.operands {
+                    let entry = single_user.entry(v).or_insert((op_id, 0));
+                    entry.0 = op_id;
+                    entry.1 += 1;
+                }
+            }
+        }
+
+        let op_ids = module.blocks[block_id].ops.clone();
+        let mut to_remove: IndexSet<OpId> = IndexSet::new();
+
+        for unbundle_id in op_ids {
+            if to_remove.contains(&unbundle_id) {
+                continue;
+            }
+            let Some(unbundle_op) = module.ops.get(unbundle_id).cloned() else {
+                continue;
+            };
+            if !matches!(
+                unbundle_op.name.to_string().as_str(),
+                "mo.tensor.unbundle" | "mo.unbundle"
+            ) || unbundle_op.operands.len() != 1
+                || unbundle_op.results.len() < 2
+            {
+                continue;
+            }
+            let n_launches = unbundle_op.results.len();
+            let mut consumers: Vec<OpId> = Vec::with_capacity(n_launches);
+            let mut unique_set: IndexSet<OpId> = IndexSet::new();
+            let mut valid = true;
+
+            for &res_v in &unbundle_op.results {
+                let Some(&(cid, count)) = single_user.get(&res_v) else {
+                    valid = false;
+                    break;
+                };
+                if count != 1
+                    || to_remove.contains(&cid)
+                    || !module.blocks[block_id].ops.contains(&cid)
+                    || !unique_set.insert(cid)
+                {
+                    valid = false;
+                    break;
+                }
+                consumers.push(cid);
+            }
+            if !valid {
+                continue;
+            }
+
+            let rep_op = module.ops[consumers[0]].clone();
+            if rep_op.results.len() != 1
+                || !rep_op.regions.is_empty()
+                || !(rep_op.is_pure() || rep_op.name.dialect == "mo")
+                || rep_op.is_op("func", "return")
+                || rep_op.is_op("func", "call")
+            {
+                continue;
+            }
+            let Some(driving_idx) = rep_op
+                .operands
+                .iter()
+                .position(|&v| v == unbundle_op.results[0])
+            else {
+                continue;
+            };
+
+            let Some(rep_res_tt) = module
+                .values
+                .get(rep_op.results[0])
+                .and_then(|v| v.ty.as_tensor())
+                .cloned()
+            else {
+                continue;
+            };
+
+            for (i, &peer_id) in consumers.iter().enumerate().skip(1) {
+                let peer_op = &module.ops[peer_id];
+                if !ops_match_ignoring_device(&rep_op, peer_op)
+                    || peer_op.operands[driving_idx] != unbundle_op.results[i]
+                {
+                    valid = false;
+                    break;
+                }
+                let Some(peer_res_tt) = module
+                    .values
+                    .get(peer_op.results[0])
+                    .and_then(|v| v.ty.as_tensor())
+                else {
+                    valid = false;
+                    break;
+                };
+                if peer_res_tt.shape != rep_res_tt.shape || peer_res_tt.dtype != rep_res_tt.dtype {
+                    valid = false;
+                    break;
+                }
+            }
+            if !valid {
+                continue;
+            }
+
+            // Validate non-driving operand positions across launches.
+            let mut merged_operands: SmallVec<[ValueId; 4]> =
+                SmallVec::from_slice(&[unbundle_op.operands[0]]);
+            for opd_idx in 0..rep_op.operands.len() {
+                if opd_idx == driving_idx {
+                    continue;
+                }
+                let first_v = module.ops[consumers[0]].operands[opd_idx];
+                let Some(first_tt) = module.values.get(first_v).and_then(|v| v.ty.as_tensor())
+                else {
+                    valid = false;
+                    break;
+                };
+                let all_equal = consumers
+                    .iter()
+                    .all(|&cid| module.ops[cid].operands[opd_idx] == first_v);
+                if all_equal {
+                    valid = false;
+                    break;
+                }
+                for &cid in &consumers {
+                    let v = module.ops[cid].operands[opd_idx];
+                    let Some(tt) = module.values.get(v).and_then(|val| val.ty.as_tensor()) else {
+                        valid = false;
+                        break;
+                    };
+                    if tt.shape != first_tt.shape || tt.dtype != first_tt.dtype {
+                        valid = false;
+                        break;
+                    }
+                    merged_operands.push(v);
+                }
+                if !valid {
+                    break;
+                }
+            }
+            if !valid {
+                continue;
+            }
+
+            let parallel_id = consumers[0];
+            let mut parallel_results = SmallVec::with_capacity(n_launches);
+            let mut locs = vec![unbundle_op.location.clone()];
+            for (idx, &cid) in consumers.iter().enumerate() {
+                let res_v = module.ops[cid].results[0];
+                locs.push(module.ops[cid].location.clone());
+                if let Some(v_mut) = module.values.get_mut(res_v) {
+                    v_mut.def = ValueDef::OpResult {
+                        op: parallel_id,
+                        index: idx as u32,
+                    };
+                }
+                parallel_results.push(res_v);
+            }
+
+            if let Some(par_op) = module.ops.get_mut(parallel_id) {
+                let wrapped_name = par_op.name.to_string();
+                par_op.name = OpName::new("mo", "parallel");
+                par_op.operands = merged_operands;
+                par_op.results = parallel_results;
+                par_op
+                    .attributes
+                    .insert("wrapped_op".into(), Attribute::String(wrapped_name));
+                par_op.attributes.insert(
+                    "parallel_launch_count".into(),
+                    Attribute::Int(n_launches as i64),
+                );
+                par_op.attributes.insert(
+                    "driving_operand_index".into(),
+                    Attribute::Int(driving_idx as i64),
+                );
+                stamp_fused_provenance(par_op, &locs);
+            }
+
+            for &dead_v in &unbundle_op.results {
+                module.values.remove(dead_v);
+            }
+            to_remove.insert(unbundle_id);
+            for &dead_cid in &consumers[1..] {
+                to_remove.insert(dead_cid);
+            }
+            created += 1;
+        }
+
+        if !to_remove.is_empty() {
+            module.blocks[block_id]
+                .ops
+                .retain(|id| !to_remove.contains(id));
+            for dead_id in to_remove {
+                module.ops.remove(dead_id);
+            }
+        }
+    }
+
+    created
+}
