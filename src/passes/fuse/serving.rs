@@ -27815,3 +27815,286 @@ pub fn splat_large_constants(module: &mut Module, min_num_elements: i64) -> usiz
     }
     splatted
 }
+
+fn is_float_tensor_type(ty: &Type) -> bool {
+    use crate::ir::mlir::DType;
+
+    if let Type::Tensor(t) = ty {
+        matches!(
+            t.dtype,
+            DType::F16 | DType::BF16 | DType::F32 | DType::F64 | DType::F8E4M3FN | DType::F8E5M2
+        )
+    } else {
+        false
+    }
+}
+
+/// Instruments `map.iter.elementwise` and `map.iter.opaque` floating-point tensor outputs with
+/// non-intrusive `nan_check_count` -> optional device-to-host `mo.transfer` -> `nan_check_raise`
+/// verification kernels at the given sampling `stride` (`stride == 0` is treated as `1`).
+///
+/// Marks each `nan_check_raise` `map.iter.opaque` kernel with `has_write_effect = true` so dead
+/// code elimination preserves the chained check sequence. Returns
+/// `(checked_float_results, total_float_results)`.
+pub fn inject_nan_check_instrumentation(module: &mut Module, stride: usize) -> (usize, usize) {
+    use crate::ir::mlir::{DType, Dim, Location, OpName, Operation, TensorType, Value, ValueDef};
+
+    let effective_stride = stride.max(1);
+    let mut total_float_results = 0usize;
+    let mut checked_float_results = 0usize;
+
+    let count_tensor_ty = Type::Tensor(TensorType {
+        shape: vec![Dim::Static(1)],
+        dtype: DType::I32,
+        encoding: None,
+    });
+    let chain_ty = Type::Opaque("!mo.chain".to_string());
+
+    let func_ids = module.functions();
+    for fn_id in func_ids {
+        let mut float_result_idx = 0usize;
+        let regions = module.ops[fn_id].regions.clone();
+        for reg_id in regions {
+            let blocks = module.regions[reg_id].blocks.clone();
+            for bid in blocks {
+                let mut current_chain: Option<ValueId> = None;
+                let ops_snapshot = module.blocks[bid].ops.clone();
+                for kernel_id in ops_snapshot {
+                    let Some(kernel_op) = module.ops.get(kernel_id).cloned() else {
+                        continue;
+                    };
+                    let full = kernel_op.name.full_name();
+                    if full != "map.iter.elementwise" && full != "map.iter.opaque" {
+                        continue;
+                    }
+                    let kernel_dev = kernel_op
+                        .attributes
+                        .get("device")
+                        .and_then(Attribute::as_str)
+                        .unwrap_or("cpu:0")
+                        .to_string();
+                    let needs_transfer = kernel_dev != "cpu" && !kernel_dev.starts_with("cpu:");
+
+                    let mut injected_ops = Vec::new();
+                    for (res_pos, &res_v) in kernel_op.results.iter().enumerate() {
+                        let Some(res_ty) = module.values.get(res_v).map(|v| v.ty.clone()) else {
+                            continue;
+                        };
+                        if !is_float_tensor_type(&res_ty) {
+                            continue;
+                        }
+                        total_float_results += 1;
+                        let sample_idx = float_result_idx;
+                        float_result_idx += 1;
+                        if effective_stride > 1 && !sample_idx.is_multiple_of(effective_stride) {
+                            continue;
+                        }
+                        checked_float_results += 1;
+
+                        let label = module.values[res_v]
+                            .ssa_name
+                            .clone()
+                            .unwrap_or_else(|| format!("{full}#{res_pos}"));
+                        let type_str = format!("{res_ty}");
+
+                        // 1. `nan_check_count` lowered to `map.iter.opaque`:
+                        let nan_cnt = module.values.insert(Value {
+                            id: ValueId::default(),
+                            ssa_name: None,
+                            ty: count_tensor_ty.clone(),
+                            def: ValueDef::BlockArgument {
+                                block: bid,
+                                index: 0,
+                            },
+                        });
+                        module.values[nan_cnt].id = nan_cnt;
+                        let inf_cnt = module.values.insert(Value {
+                            id: ValueId::default(),
+                            ssa_name: None,
+                            ty: count_tensor_ty.clone(),
+                            def: ValueDef::BlockArgument {
+                                block: bid,
+                                index: 1,
+                            },
+                        });
+                        module.values[inf_cnt].id = inf_cnt;
+                        let mut count_attrs = indexmap::IndexMap::new();
+                        count_attrs.insert(
+                            "symbol".to_string(),
+                            Attribute::String("nan_check_count".to_string()),
+                        );
+                        count_attrs
+                            .insert("device".to_string(), Attribute::String(kernel_dev.clone()));
+                        let count_op = module.ops.insert(Operation {
+                            id: OpId::default(),
+                            name: OpName::new("map", "iter.opaque"),
+                            operands: smallvec::smallvec![res_v],
+                            results: smallvec::smallvec![nan_cnt, inf_cnt],
+                            attributes: count_attrs,
+                            regions: Vec::new(),
+                            custom_syntax: false,
+                            location: Location::Unknown,
+                        });
+                        module.ops[count_op].id = count_op;
+                        module.values[nan_cnt].def = ValueDef::OpResult {
+                            op: count_op,
+                            index: 0,
+                        };
+                        module.values[inf_cnt].def = ValueDef::OpResult {
+                            op: count_op,
+                            index: 1,
+                        };
+                        injected_ops.push(count_op);
+
+                        // Lazily create `mo.chain.create` after the first checked kernel:
+                        let mut ch_val = if let Some(existing_ch) = current_chain {
+                            existing_ch
+                        } else {
+                            let init_ch = module.values.insert(Value {
+                                id: ValueId::default(),
+                                ssa_name: None,
+                                ty: chain_ty.clone(),
+                                def: ValueDef::BlockArgument {
+                                    block: bid,
+                                    index: 0,
+                                },
+                            });
+                            module.values[init_ch].id = init_ch;
+                            let ch_op = module.ops.insert(Operation {
+                                id: OpId::default(),
+                                name: OpName::new("mo", "chain.create"),
+                                operands: smallvec::SmallVec::new(),
+                                results: smallvec::smallvec![init_ch],
+                                attributes: indexmap::IndexMap::new(),
+                                regions: Vec::new(),
+                                custom_syntax: false,
+                                location: Location::Unknown,
+                            });
+                            module.ops[ch_op].id = ch_op;
+                            module.values[init_ch].def = ValueDef::OpResult {
+                                op: ch_op,
+                                index: 0,
+                            };
+                            injected_ops.push(ch_op);
+                            init_ch
+                        };
+
+                        // 2. Transfer counts to host if `kernel_dev` is not host:
+                        let mut nan_host = nan_cnt;
+                        let mut inf_host = inf_cnt;
+                        if needs_transfer {
+                            for (src_cnt, dst_slot) in
+                                [(nan_cnt, &mut nan_host), (inf_cnt, &mut inf_host)]
+                            {
+                                let xfer_t = module.values.insert(Value {
+                                    id: ValueId::default(),
+                                    ssa_name: None,
+                                    ty: count_tensor_ty.clone(),
+                                    def: ValueDef::BlockArgument {
+                                        block: bid,
+                                        index: 0,
+                                    },
+                                });
+                                module.values[xfer_t].id = xfer_t;
+                                let xfer_ch = module.values.insert(Value {
+                                    id: ValueId::default(),
+                                    ssa_name: None,
+                                    ty: chain_ty.clone(),
+                                    def: ValueDef::BlockArgument {
+                                        block: bid,
+                                        index: 1,
+                                    },
+                                });
+                                module.values[xfer_ch].id = xfer_ch;
+                                let mut xfer_attrs = indexmap::IndexMap::new();
+                                xfer_attrs.insert(
+                                    "device".to_string(),
+                                    Attribute::String("cpu:0".to_string()),
+                                );
+                                xfer_attrs.insert(
+                                    "always_elide_same_device_copy".to_string(),
+                                    Attribute::Bool(true),
+                                );
+                                let xfer_op = module.ops.insert(Operation {
+                                    id: OpId::default(),
+                                    name: OpName::new("mo", "transfer"),
+                                    operands: smallvec::smallvec![src_cnt, ch_val],
+                                    results: smallvec::smallvec![xfer_t, xfer_ch],
+                                    attributes: xfer_attrs,
+                                    regions: Vec::new(),
+                                    custom_syntax: false,
+                                    location: Location::Unknown,
+                                });
+                                module.ops[xfer_op].id = xfer_op;
+                                module.values[xfer_t].def = ValueDef::OpResult {
+                                    op: xfer_op,
+                                    index: 0,
+                                };
+                                module.values[xfer_ch].def = ValueDef::OpResult {
+                                    op: xfer_op,
+                                    index: 1,
+                                };
+                                injected_ops.push(xfer_op);
+                                *dst_slot = xfer_t;
+                                ch_val = xfer_ch;
+                            }
+                        }
+
+                        // 3. `nan_check_raise` lowered to `map.iter.opaque`
+                        // with `has_write_effect = true`:
+                        let raise_ch = module.values.insert(Value {
+                            id: ValueId::default(),
+                            ssa_name: None,
+                            ty: chain_ty.clone(),
+                            def: ValueDef::BlockArgument {
+                                block: bid,
+                                index: 0,
+                            },
+                        });
+                        module.values[raise_ch].id = raise_ch;
+                        let mut raise_attrs = indexmap::IndexMap::new();
+                        raise_attrs.insert(
+                            "symbol".to_string(),
+                            Attribute::String("nan_check_raise".to_string()),
+                        );
+                        raise_attrs
+                            .insert("device".to_string(), Attribute::String("cpu:0".to_string()));
+                        raise_attrs.insert("has_write_effect".to_string(), Attribute::Bool(true));
+                        raise_attrs.insert("label".to_string(), Attribute::String(label));
+                        raise_attrs.insert("type_str".to_string(), Attribute::String(type_str));
+                        let raise_op = module.ops.insert(Operation {
+                            id: OpId::default(),
+                            name: OpName::new("map", "iter.opaque"),
+                            operands: smallvec::smallvec![nan_host, inf_host, ch_val],
+                            results: smallvec::smallvec![raise_ch],
+                            attributes: raise_attrs,
+                            regions: Vec::new(),
+                            custom_syntax: false,
+                            location: Location::Unknown,
+                        });
+                        module.ops[raise_op].id = raise_op;
+                        module.values[raise_ch].def = ValueDef::OpResult {
+                            op: raise_op,
+                            index: 0,
+                        };
+                        injected_ops.push(raise_op);
+                        current_chain = Some(raise_ch);
+                    }
+
+                    if !injected_ops.is_empty()
+                        && let Some(pos) = module.blocks[bid]
+                            .ops
+                            .iter()
+                            .position(|&id| id == kernel_id)
+                    {
+                        for (off, iid) in injected_ops.into_iter().enumerate() {
+                            module.blocks[bid].ops.insert(pos + 1 + off, iid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (checked_float_results, total_float_results)
+}

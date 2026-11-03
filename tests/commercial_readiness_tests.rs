@@ -8016,3 +8016,57 @@ fn test_validate_device_dtypes_verify_device_graph_kernels_and_splat_large_const
         ]
     );
 }
+
+#[test]
+fn test_inject_nan_check_instrumentation_with_stride_sampling_and_host_transfer() {
+    use castforge::ir::Attribute;
+    use castforge::passes::inject_nan_check_instrumentation;
+
+    let src = concat!(
+        "module {\n",
+        "  func.func @gpu_kernels(%x: tensor<4xf32>) -> tensor<4xf32> {\n",
+        "    %k0 = \"map.iter.elementwise\"(%x) {device = \"gpu:0\"} : ",
+        "(tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %k1 = \"map.iter.elementwise\"(%k0) {device = \"gpu:0\"} : ",
+        "(tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %k2 = \"map.iter.opaque\"(%k1) {device = \"gpu:0\"} : ",
+        "(tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %k2 : tensor<4xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(src).unwrap();
+    // With `stride = 2` across 3 float kernel outputs (`%k0`, `%k1`, `%k2`), indices 0 and 2
+    // are checked (`checked = 2`, `total = 3`):
+    let (checked, total) = inject_nan_check_instrumentation(&mut m, 2);
+    assert_eq!(total, 3);
+    assert_eq!(checked, 2);
+
+    let fn_id = m.functions()[0];
+    let blk = m.regions[m.ops[fn_id].regions[0]].blocks[0];
+    let mut count_ops = 0usize;
+    let mut xfer_ops = 0usize;
+    let mut raise_ops = 0usize;
+    for &oid in &m.blocks[blk].ops {
+        let op = &m.ops[oid];
+        let full = op.name.full_name();
+        if full == "mo.transfer" {
+            xfer_ops += 1;
+        } else if full == "map.iter.opaque" {
+            match op.attributes.get("symbol").and_then(Attribute::as_str) {
+                Some("nan_check_count") => count_ops += 1,
+                Some("nan_check_raise") => {
+                    assert_eq!(
+                        op.attributes.get("has_write_effect"),
+                        Some(&Attribute::Bool(true))
+                    );
+                    raise_ops += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(count_ops, 2);
+    assert_eq!(xfer_ops, 4); // 2 transfers (`nan_count`, `inf_count`) per checked GPU kernel
+    assert_eq!(raise_ops, 2);
+}
