@@ -27,16 +27,17 @@ use castforge::passes::{
     FleetWatermarkEvictionController, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
     IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KafkaStreamPositionTable,
     KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter,
-    KvSaltQuotaRegistry, KvScaleScope, KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy,
-    LayerGroupPayloadSharder, MemoryTagSpec, MpInstanceSpec, MultiTierPrefetchPlan,
-    P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable, P2PPeerSpec, PassManager, PassRegistry,
-    PlacementRecord, PrefetchFetchingPolicy, QuiesceStateMachine, RAW_BLOCK_META_MAGIC,
-    RAW_BLOCK_SLOT_MAGIC, ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST,
-    RawBlockMetaCheckpointHeader, ReshapeDimMapping, TOKEN_WIRE_STRIDE, TierMapState,
-    TurboQuantPreset, TurboQuantSerdeConfig, WarmPrefetchJobTable, WarmPrefetchStatus,
-    analyze_kv_layer_groups, analyze_static_reshape_dim_mapping,
-    annotate_squeeze_unsqueeze_reshapes, anonymize_symbolic_dims, await_hanging_effect_chains,
-    build_orthonormal_hadamard, classify_blend_read_groups, coalesce_exhaustive_gathers_to_split,
+    KvSaltQuotaRegistry, KvScaleScope, KvStorageKeySpec, L2_AEAD_FRAME_OVERHEAD, L2_AEAD_IV_LEN,
+    L2_HKDF_INFO_PREFIX, L2FaultInjectConfig, L2FaultInjectPolicy, LayerGroupPayloadSharder,
+    MemoryTagSpec, MpInstanceSpec, MultiTierPrefetchPlan, P2P_DEFAULT_MAX_MISSES,
+    P2PPeerDiscoveryTable, P2PPeerSpec, PassManager, PassRegistry, PlacementRecord,
+    PrefetchFetchingPolicy, QuiesceStateMachine, RAW_BLOCK_META_MAGIC, RAW_BLOCK_SLOT_MAGIC,
+    ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST, RawBlockMetaCheckpointHeader,
+    ReshapeDimMapping, SaltKeyProvider, TOKEN_WIRE_STRIDE, TierMapState, TurboQuantPreset,
+    TurboQuantSerdeConfig, WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
+    analyze_static_reshape_dim_mapping, annotate_squeeze_unsqueeze_reshapes,
+    anonymize_symbolic_dims, await_hanging_effect_chains, build_orthonormal_hadamard,
+    classify_blend_read_groups, coalesce_exhaustive_gathers_to_split,
     coalesce_partitioning_slices_to_split, coalesce_unbundle_consumers_to_parallel,
     compress_splat_constants, compute_cb_group_rope_geometry, compute_ieee_crc32,
     decode_coordinator_checkpoint_envelope, decode_kv_fs_filename, decode_kv_storage_key,
@@ -45,24 +46,25 @@ use castforge::passes::{
     elide_redundant_state_transfers, eliminate_implied_dependencies,
     encode_coordinator_checkpoint_envelope, encode_kv_fs_filename, encode_kv_storage_key,
     encode_raw_block_meta_checkpoint, encode_raw_block_slot_header, encode_wide_column_row_key,
-    engine_group_layer_indices, expand_engine_block_ids, expected_contiguous_shape_from_strides,
-    find_squeeze_axis, find_unsqueeze_axis, flatten_elementwise_chains,
-    fold_extend_lifetimes_into_async_kernels, fold_unfold_hybrid_prefix_bitmaps,
-    fuse_horizontal_shared_input_ops, fuse_locations, fuse_reshape_epilogue,
-    fuse_sole_use_prologues, get_engine_group_indices, group_p2p_lookup_keys,
-    hash_packed_token_blocks_be, hash_prefix_token_blocks, hoist_callsite_invariant_subgraph_ops,
-    hoist_exec_invariant_ops, hoist_symbolic_dim_expressions, interleave_chunk_major_object_keys,
-    is_supported_arch_dtype, legalize_rowwise_reduction_launch, longest_full_attention_hit,
-    longest_joint_prefix_hit, longest_sliding_window_hit, map_axis_through_static_reshape,
-    mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops, merge_duplicate_shape_ops,
-    merge_identical_functions, merge_parallel_matmuls, num_engine_groups, num_packed_tokens,
+    engine_group_layer_indices, estimate_l2_framed_size, expand_engine_block_ids,
+    expected_contiguous_shape_from_strides, find_squeeze_axis, find_unsqueeze_axis,
+    flatten_elementwise_chains, fold_extend_lifetimes_into_async_kernels,
+    fold_unfold_hybrid_prefix_bitmaps, fuse_horizontal_shared_input_ops, fuse_locations,
+    fuse_reshape_epilogue, fuse_sole_use_prologues, get_engine_group_indices,
+    group_p2p_lookup_keys, hash_packed_token_blocks_be, hash_prefix_token_blocks,
+    hoist_callsite_invariant_subgraph_ops, hoist_exec_invariant_ops,
+    hoist_symbolic_dim_expressions, interleave_chunk_major_object_keys, is_supported_arch_dtype,
+    legalize_rowwise_reduction_launch, longest_full_attention_hit, longest_joint_prefix_hit,
+    longest_sliding_window_hit, map_axis_through_static_reshape, mark_cuda_graph_stable_tensors,
+    merge_adjacent_parallel_loops, merge_duplicate_shape_ops, merge_identical_functions,
+    merge_parallel_matmuls, num_engine_groups, num_packed_tokens, open_l2_kv_frame,
     pack_token_ids_be, plan_cacheblend_retrieve, plan_cacheblend_token_reorder,
     plan_concat_in_place, plan_device_graph_collective_partition, plan_dynamic_memory_pool,
     plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
     plan_l1_prefetch_retention, plan_multi_tier_prefetch_load, promote_narrow_accumulators,
     re_rope_key_in_place, recalculate_subchunk_blocks_to_skip, recognize_composite_activations,
     recover_contiguous_or_dim0_padded_view, resolve_l1_memory_affinity, reuse_dead_loop_buffers,
-    select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
+    seal_l2_kv_frame, select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
     sink_split_through_reshape, sink_transpose_through_elementwise_and_broadcast,
     slice_block_ids_per_group, solve_lloyd_max_gaussian, stamp_fused_provenance,
     swim_reshape_through_slice, unfold_chunk_range, unique_blend_token_coverage,
@@ -4188,4 +4190,54 @@ fn test_multi_tier_prefetch_planner_bitmap2d_and_l1_affinity() {
     assert_eq!(l1_grid.intersect(l2_grid).unwrap().popcount(), 0);
     assert_eq!(plan_l1_prefetch_retention(3, false), vec![false; 3]);
     assert_eq!(plan_l1_prefetch_retention(3, true), vec![true; 3]);
+}
+
+#[test]
+fn test_salt_key_provider_and_l2_authenticated_kv_frame_codec() {
+    // Rejects empty master key or unsupported AES key bit-width (`192`).
+    assert!(SaltKeyProvider::new(vec![], 128, L2_HKDF_INFO_PREFIX.to_vec()).is_none());
+    assert!(SaltKeyProvider::new(b"master".to_vec(), 192, L2_HKDF_INFO_PREFIX.to_vec()).is_none());
+
+    let mut provider = SaltKeyProvider::new(
+        b"0123456789abcdef0123456789abcdef".to_vec(),
+        256,
+        L2_HKDF_INFO_PREFIX.to_vec(),
+    )
+    .expect("valid 256-bit key provider");
+    assert_eq!(provider.key_len(), 32);
+    assert_eq!(provider.cached_salt_count(), 0);
+
+    let k_a1 = provider.get_key("tenant-alpha");
+    let k_a2 = provider.get_key("tenant-alpha");
+    let k_b = provider.get_key("tenant-beta");
+    assert_eq!(k_a1.len(), 32);
+    assert_eq!(k_a1, k_a2);
+    assert_ne!(k_a1, k_b);
+    assert_eq!(provider.cached_salt_count(), 2);
+
+    // Exact framed size calculation: (16 elems * 2B) + (8 elems * 4B) = 64B + 29B = 93B.
+    assert_eq!(
+        estimate_l2_framed_size(&[(16, 2), (8, 4)]),
+        64 + L2_AEAD_FRAME_OVERHEAD
+    );
+
+    let plaintext = b"kv-cache-layer-block-payload-bytes-0123456789";
+    let iv: [u8; L2_AEAD_IV_LEN] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    let frame = seal_l2_kv_frame(&mut provider, "tenant-alpha", &iv, plaintext);
+    assert_eq!(frame.len(), plaintext.len() + L2_AEAD_FRAME_OVERHEAD);
+
+    // Roundtrip with exact frame buffer AND with trailing slab padding:
+    let mut padded = frame.clone();
+    padded.extend_from_slice(&[0xAA; 32]);
+    let opened = open_l2_kv_frame(&mut provider, "tenant-alpha", &padded, plaintext.len())
+        .expect("authentic frame with trailing padding");
+    assert_eq!(opened, plaintext);
+
+    // Wrong tenant `cache_salt` fails authentication:
+    assert!(open_l2_kv_frame(&mut provider, "tenant-beta", &frame, plaintext.len()).is_none());
+
+    // Tampered ciphertext byte fails authentication:
+    let mut tampered = frame.clone();
+    tampered[15] ^= 0x01;
+    assert!(open_l2_kv_frame(&mut provider, "tenant-alpha", &tampered, plaintext.len()).is_none());
 }

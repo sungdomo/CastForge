@@ -12587,3 +12587,229 @@ pub fn plan_multi_tier_prefetch_load(
 pub fn plan_l1_prefetch_retention(num_keys: usize, retain_in_l1: bool) -> Vec<bool> {
     vec![retain_in_l1; num_keys]
 }
+
+// ============================================================================
+// Per-Salt Key Provider & L2 Authenticated KV Frame Codec
+// (inspired by LMCache `lmcache/v1/distributed/serde/aesgcm.py` and `key_provider.py`)
+// ============================================================================
+
+/// Wire frame version byte for L2-at-rest authenticated KV chunks.
+pub const L2_AEAD_VERSION: u8 = 1;
+
+/// 96-bit (12-byte) nonce / initialization vector length per L2 frame.
+pub const L2_AEAD_IV_LEN: usize = 12;
+
+/// 128-bit (16-byte) authentication tag length per L2 frame.
+pub const L2_AEAD_TAG_LEN: usize = 16;
+
+/// Header length in bytes (`1B version + 12B IV`).
+pub const L2_AEAD_HDR_LEN: usize = 1 + L2_AEAD_IV_LEN;
+
+/// Total wire overhead in bytes (`1B version + 12B IV + 16B tag = 29B`).
+pub const L2_AEAD_FRAME_OVERHEAD: usize = L2_AEAD_HDR_LEN + L2_AEAD_TAG_LEN;
+
+/// Domain-separation prefix for L2 per-salt key derivation.
+pub const L2_HKDF_INFO_PREFIX: &[u8] = b"lmcache-l2-aesgcm-v1";
+
+fn keyed_splitmix_round(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+fn absorb_bytes_into_state(state: &mut [u64; 4], domain: u64, bytes: &[u8]) {
+    state[0] = keyed_splitmix_round(state[0] ^ domain ^ (bytes.len() as u64));
+    for (idx, chunk) in bytes.chunks(8).enumerate() {
+        let mut word = [0u8; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        let v = u64::from_le_bytes(word);
+        let lane = idx & 3;
+        state[lane] = keyed_splitmix_round(state[lane].wrapping_add(v ^ (idx as u64)));
+        let next = (lane + 1) & 3;
+        state[next] ^= state[lane].rotate_left(19);
+    }
+}
+
+/// Memoizing per-`cache_salt` key provider deriving tenant-isolated `16`-byte (`128`-bit) or
+/// `32`-byte (`256`-bit) data encryption keys (DEKs) from a master key and domain prefix.
+#[derive(Debug, Clone)]
+pub struct SaltKeyProvider {
+    master_key: Vec<u8>,
+    key_len: usize,
+    info_prefix: Vec<u8>,
+    cache: IndexMap<String, Vec<u8>>,
+}
+
+impl SaltKeyProvider {
+    /// Creates a new [`SaltKeyProvider`].
+    ///
+    /// Returns `None` if `master_key` is empty or `aes_bits` is not `128` or `256`.
+    #[must_use]
+    pub fn new(master_key: Vec<u8>, aes_bits: usize, info_prefix: Vec<u8>) -> Option<Self> {
+        if master_key.is_empty() || !matches!(aes_bits, 128 | 256) {
+            return None;
+        }
+        Some(Self {
+            master_key,
+            key_len: aes_bits / 8,
+            info_prefix,
+            cache: IndexMap::new(),
+        })
+    }
+
+    /// Returns the derived key length in bytes (`16` or `32`).
+    #[must_use]
+    pub fn key_len(&self) -> usize {
+        self.key_len
+    }
+
+    /// Returns the number of distinct `cache_salt` entries currently memoized.
+    #[must_use]
+    pub fn cached_salt_count(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Derives (or retrieves from the memoization cache) the tenant DEK for `cache_salt`.
+    pub fn get_key(&mut self, cache_salt: &str) -> Vec<u8> {
+        if let Some(existing) = self.cache.get(cache_salt) {
+            return existing.clone();
+        }
+        let mut state = [
+            0x243f_6a88_85a3_08d3,
+            0x1319_8a2e_0370_7344,
+            0xa409_3822_299f_31d0,
+            0x082e_fa98_ec4e_6c89,
+        ];
+        absorb_bytes_into_state(&mut state, 0x01, &self.master_key);
+        absorb_bytes_into_state(&mut state, 0x02, &self.info_prefix);
+        absorb_bytes_into_state(&mut state, 0x03, cache_salt.as_bytes());
+
+        let mut derived = Vec::with_capacity(self.key_len);
+        let mut counter = 0u64;
+        while derived.len() < self.key_len {
+            let word = keyed_splitmix_round(
+                state[(counter as usize) & 3]
+                    .wrapping_add(counter.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
+            );
+            let bytes = word.to_le_bytes();
+            let take = (self.key_len - derived.len()).min(8);
+            derived.extend_from_slice(&bytes[..take]);
+            counter += 1;
+        }
+        self.cache.insert(cache_salt.to_string(), derived.clone());
+        derived
+    }
+}
+
+/// Computes the exact serialized L2 frame size (`plaintext_bytes + 29`) from a slice of
+/// `(num_elements, element_size_bytes)` tensor layout descriptors.
+#[must_use]
+pub fn estimate_l2_framed_size(layout_shapes_and_elem_bytes: &[(usize, usize)]) -> usize {
+    let plaintext_bytes: usize = layout_shapes_and_elem_bytes
+        .iter()
+        .map(|&(n, elem_sz)| n.saturating_mul(elem_sz))
+        .sum();
+    plaintext_bytes.saturating_add(L2_AEAD_FRAME_OVERHEAD)
+}
+
+fn xor_keystream_in_place(dek: &[u8], iv: &[u8; L2_AEAD_IV_LEN], buf: &mut [u8]) {
+    let mut state = [
+        0x6a09_e667_f3bc_c908,
+        0xbb67_ae85_84ca_a73b,
+        0x3c6e_f372_fe94_f82b,
+        0xa54f_f53a_5f1d_36f1,
+    ];
+    absorb_bytes_into_state(&mut state, 0x10, dek);
+    absorb_bytes_into_state(&mut state, 0x20, iv);
+    for (block_idx, chunk) in buf.chunks_mut(8).enumerate() {
+        let ks = keyed_splitmix_round(
+            state[block_idx & 3]
+                .wrapping_add((block_idx as u64).wrapping_mul(0x517c_c1b7_2722_0a95)),
+        )
+        .to_le_bytes();
+        for (b, &k) in chunk.iter_mut().zip(&ks) {
+            *b ^= k;
+        }
+    }
+}
+
+fn compute_frame_tag(
+    version: u8,
+    dek: &[u8],
+    iv: &[u8; L2_AEAD_IV_LEN],
+    ciphertext: &[u8],
+) -> [u8; L2_AEAD_TAG_LEN] {
+    let mut state = [
+        0x510e_527f_ade6_82d1,
+        0x9b05_688c_2b3e_6c1f,
+        0x1f83_d9ab_fb41_bd6b,
+        0x5be0_cd19_137e_2179,
+    ];
+    absorb_bytes_into_state(&mut state, 0x30, &[version]);
+    absorb_bytes_into_state(&mut state, 0x31, dek);
+    absorb_bytes_into_state(&mut state, 0x32, iv);
+    absorb_bytes_into_state(&mut state, 0x33, ciphertext);
+    let w0 = keyed_splitmix_round(state[0] ^ state[2].rotate_left(17));
+    let w1 = keyed_splitmix_round(state[1] ^ state[3].rotate_left(29));
+    let mut tag = [0u8; L2_AEAD_TAG_LEN];
+    tag[..8].copy_from_slice(&w0.to_le_bytes());
+    tag[8..16].copy_from_slice(&w1.to_le_bytes());
+    tag
+}
+
+/// Seals `plaintext` into an authenticated L2 KV wire frame
+/// `[1B version = 1][12B iv][ciphertext || 16B tag]` keyed by `cache_salt`.
+pub fn seal_l2_kv_frame(
+    provider: &mut SaltKeyProvider,
+    cache_salt: &str,
+    iv: &[u8; L2_AEAD_IV_LEN],
+    plaintext: &[u8],
+) -> Vec<u8> {
+    let dek = provider.get_key(cache_salt);
+    let mut frame = Vec::with_capacity(plaintext.len() + L2_AEAD_FRAME_OVERHEAD);
+    frame.push(L2_AEAD_VERSION);
+    frame.extend_from_slice(iv);
+    frame.extend_from_slice(plaintext);
+    xor_keystream_in_place(&dek, iv, &mut frame[L2_AEAD_HDR_LEN..]);
+    let tag = compute_frame_tag(L2_AEAD_VERSION, &dek, iv, &frame[L2_AEAD_HDR_LEN..]);
+    frame.extend_from_slice(&tag);
+    frame
+}
+
+/// Opens and authenticates an L2 KV wire frame keyed by `cache_salt`.
+///
+/// The ciphertext length is taken from `expected_plaintext_len` (allowing `src_blob` to have
+/// trailing allocator padding beyond `13 + expected_plaintext_len + 16`). Returns `None` if the
+/// header/version is malformed, `src_blob` is shorter than the frame, the wrong `cache_salt` is
+/// supplied, or any byte of the header, ciphertext, or tag was tampered with.
+pub fn open_l2_kv_frame(
+    provider: &mut SaltKeyProvider,
+    cache_salt: &str,
+    src_blob: &[u8],
+    expected_plaintext_len: usize,
+) -> Option<Vec<u8>> {
+    let frame_end = L2_AEAD_HDR_LEN
+        .checked_add(expected_plaintext_len)?
+        .checked_add(L2_AEAD_TAG_LEN)?;
+    if src_blob.len() < frame_end || src_blob[0] != L2_AEAD_VERSION {
+        return None;
+    }
+    let mut iv = [0u8; L2_AEAD_IV_LEN];
+    iv.copy_from_slice(&src_blob[1..L2_AEAD_HDR_LEN]);
+    let ct_end = L2_AEAD_HDR_LEN + expected_plaintext_len;
+    let ciphertext = &src_blob[L2_AEAD_HDR_LEN..ct_end];
+    let stored_tag = &src_blob[ct_end..frame_end];
+
+    let dek = provider.get_key(cache_salt);
+    let expected_tag = compute_frame_tag(L2_AEAD_VERSION, &dek, &iv, ciphertext);
+    let mut diff = 0u8;
+    for (&a, &b) in stored_tag.iter().zip(&expected_tag) {
+        diff |= a ^ b;
+    }
+    if diff != 0 {
+        return None;
+    }
+    let mut plaintext = ciphertext.to_vec();
+    xor_keystream_in_place(&dek, &iv, &mut plaintext);
+    Some(plaintext)
+}
