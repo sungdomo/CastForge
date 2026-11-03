@@ -5914,3 +5914,148 @@ pub fn annotate_squeeze_unsqueeze_reshapes(module: &mut Module) -> usize {
 
     annotated
 }
+
+/// Default consecutive missed coordinator polls before a peer P2P adapter is removed (`3`)
+/// (matching LMCache `lmcache/v1/multiprocess/modules/p2p_controller.py` `_MAX_MISSES = 3`).
+pub const P2P_DEFAULT_MAX_MISSES: u32 = 3;
+
+/// Peer KV instance connection metadata parsed from coordinator discovery
+/// (inspired by LMCache `lmcache/v1/multiprocess/modules/p2p_controller.py` `_PeerInstance`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct P2PPeerSpec {
+    pub instance_id: String,
+    pub ip: String,
+    pub p2p_advertised_url: String,
+    pub mq_port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct P2PPeerAdapterEntry {
+    adapter_id: u64,
+    spec: P2PPeerSpec,
+    consecutive_misses: u32,
+}
+
+/// P2P peer discovery and adapter lifecycle table with consecutive-miss tolerance
+/// (inspired by LMCache `lmcache/v1/multiprocess/modules/p2p_controller.py` `P2PController`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct P2PPeerDiscoveryTable {
+    self_instance_id: String,
+    max_misses: u32,
+    next_adapter_id: u64,
+    peers: IndexMap<String, P2PPeerAdapterEntry>,
+}
+
+impl P2PPeerDiscoveryTable {
+    /// Creates a new peer discovery table for `self_instance_id` with `max_misses` tolerance.
+    pub fn new(self_instance_id: impl Into<String>, max_misses: u32) -> Self {
+        Self {
+            self_instance_id: self_instance_id.into(),
+            max_misses: max_misses.max(1),
+            next_adapter_id: 1,
+            peers: IndexMap::new(),
+        }
+    }
+
+    /// Number of currently active peer adapters.
+    pub fn active_peer_count(&self) -> usize {
+        self.peers.len()
+    }
+
+    /// Reconciles the local peer adapter table against `reported_peers` from the coordinator,
+    /// returning `(created_adapter_ids, removed_adapter_ids)`.
+    ///
+    /// - Ignores `self_instance_id`.
+    /// - Resets `consecutive_misses = 0` for present peers with unchanged endpoints.
+    /// - Recreates the adapter if a peer's `(ip, p2p_advertised_url, mq_port)` changed.
+    /// - Increments `consecutive_misses` for absent peers and evicts them once
+    ///   `consecutive_misses >= self.max_misses`.
+    pub fn reconcile_peers(&mut self, reported_peers: &[P2PPeerSpec]) -> (Vec<u64>, Vec<u64>) {
+        let mut created = Vec::new();
+        let mut removed = Vec::new();
+        let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+        for peer in reported_peers {
+            if peer.instance_id == self.self_instance_id {
+                continue;
+            }
+            seen_ids.insert(peer.instance_id.as_str());
+            if let Some(existing) = self.peers.get_mut(&peer.instance_id) {
+                if existing.spec == *peer {
+                    existing.consecutive_misses = 0;
+                } else {
+                    removed.push(existing.adapter_id);
+                    let new_id = self.next_adapter_id;
+                    self.next_adapter_id += 1;
+                    *existing = P2PPeerAdapterEntry {
+                        adapter_id: new_id,
+                        spec: peer.clone(),
+                        consecutive_misses: 0,
+                    };
+                    created.push(new_id);
+                }
+            } else {
+                let new_id = self.next_adapter_id;
+                self.next_adapter_id += 1;
+                self.peers.insert(
+                    peer.instance_id.clone(),
+                    P2PPeerAdapterEntry {
+                        adapter_id: new_id,
+                        spec: peer.clone(),
+                        consecutive_misses: 0,
+                    },
+                );
+                created.push(new_id);
+            }
+        }
+
+        let mut to_evict = Vec::new();
+        for (inst_id, entry) in &mut self.peers {
+            if !seen_ids.contains(inst_id.as_str()) {
+                entry.consecutive_misses += 1;
+                if entry.consecutive_misses >= self.max_misses {
+                    removed.push(entry.adapter_id);
+                    to_evict.push(inst_id.clone());
+                }
+            }
+        }
+        for inst_id in to_evict {
+            self.peers.shift_remove(&inst_id);
+        }
+
+        (created, removed)
+    }
+}
+
+/// Buckets a flat RPC `keys` list into one `(object_group_id, group_keys)` row per object group in
+/// first-seen order, returning an empty `Vec` when `keys` is empty, when object groups receive
+/// different numbers of keys, or when any key's `object_group_id` is not in `registered_groups`
+/// (inspired by LMCache `lmcache/v1/multiprocess/modules/p2p_controller.py`
+/// `_group_keys_by_object_group`).
+pub fn group_p2p_lookup_keys(
+    keys: &[KvStorageKeySpec],
+    registered_groups: &[u32],
+) -> Vec<(u32, Vec<KvStorageKeySpec>)> {
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    let reg_set: std::collections::HashSet<u32> = registered_groups.iter().copied().collect();
+    let mut by_group: IndexMap<u32, Vec<KvStorageKeySpec>> = IndexMap::new();
+    for key in keys {
+        if !reg_set.contains(&key.object_group_id) {
+            return Vec::new();
+        }
+        by_group
+            .entry(key.object_group_id)
+            .or_default()
+            .push(key.clone());
+    }
+    let mut lengths = by_group.values().map(Vec::len);
+    let Some(first_len) = lengths.next() else {
+        return Vec::new();
+    };
+    if lengths.any(|l| l != first_len) {
+        return Vec::new();
+    }
+    by_group.into_iter().collect()
+}

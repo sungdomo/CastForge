@@ -20,25 +20,26 @@ use castforge::passes::{
     GdsSlabAddressManager, IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind,
     KvBlockPool, KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry,
     KvScaleScope, KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy,
-    LayerGroupPayloadSharder, PassManager, PassRegistry, ROWWISE_CHEAP_OP_COST,
-    ROWWISE_EXPENSIVE_OP_COST, TOKEN_WIRE_STRIDE, WarmPrefetchJobTable, WarmPrefetchStatus,
-    analyze_kv_layer_groups, annotate_squeeze_unsqueeze_reshapes, anonymize_symbolic_dims,
-    await_hanging_effect_chains, coalesce_partitioning_slices_to_split, compress_splat_constants,
-    decode_kv_fs_filename, decode_kv_storage_key, defer_allocs_to_first_use,
-    direct_copy_format_supported, downsample_subchunk_swa_block_ids,
-    elide_redundant_state_transfers, eliminate_implied_dependencies, encode_kv_fs_filename,
-    encode_kv_storage_key, find_squeeze_axis, find_unsqueeze_axis, flatten_elementwise_chains,
+    LayerGroupPayloadSharder, P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable, P2PPeerSpec,
+    PassManager, PassRegistry, ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST, TOKEN_WIRE_STRIDE,
+    WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
+    annotate_squeeze_unsqueeze_reshapes, anonymize_symbolic_dims, await_hanging_effect_chains,
+    coalesce_partitioning_slices_to_split, compress_splat_constants, decode_kv_fs_filename,
+    decode_kv_storage_key, defer_allocs_to_first_use, direct_copy_format_supported,
+    downsample_subchunk_swa_block_ids, elide_redundant_state_transfers,
+    eliminate_implied_dependencies, encode_kv_fs_filename, encode_kv_storage_key,
+    find_squeeze_axis, find_unsqueeze_axis, flatten_elementwise_chains,
     fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
-    fuse_sole_use_prologues, hash_packed_token_blocks_be, hash_prefix_token_blocks,
-    hoist_exec_invariant_ops, hoist_symbolic_dim_expressions, is_supported_arch_dtype,
-    legalize_rowwise_reduction_launch, longest_full_attention_hit, longest_joint_prefix_hit,
-    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops,
-    merge_duplicate_shape_ops, merge_identical_functions, num_packed_tokens, pack_token_ids_be,
-    plan_cacheblend_retrieve, plan_concat_in_place, plan_dynamic_memory_pool,
-    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
-    promote_narrow_accumulators, re_rope_key_in_place, recalculate_subchunk_blocks_to_skip,
-    reuse_dead_loop_buffers, stamp_fused_provenance, unfold_chunk_range, unpack_token_ids_be,
-    validate_target_device_dtypes,
+    fuse_sole_use_prologues, group_p2p_lookup_keys, hash_packed_token_blocks_be,
+    hash_prefix_token_blocks, hoist_exec_invariant_ops, hoist_symbolic_dim_expressions,
+    is_supported_arch_dtype, legalize_rowwise_reduction_launch, longest_full_attention_hit,
+    longest_joint_prefix_hit, longest_sliding_window_hit, mark_cuda_graph_stable_tensors,
+    merge_adjacent_parallel_loops, merge_duplicate_shape_ops, merge_identical_functions,
+    num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve, plan_concat_in_place,
+    plan_dynamic_memory_pool, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
+    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
+    recalculate_subchunk_blocks_to_skip, reuse_dead_loop_buffers, stamp_fused_provenance,
+    unfold_chunk_range, unpack_token_ids_be, validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -2379,4 +2380,56 @@ module @squeeze_unsqueeze {
             .get("castforge.unsqueeze_axis"),
         Some(&Attribute::Int(0))
     );
+}
+
+#[test]
+fn test_p2p_peer_discovery_consecutive_misses_and_group_lookup_keys() {
+    let mut table = P2PPeerDiscoveryTable::new("node-self", P2P_DEFAULT_MAX_MISSES);
+    let peer_a = P2PPeerSpec {
+        instance_id: "node-a".to_string(),
+        ip: "10.0.0.2".to_string(),
+        p2p_advertised_url: "tcp://10.0.0.2:5555".to_string(),
+        mq_port: 5556,
+    };
+    let peer_self = P2PPeerSpec {
+        instance_id: "node-self".to_string(),
+        ip: "10.0.0.1".to_string(),
+        p2p_advertised_url: "tcp://10.0.0.1:5555".to_string(),
+        mq_port: 5556,
+    };
+
+    // Poll 1: discovers `node-a` (ignores `node-self`) -> creates adapter 1
+    assert_eq!(
+        table.reconcile_peers(&[peer_self, peer_a.clone()]),
+        (vec![1], vec![])
+    );
+    assert_eq!(table.active_peer_count(), 1);
+
+    // Polls 2 & 3: `node-a` missing -> 2 consecutive misses (< 3), adapter still retained!
+    assert_eq!(table.reconcile_peers(&[]), (vec![], vec![]));
+    assert_eq!(table.reconcile_peers(&[]), (vec![], vec![]));
+    assert_eq!(table.active_peer_count(), 1);
+
+    // Poll 4: 3rd consecutive miss -> adapter 1 is evicted!
+    assert_eq!(table.reconcile_peers(&[]), (vec![], vec![1]));
+    assert_eq!(table.active_peer_count(), 0);
+
+    // Test `group_p2p_lookup_keys`: equal counts across registered groups [0, 1] succeed,
+    // unequal counts or unregistered group IDs return empty!
+    let k0 = KvStorageKeySpec {
+        model_name: "m".to_string(),
+        kv_rank: 0,
+        object_group_id: 0,
+        chunk_hash: 1,
+        cache_salt: String::new(),
+    };
+    let k1 = KvStorageKeySpec {
+        object_group_id: 1,
+        chunk_hash: 2,
+        ..k0.clone()
+    };
+    let grouped = group_p2p_lookup_keys(&[k0.clone(), k1.clone()], &[0, 1]);
+    assert_eq!(grouped.len(), 2);
+    // Unequal group counts (2 keys in group 0, 1 key in group 1) -> treated as all misses
+    assert!(group_p2p_lookup_keys(&[k0.clone(), k0, k1], &[0, 1]).is_empty());
 }
