@@ -6059,3 +6059,34 @@ pub fn group_p2p_lookup_keys(
     }
     by_group.into_iter().collect()
 }
+
+/// Encodes a [`KvStorageKeySpec`] into a 4-hex-character hash-prefixed wide-column row key
+/// (`"{hash_prefix:04x}@{model}[@lg{lg}]@{rank:08x}@{group:x}@{hash:016x}[@{salt}][@layer_{id}]"`)
+/// so tablet servers distribute rows uniformly across keyspace prefixes
+/// (inspired by LMCache `lmcache/v1/distributed/l2_adapters/bigtable_key_encoder.py`
+/// `BigtableL2KeyEncoder`).
+pub fn encode_wide_column_row_key(
+    key: &KvStorageKeySpec,
+    layer_group_size: usize,
+    layer_id: Option<u32>,
+) -> String {
+    let hash_hex = format!("{:016x}", key.chunk_hash);
+    let hash_prefix = &hash_hex[..4];
+    let model_with_lg = if layer_group_size > 0 {
+        format!("{}@lg{layer_group_size}", key.model_name)
+    } else {
+        key.model_name.clone()
+    };
+    let mut row_key = format!(
+        "{hash_prefix}@{model_with_lg}@{:08x}@{:x}@{hash_hex}",
+        key.kv_rank, key.object_group_id
+    );
+    if !key.cache_salt.is_empty() {
+        row_key.push('@');
+        row_key.push_str(&key.cache_salt);
+    }
+    if let Some(lid) = layer_id {
+        row_key.push_str(&format!("@layer_{lid}"));
+    }
+    row_key
+}

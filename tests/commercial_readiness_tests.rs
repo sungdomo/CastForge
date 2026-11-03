@@ -28,7 +28,7 @@ use castforge::passes::{
     decode_kv_storage_key, defer_allocs_to_first_use, direct_copy_format_supported,
     downsample_subchunk_swa_block_ids, elide_redundant_state_transfers,
     eliminate_implied_dependencies, encode_kv_fs_filename, encode_kv_storage_key,
-    find_squeeze_axis, find_unsqueeze_axis, flatten_elementwise_chains,
+    encode_wide_column_row_key, find_squeeze_axis, find_unsqueeze_axis, flatten_elementwise_chains,
     fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
     fuse_sole_use_prologues, group_p2p_lookup_keys, hash_packed_token_blocks_be,
     hash_prefix_token_blocks, hoist_exec_invariant_ops, hoist_symbolic_dim_expressions,
@@ -2432,4 +2432,29 @@ fn test_p2p_peer_discovery_consecutive_misses_and_group_lookup_keys() {
     assert_eq!(grouped.len(), 2);
     // Unequal group counts (2 keys in group 0, 1 key in group 1) -> treated as all misses
     assert!(group_p2p_lookup_keys(&[k0.clone(), k0, k1], &[0, 1]).is_empty());
+}
+
+#[test]
+fn test_encode_wide_column_row_key_hash_prefix_and_layer_group_suffix() {
+    let key = KvStorageKeySpec {
+        model_name: "meta-llama/Llama-3-70B".to_string(),
+        kv_rank: 2,
+        object_group_id: 1,
+        chunk_hash: 0xabcd_ef01_2345_6789,
+        cache_salt: "tenant-x".to_string(),
+    };
+    let row_key = encode_wide_column_row_key(&key, 8, Some(16));
+    assert_eq!(
+        row_key,
+        "abcd@meta-llama/Llama-3-70B@lg8@00000002@1@abcdef0123456789@tenant-x@layer_16"
+    );
+
+    let unsalted = KvStorageKeySpec {
+        cache_salt: String::new(),
+        ..key
+    };
+    assert_eq!(
+        encode_wide_column_row_key(&unsalted, 0, None),
+        "abcd@meta-llama/Llama-3-70B@00000002@1@abcdef0123456789"
+    );
 }
