@@ -1124,3 +1124,233 @@ pub fn hash_prefix_token_blocks(
     }
     Ok(out)
 }
+
+/// Compresses large uniform `stablehlo.constant` tensors with `>= min_elements` (`>= 2`) into a
+/// 1-element scalar constant (`tensor<1xdtype>`) followed by `stablehlo.broadcast_in_dim`
+/// (inspired by Modular `SplatLargeConstants.cpp`).
+///
+/// Also evicts any unreferenced uniform tensor entries from `module.tensor_store`, returning the
+/// number of large constants compressed.
+pub fn compress_splat_constants(module: &mut Module, min_elements: usize) -> usize {
+    use crate::ir::{Dim, TensorType, Type, parse_dense_f32_literal};
+    use smallvec::smallvec;
+
+    let threshold = min_elements.max(2) as i64;
+    let mut compressed = 0usize;
+
+    for fn_op_id in module.functions() {
+        let Some(&reg_id) = module.ops[fn_op_id].regions.first() else {
+            continue;
+        };
+        let Some(&block_id) = module.regions[reg_id].blocks.first() else {
+            continue;
+        };
+        let ops = module.blocks[block_id].ops.clone();
+
+        for op_id in ops {
+            let Some(op) = module.ops.get(op_id).cloned() else {
+                continue;
+            };
+            if !op.is_op("stablehlo", "constant") || op.results.is_empty() {
+                continue;
+            }
+            let orig_res = op.results[0];
+            let Some(tensor_ty) = module.values[orig_res].ty.as_tensor().cloned() else {
+                continue;
+            };
+            let Some(num_elems) = tensor_ty.num_elements() else {
+                continue;
+            };
+            if num_elems < threshold {
+                continue;
+            }
+
+            // Extract uniform scalar value if all elements are identical
+            let mut evicted_key: Option<String> = None;
+            let uniform_scalar: Option<f32> = match op.attributes.get("value") {
+                Some(Attribute::DenseElements { raw_literal, .. }) => {
+                    parse_dense_f32_literal(raw_literal, num_elems as usize).and_then(|vals| {
+                        let &v0 = vals.first()?;
+                        vals.iter()
+                            .all(|&x| (x - v0).abs() <= f32::EPSILON)
+                            .then_some(v0)
+                    })
+                }
+                Some(Attribute::TensorRef { key, .. }) => {
+                    if let Some(entry) = module.tensor_store.get(key)
+                        && let Some(vals) = entry.as_f32_slice()
+                        && let Some(&v0) = vals.first()
+                        && vals.iter().all(|&x| (x - v0).abs() <= f32::EPSILON)
+                    {
+                        evicted_key = Some(key.clone());
+                        Some(v0)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+
+            let Some(v0) = uniform_scalar else {
+                continue;
+            };
+
+            let scalar_tensor_ty = TensorType::new(vec![Dim::Static(1)], tensor_ty.dtype);
+            let scalar_ty = Type::Tensor(scalar_tensor_ty.clone());
+            let lit = format!("{v0:.6}");
+            let mut const_attrs = IndexMap::new();
+            const_attrs.insert(
+                "value".to_string(),
+                Attribute::DenseElements {
+                    ty: scalar_tensor_ty,
+                    raw_literal: lit,
+                },
+            );
+
+            // Rewrite `op_id` in place to produce the 1-element scalar constant
+            let scalar_val_id = module.values.insert_with_key(|vid| Value {
+                id: vid,
+                ssa_name: Some(format!("splat_scalar_{compressed}")),
+                ty: scalar_ty,
+                def: ValueDef::OpResult {
+                    op: op_id,
+                    index: 0,
+                },
+            });
+            module.ops[op_id].results[0] = scalar_val_id;
+            module.ops[op_id].attributes = const_attrs;
+
+            // Insert `stablehlo.broadcast_in_dim` producing the original `orig_res` ValueId
+            let mut bcast_attrs = IndexMap::new();
+            bcast_attrs.insert(
+                "broadcast_dimensions".to_string(),
+                Attribute::DenseIntArray(vec![0]),
+            );
+            let bcast_op_id = module.ops.insert_with_key(|oid| Operation {
+                id: oid,
+                name: OpName::new("stablehlo", "broadcast_in_dim"),
+                operands: smallvec![scalar_val_id],
+                results: smallvec![orig_res],
+                attributes: bcast_attrs,
+                regions: Vec::new(),
+                custom_syntax: false,
+                location: op.location.clone(),
+            });
+            module.values[orig_res].def = ValueDef::OpResult {
+                op: bcast_op_id,
+                index: 0,
+            };
+
+            if let Some(pos) = module.blocks[block_id]
+                .ops
+                .iter()
+                .position(|&id| id == op_id)
+            {
+                module.blocks[block_id].ops.insert(pos + 1, bcast_op_id);
+            }
+            if let Some(k) = evicted_key {
+                module.tensor_store.entries.shift_remove(&k);
+            }
+            compressed += 1;
+        }
+    }
+    compressed
+}
+
+/// Summary report of CUDA Graph / HIP Graph capture stability analysis
+/// (inspired by Modular `MarkStableTensorsPass.cpp`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CudaGraphCaptureReport {
+    /// `true` if every operation in the module has static shapes and no host-blocking sync ops.
+    pub is_capture_safe: bool,
+    /// Number of SSA tensor values backed by address-stable storage (arena slots, in-place
+    /// aliases, or constant weights).
+    pub stable_value_count: usize,
+    /// Number of function input arguments requiring stable device pointers or graph-exec update.
+    pub dynamic_input_count: usize,
+    /// Operations that prevent full CUDA/HIP Graph capture (e.g. dynamic shapes or host sync).
+    pub blocking_ops: Vec<String>,
+}
+
+/// Analyzes and stamps `castforge.cuda_graph_stable = true` onto operations whose tensor operands
+/// and results reside in address-stable arena slots or constant weights, and stamps
+/// `castforge.cuda_graph_capturable` on each `func.func` operation.
+pub fn mark_cuda_graph_stable_tensors(module: &mut Module) -> CudaGraphCaptureReport {
+    use crate::codegen::build_memory_plan;
+    use crate::ir::Dim;
+
+    let plan = build_memory_plan(module);
+    let mut stable_value_count = 0usize;
+    let mut dynamic_input_count = 0usize;
+    let mut blocking_ops = Vec::new();
+
+    for fn_op_id in module.functions() {
+        let Some(&reg_id) = module.ops[fn_op_id].regions.first() else {
+            continue;
+        };
+        let Some(&block_id) = module.regions[reg_id].blocks.first() else {
+            continue;
+        };
+        dynamic_input_count += module.blocks[block_id].arguments.len();
+        let ops = module.blocks[block_id].ops.clone();
+
+        for op_id in ops {
+            let Some(op) = module.ops.get(op_id).cloned() else {
+                continue;
+            };
+            if op.is_op("func", "return") {
+                continue;
+            }
+            let has_dynamic_dim = op
+                .results
+                .iter()
+                .chain(op.operands.iter())
+                .filter_map(|&v| module.values[v].ty.as_tensor())
+                .any(|t| !t.shape.iter().all(|d| matches!(d, Dim::Static(_))));
+            let is_host_sync = op.is_op("castforge", "offload_to_host")
+                || (op.is_op("stablehlo", "composite")
+                    && op
+                        .attributes
+                        .get("name")
+                        .and_then(|a| a.as_str())
+                        .is_some_and(|n| n == "castforge.offload_sync"));
+            if has_dynamic_dim || is_host_sync {
+                blocking_ops.push(op.name.to_string());
+                continue;
+            }
+
+            let all_results_stable = op.results.iter().all(|&res| {
+                op.is_op("stablehlo", "constant")
+                    || plan
+                        .allocation_for(res)
+                        .is_some_and(|a| a.arena_slot.is_some() || a.inplace_from.is_some())
+            });
+            if all_results_stable && !op.results.is_empty() {
+                stable_value_count += op.results.len();
+                if let Some(op_mut) = module.ops.get_mut(op_id) {
+                    op_mut.attributes.insert(
+                        "castforge.cuda_graph_stable".to_string(),
+                        Attribute::Bool(true),
+                    );
+                }
+            }
+        }
+    }
+
+    let is_capture_safe = blocking_ops.is_empty();
+    for fn_op_id in module.functions() {
+        if let Some(fn_op) = module.ops.get_mut(fn_op_id) {
+            fn_op.attributes.insert(
+                "castforge.cuda_graph_capturable".to_string(),
+                Attribute::Bool(is_capture_safe),
+            );
+        }
+    }
+
+    CudaGraphCaptureReport {
+        is_capture_safe,
+        stable_value_count,
+        dynamic_input_count,
+        blocking_ops,
+    }
+}

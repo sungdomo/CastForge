@@ -14,9 +14,9 @@ use castforge::ir::{DType, Dim, TensorBacking, TensorEntry, TensorStore, TensorT
 use castforge::passes::{
     AsymK16V8Codec, CacheBlendRopeSpec, ChainedBlockHashConfig, EngineKvFormat,
     KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvPageSpec, KvScaleScope, PassManager,
-    PassRegistry, analyze_kv_layer_groups, hash_prefix_token_blocks, longest_full_attention_hit,
-    longest_joint_prefix_hit, longest_sliding_window_hit, plan_jenga_kv_geometry,
-    re_rope_key_in_place,
+    PassRegistry, analyze_kv_layer_groups, compress_splat_constants, hash_prefix_token_blocks,
+    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
+    mark_cuda_graph_stable_tensors, plan_jenga_kv_geometry, re_rope_key_in_place,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -735,4 +735,46 @@ module @strided_nan_check {
     assert!(cuda_src.contains("isnan("));
     assert!(cuda_src.contains("-1024.0f"));
     assert!(cuda_src.contains("1024.0f"));
+}
+
+#[test]
+fn test_splat_constant_compression_and_cuda_graph_capture_stability() {
+    let mlir = r#"
+module @splat_and_cuda_graph {
+  func.func @main(%x: tensor<4x4xf32>) -> tensor<4x4xf32> {
+    %c = stablehlo.constant dense_resource<uniform_w> : tensor<4x4xf32>
+    %0 = stablehlo.add %x, %c : tensor<4x4xf32>
+    %1 = stablehlo.tanh %0 : tensor<4x4xf32>
+    func.return %1 : tensor<4x4xf32>
+  }
+}
+"#;
+    let mut module = parse_mlir(mlir).unwrap();
+    module.tensor_store.insert(TensorEntry::from_f32(
+        "uniform_w",
+        TensorType::new(vec![Dim::Static(4), Dim::Static(4)], DType::F32),
+        vec![2.5f32; 16],
+    ));
+
+    let input = vec![1.0f32; 16];
+    let out_before = evaluate_module(&module, std::slice::from_ref(&input)).unwrap();
+
+    // Compress uniform constants with >= 8 elements into 1-element scalar + broadcast_in_dim
+    let compressed = compress_splat_constants(&mut module, 8);
+    assert_eq!(compressed, 1);
+    assert!(module.tensor_store.get("uniform_w").is_none());
+
+    let out_after = evaluate_module(&module, &[input]).unwrap();
+    assert_eq!(out_before, out_after);
+
+    let report = mark_cuda_graph_stable_tensors(&mut module);
+    assert!(report.is_capture_safe);
+    assert!(report.blocking_ops.is_empty());
+    assert_eq!(report.dynamic_input_count, 1);
+    assert!(report.stable_value_count >= 2);
+
+    let printed = castforge::ir::print_mlir(&module);
+    assert!(printed.contains("stablehlo.broadcast_in_dim"));
+    assert!(printed.contains("castforge.cuda_graph_capturable = true"));
+    assert!(printed.contains("castforge.cuda_graph_stable = true"));
 }
