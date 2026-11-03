@@ -5833,3 +5833,77 @@ fn test_raw_block_layout_fdp_slot_allocator_and_crc32_checkpoint_recovery() {
     assert_eq!(dropped, vec!["k0".to_string()]);
     assert_eq!(alloc.free_slot_count(), 3);
 }
+
+#[test]
+fn test_prepare_device_primitives_and_hierarchical_profile_scope_tracing() {
+    use castforge::ir::Attribute;
+    use castforge::passes::{add_profile_scope_tracing, prepare_device_primitives};
+
+    let ir = concat!(
+        "module @profile_and_dev_primitives {\n",
+        "  func.func @kernel_entry(%x: tensor<4xf32>) -> tensor<4xf32> {\n",
+        "    %q = mogg.call_opaque %x",
+        " {device_ref = \"gpu:2\", profile_scope = \"model/layer0/q_proj\",",
+        " profile_color = \"blue\"} : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %spec = mgp.tensor.extract.tensor_spec %q : (tensor<4xf32>) -> tensor<1xi64>\n",
+        "    %k = mogg.call_opaque %q",
+        " {device_ref = \"gpu:2\", profile_scope = \"model/layer0/k_proj\",",
+        " profile_color = \"blue\"} : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %k : tensor<4xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(ir).expect("valid MLIR");
+
+    // 1. Add hierarchical profile scope tracing (2 leaf scopes + 2 shared ancestor scopes
+    // "model" and "model/layer0"):
+    let inserted = add_profile_scope_tracing(&mut m, false);
+    assert_eq!(inserted, 4);
+
+    // 2. Specialize device primitives (`mogg.call_opaque` -> `mogg.call_opaque.gpu`,
+    // `device_ref = "gpu:2"` -> `device_ref_id = 2`):
+    let specialized = prepare_device_primitives(&mut m);
+    assert_eq!(specialized, 2);
+
+    let func_id = m.functions()[0];
+    let blk_id = m.regions[m.ops[func_id].regions[0]].blocks[0];
+    let op_names: Vec<String> = m.blocks[blk_id]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        op_names,
+        vec![
+            "mogg.profile_scope.begin",
+            "mogg.profile_scope.begin",
+            "mogg.profile_scope.begin",
+            "mogg.call_opaque.gpu",
+            "mgp.tensor.extract.tensor_spec",
+            "mogg.profile_scope.end",
+            "mogg.profile_scope.begin",
+            "mogg.call_opaque.gpu",
+            "mogg.profile_scope.end",
+            "mogg.profile_scope.end",
+            "mogg.profile_scope.end",
+            "func.return",
+        ]
+    );
+
+    let first_begin = m.blocks[blk_id].ops[0];
+    assert_eq!(
+        m.ops[first_begin].attributes.get("name"),
+        Some(&Attribute::String("model/kernel_entry".to_string()))
+    );
+    assert_eq!(
+        m.ops[first_begin].attributes.get("color"),
+        Some(&Attribute::String("blue".to_string()))
+    );
+
+    let gpu_op = m.blocks[blk_id].ops[3];
+    assert_eq!(
+        m.ops[gpu_op].attributes.get("device_ref_id"),
+        Some(&Attribute::Int(2))
+    );
+    assert!(!m.ops[gpu_op].attributes.contains_key("device_ref"));
+}

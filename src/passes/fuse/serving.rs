@@ -19422,3 +19422,379 @@ impl RawBlockSlotAllocator {
         }
     }
 }
+
+// ============================================================================
+// Batch 22 Step 2: Device Primitive Specialization & Hierarchical Profile
+// Scope Range Tracing
+// ============================================================================
+
+fn parse_device_ref_spec(spec: &str) -> Option<(&str, i64)> {
+    if let Some((label, id_str)) = spec.split_once(':') {
+        if label.is_empty() {
+            return None;
+        }
+        let id = id_str.parse::<i64>().ok()?;
+        Some((label, id))
+    } else if !spec.is_empty() {
+        Some((spec, 0))
+    } else {
+        None
+    }
+}
+
+/// Specializes device-targeted primitive operations across `module` by
+/// appending the target device label (`.<label>`) to each operation's name
+/// and rewriting `device_ref` attributes (`"<label>:<id>"`) into integer
+/// `<attr>_id` attributes (`Attribute::Int(id)`).
+pub fn prepare_device_primitives(module: &mut Module) -> usize {
+    let mut rewritten = 0usize;
+    let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+
+    for blk_id in block_ids {
+        let Some(blk) = module.blocks.get(blk_id) else {
+            continue;
+        };
+        let ops: Vec<OpId> = blk.ops.clone();
+        for op_id in ops {
+            let Some(op) = module.ops.get(op_id) else {
+                continue;
+            };
+            if !op.regions.is_empty() {
+                continue;
+            }
+            let Some(Attribute::String(dev_ref)) = op.attributes.get("device_ref") else {
+                continue;
+            };
+            let Some((label, _)) = parse_device_ref_spec(dev_ref) else {
+                continue;
+            };
+            let label_owned = label.to_string();
+
+            let mut updated_attrs = IndexMap::new();
+            for (k, v) in &op.attributes {
+                if (k == "device_ref" || k.ends_with("_device_ref"))
+                    && let Attribute::String(s) = v
+                    && let Some((_, dev_id)) = parse_device_ref_spec(s)
+                {
+                    let new_key = format!("{k}_id");
+                    updated_attrs.insert(new_key, Attribute::Int(dev_id));
+                } else {
+                    updated_attrs.insert(k.clone(), v.clone());
+                }
+            }
+
+            if let Some(op_mut) = module.ops.get_mut(op_id) {
+                op_mut.name.name = format!("{}.{label_owned}", op_mut.name.name);
+                op_mut.attributes = updated_attrs;
+                rewritten += 1;
+            }
+        }
+    }
+
+    rewritten
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProfileScopeRun {
+    first_op: OpId,
+    last_op: OpId,
+    layers: Vec<Vec<String>>,
+}
+
+fn op_does_significant_work(op: &Operation) -> bool {
+    let full = op.name.full_name();
+    full == "func.call"
+        || full == "mogg.call"
+        || full == "mogg.call_opaque"
+        || full == "mgp.routine.async"
+        || op.attributes.contains_key("device_ref")
+        || op.attributes.contains_key("device_ref_id")
+}
+
+fn parse_op_profile_scope_layers(op: &Operation) -> Vec<Vec<String>> {
+    let Some(Attribute::String(raw)) = op.attributes.get("profile_scope") else {
+        return Vec::new();
+    };
+    raw.split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|layer| {
+            layer
+                .split('/')
+                .map(str::trim)
+                .filter(|seg| !seg.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<String>>()
+        })
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+fn add_ancestor_profile_scope_runs(
+    leaf_runs: &[ProfileScopeRun],
+    depth: usize,
+    out_runs: &mut Vec<ProfileScopeRun>,
+) {
+    let mut group_first: Option<OpId> = None;
+    let mut group_last: Option<OpId> = None;
+    let mut group_prefix: Vec<String> = Vec::new();
+    let mut group_size = 0usize;
+
+    let flush = |first: &mut Option<OpId>,
+                 last: &mut Option<OpId>,
+                 prefix: &mut Vec<String>,
+                 size: &mut usize,
+                 out: &mut Vec<ProfileScopeRun>| {
+        if *size > 1
+            && let (Some(f), Some(l)) = (*first, *last)
+        {
+            out.push(ProfileScopeRun {
+                first_op: f,
+                last_op: l,
+                layers: vec![prefix.clone()],
+            });
+        }
+        *first = None;
+        *last = None;
+        prefix.clear();
+        *size = 0;
+    };
+
+    for run in leaf_runs {
+        let participates = run.layers.len() == 1 && run.layers[0].len() > depth + 1;
+        if participates {
+            let prefix = run.layers[0][..=depth].to_vec();
+            if group_first.is_some() && prefix == group_prefix {
+                group_last = Some(run.last_op);
+                group_size += 1;
+                continue;
+            }
+            flush(
+                &mut group_first,
+                &mut group_last,
+                &mut group_prefix,
+                &mut group_size,
+                out_runs,
+            );
+            group_first = Some(run.first_op);
+            group_last = Some(run.last_op);
+            group_prefix = prefix;
+            group_size = 1;
+        } else {
+            flush(
+                &mut group_first,
+                &mut group_last,
+                &mut group_prefix,
+                &mut group_size,
+                out_runs,
+            );
+        }
+    }
+    flush(
+        &mut group_first,
+        &mut group_last,
+        &mut group_prefix,
+        &mut group_size,
+        out_runs,
+    );
+}
+
+fn format_profile_scope_label(layers: &[Vec<String>], region_name: &str) -> String {
+    if layers.is_empty() {
+        return region_name.to_string();
+    }
+    let joined_layers: Vec<String> = layers.iter().map(|l| l.join("/")).collect();
+    format!("{}/{region_name}", joined_layers.join("+"))
+}
+
+/// Synthesizes hierarchical and leaf profiler scope ranges
+/// (`mogg.profile_scope.begin` / `mogg.profile_scope.end`) around contiguous
+/// runs of significant operations inside functions in `module`. Returns the
+/// total number of profiler scope ranges inserted.
+pub fn add_profile_scope_tracing(module: &mut Module, trace_unlabelled: bool) -> usize {
+    let mut inserted_ranges = 0usize;
+    let func_ids = module.functions();
+
+    for func_id in func_ids {
+        let region_name = module.ops[func_id]
+            .attributes
+            .get("sym_name")
+            .and_then(Attribute::as_str)
+            .unwrap_or("kernel")
+            .to_string();
+        if let Some(Attribute::String(abi)) = module.ops[func_id].attributes.get("abi")
+            && abi != "mgp"
+        {
+            continue;
+        }
+        let Some(&reg_id) = module.ops[func_id].regions.first() else {
+            continue;
+        };
+        let Some(&blk_id) = module.regions[reg_id].blocks.first() else {
+            continue;
+        };
+        let orig_ops = module.blocks[blk_id].ops.clone();
+        if orig_ops.is_empty() {
+            continue;
+        }
+
+        let terminator_opt = orig_ops.last().copied().filter(|&op_id| {
+            let name = module.ops[op_id].name.full_name();
+            name == "func.return" || name == "mogg.output" || name.ends_with(".yield")
+        });
+        let body_slice = if terminator_opt.is_some() {
+            &orig_ops[..orig_ops.len() - 1]
+        } else {
+            &orig_ops[..]
+        };
+
+        let traceable: Vec<OpId> = body_slice
+            .iter()
+            .copied()
+            .filter(|&op_id| module.ops[op_id].name.full_name() != "mogg.async.ready")
+            .collect();
+        if traceable.is_empty() {
+            continue;
+        }
+
+        let mut leaf_runs: Vec<ProfileScopeRun> = Vec::new();
+        for &op_id in &traceable {
+            let op = &module.ops[op_id];
+            if !op_does_significant_work(op) {
+                if let Some(last) = leaf_runs.last_mut() {
+                    last.last_op = op_id;
+                }
+                continue;
+            }
+            let layers = parse_op_profile_scope_layers(op);
+            if layers.is_empty() {
+                if let Some(last) = leaf_runs.last_mut() {
+                    last.last_op = op_id;
+                }
+                continue;
+            }
+            if let Some(last) = leaf_runs.last_mut()
+                && last.layers == layers
+            {
+                last.last_op = op_id;
+                continue;
+            }
+            leaf_runs.push(ProfileScopeRun {
+                first_op: op_id,
+                last_op: op_id,
+                layers,
+            });
+        }
+
+        if leaf_runs.is_empty()
+            && trace_unlabelled
+            && let (Some(&first_op), Some(&last_op)) = (traceable.first(), traceable.last())
+        {
+            leaf_runs.push(ProfileScopeRun {
+                first_op,
+                last_op,
+                layers: Vec::new(),
+            });
+        }
+
+        let max_layer_len = leaf_runs
+            .iter()
+            .filter(|r| r.layers.len() == 1)
+            .map(|r| r.layers[0].len())
+            .max()
+            .unwrap_or(0);
+
+        let mut all_runs: Vec<ProfileScopeRun> = Vec::new();
+        for depth in 0..max_layer_len.saturating_sub(1) {
+            add_ancestor_profile_scope_runs(&leaf_runs, depth, &mut all_runs);
+        }
+        all_runs.extend(leaf_runs);
+
+        for run in all_runs {
+            let cur_ops = module.blocks[blk_id].ops.clone();
+            let Some(start_idx) = cur_ops.iter().position(|&id| id == run.first_op) else {
+                continue;
+            };
+            let Some(end_idx) = cur_ops.iter().position(|&id| id == run.last_op) else {
+                continue;
+            };
+            if start_idx > end_idx {
+                continue;
+            }
+            let has_sig = cur_ops[start_idx..=end_idx]
+                .iter()
+                .any(|&id| op_does_significant_work(&module.ops[id]));
+            if !has_sig {
+                continue;
+            }
+
+            let mut seen_colors: Vec<String> = Vec::new();
+            for &id in &cur_ops[start_idx..=end_idx] {
+                if let Some(Attribute::String(c)) = module.ops[id].attributes.get("profile_color")
+                    && !seen_colors.contains(c)
+                {
+                    seen_colors.push(c.clone());
+                }
+            }
+            let resolved_color = if seen_colors.len() == 1 {
+                Some(seen_colors.remove(0))
+            } else {
+                None
+            };
+
+            let scope_name = format_profile_scope_label(&run.layers, &region_name);
+            let range_ty = Type::Tensor(TensorType::new(vec![Dim::Static(1)], DType::I64));
+            let loc = module.ops[func_id].location.clone();
+
+            let begin_op = module.ops.insert_with_key(|id| Operation {
+                id,
+                name: OpName::new("mogg.profile_scope", "begin"),
+                operands: SmallVec::new(),
+                results: SmallVec::new(),
+                attributes: {
+                    let mut attrs = IndexMap::new();
+                    attrs.insert("name".to_string(), Attribute::String(scope_name));
+                    if let Some(color) = resolved_color {
+                        attrs.insert("color".to_string(), Attribute::String(color));
+                    }
+                    attrs
+                },
+                regions: Vec::new(),
+                custom_syntax: false,
+                location: loc.clone(),
+            });
+            let range_val = module.values.insert_with_key(|id| Value {
+                id,
+                ssa_name: None,
+                ty: range_ty,
+                def: ValueDef::OpResult {
+                    op: begin_op,
+                    index: 0,
+                },
+            });
+            module.ops[begin_op].results.push(range_val);
+
+            let end_op = module.ops.insert_with_key(|id| Operation {
+                id,
+                name: OpName::new("mogg.profile_scope", "end"),
+                operands: smallvec::smallvec![range_val],
+                results: SmallVec::new(),
+                attributes: IndexMap::new(),
+                regions: Vec::new(),
+                custom_syntax: false,
+                location: loc,
+            });
+
+            module.blocks[blk_id].ops.insert(start_idx, begin_op);
+            let new_end_idx = module.blocks[blk_id]
+                .ops
+                .iter()
+                .position(|&id| id == run.last_op)
+                .unwrap_or(end_idx + 1);
+            module.blocks[blk_id].ops.insert(new_end_idx + 1, end_op);
+            inserted_ranges += 1;
+        }
+    }
+
+    inserted_ranges
+}
