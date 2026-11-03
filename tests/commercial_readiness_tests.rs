@@ -6594,3 +6594,84 @@ fn test_canonicalize_funcs_for_merge_and_merge_identical_kernel_stubs() {
         Some("caller_a")
     );
 }
+
+#[test]
+fn test_lower_compiled_routines_module_load_and_init_guard() {
+    use castforge::ir::Attribute;
+    use castforge::passes::lower_compiled_routines;
+
+    let mlir_src = concat!(
+        "module {\n",
+        "  func.func @model_init(%ctx: tensor<1xi64>) -> tensor<4xf32> {\n",
+        "    %rt = \"castforge.runtime.create\"(%ctx) {slot = 5}",
+        " : (tensor<1xi64>) -> tensor<1xi64>\n",
+        "    %ld = \"castforge.compiled_load\"(%rt) : (tensor<1xi64>) -> tensor<1xi64>\n",
+        "    %ph = \"castforge.module.load.placeholder\"() : () -> tensor<1xi64>\n",
+        "    %w0 = \"castforge.compiled_call\"()",
+        " {callee_symbol = @init_weights, dispatch = \"deferred\"} : () -> tensor<4xf32>\n",
+        "    return %w0 : tensor<4xf32>\n",
+        "  }\n",
+        "  func.func @model_execute(%ctx: tensor<1xi64>, %x: tensor<4xf32>) -> tensor<4xf32> {\n",
+        "    %y = \"castforge.compiled_call\"(%x)",
+        " {callee_symbol = @fwd_kernel} : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %z = \"castforge.to_graph_from_opaque\"(%y)",
+        " : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %z : tensor<4xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(mlir_src).expect("valid mlir");
+    let funcs = m.functions();
+    let f_init = funcs[0];
+    let f_exec = funcs[1];
+
+    let init_blk = m.regions[m.ops[f_init].regions[0]].blocks[0];
+    let load_op = m.blocks[init_blk].ops[1];
+    m.ops[load_op].attributes.insert(
+        "symbols".to_string(),
+        Attribute::Array(vec![
+            Attribute::String("init_weights".to_string()),
+            Attribute::String("fwd_kernel".to_string()),
+        ]),
+    );
+
+    let lowered = lower_compiled_routines(&mut m).expect("lowering succeeds");
+    assert_eq!(lowered, 5);
+
+    // Verify `castforge.compiled_load` became `castforge.module.load` with slot=5, module_index=0:
+    assert!(m.ops[load_op].is_op("castforge", "module.load"));
+    assert_eq!(
+        m.ops[load_op].attributes.get("slot"),
+        Some(&Attribute::Int(5))
+    );
+    assert_eq!(
+        m.ops[load_op].attributes.get("module_index"),
+        Some(&Attribute::Int(0))
+    );
+
+    // Verify `castforge.module.load.placeholder` became `castforge.chain.create` over [rt, ld],
+    // and a `castforge.guard` was inserted before the init `castforge.generic.execute`:
+    let init_ops = &m.blocks[init_blk].ops;
+    assert!(m.ops[init_ops[2]].is_op("castforge", "chain.create"));
+    assert!(m.ops[init_ops[3]].is_op("castforge", "guard"));
+    assert!(m.ops[init_ops[4]].is_op("castforge", "generic.execute"));
+    assert_eq!(
+        m.ops[init_ops[4]].attributes.get("kernel_index"),
+        Some(&Attribute::Int(0))
+    );
+    assert_eq!(
+        m.ops[init_ops[4]].attributes.get("is_async"),
+        Some(&Attribute::Bool(true))
+    );
+
+    // Verify execute function lowered `compiled_call` -> `generic.execute` (kernel_index = 1)
+    // and elided `to_graph_from_opaque`:
+    let exec_blk = m.regions[m.ops[f_exec].regions[0]].blocks[0];
+    let exec_ops = &m.blocks[exec_blk].ops;
+    assert_eq!(exec_ops.len(), 2);
+    assert!(m.ops[exec_ops[0]].is_op("castforge", "generic.execute"));
+    assert_eq!(
+        m.ops[exec_ops[0]].attributes.get("kernel_index"),
+        Some(&Attribute::Int(1))
+    );
+}

@@ -21724,3 +21724,276 @@ pub fn merge_identical_kernel_stubs(module: &mut Module) -> usize {
 
     total_merged
 }
+
+/// Lowers compiled JIT routines inside top-level functions:
+/// 1. Rewrites `castforge.compiled_load` (or `mogg.compiled_load`) into `castforge.module.load`
+///    chained after the preceding `castforge.runtime.create` (or `mgp.runtime.create`), assigning
+///    a sequential `module_index` per loaded archive and indexing each symbol in its `"symbols"`
+///    array as `(module_index, kernel_index)`.
+/// 2. Replaces `castforge.module.load.placeholder` (or `mgp.module.load.placeholder`) with the
+///    single module-load chain or a newly inserted `castforge.chain.create` over all runtime-create
+///    and module-load chains.
+/// 3. Rewrites `castforge.compiled_call` (or `mogg.compiled_call`) into
+///    `castforge.generic.execute` with resolved `"runtime_slot"`, `"module_index"`,
+///    `"kernel_index"`, and `"is_async"` (`"dispatch" == "deferred"`).
+/// 4. For any `castforge.generic.execute` in an init function (`"stage" == "init"` or function name
+///    ending in `"_init"`) that does not already consume a `!chain` operand, inserts a
+///    `castforge.guard(module_load_chain, context)` before the execute so init kernels cannot run
+///    before their backing module archive is loaded.
+/// 5. Elides identity `castforge.to_graph_from_opaque` (`mogg.to_mgp_from_opaque`) conversions.
+pub fn lower_compiled_routines(module: &mut Module) -> Result<usize, String> {
+    use crate::ir::mlir::OpName;
+    use std::collections::HashMap;
+
+    let mut lowered_count = 0usize;
+    let func_ids = module.functions();
+
+    // Shared `(module_index, kernel_index)` table across init and execute functions in the module,
+    // plus `runtime_slot` discovered from `runtime.create`.
+    let mut kernel_table: HashMap<String, (i64, i64)> = HashMap::new();
+    let mut default_runtime_slot: i64 = 0;
+
+    for func_id in func_ids {
+        let sym_name = module.ops[func_id]
+            .attributes
+            .get("sym_name")
+            .and_then(|a| a.as_str())
+            .unwrap_or("")
+            .to_string();
+        let is_init_fn = module.ops[func_id]
+            .attributes
+            .get("stage")
+            .and_then(|a| a.as_str())
+            .map(|s| s == "init")
+            .unwrap_or_else(|| sym_name.ends_with("_init") || sym_name == "init");
+
+        if module.ops[func_id].regions.is_empty() {
+            continue;
+        }
+        let reg_id = module.ops[func_id].regions[0];
+        if module.regions[reg_id].blocks.is_empty() {
+            continue;
+        }
+        let blk_id = module.regions[reg_id].blocks[0];
+        let orig_ops = module.blocks[blk_id].ops.clone();
+
+        let mut module_load_chains: Vec<ValueId> = Vec::new();
+        let mut module_load_result_by_index: Vec<ValueId> = Vec::new();
+        let mut last_runtime_slot: i64 = default_runtime_slot;
+        let mut last_runtime_ctx: Option<ValueId> =
+            module.blocks[blk_id].arguments.first().copied();
+        let mut last_runtime_chain: Option<ValueId> = None;
+
+        for &op_id in &orig_ops {
+            let full = module.ops[op_id].name.full_name();
+            if full == "castforge.runtime.create" || full == "mgp.runtime.create" {
+                if let Some(Attribute::Int(s)) = module.ops[op_id].attributes.get("slot") {
+                    last_runtime_slot = *s;
+                    default_runtime_slot = *s;
+                }
+                if let Some(&ctx_v) = module.ops[op_id].operands.first() {
+                    last_runtime_ctx = Some(ctx_v);
+                }
+                if let Some(&res_v) = module.ops[op_id].results.first() {
+                    module_load_chains.push(res_v);
+                    last_runtime_chain = Some(res_v);
+                }
+            }
+        }
+
+        let mut device_module_index: i64 = 0;
+        for &op_id in &orig_ops {
+            let full = module.ops[op_id].name.full_name();
+            if full != "castforge.compiled_load" && full != "mogg.compiled_load" {
+                continue;
+            }
+            let symbols = match module.ops[op_id].attributes.get("symbols") {
+                Some(Attribute::Array(arr)) => arr.clone(),
+                _ => Vec::new(),
+            };
+            let mut kernel_names: Vec<Attribute> = Vec::new();
+            for (k_idx, sym_attr) in symbols.iter().enumerate() {
+                if let Some(s) = sym_attr.as_str() {
+                    kernel_table.insert(s.to_string(), (device_module_index, k_idx as i64));
+                    kernel_names.push(Attribute::String(s.to_string()));
+                }
+            }
+
+            module.ops[op_id].name = OpName::new("castforge", "module.load");
+            let mut new_operands: SmallVec<[ValueId; 4]> = SmallVec::new();
+            if let Some(ch) = last_runtime_chain {
+                new_operands.push(ch);
+            }
+            if let Some(ctx) = last_runtime_ctx {
+                new_operands.push(ctx);
+            }
+            if !new_operands.is_empty() {
+                module.ops[op_id].operands = new_operands;
+            }
+            module.ops[op_id]
+                .attributes
+                .insert("slot".to_string(), Attribute::Int(last_runtime_slot));
+            module.ops[op_id]
+                .attributes
+                .insert("kernel_names".to_string(), Attribute::Array(kernel_names));
+            module.ops[op_id].attributes.insert(
+                "device_ref".to_string(),
+                Attribute::String("cpu:0".to_string()),
+            );
+            module.ops[op_id].attributes.insert(
+                "module_index".to_string(),
+                Attribute::Int(device_module_index),
+            );
+
+            if let Some(&res_v) = module.ops[op_id].results.first() {
+                module_load_chains.push(res_v);
+                module_load_result_by_index.push(res_v);
+                last_runtime_chain = Some(res_v);
+            }
+            device_module_index += 1;
+            lowered_count += 1;
+        }
+
+        // Replace `module.load.placeholder` and rewrite `compiled_call` / `to_graph_from_opaque`.
+        let mut new_block_ops: Vec<OpId> = Vec::with_capacity(orig_ops.len() + 4);
+        let mut value_replacements: HashMap<ValueId, ValueId> = HashMap::new();
+
+        for &op_id in &orig_ops {
+            // Apply any accumulated SSA value replacements to this op's operands first.
+            for opd in module.ops[op_id].operands.iter_mut() {
+                if let Some(&rep) = value_replacements.get(opd) {
+                    *opd = rep;
+                }
+            }
+
+            let full = module.ops[op_id].name.full_name();
+            if (full == "castforge.module.load.placeholder"
+                || full == "mgp.module.load.placeholder")
+                && !module_load_chains.is_empty()
+            {
+                let ph_res = module.ops[op_id].results[0];
+                if module_load_chains.len() == 1 {
+                    value_replacements.insert(ph_res, module_load_chains[0]);
+                } else {
+                    module.ops[op_id].name = OpName::new("castforge", "chain.create");
+                    module.ops[op_id].operands = SmallVec::from_vec(module_load_chains.clone());
+                    new_block_ops.push(op_id);
+                }
+                lowered_count += 1;
+                continue;
+            }
+
+            if (full == "castforge.to_graph_from_opaque" || full == "mogg.to_mgp_from_opaque")
+                && !module.ops[op_id].operands.is_empty()
+                && !module.ops[op_id].results.is_empty()
+            {
+                let inp = module.ops[op_id].operands[0];
+                let out = module.ops[op_id].results[0];
+                value_replacements.insert(out, inp);
+                lowered_count += 1;
+                continue;
+            }
+
+            if full == "castforge.compiled_call" || full == "mogg.compiled_call" {
+                let callee = module.ops[op_id]
+                    .attributes
+                    .get("callee_symbol")
+                    .or_else(|| module.ops[op_id].attributes.get("callee"))
+                    .and_then(|a| a.as_str())
+                    .ok_or_else(|| "compiled_call missing 'callee_symbol' attribute".to_string())?
+                    .to_string();
+                let &(mod_idx, kern_idx) = kernel_table.get(&callee).ok_or_else(|| {
+                    format!("compiled kernel '{callee}' is not present in any loaded module")
+                })?;
+
+                let is_async = module.ops[op_id]
+                    .attributes
+                    .get("dispatch")
+                    .and_then(|a| a.as_str())
+                    .map(|d| d == "deferred")
+                    .unwrap_or(false);
+
+                // Check if any operand is already a chain before rewriting.
+                let has_chain_operand = module.ops[op_id].operands.iter().any(|&v| {
+                    matches!(
+                        &module.values[v].ty,
+                        Type::Opaque(s) if s.contains("chain")
+                    )
+                });
+
+                let mut ctx_val = last_runtime_ctx;
+                if is_init_fn
+                    && !has_chain_operand
+                    && (mod_idx as usize) < module_load_result_by_index.len()
+                    && let Some(raw_ctx) = ctx_val
+                {
+                    let load_chain = module_load_result_by_index[mod_idx as usize];
+                    let ctx_ty = module.values[raw_ctx].ty.clone();
+                    let loc = module.ops[op_id].location.clone();
+                    let guard_id = module.ops.insert_with_key(|oid| Operation {
+                        id: oid,
+                        name: OpName::new("castforge", "guard"),
+                        operands: SmallVec::from_slice(&[load_chain, raw_ctx]),
+                        results: SmallVec::new(),
+                        attributes: IndexMap::new(),
+                        regions: Vec::new(),
+                        custom_syntax: false,
+                        location: loc,
+                    });
+                    let guarded_ctx = module.values.insert_with_key(|vid| Value {
+                        id: vid,
+                        ssa_name: None,
+                        ty: ctx_ty,
+                        def: ValueDef::OpResult {
+                            op: guard_id,
+                            index: 0,
+                        },
+                    });
+                    module.ops[guard_id].results.push(guarded_ctx);
+                    new_block_ops.push(guard_id);
+                    ctx_val = Some(guarded_ctx);
+                }
+
+                if let Some(c) = ctx_val
+                    && module.ops[op_id].operands.first().copied() != Some(c)
+                {
+                    module.ops[op_id].operands.insert(0, c);
+                }
+                module.ops[op_id].name = OpName::new("castforge", "generic.execute");
+                module.ops[op_id].attributes.insert(
+                    "runtime_slot".to_string(),
+                    Attribute::Int(last_runtime_slot),
+                );
+                module.ops[op_id]
+                    .attributes
+                    .insert("module_index".to_string(), Attribute::Int(mod_idx));
+                module.ops[op_id]
+                    .attributes
+                    .insert("kernel_index".to_string(), Attribute::Int(kern_idx));
+                module.ops[op_id]
+                    .attributes
+                    .insert("is_async".to_string(), Attribute::Bool(is_async));
+
+                // Convert any `!mo.opaque<...>` result types to `!castforge.opaque<...>`.
+                let res_ids: Vec<ValueId> = module.ops[op_id].results.iter().copied().collect();
+                for rv in res_ids {
+                    if let Type::Opaque(ref mut s) = module.values[rv].ty
+                        && let Some(rest) = s.strip_prefix("!mo.opaque")
+                    {
+                        *s = format!("!castforge.opaque{rest}");
+                    }
+                }
+
+                new_block_ops.push(op_id);
+                lowered_count += 1;
+                continue;
+            }
+
+            new_block_ops.push(op_id);
+        }
+
+        module.blocks[blk_id].ops = new_block_ops;
+    }
+
+    Ok(lowered_count)
+}
