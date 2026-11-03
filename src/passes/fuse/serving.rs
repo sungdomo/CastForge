@@ -1743,12 +1743,14 @@ pub fn fuse_sole_use_prologues(module: &mut Module) -> usize {
 
             let raw_input = prod_op.operands[0];
             let prod_name = prod_op.name.name.clone();
+            let merged_locs = [prod_op.location.clone(), cons_op.location.clone()];
             if let Some(cons_mut) = module.ops.get_mut(cons_id) {
                 cons_mut.operands[0] = raw_input;
                 cons_mut.attributes.insert(
                     "castforge.prologue_op".to_string(),
                     Attribute::String(prod_name),
                 );
+                stamp_fused_provenance(cons_mut, &merged_locs);
             }
             to_remove.insert(prod_id);
             fused_count += 1;
@@ -1889,4 +1891,72 @@ pub fn plan_kernel_sequence_fusion(
         }
     }
     sets
+}
+
+/// Combines multiple constituent [`Location`]s into a single deduplicated fused location
+/// (`Location::Named("op1+op2+...")`), preserving source provenance across operator fusions
+/// (inspired by Modular `GraphCompiler/AGENTS.md` `QA-C1` `getFusedLoc` & `FuseMutableLoads.cpp`).
+pub fn fuse_locations(locs: &[Location]) -> Location {
+    let mut parts: Vec<String> = Vec::new();
+    let mut single_flc: Option<Location> = None;
+    let mut non_unknown_count = 0usize;
+
+    for loc in locs {
+        match loc {
+            Location::Unknown => {}
+            Location::Named(name) => {
+                non_unknown_count += 1;
+                for token in name.split('+') {
+                    let trimmed = token.trim();
+                    if !trimmed.is_empty() && !parts.iter().any(|p| p == trimmed) {
+                        parts.push(trimmed.to_string());
+                    }
+                }
+            }
+            Location::FileLineCol { file, line, col } => {
+                non_unknown_count += 1;
+                if non_unknown_count == 1 {
+                    single_flc = Some(loc.clone());
+                } else {
+                    single_flc = None;
+                }
+                let formatted = format!("{file}:{line}:{col}");
+                if !parts.iter().any(|p| p == &formatted) {
+                    parts.push(formatted);
+                }
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        Location::Unknown
+    } else if non_unknown_count == 1
+        && parts.len() == 1
+        && let Some(flc) = single_flc
+    {
+        flc
+    } else {
+        Location::Named(parts.join("+"))
+    }
+}
+
+/// Stamps `target_op` with the combined [`Location`] from `source_locs` via [`fuse_locations`]
+/// and records a human-readable `castforge.provenance` string attribute when known so lowered
+/// Loop IR and target codegen retain fused operator provenance comments.
+pub fn stamp_fused_provenance(target_op: &mut Operation, source_locs: &[Location]) {
+    let fused = fuse_locations(source_locs);
+    if fused != Location::Unknown {
+        let prov_str = match &fused {
+            Location::Named(s) => s.clone(),
+            Location::FileLineCol { file, line, col } => format!("{file}:{line}:{col}"),
+            Location::Unknown => String::new(),
+        };
+        target_op.location = fused;
+        if !prov_str.is_empty() {
+            target_op.attributes.insert(
+                "castforge.provenance".to_string(),
+                Attribute::String(prov_str),
+            );
+        }
+    }
 }

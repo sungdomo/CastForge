@@ -127,6 +127,13 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                     "Groupwise quantized weight ({scheme})"
                 )));
             }
+            if let Some(prov) = op
+                .attributes
+                .get("castforge.provenance")
+                .and_then(|a| a.as_str())
+            {
+                body.push(LoopStmt::Comment(format!("Provenance: {prov}")));
+            }
 
             let is_profiled = op
                 .attributes

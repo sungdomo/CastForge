@@ -10,15 +10,18 @@ use castforge::ffi::{
     castforge_compile_mlir, castforge_free_string, castforge_optimize_mlir, castforge_version,
 };
 use castforge::ir::formats::{import_gguf_bytes, import_onnx_json};
-use castforge::ir::{DType, Dim, TensorBacking, TensorEntry, TensorStore, TensorType, parse_mlir};
+use castforge::ir::{
+    DType, Dim, Location, TensorBacking, TensorEntry, TensorStore, TensorType, parse_mlir,
+};
 use castforge::passes::{
     AsymK16V8Codec, CacheBlendRopeSpec, ChainedBlockHashConfig, DEFAULT_MAX_KERNELS_IN_FUSION_SET,
     EngineKvFormat, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode,
     KvPageSpec, KvScaleScope, PassManager, PassRegistry, analyze_kv_layer_groups,
-    compress_splat_constants, direct_copy_format_supported, fuse_sole_use_prologues,
-    hash_prefix_token_blocks, longest_full_attention_hit, longest_joint_prefix_hit,
-    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, plan_jenga_kv_geometry,
-    plan_kernel_sequence_fusion, plan_kv_dma_transfer, re_rope_key_in_place,
+    compress_splat_constants, direct_copy_format_supported, fuse_locations,
+    fuse_sole_use_prologues, hash_prefix_token_blocks, longest_full_attention_hit,
+    longest_joint_prefix_hit, longest_sliding_window_hit, mark_cuda_graph_stable_tensors,
+    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
+    re_rope_key_in_place, stamp_fused_provenance,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -924,4 +927,57 @@ module @sequence_fusion {
     assert_eq!(sets[3].set_id, 3);
     assert_eq!(sets[3].device_context, "gpu:1");
     assert_eq!(sets[3].op_names, vec!["stablehlo.log"]);
+}
+
+#[test]
+fn test_fused_location_provenance_preservation_across_lowering() {
+    let fused_loc = fuse_locations(&[
+        Location::Named("attn_q_tanh".to_string()),
+        Location::Unknown,
+        Location::FileLineCol {
+            file: "llama.py".to_string(),
+            line: 142,
+            col: 8,
+        },
+        Location::Named("attn_q_tanh".to_string()), // duplicate should be deduplicated
+    ]);
+    assert_eq!(
+        fused_loc,
+        Location::Named("attn_q_tanh+llama.py:142:8".to_string())
+    );
+
+    let mlir = r#"
+module @provenance_fusion {
+  func.func @main(%x: tensor<4x4xf32>, %w: tensor<4x4xf32>) -> tensor<4x4xf32> {
+    %0 = stablehlo.tanh %x : tensor<4x4xf32>
+    %1 = stablehlo.dot_general %0, %w : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xf32>
+    func.return %1 : tensor<4x4xf32>
+  }
+}
+"#;
+    let mut module = parse_mlir(mlir).unwrap();
+    // Stamp constituent source locations on `tanh` and `dot_general` before prologue fusion
+    for (_, op) in module.ops.iter_mut() {
+        if op.is_op("stablehlo", "tanh") {
+            op.location = Location::Named("layer0.input_tanh".to_string());
+        } else if op.is_op("stablehlo", "dot_general") {
+            stamp_fused_provenance(
+                op,
+                &[Location::FileLineCol {
+                    file: "model.py".to_string(),
+                    line: 88,
+                    col: 12,
+                }],
+            );
+        }
+    }
+
+    let fused = fuse_sole_use_prologues(&mut module);
+    assert_eq!(fused, 1);
+
+    let backend_reg = BackendRegistry::with_builtin_backends();
+    let cuda_src = backend_reg
+        .generate("cuda", &module, &TargetConfig::default())
+        .unwrap();
+    assert!(cuda_src.contains("Provenance: layer0.input_tanh+model.py:88:12"));
 }
