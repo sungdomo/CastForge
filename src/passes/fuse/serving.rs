@@ -3125,3 +3125,128 @@ pub fn flatten_elementwise_chains(module: &mut Module) -> usize {
     }
     flattened_count
 }
+
+fn is_named_state_op(op: &Operation, short_name: &str) -> bool {
+    op.name.name == short_name
+        || (op.is_op("stablehlo", "composite")
+            && op
+                .attributes
+                .get("name")
+                .and_then(|a| a.as_str())
+                .is_some_and(|n| n.ends_with(short_name)))
+}
+
+/// Elides redundant store-to-load roundtrips (`kv_offload -> kv_reload` and exact
+/// `dynamic_update_slice -> dynamic_slice` read-after-write pairs) and dead overwritten stores
+/// (`dynamic_update_slice -> dynamic_update_slice` writing the exact same slice when the first
+/// store has a single use) (inspired by Modular `ElideRedundantMutableOps.cpp`).
+///
+/// Returns the number of redundant state transfer / slice operations elided.
+pub fn elide_redundant_state_transfers(module: &mut Module) -> usize {
+    let mut elided = 0usize;
+
+    for fn_op_id in module.functions() {
+        let Some(&reg_id) = module.ops[fn_op_id].regions.first() else {
+            continue;
+        };
+        let Some(&block_id) = module.regions[reg_id].blocks.first() else {
+            continue;
+        };
+
+        loop {
+            let mut changed = false;
+            let ops = module.blocks[block_id].ops.clone();
+
+            for &op_id in &ops {
+                let Some(op) = module.ops.get(op_id).cloned() else {
+                    continue;
+                };
+                if op.results.len() != 1 || op.operands.is_empty() {
+                    continue;
+                }
+                let out_val = op.results[0];
+
+                // 1. `kv_offload -> kv_reload` store-to-load forwarding
+                if is_named_state_op(&op, "kv_reload") {
+                    let in_val = op.operands[0];
+                    if let ValueDef::OpResult { op: prod_id, .. } = module.values[in_val].def
+                        && let Some(prod_op) = module.ops.get(prod_id).cloned()
+                        && is_named_state_op(&prod_op, "kv_offload")
+                        && !prod_op.operands.is_empty()
+                    {
+                        let orig_tensor = prod_op.operands[0];
+                        module.replace_all_uses(out_val, orig_tensor);
+                        module.remove_op(block_id, op_id);
+                        elided += 1;
+                        if module.use_count(in_val) == 0 {
+                            module.remove_op(block_id, prod_id);
+                            elided += 1;
+                        }
+                        changed = true;
+                        break;
+                    }
+                }
+
+                // 2. `dynamic_update_slice -> dynamic_slice` exact read-after-write forwarding
+                if op.is_op("stablehlo", "dynamic_slice") && op.operands.len() >= 2 {
+                    let src_buf = op.operands[0];
+                    let slice_indices = &op.operands[1..];
+                    if let ValueDef::OpResult { op: upd_id, .. } = module.values[src_buf].def
+                        && let Some(upd_op) = module.ops.get(upd_id).cloned()
+                        && upd_op.is_op("stablehlo", "dynamic_update_slice")
+                        && upd_op.operands.len() == op.operands.len() + 1
+                    {
+                        let patch_val = upd_op.operands[1];
+                        let upd_indices = &upd_op.operands[2..];
+                        if slice_indices == upd_indices
+                            && module.values[out_val].ty == module.values[patch_val].ty
+                        {
+                            module.replace_all_uses(out_val, patch_val);
+                            module.remove_op(block_id, op_id);
+                            elided += 1;
+                            if module.use_count(src_buf) == 0 {
+                                module.remove_op(block_id, upd_id);
+                                elided += 1;
+                            }
+                            changed = true;
+                            break;
+                        }
+                    }
+                }
+
+                // 3. `dynamic_update_slice -> dynamic_update_slice` dead overwritten store elision
+                if op.is_op("stablehlo", "dynamic_update_slice") && op.operands.len() >= 3 {
+                    let prev_buf = op.operands[0];
+                    let cur_patch = op.operands[1];
+                    let cur_indices = &op.operands[2..];
+                    if module.use_count(prev_buf) == 1
+                        && let ValueDef::OpResult { op: prev_id, .. } = module.values[prev_buf].def
+                        && let Some(prev_op) = module.ops.get(prev_id).cloned()
+                        && prev_op.is_op("stablehlo", "dynamic_update_slice")
+                        && prev_op.operands.len() == op.operands.len()
+                    {
+                        let base_buf = prev_op.operands[0];
+                        let prev_patch = prev_op.operands[1];
+                        let prev_indices = &prev_op.operands[2..];
+                        if cur_indices == prev_indices
+                            && module.values[cur_patch].ty == module.values[prev_patch].ty
+                        {
+                            if let Some(op_mut) = module.ops.get_mut(op_id) {
+                                op_mut.operands[0] = base_buf;
+                            }
+                            module.remove_op(block_id, prev_id);
+                            elided += 1;
+                            changed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if !changed {
+                break;
+            }
+        }
+    }
+    elided
+}

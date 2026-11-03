@@ -19,12 +19,12 @@ use castforge::passes::{
     KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode, KvPageSpec,
     KvSaltQuotaRegistry, KvScaleScope, PassManager, PassRegistry, analyze_kv_layer_groups,
     anonymize_symbolic_dims, compress_splat_constants, direct_copy_format_supported,
-    flatten_elementwise_chains, fuse_locations, fuse_reshape_epilogue, fuse_sole_use_prologues,
-    hash_prefix_token_blocks, longest_full_attention_hit, longest_joint_prefix_hit,
-    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_identical_functions,
-    plan_cacheblend_retrieve, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
-    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
-    stamp_fused_provenance,
+    elide_redundant_state_transfers, flatten_elementwise_chains, fuse_locations,
+    fuse_reshape_epilogue, fuse_sole_use_prologues, hash_prefix_token_blocks,
+    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
+    mark_cuda_graph_stable_tensors, merge_identical_functions, plan_cacheblend_retrieve,
+    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
+    promote_narrow_accumulators, re_rope_key_in_place, stamp_fused_provenance,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -1268,4 +1268,39 @@ fn test_flatten_elementwise_chains_eliminates_interior_reshapes() {
 
     let out_after = evaluate_module(&module, &[input]).unwrap();
     assert_eq!(out_before, out_after);
+}
+
+#[test]
+fn test_elide_redundant_state_transfers_store_load_and_dead_store() {
+    let mlir = concat!(
+        "module @elide_state {\n",
+        "  func.func @main(%buf: tensor<8xf32>, %p1: tensor<4xf32>, ",
+        "%p2: tensor<4xf32>, %idx: tensor<i32>) -> tensor<4xf32> {\n",
+        "    %u1 = stablehlo.dynamic_update_slice %buf, %p1, %idx ",
+        ": (tensor<8xf32>, tensor<4xf32>, tensor<i32>) -> tensor<8xf32>\n",
+        "    %u2 = stablehlo.dynamic_update_slice %u1, %p2, %idx ",
+        ": (tensor<8xf32>, tensor<4xf32>, tensor<i32>) -> tensor<8xf32>\n",
+        "    %sl = stablehlo.dynamic_slice %u2, %idx ",
+        ": (tensor<8xf32>, tensor<i32>) -> tensor<4xf32>\n",
+        "    %off = stablehlo.composite %sl {name = \"castforge.kv_offload\"} ",
+        ": (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %rel = stablehlo.composite %off {name = \"castforge.kv_reload\"} ",
+        ": (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    func.return %rel : tensor<4xf32>\n",
+        "  }\n",
+        "}\n",
+    );
+    let mut module = parse_mlir(mlir).unwrap();
+    // 1. `%u1` is overwritten by `%u2` at the exact same `%idx` -> `%u1` elided (1)
+    // 2. `%sl` reads exact slice written by `%u2` -> forwards `%p2`, elides `%sl` + `%u2` (2)
+    // 3. `%rel` reloads `%off` -> forwards `%p2` and elides `%rel` + `%off` (2)
+    let elided = elide_redundant_state_transfers(&mut module);
+    assert_eq!(elided, 5);
+
+    let printed = castforge::ir::print_mlir(&module);
+    assert!(!printed.contains("dynamic_update_slice"));
+    assert!(!printed.contains("dynamic_slice"));
+    assert!(!printed.contains("kv_offload"));
+    assert!(!printed.contains("kv_reload"));
+    assert!(printed.contains("return %p2 : tensor<4xf32>"));
 }
