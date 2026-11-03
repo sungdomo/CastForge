@@ -5488,3 +5488,101 @@ pub fn merge_adjacent_parallel_loops(loop_module: &mut crate::ir::loops::LoopMod
 
     merged_count
 }
+
+fn is_effectful_chain_producer(op: &Operation) -> bool {
+    if matches!(
+        op.attributes.get("castforge.async_chain"),
+        Some(Attribute::Bool(true))
+    ) {
+        return true;
+    }
+    matches!(
+        op.name.to_string().as_str(),
+        "castforge.kv_offload"
+            | "castforge.kv_store"
+            | "castforge.async_copy"
+            | "castforge.device_transfer"
+            | "stablehlo.send"
+            | "stablehlo.outfeed"
+    )
+}
+
+/// Awaits unused ("hanging") asynchronous/effectful operation results before each block's
+/// terminator (`func.return` / `return`) by inserting a `castforge.chain_await` barrier operation
+/// and recording `castforge.awaited_hanging_chains` on the terminator
+/// (inspired by Modular `GraphCompiler/lib/MGPDialect/Transforms/FixupOverhangsPass.cpp`).
+///
+/// Matching `FixupOverhangsPass`: at most one unused result per hanging op is collected ("A
+/// failing op sets all its results to error, so one per op suffices"). Returns the total number of
+/// hanging chains awaited across the module.
+pub fn await_hanging_effect_chains(module: &mut Module) -> usize {
+    let mut awaited_total = 0usize;
+    let block_ids: Vec<_> = module.blocks.keys().collect();
+
+    for block_id in block_ids {
+        let op_ids = module.blocks[block_id].ops.clone();
+        let Some(&term_id) = op_ids.last() else {
+            continue;
+        };
+        let Some(term_op) = module.ops.get(term_id).cloned() else {
+            continue;
+        };
+        if !matches!(
+            term_op.name.to_string().as_str(),
+            "func.return" | "return" | "stablehlo.return"
+        ) {
+            continue;
+        }
+
+        let mut hanging_chains: Vec<ValueId> = Vec::new();
+        let mut hanging_locs: Vec<Location> = Vec::new();
+
+        for &op_id in &op_ids[..op_ids.len() - 1] {
+            let Some(op) = module.ops.get(op_id) else {
+                continue;
+            };
+            if !is_effectful_chain_producer(op) {
+                continue;
+            }
+            for &res_val in &op.results {
+                if module.use_count(res_val) == 0 {
+                    hanging_chains.push(res_val);
+                    hanging_locs.push(op.location.clone());
+                    break;
+                }
+            }
+        }
+
+        if hanging_chains.is_empty() {
+            continue;
+        }
+
+        let count = hanging_chains.len();
+        awaited_total += count;
+        let fused_loc = fuse_locations(&hanging_locs);
+
+        let await_op_id = module.ops.insert_with_key(|id| Operation {
+            id,
+            name: crate::ir::OpName::new("castforge", "chain_await"),
+            operands: hanging_chains.into(),
+            results: Default::default(),
+            attributes: IndexMap::new(),
+            regions: Default::default(),
+            custom_syntax: false,
+            location: fused_loc,
+        });
+
+        if let Some(term_mut) = module.ops.get_mut(term_id) {
+            term_mut.attributes.insert(
+                "castforge.awaited_hanging_chains".to_string(),
+                Attribute::Int(count as i64),
+            );
+        }
+
+        let block_ops = &mut module.blocks[block_id].ops;
+        let insert_pos = block_ops.len().saturating_sub(1);
+        block_ops.insert(insert_pos, await_op_id);
+    }
+
+    awaited_total
+}

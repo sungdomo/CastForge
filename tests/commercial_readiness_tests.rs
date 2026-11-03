@@ -22,9 +22,9 @@ use castforge::passes::{
     KvScaleScope, KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy,
     LayerGroupPayloadSharder, PassManager, PassRegistry, ROWWISE_CHEAP_OP_COST,
     ROWWISE_EXPENSIVE_OP_COST, TOKEN_WIRE_STRIDE, WarmPrefetchJobTable, WarmPrefetchStatus,
-    analyze_kv_layer_groups, anonymize_symbolic_dims, compress_splat_constants,
-    decode_kv_fs_filename, decode_kv_storage_key, defer_allocs_to_first_use,
-    direct_copy_format_supported, downsample_subchunk_swa_block_ids,
+    analyze_kv_layer_groups, anonymize_symbolic_dims, await_hanging_effect_chains,
+    compress_splat_constants, decode_kv_fs_filename, decode_kv_storage_key,
+    defer_allocs_to_first_use, direct_copy_format_supported, downsample_subchunk_swa_block_ids,
     elide_redundant_state_transfers, encode_kv_fs_filename, encode_kv_storage_key,
     flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
     fuse_reshape_epilogue, fuse_sole_use_prologues, hash_packed_token_blocks_be,
@@ -2204,4 +2204,40 @@ fn test_merge_adjacent_parallel_loops_forwards_yield_and_rejects_cross_iter_haza
 
     // Kernel 1 (cross-iteration hazard `tmp[i + 1]`) remains unmerged (Alloc + 2 For loops)
     assert_eq!(loop_mod.kernels[1].body.len(), 3);
+}
+
+#[test]
+fn test_await_hanging_effect_chains_inserts_barrier_before_terminator() {
+    use castforge::ir::Attribute;
+
+    // `%offload` (`castforge.kv_offload`) is an asynchronous effectful op whose result is unused
+    // (`use_empty()`), while `%y` (`stablehlo.abs`) is returned by `func.return`.
+    let mlir = r#"
+module @fixup_overhangs {
+  func.func @main(%x: tensor<4xf32>) -> tensor<4xf32> {
+    %offload = "castforge.kv_offload"(%x) {slot = 0 : i64} : (tensor<4xf32>) -> tensor<4xf32>
+    %y = stablehlo.abs %x : tensor<4xf32>
+    return %y : tensor<4xf32>
+  }
+}
+"#;
+    let mut module = parse_mlir(mlir).expect("valid MLIR");
+    let awaited = await_hanging_effect_chains(&mut module);
+    assert_eq!(awaited, 1);
+
+    let func_id = module.functions()[0];
+    let func_block = module.regions[module.ops[func_id].regions[0]].blocks[0];
+    let ops = &module.blocks[func_block].ops;
+    assert_eq!(ops.len(), 4);
+    assert_eq!(module.ops[ops[2]].name.to_string(), "castforge.chain_await");
+    assert_eq!(
+        module.ops[ops[3]]
+            .attributes
+            .get("castforge.awaited_hanging_chains"),
+        Some(&Attribute::Int(1))
+    );
+
+    // Running `await_hanging_effect_chains` a second time is idempotent (`%offload` is now used
+    // by `castforge.chain_await`!)
+    assert_eq!(await_hanging_effect_chains(&mut module), 0);
 }
