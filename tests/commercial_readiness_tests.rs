@@ -6675,3 +6675,294 @@ fn test_lower_compiled_routines_module_load_and_init_guard() {
         Some(&Attribute::Int(1))
     );
 }
+
+#[test]
+fn test_outline_models_to_callables_splits_init_exec_and_propagates_prefixes() {
+    use castforge::ir::{
+        Attribute, Block, DType, Dim, Location, Module, OpName, Operation, Region, TensorType,
+        Type, Value, ValueDef,
+    };
+    use castforge::passes::outline_models_to_callables;
+    use indexmap::IndexMap;
+    use smallvec::SmallVec;
+
+    let mut m = Module::new(Some("outline_test".to_string()));
+    let root_blk = m.regions[m.root_region].blocks[0];
+    let f32_ty = Type::Tensor(TensorType::new(vec![Dim::Static(4)], DType::F32));
+    let ch_ty = Type::Opaque("!mef.chain".to_string());
+    let str_ty = Type::Opaque("!mgp.opaque<\"mojo_string\">".to_string());
+
+    // Build subgraph `sub_layer` (`is_subgraph = true`, `implicit_args_count = 1`) with an init
+    // region containing a placeholder `mgp.buffer.constant_external` and an execute region:
+    let sub_init_blk = m.blocks.insert_with_key(|id| Block {
+        id,
+        label: None,
+        arguments: Vec::new(),
+        ops: Vec::new(),
+    });
+    let sub_init_ch = m.values.insert_with_key(|id| Value {
+        id,
+        ssa_name: None,
+        ty: ch_ty.clone(),
+        def: ValueDef::BlockArgument {
+            block: sub_init_blk,
+            index: 0,
+        },
+    });
+    m.blocks[sub_init_blk].arguments.push(sub_init_ch);
+    let raw_name_op = m.ops.insert_with_key(|id| Operation {
+        id,
+        name: OpName::new("mgp", "string.create"),
+        operands: SmallVec::new(),
+        results: SmallVec::new(),
+        attributes: IndexMap::new(),
+        regions: Vec::new(),
+        custom_syntax: false,
+        location: Location::Unknown,
+    });
+    let raw_name_val = m.values.insert_with_key(|id| Value {
+        id,
+        ssa_name: None,
+        ty: str_ty,
+        def: ValueDef::OpResult {
+            op: raw_name_op,
+            index: 0,
+        },
+    });
+    m.ops[raw_name_op].results.push(raw_name_val);
+    let ext_const_op = m.ops.insert_with_key(|id| Operation {
+        id,
+        name: OpName::new("mgp", "buffer.constant_external"),
+        operands: SmallVec::from_slice(&[raw_name_val]),
+        results: SmallVec::new(),
+        attributes: {
+            let mut a = IndexMap::new();
+            a.insert("e_is_placeholder".to_string(), Attribute::Bool(true));
+            a
+        },
+        regions: Vec::new(),
+        custom_syntax: false,
+        location: Location::Unknown,
+    });
+    let ext_w_val = m.values.insert_with_key(|id| Value {
+        id,
+        ssa_name: None,
+        ty: f32_ty.clone(),
+        def: ValueDef::OpResult {
+            op: ext_const_op,
+            index: 0,
+        },
+    });
+    m.ops[ext_const_op].results.push(ext_w_val);
+    let sub_init_out = m.ops.insert_with_key(|id| Operation {
+        id,
+        name: OpName::new("mef", "output"),
+        operands: SmallVec::from_slice(&[sub_init_ch, ext_w_val]),
+        results: SmallVec::new(),
+        attributes: IndexMap::new(),
+        regions: Vec::new(),
+        custom_syntax: false,
+        location: Location::Unknown,
+    });
+    m.blocks[sub_init_blk].ops = vec![raw_name_op, ext_const_op, sub_init_out];
+    let sub_init_reg = m.regions.insert_with_key(|id| Region {
+        id,
+        blocks: vec![sub_init_blk],
+    });
+
+    let sub_exec_blk = m.blocks.insert_with_key(|id| Block {
+        id,
+        label: None,
+        arguments: Vec::new(),
+        ops: Vec::new(),
+    });
+    let sub_exec_w = m.values.insert_with_key(|id| Value {
+        id,
+        ssa_name: None,
+        ty: f32_ty.clone(),
+        def: ValueDef::BlockArgument {
+            block: sub_exec_blk,
+            index: 0,
+        },
+    });
+    let sub_exec_x = m.values.insert_with_key(|id| Value {
+        id,
+        ssa_name: None,
+        ty: f32_ty.clone(),
+        def: ValueDef::BlockArgument {
+            block: sub_exec_blk,
+            index: 1,
+        },
+    });
+    m.blocks[sub_exec_blk].arguments = vec![sub_exec_w, sub_exec_x];
+    let sub_exec_out = m.ops.insert_with_key(|id| Operation {
+        id,
+        name: OpName::new("mef", "output"),
+        operands: SmallVec::from_slice(&[sub_exec_x]),
+        results: SmallVec::new(),
+        attributes: IndexMap::new(),
+        regions: Vec::new(),
+        custom_syntax: false,
+        location: Location::Unknown,
+    });
+    m.blocks[sub_exec_blk].ops = vec![sub_exec_out];
+    let sub_exec_reg = m.regions.insert_with_key(|id| Region {
+        id,
+        blocks: vec![sub_exec_blk],
+    });
+
+    let sub_model = m.ops.insert_with_key(|id| Operation {
+        id,
+        name: OpName::new("mgp", "model"),
+        operands: SmallVec::new(),
+        results: SmallVec::new(),
+        attributes: {
+            let mut a = IndexMap::new();
+            a.insert(
+                "sym_name".to_string(),
+                Attribute::String("sub_layer".to_string()),
+            );
+            a.insert("is_subgraph".to_string(), Attribute::Bool(true));
+            a.insert("implicit_args_count".to_string(), Attribute::Int(1));
+            a
+        },
+        regions: vec![sub_init_reg, sub_exec_reg],
+        custom_syntax: false,
+        location: Location::Unknown,
+    });
+
+    // Build entry model `main_model` (`is_subgraph = false`) calling `@sub_layer` with prefix:
+    let main_init_blk = m.blocks.insert_with_key(|id| Block {
+        id,
+        label: None,
+        arguments: Vec::new(),
+        ops: Vec::new(),
+    });
+    let main_init_ch = m.values.insert_with_key(|id| Value {
+        id,
+        ssa_name: None,
+        ty: ch_ty,
+        def: ValueDef::BlockArgument {
+            block: main_init_blk,
+            index: 0,
+        },
+    });
+    m.blocks[main_init_blk].arguments.push(main_init_ch);
+    let main_init_out = m.ops.insert_with_key(|id| Operation {
+        id,
+        name: OpName::new("mef", "output"),
+        operands: SmallVec::from_slice(&[main_init_ch]),
+        results: SmallVec::new(),
+        attributes: IndexMap::new(),
+        regions: Vec::new(),
+        custom_syntax: false,
+        location: Location::Unknown,
+    });
+    m.blocks[main_init_blk].ops = vec![main_init_out];
+    let main_init_reg = m.regions.insert_with_key(|id| Region {
+        id,
+        blocks: vec![main_init_blk],
+    });
+
+    let main_exec_blk = m.blocks.insert_with_key(|id| Block {
+        id,
+        label: None,
+        arguments: Vec::new(),
+        ops: Vec::new(),
+    });
+    let main_exec_x = m.values.insert_with_key(|id| Value {
+        id,
+        ssa_name: None,
+        ty: f32_ty.clone(),
+        def: ValueDef::BlockArgument {
+            block: main_exec_blk,
+            index: 0,
+        },
+    });
+    m.blocks[main_exec_blk].arguments.push(main_exec_x);
+    let call_sub = m.ops.insert_with_key(|id| Operation {
+        id,
+        name: OpName::new("mgp", "call"),
+        operands: SmallVec::from_slice(&[main_exec_x, main_exec_x, main_exec_x]),
+        results: SmallVec::new(),
+        attributes: {
+            let mut a = IndexMap::new();
+            a.insert(
+                "callee".to_string(),
+                Attribute::SymbolRef("sub_layer".to_string()),
+            );
+            a.insert(
+                "prefix".to_string(),
+                Attribute::String("blocks.0.".to_string()),
+            );
+            a
+        },
+        regions: Vec::new(),
+        custom_syntax: false,
+        location: Location::Unknown,
+    });
+    let call_res = m.values.insert_with_key(|id| Value {
+        id,
+        ssa_name: None,
+        ty: f32_ty,
+        def: ValueDef::OpResult {
+            op: call_sub,
+            index: 0,
+        },
+    });
+    m.ops[call_sub].results.push(call_res);
+    let main_exec_out = m.ops.insert_with_key(|id| Operation {
+        id,
+        name: OpName::new("mef", "output"),
+        operands: SmallVec::from_slice(&[call_res]),
+        results: SmallVec::new(),
+        attributes: IndexMap::new(),
+        regions: Vec::new(),
+        custom_syntax: false,
+        location: Location::Unknown,
+    });
+    m.blocks[main_exec_blk].ops = vec![call_sub, main_exec_out];
+    let main_exec_reg = m.regions.insert_with_key(|id| Region {
+        id,
+        blocks: vec![main_exec_blk],
+    });
+
+    let main_model = m.ops.insert_with_key(|id| Operation {
+        id,
+        name: OpName::new("mgp", "model"),
+        operands: SmallVec::new(),
+        results: SmallVec::new(),
+        attributes: {
+            let mut a = IndexMap::new();
+            a.insert(
+                "sym_name".to_string(),
+                Attribute::String("main_model".to_string()),
+            );
+            a.insert("is_subgraph".to_string(), Attribute::Bool(false));
+            a
+        },
+        regions: vec![main_init_reg, main_exec_reg],
+        custom_syntax: false,
+        location: Location::Unknown,
+    });
+
+    m.blocks[root_blk].ops = vec![sub_model, main_model];
+
+    let outlined = outline_models_to_callables(&mut m).expect("outline succeeds");
+    assert_eq!(outlined, 2);
+
+    // Root block now holds: sub_layer$init, sub_layer$exec, main_model$init, main_model$exec,
+    // and the wrapper mef.model for main_model (5 ops total):
+    let top_ops = &m.blocks[root_blk].ops;
+    assert_eq!(top_ops.len(), 5);
+    assert!(m.ops[top_ops[0]].is_op("mef", "callable"));
+    assert_eq!(
+        m.ops[top_ops[0]]
+            .attributes
+            .get("sym_name")
+            .and_then(|a| a.as_str()),
+        Some("sub_layer$init")
+    );
+    assert!(m.ops[top_ops[4]].is_op("mef", "model"));
+    assert!(m.ops[call_sub].is_op("grt", "invoke"));
+}

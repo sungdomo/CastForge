@@ -21997,3 +21997,670 @@ pub fn lower_compiled_routines(module: &mut Module) -> Result<usize, String> {
 
     Ok(lowered_count)
 }
+
+/// Outlines `castforge.model` (or `mgp.model`) ops into pairs of `mef.callable` (`<name>$init` and
+/// `<name>$exec`) in post-order over the subgraph call graph:
+/// - Rejects cycles in the subgraph call graph with an explicit error.
+/// - For subgraph models (`"is_subgraph" == true`), appends a runtime string prefix argument to the
+///   init block, inserts a prefix argument into the execute block after `"implicit_args_count"`,
+///   concatenates the prefix onto placeholder `mgp.buffer.constant_external` (or
+///   `castforge.buffer.constant_external`) weight names via `mgp.string.concat`, and appends the
+///   prefix to the init terminator outputs so the execute stage receives it through the forwarded
+///   bundle.
+/// - Rewrites `mgp.call` (or `castforge.call_subgraph`) ops by synthesizing `mgp.string.create`
+///   (and `mgp.string.concat` when nested inside a subgraph), invoking `<callee>$init` via
+///   `grt.invoke` in the parent init block, threading the callee's init results into the parent
+///   init output and parent execute arguments, and replacing the call with `grt.invoke` to
+///   `<callee>$exec`.
+/// - Wraps non-subgraph entry models in a `mef.model` containing forwarding `grt.invoke` +
+///   `mef.output` blocks for init and execute.
+///
+/// Returns the number of `model` ops outlined.
+pub fn outline_models_to_callables(module: &mut Module) -> Result<usize, String> {
+    use crate::ir::mlir::{Block, OpName, Region};
+    use std::collections::{HashMap, HashSet};
+
+    let Some(root_reg) = module.regions.get(module.root_region) else {
+        return Ok(0);
+    };
+    let Some(&root_blk) = root_reg.blocks.first() else {
+        return Ok(0);
+    };
+    let root_ops = module.blocks[root_blk].ops.clone();
+
+    let mut model_by_name: IndexMap<String, OpId> = IndexMap::new();
+    let mut entry_models: Vec<String> = Vec::new();
+
+    for &op_id in &root_ops {
+        let full = module.ops[op_id].name.full_name();
+        if full != "castforge.model" && full != "mgp.model" {
+            continue;
+        }
+        let name = module.ops[op_id]
+            .attributes
+            .get("sym_name")
+            .and_then(|a| a.as_str())
+            .ok_or_else(|| "model op is missing 'sym_name' attribute".to_string())?
+            .to_string();
+        if model_by_name.contains_key(&name) {
+            return Err(format!(
+                "two models with the same symbol name existed: {name}"
+            ));
+        }
+        let is_subgraph = module.ops[op_id]
+            .attributes
+            .get("is_subgraph")
+            .and_then(|a| a.as_bool())
+            .unwrap_or(false);
+        if !is_subgraph {
+            entry_models.push(name.clone());
+        }
+        model_by_name.insert(name, op_id);
+    }
+
+    if model_by_name.is_empty() {
+        return Ok(0);
+    }
+
+    // Build call-graph edges (`mgp.call` / `castforge.call_subgraph` inside execute region) and
+    // verify acyclic post-order traversal from entry models.
+    let mut callees_of: HashMap<String, Vec<(OpId, String, String)>> = HashMap::new();
+    for (name, &model_id) in &model_by_name {
+        if module.ops[model_id].regions.len() < 2 {
+            return Err(format!("model '{name}' must have init and execute regions"));
+        }
+        let exec_reg = module.ops[model_id].regions[1];
+        let exec_blk = module.regions[exec_reg].blocks[0];
+        let mut calls = Vec::new();
+        for &op_id in &module.blocks[exec_blk].ops {
+            let full = module.ops[op_id].name.full_name();
+            if full == "mgp.call" || full == "castforge.call_subgraph" {
+                let callee = module.ops[op_id]
+                    .attributes
+                    .get("callee")
+                    .and_then(|a| a.as_str())
+                    .ok_or_else(|| "subgraph call missing 'callee' attribute".to_string())?
+                    .trim_start_matches('@')
+                    .to_string();
+                if !model_by_name.contains_key(&callee) {
+                    return Err(format!(
+                        "CallOp's callee '{callee}' did not exist in module"
+                    ));
+                }
+                let prefix = module.ops[op_id]
+                    .attributes
+                    .get("prefix")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                calls.push((op_id, callee, prefix));
+            }
+        }
+        callees_of.insert(name.clone(), calls);
+    }
+
+    // DFS post-order with cycle detection.
+    let mut post_order: Vec<String> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut on_stack: HashSet<String> = HashSet::new();
+
+    fn dfs_order(
+        curr: &str,
+        callees_of: &HashMap<String, Vec<(OpId, String, String)>>,
+        visited: &mut HashSet<String>,
+        on_stack: &mut HashSet<String>,
+        post_order: &mut Vec<String>,
+    ) -> Result<(), String> {
+        if on_stack.contains(curr) {
+            return Err(format!("cycle detected in subgraph call graph at '{curr}'"));
+        }
+        if visited.contains(curr) {
+            return Ok(());
+        }
+        on_stack.insert(curr.to_string());
+        if let Some(edges) = callees_of.get(curr) {
+            for (_, callee, _) in edges {
+                dfs_order(callee, callees_of, visited, on_stack, post_order)?;
+            }
+        }
+        on_stack.remove(curr);
+        visited.insert(curr.to_string());
+        post_order.push(curr.to_string());
+        Ok(())
+    }
+
+    for entry in &entry_models {
+        dfs_order(
+            entry,
+            &callees_of,
+            &mut visited,
+            &mut on_stack,
+            &mut post_order,
+        )?;
+    }
+    for name in model_by_name.keys() {
+        if !visited.contains(name) {
+            dfs_order(
+                name,
+                &callees_of,
+                &mut visited,
+                &mut on_stack,
+                &mut post_order,
+            )?;
+        }
+    }
+
+    let str_ty = Type::Opaque("!mgp.opaque<\"mojo_string\">".to_string());
+    let mut exec_prefix_by_model: HashMap<String, ValueId> = HashMap::new();
+
+    // Step 1: `localPropagatePrefixes` on all subgraphs before sealing.
+    for (name, &model_id) in &model_by_name {
+        let is_subgraph = module.ops[model_id]
+            .attributes
+            .get("is_subgraph")
+            .and_then(|a| a.as_bool())
+            .unwrap_or(false);
+        if !is_subgraph {
+            continue;
+        }
+        let implicit_count = match module.ops[model_id].attributes.get("implicit_args_count") {
+            Some(Attribute::Int(n)) if *n >= 0 => *n as usize,
+            _ => 0,
+        };
+        let init_reg = module.ops[model_id].regions[0];
+        let exec_reg = module.ops[model_id].regions[1];
+        let init_blk = module.regions[init_reg].blocks[0];
+        let exec_blk = module.regions[exec_reg].blocks[0];
+        let loc = module.ops[model_id].location.clone();
+
+        let init_arg_idx = module.blocks[init_blk].arguments.len() as u32;
+        let init_prefix = module.values.insert_with_key(|vid| Value {
+            id: vid,
+            ssa_name: None,
+            ty: str_ty.clone(),
+            def: ValueDef::BlockArgument {
+                block: init_blk,
+                index: init_arg_idx,
+            },
+        });
+        module.blocks[init_blk].arguments.push(init_prefix);
+
+        let ins_pos = implicit_count.min(module.blocks[exec_blk].arguments.len());
+        let exec_prefix = module.values.insert_with_key(|vid| Value {
+            id: vid,
+            ssa_name: None,
+            ty: str_ty.clone(),
+            def: ValueDef::BlockArgument {
+                block: exec_blk,
+                index: ins_pos as u32,
+            },
+        });
+        module.blocks[exec_blk]
+            .arguments
+            .insert(ins_pos, exec_prefix);
+        exec_prefix_by_model.insert(name.clone(), exec_prefix);
+
+        for (blk_id, p_val) in [(init_blk, init_prefix), (exec_blk, exec_prefix)] {
+            let orig_ops = module.blocks[blk_id].ops.clone();
+            let mut updated_ops = Vec::with_capacity(orig_ops.len() + 2);
+            for op_id in orig_ops {
+                let full = module.ops[op_id].name.full_name();
+                let is_placeholder = module.ops[op_id]
+                    .attributes
+                    .get("e_is_placeholder")
+                    .and_then(|a| a.as_bool())
+                    .unwrap_or(false);
+                if (full == "mgp.buffer.constant_external"
+                    || full == "castforge.buffer.constant_external")
+                    && is_placeholder
+                    && !module.ops[op_id].operands.is_empty()
+                {
+                    let raw_name = module.ops[op_id].operands[0];
+                    let concat_loc = loc.clone();
+                    let concat_id = module.ops.insert_with_key(|oid| Operation {
+                        id: oid,
+                        name: OpName::new("mgp", "string.concat"),
+                        operands: SmallVec::from_slice(&[p_val, raw_name]),
+                        results: SmallVec::new(),
+                        attributes: IndexMap::new(),
+                        regions: Vec::new(),
+                        custom_syntax: false,
+                        location: concat_loc,
+                    });
+                    let concat_res = module.values.insert_with_key(|vid| Value {
+                        id: vid,
+                        ssa_name: None,
+                        ty: str_ty.clone(),
+                        def: ValueDef::OpResult {
+                            op: concat_id,
+                            index: 0,
+                        },
+                    });
+                    module.ops[concat_id].results.push(concat_res);
+                    module.ops[op_id].operands[0] = concat_res;
+                    updated_ops.push(concat_id);
+                }
+                updated_ops.push(op_id);
+            }
+            module.blocks[blk_id].ops = updated_ops;
+        }
+
+        // Append `init_prefix` to the init terminator's operands so exec receives it.
+        if let Some(&term_id) = module.blocks[init_blk].ops.last() {
+            module.ops[term_id].operands.push(init_prefix);
+        }
+    }
+
+    // Step 2: `rewriteAndSeal` in post-order.
+    // Maps sealed model name -> (init_result_types, exec_result_types).
+    type SealedSig = (Vec<Type>, Vec<Type>);
+    let mut sealed_sigs: HashMap<String, SealedSig> = HashMap::new();
+    let mut new_top_level_ops: Vec<OpId> = Vec::new();
+    let mut erased_models: HashSet<OpId> = HashSet::new();
+
+    for name in &post_order {
+        let model_id = model_by_name[name];
+        let loc = module.ops[model_id].location.clone();
+        let is_subgraph = module.ops[model_id]
+            .attributes
+            .get("is_subgraph")
+            .and_then(|a| a.as_bool())
+            .unwrap_or(false);
+        let init_reg = module.ops[model_id].regions[0];
+        let exec_reg = module.ops[model_id].regions[1];
+        let init_blk = module.regions[init_reg].blocks[0];
+        let exec_blk = module.regions[exec_reg].blocks[0];
+
+        let calls = callees_of.get(name).cloned().unwrap_or_default();
+        if !calls.is_empty() {
+            let init_term = *module.blocks[init_blk]
+                .ops
+                .last()
+                .ok_or_else(|| format!("model '{name}' init block has no terminator"))?;
+            let init_args_snapshot = module.blocks[init_blk].arguments.clone();
+            let mut init_chains: SmallVec<[ValueId; 4]> = SmallVec::new();
+            let mut pre_term_ops: Vec<OpId> = Vec::new();
+
+            // Per-call forwarded init results and exec bundle args.
+            let mut call_init_results: Vec<Vec<ValueId>> = Vec::new();
+            let mut call_init_types: Vec<Vec<Type>> = Vec::new();
+
+            for (_call_op, callee_name, prefix_str) in &calls {
+                let (callee_init_res_tys, _) = sealed_sigs
+                    .get(callee_name)
+                    .ok_or_else(|| format!("callee '{callee_name}' was not sealed before caller"))?
+                    .clone();
+
+                let str_create_loc = loc.clone();
+                let str_create_id = module.ops.insert_with_key(|oid| Operation {
+                    id: oid,
+                    name: OpName::new("mgp", "string.create"),
+                    operands: SmallVec::new(),
+                    results: SmallVec::new(),
+                    attributes: {
+                        let mut m = IndexMap::new();
+                        m.insert("value".to_string(), Attribute::String(prefix_str.clone()));
+                        m
+                    },
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: str_create_loc,
+                });
+                let mut prefix_val = module.values.insert_with_key(|vid| Value {
+                    id: vid,
+                    ssa_name: None,
+                    ty: str_ty.clone(),
+                    def: ValueDef::OpResult {
+                        op: str_create_id,
+                        index: 0,
+                    },
+                });
+                module.ops[str_create_id].results.push(prefix_val);
+                pre_term_ops.push(str_create_id);
+
+                if let Some(&parent_prefix) = exec_prefix_by_model.get(name) {
+                    let concat_loc = loc.clone();
+                    let concat_id = module.ops.insert_with_key(|oid| Operation {
+                        id: oid,
+                        name: OpName::new("mgp", "string.concat"),
+                        operands: SmallVec::from_slice(&[parent_prefix, prefix_val]),
+                        results: SmallVec::new(),
+                        attributes: IndexMap::new(),
+                        regions: Vec::new(),
+                        custom_syntax: false,
+                        location: concat_loc,
+                    });
+                    let concat_val = module.values.insert_with_key(|vid| Value {
+                        id: vid,
+                        ssa_name: None,
+                        ty: str_ty.clone(),
+                        def: ValueDef::OpResult {
+                            op: concat_id,
+                            index: 0,
+                        },
+                    });
+                    module.ops[concat_id].results.push(concat_val);
+                    pre_term_ops.push(concat_id);
+                    prefix_val = concat_val;
+                }
+
+                let mut invoke_init_args: SmallVec<[ValueId; 4]> =
+                    SmallVec::from_slice(&init_args_snapshot);
+                invoke_init_args.push(prefix_val);
+                if let Some(&first_arg) = init_args_snapshot.first() {
+                    init_chains.push(first_arg);
+                }
+
+                let invoke_loc = loc.clone();
+                let init_callee_sym = format!("{callee_name}$init");
+                let invoke_init_id = module.ops.insert_with_key(|oid| Operation {
+                    id: oid,
+                    name: OpName::new("grt", "invoke"),
+                    operands: invoke_init_args,
+                    results: SmallVec::new(),
+                    attributes: {
+                        let mut m = IndexMap::new();
+                        m.insert("callee".to_string(), Attribute::SymbolRef(init_callee_sym));
+                        m
+                    },
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: invoke_loc,
+                });
+                let mut results_vec = Vec::new();
+                for (r_idx, r_ty) in callee_init_res_tys.iter().enumerate() {
+                    let rv = module.values.insert_with_key(|vid| Value {
+                        id: vid,
+                        ssa_name: None,
+                        ty: r_ty.clone(),
+                        def: ValueDef::OpResult {
+                            op: invoke_init_id,
+                            index: r_idx as u32,
+                        },
+                    });
+                    module.ops[invoke_init_id].results.push(rv);
+                    results_vec.push(rv);
+                }
+                pre_term_ops.push(invoke_init_id);
+                call_init_results.push(results_vec);
+                call_init_types.push(callee_init_res_tys);
+            }
+
+            // Stack child init outputs onto parent init terminator and insert corresponding exec
+            // block arguments.
+            let mut exec_bundles: Vec<Vec<ValueId>> = Vec::new();
+            for (res_vals, res_tys) in call_init_results.iter().zip(call_init_types.iter()) {
+                let ins_base = module.ops[init_term].operands.len();
+                for &rv in res_vals {
+                    module.ops[init_term].operands.push(rv);
+                }
+                let mut bundle = Vec::new();
+                for (i, ty) in res_tys.iter().enumerate() {
+                    let pos = (ins_base + i).min(module.blocks[exec_blk].arguments.len());
+                    let exec_arg = module.values.insert_with_key(|vid| Value {
+                        id: vid,
+                        ssa_name: None,
+                        ty: ty.clone(),
+                        def: ValueDef::BlockArgument {
+                            block: exec_blk,
+                            index: pos as u32,
+                        },
+                    });
+                    module.blocks[exec_blk].arguments.insert(pos, exec_arg);
+                    bundle.push(exec_arg);
+                }
+                exec_bundles.push(bundle);
+            }
+
+            // Replace each `mgp.call` in `exec_blk` with `grt.invoke` to `<callee>$exec`.
+            for ((call_op, callee_name, _), mut bundle) in calls.into_iter().zip(exec_bundles) {
+                let drop_count = bundle.len().saturating_sub(1);
+                let orig_call_opds: Vec<ValueId> =
+                    module.ops[call_op].operands.iter().copied().collect();
+                let explicit_slice = if orig_call_opds.len() >= drop_count {
+                    &orig_call_opds[drop_count..]
+                } else {
+                    &orig_call_opds[..]
+                };
+                bundle.extend_from_slice(explicit_slice);
+                module.ops[call_op].name = OpName::new("grt", "invoke");
+                module.ops[call_op].operands = SmallVec::from_vec(bundle);
+                module.ops[call_op].attributes.insert(
+                    "callee".to_string(),
+                    Attribute::SymbolRef(format!("{callee_name}$exec")),
+                );
+            }
+
+            // Join child init chains with parent init chain[0] via `grt.chain.create`.
+            if !module.ops[init_term].operands.is_empty() {
+                let parent_chain = module.ops[init_term].operands[0];
+                init_chains.push(parent_chain);
+                let chain_ty = module.values[parent_chain].ty.clone();
+                let chain_loc = loc.clone();
+                let chain_create_id = module.ops.insert_with_key(|oid| Operation {
+                    id: oid,
+                    name: OpName::new("grt", "chain.create"),
+                    operands: init_chains,
+                    results: SmallVec::new(),
+                    attributes: IndexMap::new(),
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: chain_loc,
+                });
+                let new_chain = module.values.insert_with_key(|vid| Value {
+                    id: vid,
+                    ssa_name: None,
+                    ty: chain_ty,
+                    def: ValueDef::OpResult {
+                        op: chain_create_id,
+                        index: 0,
+                    },
+                });
+                module.ops[chain_create_id].results.push(new_chain);
+                module.ops[init_term].operands[0] = new_chain;
+                pre_term_ops.push(chain_create_id);
+            }
+
+            let term_pos = module.blocks[init_blk].ops.len() - 1;
+            module.blocks[init_blk]
+                .ops
+                .splice(term_pos..term_pos, pre_term_ops);
+        }
+
+        // Compute final init and exec signatures.
+        let init_in_tys: Vec<Type> = module.blocks[init_blk]
+            .arguments
+            .iter()
+            .map(|&v| module.values[v].ty.clone())
+            .collect();
+        let init_out_tys: Vec<Type> = module.blocks[init_blk]
+            .ops
+            .last()
+            .map(|&tid| {
+                module.ops[tid]
+                    .operands
+                    .iter()
+                    .map(|&v| module.values[v].ty.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let exec_in_tys: Vec<Type> = module.blocks[exec_blk]
+            .arguments
+            .iter()
+            .map(|&v| module.values[v].ty.clone())
+            .collect();
+        let exec_out_tys: Vec<Type> = module.blocks[exec_blk]
+            .ops
+            .last()
+            .map(|&tid| {
+                module.ops[tid]
+                    .operands
+                    .iter()
+                    .map(|&v| module.values[v].ty.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        sealed_sigs.insert(name.clone(), (init_out_tys.clone(), exec_out_tys.clone()));
+
+        let init_fn_ty = Type::Function {
+            inputs: init_in_tys.clone(),
+            results: init_out_tys.clone(),
+        };
+        let exec_fn_ty = Type::Function {
+            inputs: exec_in_tys.clone(),
+            results: exec_out_tys.clone(),
+        };
+
+        let init_callable_loc = loc.clone();
+        let init_sym = format!("{name}$init");
+        let init_callable_id = module.ops.insert_with_key(|oid| Operation {
+            id: oid,
+            name: OpName::new("mef", "callable"),
+            operands: SmallVec::new(),
+            results: SmallVec::new(),
+            attributes: {
+                let mut m = IndexMap::new();
+                m.insert("sym_name".to_string(), Attribute::String(init_sym.clone()));
+                m.insert(
+                    "function_type".to_string(),
+                    Attribute::Type(init_fn_ty.clone()),
+                );
+                m
+            },
+            regions: vec![init_reg],
+            custom_syntax: false,
+            location: init_callable_loc,
+        });
+
+        let exec_callable_loc = loc.clone();
+        let exec_sym = format!("{name}$exec");
+        let exec_callable_id = module.ops.insert_with_key(|oid| Operation {
+            id: oid,
+            name: OpName::new("mef", "callable"),
+            operands: SmallVec::new(),
+            results: SmallVec::new(),
+            attributes: {
+                let mut m = IndexMap::new();
+                m.insert("sym_name".to_string(), Attribute::String(exec_sym.clone()));
+                m.insert(
+                    "function_type".to_string(),
+                    Attribute::Type(exec_fn_ty.clone()),
+                );
+                m
+            },
+            regions: vec![exec_reg],
+            custom_syntax: false,
+            location: exec_callable_loc,
+        });
+
+        new_top_level_ops.push(init_callable_id);
+        new_top_level_ops.push(exec_callable_id);
+
+        if !is_subgraph {
+            // Synthesize wrapper `mef.model` with forwarding `grt.invoke` + `mef.output` regions.
+            let mut wrapper_regions = Vec::new();
+            for (in_tys, out_tys, callee_sym) in [
+                (&init_in_tys, &init_out_tys, &init_sym),
+                (&exec_in_tys, &exec_out_tys, &exec_sym),
+            ] {
+                let w_blk = module.blocks.insert_with_key(|bid| Block {
+                    id: bid,
+                    label: None,
+                    arguments: Vec::new(),
+                    ops: Vec::new(),
+                });
+                let mut w_args: SmallVec<[ValueId; 4]> = SmallVec::new();
+                for (idx, ty) in in_tys.iter().enumerate() {
+                    let av = module.values.insert_with_key(|vid| Value {
+                        id: vid,
+                        ssa_name: None,
+                        ty: ty.clone(),
+                        def: ValueDef::BlockArgument {
+                            block: w_blk,
+                            index: idx as u32,
+                        },
+                    });
+                    module.blocks[w_blk].arguments.push(av);
+                    w_args.push(av);
+                }
+                let inv_loc = loc.clone();
+                let sym_str = callee_sym.clone();
+                let inv_id = module.ops.insert_with_key(|oid| Operation {
+                    id: oid,
+                    name: OpName::new("grt", "invoke"),
+                    operands: w_args,
+                    results: SmallVec::new(),
+                    attributes: {
+                        let mut m = IndexMap::new();
+                        m.insert("callee".to_string(), Attribute::SymbolRef(sym_str));
+                        m
+                    },
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: inv_loc,
+                });
+                let mut inv_results: SmallVec<[ValueId; 4]> = SmallVec::new();
+                for (idx, ty) in out_tys.iter().enumerate() {
+                    let rv = module.values.insert_with_key(|vid| Value {
+                        id: vid,
+                        ssa_name: None,
+                        ty: ty.clone(),
+                        def: ValueDef::OpResult {
+                            op: inv_id,
+                            index: idx as u32,
+                        },
+                    });
+                    module.ops[inv_id].results.push(rv);
+                    inv_results.push(rv);
+                }
+                let out_loc = loc.clone();
+                let out_id = module.ops.insert_with_key(|oid| Operation {
+                    id: oid,
+                    name: OpName::new("mef", "output"),
+                    operands: inv_results,
+                    results: SmallVec::new(),
+                    attributes: IndexMap::new(),
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: out_loc,
+                });
+                module.blocks[w_blk].ops = vec![inv_id, out_id];
+                let w_reg = module.regions.insert_with_key(|rid| Region {
+                    id: rid,
+                    blocks: vec![w_blk],
+                });
+                wrapper_regions.push(w_reg);
+            }
+
+            let mut mef_attrs = module.ops[model_id].attributes.clone();
+            mef_attrs.insert("init_type".to_string(), Attribute::Type(init_fn_ty));
+            mef_attrs.insert("exec_type".to_string(), Attribute::Type(exec_fn_ty));
+            let mef_model_id = module.ops.insert_with_key(|oid| Operation {
+                id: oid,
+                name: OpName::new("mef", "model"),
+                operands: SmallVec::new(),
+                results: SmallVec::new(),
+                attributes: mef_attrs,
+                regions: wrapper_regions,
+                custom_syntax: false,
+                location: loc,
+            });
+            new_top_level_ops.push(mef_model_id);
+        }
+
+        erased_models.insert(model_id);
+    }
+
+    let outlined_count = erased_models.len();
+    module.blocks[root_blk]
+        .ops
+        .retain(|id| !erased_models.contains(id));
+    module.blocks[root_blk].ops.extend(new_top_level_ops);
+    for dead_id in erased_models {
+        module.ops.remove(dead_id);
+    }
+
+    Ok(outlined_count)
+}
