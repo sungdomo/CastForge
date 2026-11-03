@@ -16,14 +16,15 @@ use castforge::ir::{
 use castforge::passes::{
     ArcKvEvictionPolicy, AsymK16V8Codec, CBChunkMatch, CBGroupSpec, CacheBlendRopeSpec,
     CacheGenCdfCodec, ChainedBlockHashConfig, DEFAULT_MAX_KERNELS_IN_FUSION_SET, DeviceTargetArch,
-    EngineKvFormat, FULL_ATTENTION_WINDOW, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
-    IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
-    KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope,
-    KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy, LayerGroupPayloadSharder,
-    PassManager, PassRegistry, ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST, TOKEN_WIRE_STRIDE,
-    WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups, anonymize_symbolic_dims,
-    compress_splat_constants, decode_kv_fs_filename, decode_kv_storage_key,
-    defer_allocs_to_first_use, direct_copy_format_supported, downsample_subchunk_swa_block_ids,
+    DynamicAllocRequest, EngineKvFormat, FULL_ATTENTION_WINDOW, GDS_DEFAULT_ALIGN_BYTES,
+    GdsSlabAddressManager, IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind,
+    KvBlockPool, KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry,
+    KvScaleScope, KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy,
+    LayerGroupPayloadSharder, PassManager, PassRegistry, ROWWISE_CHEAP_OP_COST,
+    ROWWISE_EXPENSIVE_OP_COST, TOKEN_WIRE_STRIDE, WarmPrefetchJobTable, WarmPrefetchStatus,
+    analyze_kv_layer_groups, anonymize_symbolic_dims, compress_splat_constants,
+    decode_kv_fs_filename, decode_kv_storage_key, defer_allocs_to_first_use,
+    direct_copy_format_supported, downsample_subchunk_swa_block_ids,
     elide_redundant_state_transfers, encode_kv_fs_filename, encode_kv_storage_key,
     flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
     fuse_reshape_epilogue, fuse_sole_use_prologues, hash_packed_token_blocks_be,
@@ -31,10 +32,11 @@ use castforge::passes::{
     is_supported_arch_dtype, legalize_rowwise_reduction_launch, longest_full_attention_hit,
     longest_joint_prefix_hit, longest_sliding_window_hit, mark_cuda_graph_stable_tensors,
     merge_duplicate_shape_ops, merge_identical_functions, num_packed_tokens, pack_token_ids_be,
-    plan_cacheblend_retrieve, plan_concat_in_place, plan_jenga_kv_geometry,
-    plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
-    re_rope_key_in_place, recalculate_subchunk_blocks_to_skip, reuse_dead_loop_buffers,
-    stamp_fused_provenance, unfold_chunk_range, unpack_token_ids_be, validate_target_device_dtypes,
+    plan_cacheblend_retrieve, plan_concat_in_place, plan_dynamic_memory_pool,
+    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
+    promote_narrow_accumulators, re_rope_key_in_place, recalculate_subchunk_blocks_to_skip,
+    reuse_dead_loop_buffers, stamp_fused_provenance, unfold_chunk_range, unpack_token_ids_be,
+    validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -2049,4 +2051,54 @@ fn test_token_wire_codec_be_and_zero_unpack_chunk_hashing() {
     let h_mod = hash_packed_token_blocks_be(&modified, 3, 0);
     assert_ne!(h_all[0], h_mod[0]);
     assert_ne!(h_all[1], h_mod[1]);
+}
+
+#[test]
+fn test_dynamic_memory_pool_lcm_alignment_can_share_and_bulk_slice() {
+    // Provide 3 allocations out of topological order:
+    // - `buf_late` (first_use = 5..8, size = 256, align = 128)
+    // - `buf_a` (first_use = 1..3, size = 256, align = 64)
+    // - `buf_b` (first_use = 2..4, size = 128, align = 96) -> overlaps `buf_a`!
+    // Notice `buf_late` (5..8) executes strictly after both `buf_a` (1..3) and `buf_b` (2..4),
+    // so `buf_late` can share offset 0 with `buf_a`!
+    let allocs = vec![
+        DynamicAllocRequest {
+            name: "buf_late".to_string(),
+            size_bytes: 256,
+            alignment_bytes: 128,
+            first_use_idx: 5,
+            last_use_idx: 8,
+            location: Location::Named("loc_late".to_string()),
+        },
+        DynamicAllocRequest {
+            name: "buf_a".to_string(),
+            size_bytes: 256,
+            alignment_bytes: 64,
+            first_use_idx: 1,
+            last_use_idx: 3,
+            location: Location::Named("loc_a".to_string()),
+        },
+        DynamicAllocRequest {
+            name: "buf_b".to_string(),
+            size_bytes: 128,
+            alignment_bytes: 96,
+            first_use_idx: 2,
+            last_use_idx: 4,
+            location: Location::Named("loc_b".to_string()),
+        },
+    ];
+
+    let plan = plan_dynamic_memory_pool(&allocs);
+    // Ordered by `first_use_idx`: ["buf_a", "buf_b", "buf_late"]
+    assert_eq!(plan.ordered_names, vec!["buf_a", "buf_b", "buf_late"]);
+    // LCM(64, 96, 128) = 384
+    assert_eq!(plan.pool_alignment_bytes, 384);
+    // `buf_a` at 0 (size 256); `buf_b` conflicts with `buf_a` and needs 96-byte alignment -> 288;
+    // `buf_late` shares with both `buf_a` and `buf_b` -> placed at offset 0!
+    assert_eq!(plan.bulk_slice_offsets, vec![0, 288, 0]);
+    assert_eq!(plan.high_watermark_bytes, 288 + 128);
+    assert_eq!(
+        plan.fused_location,
+        Location::Named("loc_a+loc_b+loc_late".to_string())
+    );
 }

@@ -5198,3 +5198,117 @@ pub fn hash_packed_token_blocks_be(packed: &[u8], chunk_tokens: usize, seed: u64
     }
     hashes
 }
+
+/// Descriptor for an intermediate buffer allocation input to [`plan_dynamic_memory_pool`]
+/// (inspired by Modular `GraphCompiler/lib/MGPDialect/Transforms/DynamicMemoryPlanningPass.cpp`
+/// `AllocInfo`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicAllocRequest {
+    /// Buffer symbol / identifier.
+    pub name: String,
+    /// Allocation size in bytes.
+    pub size_bytes: u64,
+    /// Required base-address alignment in bytes.
+    pub alignment_bytes: u64,
+    /// Earliest topological statement/operation use index.
+    pub first_use_idx: usize,
+    /// Latest topological statement/operation use index.
+    pub last_use_idx: usize,
+    /// Source location of the allocation op.
+    pub location: Location,
+}
+
+/// Bulk-slice memory pool plan produced by [`plan_dynamic_memory_pool`]
+/// (inspired by Modular `DynamicMemoryPlanningPass.cpp` `BufferPlanOp` + `BufferBulkSliceOp`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicMemoryPoolPlan {
+    /// Allocations ordered by ascending `first_use_idx`.
+    pub ordered_names: Vec<String>,
+    /// Assigned byte offset for each ordered allocation inside the shared memory pool.
+    pub bulk_slice_offsets: Vec<u64>,
+    /// Byte size for each ordered allocation.
+    pub bulk_slice_sizes: Vec<u64>,
+    /// Symmetric `n * n` pairwise shareability matrix (`can_share[i * n + j]`).
+    pub can_share: Vec<bool>,
+    /// Pool alignment in bytes (`LCM` of all constituent buffer alignments).
+    pub pool_alignment_bytes: u64,
+    /// Peak byte footprint (`high_watermark`) of the consolidated memory pool.
+    pub high_watermark_bytes: u64,
+    /// Fused source provenance across all consolidated buffer allocations.
+    pub fused_location: Location,
+}
+
+/// Plans a consolidated LCM-aligned memory pool and single `BufferBulkSliceOp` layout for
+/// intermediate buffer allocations
+/// (inspired by Modular `GraphCompiler/lib/MGPDialect/Transforms/DynamicMemoryPlanningPass.cpp`).
+///
+/// 1. Sorts allocations by earliest topological use (`first_use_idx`),
+/// 2. Computes `pool_alignment_bytes = LCM(alignments)`,
+/// 3. Builds the symmetric `n * n` `can_share` matrix (`true` iff all uses of `i` execute strictly
+///    after all uses of `j` or vice versa),
+/// 4. Greedily packs buffers into aligned offsets while respecting non-shareable interference, and
+/// 5. Fuses all allocation [`Location`]s via [`fuse_locations`].
+pub fn plan_dynamic_memory_pool(allocs: &[DynamicAllocRequest]) -> DynamicMemoryPoolPlan {
+    let mut sorted = allocs.to_vec();
+    sorted.sort_by_key(|a| a.first_use_idx);
+
+    let n = sorted.len();
+    let mut pool_alignment_bytes = 1u64;
+    let mut locs = Vec::with_capacity(n);
+    for a in &sorted {
+        pool_alignment_bytes =
+            checked_lcm_u64(pool_alignment_bytes, a.alignment_bytes.max(1)).unwrap_or(u64::MAX);
+        locs.push(a.location.clone());
+    }
+
+    let mut can_share = vec![false; n * n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let sharable = sorted[i].last_use_idx < sorted[j].first_use_idx
+                || sorted[j].last_use_idx < sorted[i].first_use_idx;
+            can_share[i * n + j] = sharable;
+            can_share[j * n + i] = sharable;
+        }
+    }
+
+    let mut offsets = vec![0u64; n];
+    let mut high_watermark_bytes = 0u64;
+
+    for i in 0..n {
+        let align = sorted[i].alignment_bytes.max(1);
+        let size_i = sorted[i].size_bytes;
+        let mut cand_offset = 0u64;
+
+        // Advance `cand_offset` past any interfering (`!can_share`) already-placed buffer `j < i`.
+        loop {
+            cand_offset = cand_offset.div_ceil(align) * align;
+            let end_i = cand_offset + size_i;
+            let conflict = (0..i).find(|&j| {
+                if can_share[i * n + j] {
+                    return false;
+                }
+                let start_j = offsets[j];
+                let end_j = start_j + sorted[j].size_bytes;
+                cand_offset < end_j && start_j < end_i
+            });
+            if let Some(j) = conflict {
+                cand_offset = offsets[j] + sorted[j].size_bytes;
+            } else {
+                break;
+            }
+        }
+
+        offsets[i] = cand_offset;
+        high_watermark_bytes = high_watermark_bytes.max(cand_offset + size_i);
+    }
+
+    DynamicMemoryPoolPlan {
+        ordered_names: sorted.iter().map(|a| a.name.clone()).collect(),
+        bulk_slice_offsets: offsets,
+        bulk_slice_sizes: sorted.iter().map(|a| a.size_bytes).collect(),
+        can_share,
+        pool_alignment_bytes,
+        high_watermark_bytes,
+        fused_location: fuse_locations(&locs),
+    }
+}
