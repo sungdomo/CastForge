@@ -17837,3 +17837,225 @@ impl SubByteKvSerdeSpec {
         Ok(raw_bytes + quant_bytes)
     }
 }
+
+// ============================================================================
+// Batch 21 Step 2: Model Input Argument Static Shape Verifier
+// ============================================================================
+
+/// Formats a tensor shape `[Dim]` into a comma-separated diagnostic string where `Dim::Static(d)`
+/// prints as `"{d}"` and `Dim::Dynamic(_)` prints as `"any"`.
+#[must_use]
+pub fn format_expected_tensor_shape(shape: &[Dim]) -> String {
+    shape
+        .iter()
+        .map(|d| match d {
+            Dim::Static(v) => v.to_string(),
+            _ => "any".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Inserts runtime shape-verification assertions (`mgp.tensor.extract.tensor_spec`,
+/// `index.constant`, `mgp.tensor_spec.get_dim`, `index.cmp`, `pop.and`, and `mgp.assert`) at the
+/// start of each function's entry block for every non-chain tensor block argument that has at
+/// least one static dimension. Returns the number of verified tensor arguments.
+pub fn verify_model_argument_shapes(module: &mut Module) -> usize {
+    let funcs = module.functions();
+    let mut verified_args = 0usize;
+
+    for func_id in funcs {
+        if module.ops[func_id].regions.is_empty() {
+            continue;
+        }
+        let reg_id = module.ops[func_id].regions[0];
+        if module.regions[reg_id].blocks.is_empty() {
+            continue;
+        }
+        let blk_id = module.regions[reg_id].blocks[0];
+        let args = module.blocks[blk_id].arguments.clone();
+        let loc = module.ops[func_id].location.clone();
+        let i64_scalar_ty = Type::Tensor(crate::ir::mlir::TensorType {
+            shape: vec![Dim::Static(1)],
+            dtype: DType::I64,
+            encoding: None,
+        });
+
+        let mut prepended_ops: Vec<OpId> = Vec::new();
+        let mut explicit_arg_idx = 0usize;
+
+        for &arg_val in &args {
+            if is_chain_tensor_type(&module.values[arg_val].ty) {
+                continue;
+            }
+            let cur_arg_idx = explicit_arg_idx;
+            explicit_arg_idx += 1;
+
+            let Type::Tensor(ref t_ty) = module.values[arg_val].ty else {
+                continue;
+            };
+            let shape = t_ty.shape.clone();
+            if shape.is_empty() || !shape.iter().any(|d| matches!(d, Dim::Static(_))) {
+                continue;
+            }
+
+            // 1. `mgp.tensor.extract.tensor_spec %arg`
+            let spec_op = module.ops.insert_with_key(|id| Operation {
+                id,
+                name: OpName::new("mgp", "tensor.extract.tensor_spec"),
+                operands: SmallVec::from_slice(&[arg_val]),
+                results: SmallVec::new(),
+                attributes: IndexMap::new(),
+                regions: Vec::new(),
+                custom_syntax: false,
+                location: loc.clone(),
+            });
+            let spec_val = module.values.insert_with_key(|id| Value {
+                id,
+                ssa_name: None,
+                ty: i64_scalar_ty.clone(),
+                def: ValueDef::OpResult {
+                    op: spec_op,
+                    index: 0,
+                },
+            });
+            module.ops[spec_op].results.push(spec_val);
+            prepended_ops.push(spec_op);
+
+            let mut are_equal: Option<ValueId> = None;
+            for (dim_idx, dim) in shape.iter().enumerate() {
+                let Dim::Static(expected_d) = *dim else {
+                    continue;
+                };
+
+                let mut cst_attrs = IndexMap::new();
+                cst_attrs.insert("value".to_string(), Attribute::Int(expected_d));
+                let cst_op = module.ops.insert_with_key(|id| Operation {
+                    id,
+                    name: OpName::new("index", "constant"),
+                    operands: SmallVec::new(),
+                    results: SmallVec::new(),
+                    attributes: cst_attrs,
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: loc.clone(),
+                });
+                let cst_val = module.values.insert_with_key(|id| Value {
+                    id,
+                    ssa_name: None,
+                    ty: i64_scalar_ty.clone(),
+                    def: ValueDef::OpResult {
+                        op: cst_op,
+                        index: 0,
+                    },
+                });
+                module.ops[cst_op].results.push(cst_val);
+                prepended_ops.push(cst_op);
+
+                let mut get_dim_attrs = IndexMap::new();
+                get_dim_attrs.insert("dim_index".to_string(), Attribute::Int(dim_idx as i64));
+                let get_dim_op = module.ops.insert_with_key(|id| Operation {
+                    id,
+                    name: OpName::new("mgp", "tensor_spec.get_dim"),
+                    operands: SmallVec::from_slice(&[spec_val]),
+                    results: SmallVec::new(),
+                    attributes: get_dim_attrs,
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: loc.clone(),
+                });
+                let rt_dim_val = module.values.insert_with_key(|id| Value {
+                    id,
+                    ssa_name: None,
+                    ty: i64_scalar_ty.clone(),
+                    def: ValueDef::OpResult {
+                        op: get_dim_op,
+                        index: 0,
+                    },
+                });
+                module.ops[get_dim_op].results.push(rt_dim_val);
+                prepended_ops.push(get_dim_op);
+
+                let mut cmp_attrs = IndexMap::new();
+                cmp_attrs.insert("predicate".to_string(), Attribute::String("eq".to_string()));
+                let cmp_op = module.ops.insert_with_key(|id| Operation {
+                    id,
+                    name: OpName::new("index", "cmp"),
+                    operands: SmallVec::from_slice(&[rt_dim_val, cst_val]),
+                    results: SmallVec::new(),
+                    attributes: cmp_attrs,
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: loc.clone(),
+                });
+                let cmp_val = module.values.insert_with_key(|id| Value {
+                    id,
+                    ssa_name: None,
+                    ty: i64_scalar_ty.clone(),
+                    def: ValueDef::OpResult {
+                        op: cmp_op,
+                        index: 0,
+                    },
+                });
+                module.ops[cmp_op].results.push(cmp_val);
+                prepended_ops.push(cmp_op);
+
+                are_equal = Some(match are_equal {
+                    None => cmp_val,
+                    Some(prev) => {
+                        let and_op = module.ops.insert_with_key(|id| Operation {
+                            id,
+                            name: OpName::new("pop", "and"),
+                            operands: SmallVec::from_slice(&[prev, cmp_val]),
+                            results: SmallVec::new(),
+                            attributes: IndexMap::new(),
+                            regions: Vec::new(),
+                            custom_syntax: false,
+                            location: loc.clone(),
+                        });
+                        let and_val = module.values.insert_with_key(|id| Value {
+                            id,
+                            ssa_name: None,
+                            ty: i64_scalar_ty.clone(),
+                            def: ValueDef::OpResult {
+                                op: and_op,
+                                index: 0,
+                            },
+                        });
+                        module.ops[and_op].results.push(and_val);
+                        prepended_ops.push(and_op);
+                        and_val
+                    }
+                });
+            }
+
+            if let Some(cond_val) = are_equal {
+                let msg = format!(
+                    "Tensor type mismatch for argument {cur_arg_idx}: Expected shape: [{}]",
+                    format_expected_tensor_shape(&shape)
+                );
+                let mut assert_attrs = IndexMap::new();
+                assert_attrs.insert("message".to_string(), Attribute::String(msg));
+                let assert_op = module.ops.insert_with_key(|id| Operation {
+                    id,
+                    name: OpName::new("mgp", "assert"),
+                    operands: SmallVec::from_slice(&[cond_val]),
+                    results: SmallVec::new(),
+                    attributes: assert_attrs,
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: loc.clone(),
+                });
+                prepended_ops.push(assert_op);
+                verified_args += 1;
+            }
+        }
+
+        if !prepended_ops.is_empty() {
+            prepended_ops.extend_from_slice(&module.blocks[blk_id].ops);
+            module.blocks[blk_id].ops = prepended_ops;
+        }
+    }
+
+    verified_args
+}

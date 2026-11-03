@@ -5456,3 +5456,57 @@ fn test_strided_kv_contiguous_view_recovery_and_sub_byte_serde_layout() {
         .expect("valid layout");
     assert_eq!(total, 131_072 + 51_456);
 }
+
+#[test]
+fn test_verify_model_argument_shapes_emits_spec_checks_and_assert() {
+    use castforge::ir::mlir::{Attribute, Dim};
+    use castforge::passes::{format_expected_tensor_shape, verify_model_argument_shapes};
+
+    assert_eq!(
+        format_expected_tensor_shape(&[Dim::Dynamic, Dim::Static(16), Dim::Static(64)]),
+        "any,16,64"
+    );
+
+    let mlir = concat!(
+        "module @verify_args {\n",
+        "  func.func @main(%ch0: tensor<1xi64>, %x: tensor<?x16x64xf32>, %dyn: tensor<?x?xf32>)",
+        " -> tensor<1xi64> {\n",
+        "    return %ch0 : tensor<1xi64>\n",
+        "  }\n",
+        "}\n",
+    );
+
+    let mut m = parse_mlir(mlir).expect("valid MLIR");
+    // `%ch0` is a chain, `%dyn` has all dynamic dimensions, so only `%x` (argument 0) is verified:
+    assert_eq!(verify_model_argument_shapes(&mut m), 1);
+
+    let func_id = m.functions()[0];
+    let blk_id = m.regions[m.ops[func_id].regions[0]].blocks[0];
+    let op_names: Vec<String> = m.blocks[blk_id]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        op_names,
+        vec![
+            "mgp.tensor.extract.tensor_spec",
+            "index.constant",
+            "mgp.tensor_spec.get_dim",
+            "index.cmp",
+            "index.constant",
+            "mgp.tensor_spec.get_dim",
+            "index.cmp",
+            "pop.and",
+            "mgp.assert",
+            "func.return",
+        ]
+    );
+    let assert_op = m.blocks[blk_id].ops[8];
+    assert_eq!(
+        m.ops[assert_op].attributes.get("message"),
+        Some(&Attribute::String(
+            "Tensor type mismatch for argument 0: Expected shape: [any,16,64]".to_string()
+        ))
+    );
+}
