@@ -7221,3 +7221,205 @@ pub fn map_axis_through_static_reshape(
     }
     Some(new_axis)
 }
+
+fn extract_single_int_attr(attr: &Attribute) -> Option<i64> {
+    match attr {
+        Attribute::Int(v) => Some(*v),
+        Attribute::DenseIntArray(v) if v.len() == 1 => Some(v[0]),
+        Attribute::Array(v) if v.len() == 1 => extract_single_int_attr(&v[0]),
+        Attribute::Opaque(s) | Attribute::String(s) => {
+            s.split(':').next()?.trim().parse::<i64>().ok()
+        }
+        _ => None,
+    }
+}
+
+fn extract_gather_single_index(module: &Module, op: &Operation) -> Option<i64> {
+    if let Some(attr) = op
+        .attributes
+        .get("index")
+        .or_else(|| op.attributes.get("indices"))
+        .or_else(|| op.attributes.get("start_indices"))
+        && let Some(idx) = extract_single_int_attr(attr)
+    {
+        return Some(idx);
+    }
+    if let Some(&idx_val) = op.operands.get(1)
+        && let Some(v_info) = module.values.get(idx_val)
+        && let ValueDef::OpResult { op: def_id, .. } = v_info.def
+        && let Some(def_op) = module.ops.get(def_id)
+        && matches!(
+            def_op.name.to_string().as_str(),
+            "stablehlo.constant" | "arith.constant" | "mo.constant"
+        )
+        && let Some(val_attr) = def_op.attributes.get("value")
+    {
+        return extract_single_int_attr(val_attr);
+    }
+    None
+}
+
+/// Rewrites exhaustive single-index axis-0 `gather` operations (`mo.gather`, `stablehlo.gather`,
+/// `onnx.Gather`) in a basic block that cover every index `0..N` of a static outer dimension `N`
+/// into a single `mo.split` inserted before the earliest gather in the group.
+///
+/// Returns the number of `mo.split` operations created.
+pub fn coalesce_exhaustive_gathers_to_split(module: &mut Module) -> usize {
+    let mut coalesced = 0usize;
+    let block_ids: Vec<_> = module.blocks.keys().collect();
+
+    for block_id in block_ids {
+        let block_ops = module.blocks[block_id].ops.clone();
+        // Map each input `ValueId` to `(axis0_len, Vec<(block_pos, op_id, gather_idx)>)`.
+        type GatherEntry = (usize, OpId, i64);
+        let mut by_input: IndexMap<ValueId, (usize, Vec<GatherEntry>)> = IndexMap::new();
+
+        for (pos, &op_id) in block_ops.iter().enumerate() {
+            let Some(op) = module.ops.get(op_id) else {
+                continue;
+            };
+            if !matches!(
+                op.name.to_string().as_str(),
+                "mo.gather" | "stablehlo.gather" | "onnx.Gather"
+            ) {
+                continue;
+            }
+            if op.operands.is_empty() || op.results.len() != 1 {
+                continue;
+            }
+            let axis = op
+                .attributes
+                .get("axis")
+                .or_else(|| op.attributes.get("dimension"))
+                .and_then(extract_single_int_attr)
+                .unwrap_or(0);
+            if axis != 0 {
+                continue;
+            }
+            let Some(idx) = extract_gather_single_index(module, op) else {
+                continue;
+            };
+            let input_val = op.operands[0];
+            let Some(in_info) = module.values.get(input_val) else {
+                continue;
+            };
+            let Type::Tensor(ref in_tt) = in_info.ty else {
+                continue;
+            };
+            let Some(Dim::Static(axis0_dim)) = in_tt.shape.first() else {
+                continue;
+            };
+            if *axis0_dim <= 0 || idx < 0 || idx >= *axis0_dim {
+                continue;
+            }
+            let entry = by_input
+                .entry(input_val)
+                .or_insert_with(|| (*axis0_dim as usize, Vec::new()));
+            entry.1.push((pos, op_id, idx));
+        }
+
+        let mut insertions: std::collections::HashMap<OpId, OpId> =
+            std::collections::HashMap::new();
+        let mut to_remove: std::collections::HashSet<OpId> = std::collections::HashSet::new();
+
+        for (input_val, (axis0_len, entries)) in by_input {
+            if entries.len() < axis0_len {
+                continue;
+            }
+            // Keep first-seen gather for each index `0..axis0_len` and find the dominant gather.
+            let mut idx_to_gather: Vec<Option<(usize, OpId)>> = vec![None; axis0_len];
+            for &(pos, op_id, idx) in &entries {
+                let slot = &mut idx_to_gather[idx as usize];
+                if slot.is_none() {
+                    *slot = Some((pos, op_id));
+                }
+            }
+            if idx_to_gather.iter().any(Option::is_none) {
+                continue;
+            }
+            let matched: Vec<(usize, OpId)> =
+                idx_to_gather.into_iter().map(Option::unwrap).collect();
+
+            // Verify consistent device placement across all gathers in the group.
+            let first_dev = module.ops[matched[0].1]
+                .attributes
+                .get("castforge.device")
+                .cloned();
+            let same_device = matched.iter().all(|&(_, g_id)| {
+                module.ops[g_id].attributes.get("castforge.device") == first_dev.as_ref()
+            });
+            if !same_device {
+                continue;
+            }
+
+            let dominant_op_id = matched
+                .iter()
+                .min_by_key(|&&(pos, _)| pos)
+                .map(|&(_, id)| id)
+                .unwrap();
+
+            let mut split_results = Vec::with_capacity(axis0_len);
+            let mut locs = Vec::with_capacity(axis0_len);
+            for &(_, g_id) in &matched {
+                split_results.push(module.ops[g_id].results[0]);
+                locs.push(module.ops[g_id].location.clone());
+            }
+
+            let mut split_attrs = IndexMap::new();
+            split_attrs.insert("axis".to_string(), Attribute::Int(0));
+            split_attrs.insert(
+                "split_sizes".to_string(),
+                Attribute::DenseIntArray(vec![1; axis0_len]),
+            );
+            if let Some(dev) = first_dev {
+                split_attrs.insert("castforge.device".to_string(), dev);
+            }
+
+            let split_op_id = module.ops.insert_with_key(|id| Operation {
+                id,
+                name: crate::ir::OpName::new("mo", "split"),
+                operands: smallvec::smallvec![input_val],
+                results: split_results.iter().copied().collect(),
+                attributes: split_attrs,
+                regions: Default::default(),
+                custom_syntax: false,
+                location: fuse_locations(&locs),
+            });
+            if let Some(split_op) = module.ops.get_mut(split_op_id) {
+                stamp_fused_provenance(split_op, &locs);
+            }
+
+            for (idx, &res_val) in split_results.iter().enumerate() {
+                if let Some(v_info) = module.values.get_mut(res_val) {
+                    v_info.def = ValueDef::OpResult {
+                        op: split_op_id,
+                        index: idx as u32,
+                    };
+                }
+            }
+
+            insertions.insert(dominant_op_id, split_op_id);
+            for &(_, g_id) in &matched {
+                to_remove.insert(g_id);
+            }
+            coalesced += 1;
+        }
+
+        if !insertions.is_empty() {
+            let mut new_block_ops = Vec::with_capacity(block_ops.len());
+            for op_id in block_ops {
+                if let Some(&split_id) = insertions.get(&op_id) {
+                    new_block_ops.push(split_id);
+                }
+                if to_remove.contains(&op_id) {
+                    module.ops.remove(op_id);
+                } else {
+                    new_block_ops.push(op_id);
+                }
+            }
+            module.blocks[block_id].ops = new_block_ops;
+        }
+    }
+
+    coalesced
+}

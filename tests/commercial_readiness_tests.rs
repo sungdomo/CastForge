@@ -26,23 +26,24 @@ use castforge::passes::{
     ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST, ReshapeDimMapping, TOKEN_WIRE_STRIDE,
     WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
     analyze_static_reshape_dim_mapping, annotate_squeeze_unsqueeze_reshapes,
-    anonymize_symbolic_dims, await_hanging_effect_chains, coalesce_partitioning_slices_to_split,
-    compress_splat_constants, decode_kv_fs_filename, decode_kv_storage_key,
-    defer_allocs_to_first_use, direct_copy_format_supported, downsample_subchunk_swa_block_ids,
-    elide_redundant_state_transfers, eliminate_implied_dependencies, encode_kv_fs_filename,
-    encode_kv_storage_key, encode_wide_column_row_key, find_squeeze_axis, find_unsqueeze_axis,
-    flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
-    fuse_reshape_epilogue, fuse_sole_use_prologues, group_p2p_lookup_keys,
-    hash_packed_token_blocks_be, hash_prefix_token_blocks, hoist_exec_invariant_ops,
-    hoist_symbolic_dim_expressions, is_supported_arch_dtype, legalize_rowwise_reduction_launch,
-    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
-    map_axis_through_static_reshape, mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops,
-    merge_duplicate_shape_ops, merge_identical_functions, merge_parallel_matmuls,
-    num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve, plan_cacheblend_token_reorder,
-    plan_concat_in_place, plan_dynamic_memory_pool, plan_jenga_kv_geometry,
-    plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
-    re_rope_key_in_place, recalculate_subchunk_blocks_to_skip, reuse_dead_loop_buffers,
-    stamp_fused_provenance, unfold_chunk_range, unique_blend_token_coverage, unpack_token_ids_be,
+    anonymize_symbolic_dims, await_hanging_effect_chains, coalesce_exhaustive_gathers_to_split,
+    coalesce_partitioning_slices_to_split, compress_splat_constants, decode_kv_fs_filename,
+    decode_kv_storage_key, defer_allocs_to_first_use, direct_copy_format_supported,
+    downsample_subchunk_swa_block_ids, elide_redundant_state_transfers,
+    eliminate_implied_dependencies, encode_kv_fs_filename, encode_kv_storage_key,
+    encode_wide_column_row_key, find_squeeze_axis, find_unsqueeze_axis, flatten_elementwise_chains,
+    fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
+    fuse_sole_use_prologues, group_p2p_lookup_keys, hash_packed_token_blocks_be,
+    hash_prefix_token_blocks, hoist_exec_invariant_ops, hoist_symbolic_dim_expressions,
+    is_supported_arch_dtype, legalize_rowwise_reduction_launch, longest_full_attention_hit,
+    longest_joint_prefix_hit, longest_sliding_window_hit, map_axis_through_static_reshape,
+    mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops, merge_duplicate_shape_ops,
+    merge_identical_functions, merge_parallel_matmuls, num_packed_tokens, pack_token_ids_be,
+    plan_cacheblend_retrieve, plan_cacheblend_token_reorder, plan_concat_in_place,
+    plan_dynamic_memory_pool, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
+    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
+    recalculate_subchunk_blocks_to_skip, reuse_dead_loop_buffers, stamp_fused_provenance,
+    unfold_chunk_range, unique_blend_token_coverage, unpack_token_ids_be,
     validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
@@ -2734,4 +2735,55 @@ fn test_static_reshape_dim_mapping_and_axis_through_reshape() {
     assert!(analyze_static_reshape_dim_mapping(&[0, 2], &[0, 4]).is_none());
     assert!(analyze_static_reshape_dim_mapping(&[3, 5], &[16]).is_none());
     assert!(analyze_static_reshape_dim_mapping(&[3, -1, 5], &[15, -1]).is_none());
+}
+
+#[test]
+fn test_coalesce_exhaustive_gathers_to_split_dominance_and_partial_rejection() {
+    use castforge::ir::Attribute;
+
+    let mlir = r#"
+module @gathers_to_split {
+  func.func @main(%x: tensor<3x8xf32>) {
+    %g2 = mo.gather %x {axis = 0, index = 2} : (tensor<3x8xf32>) -> tensor<1x8xf32>
+    %g0 = mo.gather %x {axis = 0, index = 0} : (tensor<3x8xf32>) -> tensor<1x8xf32>
+    %g1 = mo.gather %x {axis = 0, index = 1} : (tensor<3x8xf32>) -> tensor<1x8xf32>
+    %sum01 = stablehlo.add %g0, %g1 : tensor<1x8xf32>
+    %sum012 = stablehlo.add %sum01, %g2 : tensor<1x8xf32>
+    return %sum012 : tensor<1x8xf32>
+  }
+}
+"#;
+    let mut module = parse_mlir(mlir).expect("valid MLIR");
+    assert_eq!(coalesce_exhaustive_gathers_to_split(&mut module), 1);
+
+    let func_id = module.functions()[0];
+    let block_id = module.regions[module.ops[func_id].regions[0]].blocks[0];
+    let ops = &module.blocks[block_id].ops;
+    // The 3 gathers are replaced by a single `mo.split` at the dominant position (index 0):
+    assert_eq!(ops.len(), 4);
+    assert!(module.ops[ops[0]].is_op("mo", "split"));
+    assert_eq!(
+        module.ops[ops[0]].attributes.get("split_sizes"),
+        Some(&Attribute::DenseIntArray(vec![1, 1, 1]))
+    );
+    // Verify %g0, %g1, %g2 map to split results #0, #1, #2 in index order (not block order):
+    let split_results = &module.ops[ops[0]].results;
+    assert_eq!(split_results.len(), 3);
+    assert_eq!(module.ops[ops[1]].operands[0], split_results[0]);
+    assert_eq!(module.ops[ops[1]].operands[1], split_results[1]);
+    assert_eq!(module.ops[ops[2]].operands[1], split_results[2]);
+
+    // Partial gather coverage (missing index 2 of 3) must NOT be rewritten:
+    let partial_mlir = r#"
+module @partial_gathers {
+  func.func @main(%x: tensor<3x8xf32>) {
+    %g0 = mo.gather %x {axis = 0, index = 0} : (tensor<3x8xf32>) -> tensor<1x8xf32>
+    %g1 = mo.gather %x {axis = 0, index = 1} : (tensor<3x8xf32>) -> tensor<1x8xf32>
+    %sum01 = stablehlo.add %g0, %g1 : tensor<1x8xf32>
+    return %sum01 : tensor<1x8xf32>
+  }
+}
+"#;
+    let mut partial_mod = parse_mlir(partial_mlir).expect("valid MLIR");
+    assert_eq!(coalesce_exhaustive_gathers_to_split(&mut partial_mod), 0);
 }
