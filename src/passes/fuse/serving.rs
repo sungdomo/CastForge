@@ -30098,3 +30098,546 @@ pub fn fixup_isolated_from_above_regions(module: &mut Module) -> usize {
 
     fixed_ops
 }
+
+/// Returns the device string of an operation, defaulting to `"cpu:0"`.
+fn op_device_or_default(op: &Operation) -> &str {
+    match op.attributes.get("device") {
+        Some(Attribute::String(s)) if !s.is_empty() => s.as_str(),
+        _ => "cpu:0",
+    }
+}
+
+/// Checks whether a `map.iter.elementwise` operation is a plain single-output foreach without
+/// input or output `!mo.chain` tokens.
+fn is_plain_elementwise_foreach(module: &Module, op_id: OpId) -> bool {
+    let op = &module.ops[op_id];
+    if op.name.full_name() != "map.iter.elementwise" || op.results.len() != 1 {
+        return false;
+    }
+    let no_chain_in = op
+        .operands
+        .iter()
+        .all(|&v| !matches!(&module.values[v].ty, Type::Opaque(s) if s == "!mo.chain"));
+    let no_chain_out = op
+        .results
+        .iter()
+        .all(|&v| !matches!(&module.values[v].ty, Type::Opaque(s) if s == "!mo.chain"));
+    no_chain_in && no_chain_out
+}
+
+/// Checks whether `per_row_ty` has the same rank and non-axis dimensions as `full_ty`, with
+/// dimension `axis` equal to static `1`.
+fn has_matching_per_row_shape(full_ty: &Type, per_row_ty: &Type, axis: usize) -> bool {
+    let (Type::Tensor(full_tt), Type::Tensor(row_tt)) = (full_ty, per_row_ty) else {
+        return false;
+    };
+    if full_tt.shape.len() != row_tt.shape.len() || axis >= full_tt.shape.len() {
+        return false;
+    }
+    if row_tt.shape[axis] != Dim::Static(1) {
+        return false;
+    }
+    for d in 0..full_tt.shape.len() {
+        if d != axis && full_tt.shape[d] != row_tt.shape[d] {
+            return false;
+        }
+    }
+    true
+}
+
+/// Checks whether `idx_val` inside `body_blk` is produced by a chain of index views that includes
+/// `map.index.reshape`.
+fn index_value_crosses_reshape(module: &Module, body_blk: BlockId, idx_val: ValueId) -> bool {
+    let mut worklist = vec![idx_val];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(curr) = worklist.pop() {
+        if !visited.insert(curr) {
+            continue;
+        }
+        if let crate::ir::mlir::ValueDef::OpResult { op: def_op, .. } = module.values[curr].def
+            && module.blocks[body_blk].ops.contains(&def_op)
+        {
+            let name = module.ops[def_op].name.full_name();
+            if name == "map.index.reshape" {
+                return true;
+            }
+            if name.starts_with("map.index.") {
+                for &opd in &module.ops[def_op].operands {
+                    worklist.push(opd);
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Merges boolean effect attributes (`has_read_effect`, `has_write_effect`) from `src_op` into
+/// `dst_op`.
+fn merge_map_iter_effects(module: &mut Module, dst_op: OpId, src_op: OpId) {
+    for attr_name in ["has_read_effect", "has_write_effect"] {
+        let src_has = matches!(
+            module.ops[src_op].attributes.get(attr_name),
+            Some(Attribute::Bool(true))
+        );
+        let dst_has = matches!(
+            module.ops[dst_op].attributes.get(attr_name),
+            Some(Attribute::Bool(true))
+        );
+        if src_has || dst_has {
+            module.ops[dst_op]
+                .attributes
+                .insert(attr_name.to_string(), Attribute::Bool(true));
+        }
+    }
+}
+
+/// Fuses sole-use plain `map.iter.elementwise` producers and per-row `map.iter.elementwise`
+/// consumers into `map.iter.rowwise` reductions on the same device.
+///
+/// 1. **Producer fusion**: When a plain `map.iter.elementwise` producer on the same device is only
+///    read by a `map.iter.rowwise` via `map.load` (without crossing a `map.index.reshape`
+///    barrier), its body computation is spliced into `map.iter.rowwise` at each load site and its
+///    inputs are deduplicated into the reduction.
+/// 2. **Consumer fusion**: When a plain `map.iter.elementwise` consumer on the same device has the
+///    per-row shape of `map.iter.rowwise` (reduced `axis` dimension equal to `1`) and reads the
+///    reduction's per-row output at its loop index, its body is appended to the reduction's row
+///    epilogue and intermediate per-row stores with no remaining external users are eliminated.
+///
+/// Returns `(producers_fused, consumers_fused)`.
+pub fn fuse_rowwise_reductions(module: &mut Module) -> (usize, usize) {
+    let mut producers_fused = 0usize;
+    let mut consumers_fused = 0usize;
+
+    for func_id in module.functions() {
+        let regions = module.ops[func_id].regions.clone();
+        for reg_id in regions {
+            let blocks = module.regions[reg_id].blocks.clone();
+            for blk_id in blocks {
+                let rowwise_candidates: Vec<OpId> = module.blocks[blk_id]
+                    .ops
+                    .iter()
+                    .copied()
+                    .filter(|&id| module.ops[id].name.full_name() == "map.iter.rowwise")
+                    .collect();
+
+                for dst_id in rowwise_candidates {
+                    if !module.blocks[blk_id].ops.contains(&dst_id) {
+                        continue;
+                    }
+
+                    // --- Phase 1: Fuse eligible elementwise producers into `dst_id` ---
+                    loop {
+                        let dst_dev = op_device_or_default(&module.ops[dst_id]).to_string();
+                        let Some(&dst_reg) = module.ops[dst_id].regions.first() else {
+                            break;
+                        };
+                        let Some(&dst_blk) = module.regions[dst_reg].blocks.first() else {
+                            break;
+                        };
+                        let dst_operands = module.ops[dst_id].operands.clone();
+
+                        let mut found_producer: Option<(usize, OpId, ValueId)> = None;
+                        for (inp_idx, &inp_val) in dst_operands.iter().enumerate() {
+                            let crate::ir::mlir::ValueDef::OpResult { op: src_id, .. } =
+                                module.values[inp_val].def
+                            else {
+                                continue;
+                            };
+                            if !module.blocks[blk_id].ops.contains(&src_id)
+                                || !is_plain_elementwise_foreach(module, src_id)
+                                || op_device_or_default(&module.ops[src_id]) != dst_dev
+                            {
+                                continue;
+                            }
+                            // Check that `dst_id` is the only user of `inp_val` in `blk_id`:
+                            let sole_user = module.blocks[blk_id]
+                                .ops
+                                .iter()
+                                .filter(|&&op| module.ops[op].operands.contains(&inp_val))
+                                .all(|&op| op == dst_id);
+                            if !sole_user || inp_idx >= module.blocks[dst_blk].arguments.len() {
+                                continue;
+                            }
+                            let dst_in_barg = module.blocks[dst_blk].arguments[inp_idx];
+                            // Every use of `dst_in_barg` inside `dst_blk` must be a `map.load`
+                            // whose index does not cross `map.index.reshape`:
+                            let load_ops: Vec<OpId> = module.blocks[dst_blk]
+                                .ops
+                                .iter()
+                                .copied()
+                                .filter(|&op| module.ops[op].operands.contains(&dst_in_barg))
+                                .collect();
+                            if load_ops.is_empty() {
+                                continue;
+                            }
+                            let valid_loads = load_ops.iter().all(|&lop| {
+                                module.ops[lop].name.full_name() == "map.load"
+                                    && module.ops[lop].operands.len() == 2
+                                    && module.ops[lop].operands[0] == dst_in_barg
+                                    && !index_value_crosses_reshape(
+                                        module,
+                                        dst_blk,
+                                        module.ops[lop].operands[1],
+                                    )
+                            });
+                            if valid_loads {
+                                found_producer = Some((inp_idx, src_id, dst_in_barg));
+                                break;
+                            }
+                        }
+
+                        let Some((inp_idx, src_id, dst_in_barg)) = found_producer else {
+                            break;
+                        };
+                        let Some(&src_reg) = module.ops[src_id].regions.first() else {
+                            break;
+                        };
+                        let Some(&src_blk) = module.regions[src_reg].blocks.first() else {
+                            break;
+                        };
+                        let src_inputs = module.ops[src_id].operands.clone();
+                        let src_bargs = module.blocks[src_blk].arguments.clone();
+                        if src_bargs.len() < src_inputs.len() + 2 {
+                            break;
+                        }
+                        let src_loop_idx_barg = *src_bargs.last().unwrap();
+
+                        // Map `src`'s first input into `inp_idx` and deduplicate/append any
+                        // additional `src` inputs:
+                        let mut src_barg_map = std::collections::HashMap::<ValueId, ValueId>::new();
+                        if !src_inputs.is_empty() {
+                            module.ops[dst_id].operands[inp_idx] = src_inputs[0];
+                            let ty0 = module.values[src_inputs[0]].ty.clone();
+                            module.values[dst_in_barg].ty = ty0;
+                            src_barg_map.insert(src_bargs[0], dst_in_barg);
+
+                            for (extra_i, &extra_in) in src_inputs.iter().enumerate().skip(1) {
+                                if let Some(existing_pos) = module.ops[dst_id]
+                                    .operands
+                                    .iter()
+                                    .position(|&v| v == extra_in)
+                                {
+                                    let existing_barg =
+                                        module.blocks[dst_blk].arguments[existing_pos];
+                                    src_barg_map.insert(src_bargs[extra_i], existing_barg);
+                                } else {
+                                    let new_pos = module.ops[dst_id].operands.len();
+                                    module.ops[dst_id].operands.insert(new_pos, extra_in);
+                                    let ty = module.values[extra_in].ty.clone();
+                                    let new_barg = module.add_block_argument(dst_blk, None, ty);
+                                    // Move `new_barg` to `new_pos` (before output & row args):
+                                    let popped = module.blocks[dst_blk].arguments.pop().unwrap();
+                                    module.blocks[dst_blk].arguments.insert(new_pos, popped);
+                                    for (pos, &b) in
+                                        module.blocks[dst_blk].arguments.iter().enumerate()
+                                    {
+                                        module.values[b].def =
+                                            crate::ir::mlir::ValueDef::BlockArgument {
+                                                block: dst_blk,
+                                                index: pos as u32,
+                                            };
+                                    }
+                                    src_barg_map.insert(src_bargs[extra_i], new_barg);
+                                }
+                            }
+                        }
+
+                        // Splice `src_blk` ops before each `map.load` of `dst_in_barg`:
+                        let load_sites: Vec<OpId> = module.blocks[dst_blk]
+                            .ops
+                            .iter()
+                            .copied()
+                            .filter(|&op| {
+                                module.ops[op].name.full_name() == "map.load"
+                                    && module.ops[op].operands.first() == Some(&dst_in_barg)
+                            })
+                            .collect();
+                        let src_body_ops = module.blocks[src_blk].ops.clone();
+
+                        for load_id in load_sites {
+                            let load_idx_val = module.ops[load_id].operands[1];
+                            let load_res_val = module.ops[load_id].results[0];
+                            let mut val_map = src_barg_map.clone();
+                            val_map.insert(src_loop_idx_barg, load_idx_val);
+
+                            let mut cloned_ops = Vec::new();
+                            let mut stored_replacement = None;
+                            for &sop in &src_body_ops {
+                                if module.ops[sop].name.full_name() == "map.store" {
+                                    if let Some(&val_opd) = module.ops[sop].operands.first() {
+                                        stored_replacement =
+                                            Some(val_map.get(&val_opd).copied().unwrap_or(val_opd));
+                                    }
+                                    continue;
+                                }
+                                let mapped_operands: smallvec::SmallVec<[ValueId; 4]> = module.ops
+                                    [sop]
+                                    .operands
+                                    .iter()
+                                    .map(|&v| val_map.get(&v).copied().unwrap_or(v))
+                                    .collect();
+                                let res_types: Vec<Type> = module.ops[sop]
+                                    .results
+                                    .iter()
+                                    .map(|&r| module.values[r].ty.clone())
+                                    .collect();
+                                let new_op = module.ops.insert(Operation {
+                                    id: OpId::default(),
+                                    name: module.ops[sop].name.clone(),
+                                    operands: mapped_operands,
+                                    results: smallvec::SmallVec::new(),
+                                    attributes: module.ops[sop].attributes.clone(),
+                                    regions: Vec::new(),
+                                    custom_syntax: module.ops[sop].custom_syntax,
+                                    location: module.ops[sop].location.clone(),
+                                });
+                                module.ops[new_op].id = new_op;
+                                for (r_idx, r_ty) in res_types.into_iter().enumerate() {
+                                    let rv = module.values.insert(crate::ir::mlir::Value {
+                                        id: ValueId::default(),
+                                        ssa_name: None,
+                                        ty: r_ty,
+                                        def: crate::ir::mlir::ValueDef::OpResult {
+                                            op: new_op,
+                                            index: r_idx as u32,
+                                        },
+                                    });
+                                    module.values[rv].id = rv;
+                                    module.ops[new_op].results.push(rv);
+                                    val_map.insert(module.ops[sop].results[r_idx], rv);
+                                }
+                                cloned_ops.push(new_op);
+                            }
+
+                            if let Some(rep_val) = stored_replacement {
+                                // Replace uses of `load_res_val` in `dst_blk` with `rep_val`:
+                                for &bop in &module.blocks[dst_blk].ops {
+                                    for opd in &mut module.ops[bop].operands {
+                                        if *opd == load_res_val {
+                                            *opd = rep_val;
+                                        }
+                                    }
+                                }
+                                let load_pos = module.blocks[dst_blk]
+                                    .ops
+                                    .iter()
+                                    .position(|&x| x == load_id)
+                                    .unwrap();
+                                module.blocks[dst_blk]
+                                    .ops
+                                    .splice(load_pos..=load_pos, cloned_ops);
+                            }
+                        }
+
+                        merge_map_iter_effects(module, dst_id, src_id);
+                        module.blocks[blk_id].ops.retain(|&op| op != src_id);
+                        producers_fused += 1;
+                    }
+
+                    // --- Phase 2: Fuse eligible per-row elementwise consumers into `dst_id` ---
+                    loop {
+                        if module.ops[dst_id].results.len() != 1
+                            || module.ops[dst_id].operands.is_empty()
+                        {
+                            break;
+                        }
+                        let dst_res = module.ops[dst_id].results[0];
+                        let dst_dev = op_device_or_default(&module.ops[dst_id]).to_string();
+                        let axis = match module.ops[dst_id].attributes.get("axis") {
+                            Some(Attribute::Int(v)) if *v >= 0 => *v as usize,
+                            _ => 1usize,
+                        };
+                        let full_ty = module.values[module.ops[dst_id].operands[0]].ty.clone();
+                        let Some(&dst_reg) = module.ops[dst_id].regions.first() else {
+                            break;
+                        };
+                        let Some(&dst_blk) = module.regions[dst_reg].blocks.first() else {
+                            break;
+                        };
+                        let num_dst_inputs = module.ops[dst_id].operands.len();
+                        if module.blocks[dst_blk].arguments.len() < num_dst_inputs + 2 {
+                            break;
+                        }
+                        let dst_out_barg = module.blocks[dst_blk].arguments[num_dst_inputs];
+                        let dst_row_barg = *module.blocks[dst_blk].arguments.last().unwrap();
+
+                        // Verify `dst_out_barg` has a single `map.store(val, dst_out_barg,
+                        // dst_row_barg)` in `dst_blk`:
+                        let out_stores: Vec<OpId> = module.blocks[dst_blk]
+                            .ops
+                            .iter()
+                            .copied()
+                            .filter(|&op| module.ops[op].operands.contains(&dst_out_barg))
+                            .collect();
+                        if out_stores.len() != 1 {
+                            break;
+                        }
+                        let row_store_id = out_stores[0];
+                        if module.ops[row_store_id].name.full_name() != "map.store"
+                            || module.ops[row_store_id].operands.len() != 3
+                            || module.ops[row_store_id].operands[1] != dst_out_barg
+                            || module.ops[row_store_id].operands[2] != dst_row_barg
+                        {
+                            break;
+                        }
+                        let per_row_stored_val = module.ops[row_store_id].operands[0];
+
+                        // Find a consumer `map.iter.elementwise` in `blk_id` reading `dst_res`:
+                        let candidate_consumer =
+                            module.blocks[blk_id].ops.iter().copied().find(|&op| {
+                                op != dst_id
+                                    && is_plain_elementwise_foreach(module, op)
+                                    && op_device_or_default(&module.ops[op]) == dst_dev
+                                    && module.ops[op].operands.contains(&dst_res)
+                                    && has_matching_per_row_shape(
+                                        &full_ty,
+                                        &module.values[module.ops[op].results[0]].ty,
+                                        axis,
+                                    )
+                            });
+                        let Some(cons_id) = candidate_consumer else {
+                            break;
+                        };
+                        let Some(&cons_reg) = module.ops[cons_id].regions.first() else {
+                            break;
+                        };
+                        let Some(&cons_blk) = module.regions[cons_reg].blocks.first() else {
+                            break;
+                        };
+                        let cons_inputs = module.ops[cons_id].operands.clone();
+                        let cons_bargs = module.blocks[cons_blk].arguments.clone();
+                        if cons_bargs.len() < cons_inputs.len() + 2 {
+                            break;
+                        }
+                        let cons_out_barg = cons_bargs[cons_inputs.len()];
+                        let cons_loop_barg = *cons_bargs.last().unwrap();
+
+                        // Every use of the consumer's input block arg for `dst_res` must be a
+                        // `map.load` at `cons_loop_barg`:
+                        let mut valid_consumer_loads = true;
+                        for (ci, &cin) in cons_inputs.iter().enumerate() {
+                            if cin == dst_res {
+                                let cbarg = cons_bargs[ci];
+                                for &cop in &module.blocks[cons_blk].ops {
+                                    if module.ops[cop].operands.contains(&cbarg)
+                                        && (module.ops[cop].name.full_name() != "map.load"
+                                            || module.ops[cop].operands.len() != 2
+                                            || module.ops[cop].operands[0] != cbarg
+                                            || module.ops[cop].operands[1] != cons_loop_barg)
+                                    {
+                                        valid_consumer_loads = false;
+                                    }
+                                }
+                            }
+                        }
+                        if !valid_consumer_loads {
+                            break;
+                        }
+
+                        // Map `cons_blk` block arguments into `dst_blk`:
+                        let mut cons_map = std::collections::HashMap::<ValueId, ValueId>::new();
+                        cons_map.insert(cons_out_barg, dst_out_barg);
+                        cons_map.insert(cons_loop_barg, dst_row_barg);
+                        let mut dst_res_bargs = std::collections::HashSet::<ValueId>::new();
+                        for (ci, &cin) in cons_inputs.iter().enumerate() {
+                            if cin == dst_res {
+                                dst_res_bargs.insert(cons_bargs[ci]);
+                            } else if let Some(existing_pos) =
+                                module.ops[dst_id].operands.iter().position(|&v| v == cin)
+                            {
+                                let existing_barg = module.blocks[dst_blk].arguments[existing_pos];
+                                cons_map.insert(cons_bargs[ci], existing_barg);
+                            } else {
+                                let insert_pos = module.ops[dst_id].operands.len();
+                                module.ops[dst_id].operands.push(cin);
+                                let ty = module.values[cin].ty.clone();
+                                let new_barg = module.add_block_argument(dst_blk, None, ty);
+                                let popped = module.blocks[dst_blk].arguments.pop().unwrap();
+                                module.blocks[dst_blk].arguments.insert(insert_pos, popped);
+                                for (pos, &b) in module.blocks[dst_blk].arguments.iter().enumerate()
+                                {
+                                    module.values[b].def =
+                                        crate::ir::mlir::ValueDef::BlockArgument {
+                                            block: dst_blk,
+                                            index: pos as u32,
+                                        };
+                                }
+                                cons_map.insert(cons_bargs[ci], new_barg);
+                            }
+                        }
+
+                        // Remove `row_store_id` from `dst_blk` and append `cons_blk` ops:
+                        module.blocks[dst_blk].ops.retain(|&op| op != row_store_id);
+                        let cons_body_ops = module.blocks[cons_blk].ops.clone();
+                        for &cop in &cons_body_ops {
+                            if module.ops[cop].name.full_name() == "map.load"
+                                && let Some(&t_opd) = module.ops[cop].operands.first()
+                                && dst_res_bargs.contains(&t_opd)
+                            {
+                                cons_map.insert(module.ops[cop].results[0], per_row_stored_val);
+                                continue;
+                            }
+                            let mapped_operands: smallvec::SmallVec<[ValueId; 4]> = module.ops[cop]
+                                .operands
+                                .iter()
+                                .map(|&v| cons_map.get(&v).copied().unwrap_or(v))
+                                .collect();
+                            let res_types: Vec<Type> = module.ops[cop]
+                                .results
+                                .iter()
+                                .map(|&r| module.values[r].ty.clone())
+                                .collect();
+                            let new_op = module.ops.insert(Operation {
+                                id: OpId::default(),
+                                name: module.ops[cop].name.clone(),
+                                operands: mapped_operands,
+                                results: smallvec::SmallVec::new(),
+                                attributes: module.ops[cop].attributes.clone(),
+                                regions: Vec::new(),
+                                custom_syntax: module.ops[cop].custom_syntax,
+                                location: module.ops[cop].location.clone(),
+                            });
+                            module.ops[new_op].id = new_op;
+                            for (r_idx, r_ty) in res_types.into_iter().enumerate() {
+                                let rv = module.values.insert(crate::ir::mlir::Value {
+                                    id: ValueId::default(),
+                                    ssa_name: None,
+                                    ty: r_ty,
+                                    def: crate::ir::mlir::ValueDef::OpResult {
+                                        op: new_op,
+                                        index: r_idx as u32,
+                                    },
+                                });
+                                module.values[rv].id = rv;
+                                module.ops[new_op].results.push(rv);
+                                cons_map.insert(module.ops[cop].results[r_idx], rv);
+                            }
+                            module.blocks[dst_blk].ops.push(new_op);
+                        }
+
+                        // Update `dst_res` type to match `cons`'s result type and replace uses:
+                        let cons_res = module.ops[cons_id].results[0];
+                        let cons_res_ty = module.values[cons_res].ty.clone();
+                        module.values[dst_res].ty = cons_res_ty.clone();
+                        module.values[dst_out_barg].ty = cons_res_ty;
+                        for &bop in &module.blocks[blk_id].ops {
+                            if bop != cons_id {
+                                for opd in &mut module.ops[bop].operands {
+                                    if *opd == cons_res {
+                                        *opd = dst_res;
+                                    }
+                                }
+                            }
+                        }
+
+                        merge_map_iter_effects(module, dst_id, cons_id);
+                        module.blocks[blk_id].ops.retain(|&op| op != cons_id);
+                        consumers_fused += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    (producers_fused, consumers_fused)
+}

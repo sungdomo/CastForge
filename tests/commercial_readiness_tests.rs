@@ -8756,3 +8756,220 @@ fn test_attach_python_stack_traces_and_fixup_isolated_from_above_regions() {
         &[body_arg0, body_free_barg]
     );
 }
+
+#[test]
+fn test_fuse_rowwise_reductions_fuses_producer_and_per_row_consumer() {
+    use castforge::ir::Attribute;
+    use castforge::ir::mlir::OpName;
+    use castforge::passes::fuse_rowwise_reductions;
+
+    let src = concat!(
+        "module {\n",
+        "  func.func @rowwise_fusion(\n",
+        "    %x: tensor<4x8xf32>,\n",
+        "    %bias: tensor<4x1xf32>\n",
+        "  ) -> tensor<4x1xf32> {\n",
+        "    return %bias : tensor<4x1xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(src).unwrap();
+    let fn_id = m.functions()[0];
+    let fn_blk = m.regions[m.ops[fn_id].regions[0]].blocks[0];
+    let ret_id = m.blocks[fn_blk].ops[0];
+    let args = m.blocks[fn_blk].arguments.clone();
+    let (x_arg, bias_arg) = (args[0], args[1]);
+    let full_ty = m.values[x_arg].ty.clone();
+    let row_ty = m.values[bias_arg].ty.clone();
+    let idx_ty = castforge::ir::Type::Scalar(DType::Index);
+    let f32_ty = castforge::ir::Type::Scalar(DType::F32);
+
+    // 1. Build producer `map.iter.elementwise(%x) -> tensor<4x8xf32>` computing `exp(load(%x))`:
+    let prod_blk = m.create_block(None);
+    let p_in = m.add_block_argument(prod_blk, None, full_ty.clone());
+    let p_out = m.add_block_argument(prod_blk, None, full_ty.clone());
+    let p_idx = m.add_block_argument(prod_blk, None, idx_ty.clone());
+    let p_load = m.add_operation(
+        prod_blk,
+        OpName::new("map", "load"),
+        smallvec::smallvec![p_in, p_idx],
+        vec![(None, f32_ty.clone())],
+        indexmap::IndexMap::new(),
+        vec![],
+        false,
+        Location::Unknown,
+    );
+    let p_loaded = m.ops[p_load].results[0];
+    let p_exp = m.add_operation(
+        prod_blk,
+        OpName::new("rmo", "exp"),
+        smallvec::smallvec![p_loaded],
+        vec![(None, f32_ty.clone())],
+        indexmap::IndexMap::new(),
+        vec![],
+        false,
+        Location::Unknown,
+    );
+    let p_exp_val = m.ops[p_exp].results[0];
+    m.add_operation(
+        prod_blk,
+        OpName::new("map", "store"),
+        smallvec::smallvec![p_exp_val, p_out, p_idx],
+        vec![],
+        indexmap::IndexMap::new(),
+        vec![],
+        false,
+        Location::Unknown,
+    );
+    let prod_reg = m.create_region(vec![prod_blk]);
+    let mut prod_attrs = indexmap::IndexMap::new();
+    prod_attrs.insert("device".to_string(), Attribute::String("gpu:0".to_string()));
+    prod_attrs.insert("has_read_effect".to_string(), Attribute::Bool(true));
+    let prod_op = m.add_operation(
+        fn_blk,
+        OpName::new("map", "iter.elementwise"),
+        smallvec::smallvec![x_arg],
+        vec![(None, full_ty.clone())],
+        prod_attrs,
+        vec![prod_reg],
+        false,
+        Location::Unknown,
+    );
+    let prod_res = m.ops[prod_op].results[0];
+
+    // 2. Build `map.iter.rowwise(%prod_res) {axis = 1, device = "gpu:0"} -> tensor<4x1xf32>`:
+    let row_blk = m.create_block(None);
+    let r_in = m.add_block_argument(row_blk, None, full_ty.clone());
+    let r_out = m.add_block_argument(row_blk, None, row_ty.clone());
+    let r_idx = m.add_block_argument(row_blk, None, idx_ty.clone());
+    let r_load = m.add_operation(
+        row_blk,
+        OpName::new("map", "load"),
+        smallvec::smallvec![r_in, r_idx],
+        vec![(None, f32_ty.clone())],
+        indexmap::IndexMap::new(),
+        vec![],
+        false,
+        Location::Unknown,
+    );
+    let r_loaded = m.ops[r_load].results[0];
+    m.add_operation(
+        row_blk,
+        OpName::new("map", "store"),
+        smallvec::smallvec![r_loaded, r_out, r_idx],
+        vec![],
+        indexmap::IndexMap::new(),
+        vec![],
+        false,
+        Location::Unknown,
+    );
+    let row_reg = m.create_region(vec![row_blk]);
+    let mut row_attrs = indexmap::IndexMap::new();
+    row_attrs.insert("axis".to_string(), Attribute::Int(1));
+    row_attrs.insert("device".to_string(), Attribute::String("gpu:0".to_string()));
+    let row_op = m.add_operation(
+        fn_blk,
+        OpName::new("map", "iter.rowwise"),
+        smallvec::smallvec![prod_res],
+        vec![(None, row_ty.clone())],
+        row_attrs,
+        vec![row_reg],
+        false,
+        Location::Unknown,
+    );
+    let row_res = m.ops[row_op].results[0];
+
+    // 3. Build per-row consumer `map.iter.elementwise(%row_res, %bias) -> tensor<4x1xf32>`:
+    let cons_blk = m.create_block(None);
+    let c_in0 = m.add_block_argument(cons_blk, None, row_ty.clone());
+    let c_in1 = m.add_block_argument(cons_blk, None, row_ty.clone());
+    let c_out = m.add_block_argument(cons_blk, None, row_ty.clone());
+    let c_idx = m.add_block_argument(cons_blk, None, idx_ty);
+    let c_load0 = m.add_operation(
+        cons_blk,
+        OpName::new("map", "load"),
+        smallvec::smallvec![c_in0, c_idx],
+        vec![(None, f32_ty.clone())],
+        indexmap::IndexMap::new(),
+        vec![],
+        false,
+        Location::Unknown,
+    );
+    let c_val0 = m.ops[c_load0].results[0];
+    let c_load1 = m.add_operation(
+        cons_blk,
+        OpName::new("map", "load"),
+        smallvec::smallvec![c_in1, c_idx],
+        vec![(None, f32_ty.clone())],
+        indexmap::IndexMap::new(),
+        vec![],
+        false,
+        Location::Unknown,
+    );
+    let c_val1 = m.ops[c_load1].results[0];
+    let c_add = m.add_operation(
+        cons_blk,
+        OpName::new("rmo", "add"),
+        smallvec::smallvec![c_val0, c_val1],
+        vec![(None, f32_ty)],
+        indexmap::IndexMap::new(),
+        vec![],
+        false,
+        Location::Unknown,
+    );
+    let c_sum = m.ops[c_add].results[0];
+    m.add_operation(
+        cons_blk,
+        OpName::new("map", "store"),
+        smallvec::smallvec![c_sum, c_out, c_idx],
+        vec![],
+        indexmap::IndexMap::new(),
+        vec![],
+        false,
+        Location::Unknown,
+    );
+    let cons_reg = m.create_region(vec![cons_blk]);
+    let mut cons_attrs = indexmap::IndexMap::new();
+    cons_attrs.insert("device".to_string(), Attribute::String("gpu:0".to_string()));
+    let cons_op = m.add_operation(
+        fn_blk,
+        OpName::new("map", "iter.elementwise"),
+        smallvec::smallvec![row_res, bias_arg],
+        vec![(None, row_ty)],
+        cons_attrs,
+        vec![cons_reg],
+        false,
+        Location::Unknown,
+    );
+    let cons_res = m.ops[cons_op].results[0];
+
+    // Move `return` to the end of `fn_blk` and make it return `cons_res`:
+    m.ops[ret_id].operands[0] = cons_res;
+    m.blocks[fn_blk].ops.retain(|&op| op != ret_id);
+    m.blocks[fn_blk].ops.push(ret_id);
+
+    let (producers_fused, consumers_fused) = fuse_rowwise_reductions(&mut m);
+    assert_eq!(producers_fused, 1);
+    assert_eq!(consumers_fused, 1);
+
+    // Only `map.iter.rowwise` and `func.return` remain in `fn_blk`:
+    let remaining: Vec<String> = m.blocks[fn_blk]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(remaining, vec!["map.iter.rowwise", "func.return"]);
+    assert_eq!(m.ops[row_op].operands.as_slice(), &[x_arg, bias_arg]);
+    assert_eq!(m.ops[ret_id].operands[0], row_res);
+
+    // Inside `row_blk`, both producer (`rmo.exp`) and consumer (`rmo.add`) are fused:
+    let row_body_ops: Vec<String> = m.blocks[row_blk]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        row_body_ops,
+        vec!["map.load", "rmo.exp", "map.load", "rmo.add", "map.store"]
+    );
+}
