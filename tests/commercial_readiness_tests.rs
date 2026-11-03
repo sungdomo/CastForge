@@ -7618,3 +7618,64 @@ fn test_create_parallel_from_unbundle_and_fold_identity_tensor_bundles() {
         ]
     );
 }
+
+#[test]
+fn test_merge_adjacent_parallels_fuses_producer_consumer_and_drops_internal_yield() {
+    use castforge::passes::{
+        create_parallel_from_unbundle, fold_identity_tensor_bundles, merge_adjacent_parallels,
+    };
+
+    let src = concat!(
+        "module {\n",
+        "  func.func @pipeline_parallels(\n",
+        "    %b_in: !mo.bundle<tensor<4xf32>, tensor<4xf32>>,\n",
+        "    %w0: tensor<4xf32>,\n",
+        "    %w1: tensor<4xf32>\n",
+        "  ) -> (tensor<4xf32>, tensor<4xf32>) {\n",
+        "    %u0, %u1 = \"mo.tensor.unbundle\"(%b_in) : ",
+        "(!mo.bundle<tensor<4xf32>, tensor<4xf32>>) -> (tensor<4xf32>, tensor<4xf32>)\n",
+        "    %a0 = \"mo.add\"(%u0, %w0) {device = \"gpu:0\"} : ",
+        "(tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %a1 = \"mo.add\"(%u1, %w1) {device = \"gpu:1\"} : ",
+        "(tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %r0 = \"mo.relu\"(%a0) {device = \"gpu:0\"} : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %r1 = \"mo.relu\"(%a1) {device = \"gpu:1\"} : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %r0, %r1 : tensor<4xf32>, tensor<4xf32>\n",
+        "  }\n",
+        "}\n"
+    );
+    let mut m = parse_mlir(src).unwrap();
+    assert_eq!(create_parallel_from_unbundle(&mut m), 2);
+    assert_eq!(fold_identity_tensor_bundles(&mut m), 2);
+
+    // Now fuse the producer `mo.parallel` (`mo.add`) and consumer `mo.parallel` (`mo.relu`)
+    // into a single `mo.parallel` whose body executes `mo.add` -> `mo.relu` -> `mo.yield`:
+    let merged = merge_adjacent_parallels(&mut m);
+    assert_eq!(merged, 1);
+
+    let fn_id = m.functions()[0];
+    let blk = m.regions[m.ops[fn_id].regions[0]].blocks[0];
+    let op_names: Vec<String> = m.blocks[blk]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(
+        op_names,
+        vec![
+            "mo.tensor.bundle",
+            "mo.parallel",
+            "mo.tensor.unbundle",
+            "func.return"
+        ]
+    );
+    let par_id = m.blocks[blk].ops[1];
+    assert_eq!(m.ops[par_id].results.len(), 1);
+    let par_blk = m.regions[m.ops[par_id].regions[0]].blocks[0];
+    let body_ops: Vec<String> = m.blocks[par_blk]
+        .ops
+        .iter()
+        .map(|&id| m.ops[id].name.full_name())
+        .collect();
+    assert_eq!(body_ops, vec!["mo.add", "mo.relu", "mo.yield"]);
+}

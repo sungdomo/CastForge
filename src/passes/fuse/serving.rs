@@ -25488,3 +25488,617 @@ pub fn fold_identity_tensor_bundles(module: &mut Module) -> usize {
     }
     folded
 }
+
+struct ParallelOperandsLayout {
+    bundle_inputs: Vec<ValueId>,
+    buffers: Vec<ValueId>,
+    in_chain: Option<ValueId>,
+    bundle_results: Vec<ValueId>,
+    out_chain: Option<ValueId>,
+}
+
+struct SelectedParallelMerge {
+    prod_id: OpId,
+    prod_layout: ParallelOperandsLayout,
+    shared_inputs: Vec<Option<usize>>,
+    buffers: Vec<ValueId>,
+    in_chain: Option<ValueId>,
+}
+
+fn inspect_parallel_op(module: &Module, op_id: OpId) -> Option<ParallelOperandsLayout> {
+    let op = module.ops.get(op_id)?;
+    if op.name.full_name() != "mo.parallel" || op.regions.len() != 1 {
+        return None;
+    }
+    let reg = module.regions.get(op.regions[0])?;
+    if reg.blocks.len() != 1 {
+        return None;
+    }
+    let mut bundle_inputs = Vec::new();
+    let mut buffers = Vec::new();
+    let mut in_chain = None;
+    for &v in &op.operands {
+        let ty = &module.values.get(v)?.ty;
+        if is_chain_type(ty) {
+            in_chain = Some(v);
+        } else if is_mutable_operand_type(ty) {
+            buffers.push(v);
+        } else {
+            bundle_inputs.push(v);
+        }
+    }
+    let mut bundle_results = Vec::new();
+    let mut out_chain = None;
+    for &r in &op.results {
+        let ty = &module.values.get(r)?.ty;
+        if is_chain_type(ty) {
+            out_chain = Some(r);
+        } else {
+            bundle_results.push(r);
+        }
+    }
+    Some(ParallelOperandsLayout {
+        bundle_inputs,
+        buffers,
+        in_chain,
+        bundle_results,
+        out_chain,
+    })
+}
+
+fn value_transitively_depends_on_op(module: &Module, root: ValueId, target_op: OpId) -> bool {
+    let mut visited = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    while let Some(v) = stack.pop() {
+        if !visited.insert(v) {
+            continue;
+        }
+        let Some(crate::ir::mlir::ValueDef::OpResult { op: def_op, .. }) =
+            module.values.get(v).map(|val| val.def)
+        else {
+            continue;
+        };
+        if def_op == target_op {
+            return true;
+        }
+        if let Some(op) = module.ops.get(def_op) {
+            stack.extend(op.operands.iter().copied());
+        }
+    }
+    false
+}
+
+/// Fuses adjacent `mo.parallel` producer and consumer operations in the same block when the
+/// consumer takes one or more producer bundle results directly as inputs, no dependence cycle
+/// exists through non-shared consumer inputs, and buffer/chain constraints match.
+///
+/// Drops producer bundle outputs used exclusively by the consumer and performs at most one
+/// merge per walk iteration until fixed point. Returns the number of parallel merges performed.
+pub fn merge_adjacent_parallels(module: &mut Module) -> usize {
+    use crate::ir::mlir::{Block, Location, OpName, Operation, Region, RegionId, Value, ValueDef};
+
+    let mut merged_count = 0usize;
+    loop {
+        let mut merged_in_iter = false;
+        let use_counts = {
+            let mut counts: std::collections::HashMap<ValueId, usize> =
+                std::collections::HashMap::new();
+            for op in module.ops.values() {
+                for &v in &op.operands {
+                    *counts.entry(v).or_insert(0) += 1;
+                }
+            }
+            counts
+        };
+
+        let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+        for bid in block_ids {
+            let ops_snapshot = module.blocks[bid].ops.clone();
+            for &consumer_id in &ops_snapshot {
+                let Some(consumer_layout) = inspect_parallel_op(module, consumer_id) else {
+                    continue;
+                };
+                // Collect candidate producer `mo.parallel` ops in consumer-input order:
+                let mut candidates_in_order = Vec::new();
+                let mut seen_producers = std::collections::HashSet::new();
+                for &inp in &consumer_layout.bundle_inputs {
+                    if let Some(ValueDef::OpResult { op: prod_id, .. }) =
+                        module.values.get(inp).map(|v| v.def)
+                        && prod_id != consumer_id
+                        && module.blocks[bid].ops.contains(&prod_id)
+                        && inspect_parallel_op(module, prod_id).is_some()
+                        && seen_producers.insert(prod_id)
+                    {
+                        candidates_in_order.push(prod_id);
+                    }
+                }
+
+                let mut selected: Option<SelectedParallelMerge> = None;
+
+                for prod_id in candidates_in_order {
+                    let Some(prod_layout) = inspect_parallel_op(module, prod_id) else {
+                        continue;
+                    };
+                    let mut shared_inputs = Vec::with_capacity(consumer_layout.bundle_inputs.len());
+                    for &inp in &consumer_layout.bundle_inputs {
+                        let shared_idx = prod_layout.bundle_results.iter().position(|&r| r == inp);
+                        shared_inputs.push(shared_idx);
+                    }
+                    // Reject if any non-shared consumer input transitively depends on `prod_id`:
+                    let has_cycle =
+                        consumer_layout
+                            .bundle_inputs
+                            .iter()
+                            .enumerate()
+                            .any(|(i, &inp)| {
+                                shared_inputs[i].is_none()
+                                    && value_transitively_depends_on_op(module, inp, prod_id)
+                            });
+                    if has_cycle {
+                        continue;
+                    }
+
+                    // Resolve buffer + chain plan:
+                    let (buffers, in_chain) = match (
+                        prod_layout.in_chain,
+                        prod_layout.out_chain,
+                        consumer_layout.in_chain,
+                    ) {
+                        (Some(p_in), Some(p_out), Some(c_in)) => {
+                            if prod_layout.buffers != consumer_layout.buffers
+                                || c_in != p_out
+                                || use_counts.get(&p_out).copied().unwrap_or(0) != 1
+                            {
+                                continue;
+                            }
+                            (prod_layout.buffers.clone(), Some(p_in))
+                        }
+                        (Some(p_in), _, None) => (prod_layout.buffers.clone(), Some(p_in)),
+                        (None, _, Some(c_in)) => (consumer_layout.buffers.clone(), Some(c_in)),
+                        (None, _, None) => (Vec::new(), None),
+                        _ => continue,
+                    };
+
+                    selected = Some(SelectedParallelMerge {
+                        prod_id,
+                        prod_layout,
+                        shared_inputs,
+                        buffers,
+                        in_chain,
+                    });
+                    break;
+                }
+
+                let Some(SelectedParallelMerge {
+                    prod_id,
+                    prod_layout,
+                    shared_inputs,
+                    buffers: merged_buffers,
+                    in_chain: merged_in_chain,
+                }) = selected
+                else {
+                    continue;
+                };
+
+                let prod_body_reg = module.ops[prod_id].regions[0];
+                let prod_body_blk = module.regions[prod_body_reg].blocks[0];
+                let cons_body_reg = module.ops[consumer_id].regions[0];
+                let cons_body_blk = module.regions[cons_body_reg].blocks[0];
+
+                let Some(&prod_yield_id) = module.blocks[prod_body_blk].ops.last() else {
+                    continue;
+                };
+                let Some(&cons_yield_id) = module.blocks[cons_body_blk].ops.last() else {
+                    continue;
+                };
+                if module.ops[prod_yield_id].name.full_name() != "mo.yield"
+                    || module.ops[cons_yield_id].name.full_name() != "mo.yield"
+                {
+                    continue;
+                }
+
+                let prod_num_bundles = prod_layout.bundle_results.len();
+                let cons_num_bundles = consumer_layout.bundle_results.len();
+
+                let mut drop_prod_yield = vec![false; prod_num_bundles];
+                for (i, &res_v) in prod_layout.bundle_results.iter().enumerate() {
+                    let has_external_user = module
+                        .ops
+                        .iter()
+                        .any(|(oid, op)| oid != consumer_id && op.operands.contains(&res_v));
+                    drop_prod_yield[i] = !has_external_user;
+                }
+
+                let mut merged_bundle_inputs = prod_layout.bundle_inputs.clone();
+                let mut cons_appended_arg_idx = vec![0usize; consumer_layout.bundle_inputs.len()];
+                let mut appended_idx = prod_layout.bundle_inputs.len();
+                for (bi, &inp) in consumer_layout.bundle_inputs.iter().enumerate() {
+                    if shared_inputs[bi].is_none() {
+                        merged_bundle_inputs.push(inp);
+                        cons_appended_arg_idx[bi] = appended_idx;
+                        appended_idx += 1;
+                    }
+                }
+
+                let merged_blk = module.blocks.insert(Block {
+                    id: BlockId::default(),
+                    label: None,
+                    arguments: Vec::new(),
+                    ops: Vec::new(),
+                });
+                module.blocks[merged_blk].id = merged_blk;
+
+                let prod_blk_args = module.blocks[prod_body_blk].arguments.clone();
+                let cons_blk_args = module.blocks[cons_body_blk].arguments.clone();
+                let mut merged_blk_args = Vec::new();
+                for &pa in &prod_blk_args[..prod_layout.bundle_inputs.len()] {
+                    let ty = module.values[pa].ty.clone();
+                    let arg_v = module.values.insert(Value {
+                        id: ValueId::default(),
+                        ssa_name: None,
+                        ty,
+                        def: ValueDef::BlockArgument {
+                            block: merged_blk,
+                            index: merged_blk_args.len() as u32,
+                        },
+                    });
+                    module.values[arg_v].id = arg_v;
+                    merged_blk_args.push(arg_v);
+                }
+                for (bi, &ca) in cons_blk_args[..consumer_layout.bundle_inputs.len()]
+                    .iter()
+                    .enumerate()
+                {
+                    if shared_inputs[bi].is_none() {
+                        let ty = module.values[ca].ty.clone();
+                        let arg_v = module.values.insert(Value {
+                            id: ValueId::default(),
+                            ssa_name: None,
+                            ty,
+                            def: ValueDef::BlockArgument {
+                                block: merged_blk,
+                                index: merged_blk_args.len() as u32,
+                            },
+                        });
+                        module.values[arg_v].id = arg_v;
+                        merged_blk_args.push(arg_v);
+                    }
+                }
+                let merged_chain_arg = if let Some(ch_v) = merged_in_chain {
+                    let ty = module.values[ch_v].ty.clone();
+                    let arg_v = module.values.insert(Value {
+                        id: ValueId::default(),
+                        ssa_name: None,
+                        ty,
+                        def: ValueDef::BlockArgument {
+                            block: merged_blk,
+                            index: merged_blk_args.len() as u32,
+                        },
+                    });
+                    module.values[arg_v].id = arg_v;
+                    merged_blk_args.push(arg_v);
+                    Some(arg_v)
+                } else {
+                    None
+                };
+                module.blocks[merged_blk].arguments = merged_blk_args.clone();
+
+                let mut mapping: std::collections::HashMap<ValueId, ValueId> =
+                    std::collections::HashMap::new();
+                for i in 0..prod_layout.bundle_inputs.len() {
+                    mapping.insert(prod_blk_args[i], merged_blk_args[i]);
+                }
+                if prod_layout.in_chain.is_some()
+                    && let (Some(&p_ch_arg), Some(m_ch_arg)) =
+                        (prod_blk_args.last(), merged_chain_arg)
+                {
+                    mapping.insert(p_ch_arg, m_ch_arg);
+                }
+
+                // Clone producer body ops (excluding terminator):
+                let prod_body_ops: Vec<OpId> = module.blocks[prod_body_blk]
+                    .ops
+                    .iter()
+                    .copied()
+                    .filter(|&id| id != prod_yield_id)
+                    .collect();
+                for old_op_id in prod_body_ops {
+                    let old_op = module.ops[old_op_id].clone();
+                    let new_operands: smallvec::SmallVec<[ValueId; 4]> = old_op
+                        .operands
+                        .iter()
+                        .map(|v| mapping.get(v).copied().unwrap_or(*v))
+                        .collect();
+                    let mut new_results = smallvec::SmallVec::<[ValueId; 2]>::new();
+                    for &old_r in &old_op.results {
+                        let r_ty = module.values[old_r].ty.clone();
+                        let new_r = module.values.insert(Value {
+                            id: ValueId::default(),
+                            ssa_name: None,
+                            ty: r_ty,
+                            def: ValueDef::BlockArgument {
+                                block: merged_blk,
+                                index: 0,
+                            },
+                        });
+                        module.values[new_r].id = new_r;
+                        mapping.insert(old_r, new_r);
+                        new_results.push(new_r);
+                    }
+                    let new_op = module.ops.insert(Operation {
+                        id: OpId::default(),
+                        name: old_op.name,
+                        operands: new_operands,
+                        results: new_results.clone(),
+                        attributes: old_op.attributes,
+                        regions: Vec::new(),
+                        custom_syntax: old_op.custom_syntax,
+                        location: old_op.location,
+                    });
+                    module.ops[new_op].id = new_op;
+                    for (idx, &nr) in new_results.iter().enumerate() {
+                        module.values[nr].def = ValueDef::OpResult {
+                            op: new_op,
+                            index: idx as u32,
+                        };
+                    }
+                    module.blocks[merged_blk].ops.push(new_op);
+                }
+
+                let prod_yield_operands = module.ops[prod_yield_id].operands.clone();
+                for (bi, &ca) in cons_blk_args[..consumer_layout.bundle_inputs.len()]
+                    .iter()
+                    .enumerate()
+                {
+                    if let Some(prod_idx) = shared_inputs[bi] {
+                        let py = prod_yield_operands[prod_idx];
+                        let mapped_py = mapping.get(&py).copied().unwrap_or(py);
+                        mapping.insert(ca, mapped_py);
+                    } else {
+                        mapping.insert(ca, merged_blk_args[cons_appended_arg_idx[bi]]);
+                    }
+                }
+                if consumer_layout.in_chain.is_some()
+                    && let Some(&c_ch_arg) = cons_blk_args.last()
+                {
+                    if prod_layout.in_chain.is_some() {
+                        if let Some(&py_last) = prod_yield_operands.last() {
+                            let mapped_ch = mapping.get(&py_last).copied().unwrap_or(py_last);
+                            mapping.insert(c_ch_arg, mapped_ch);
+                        }
+                    } else if let Some(m_ch_arg) = merged_chain_arg {
+                        mapping.insert(c_ch_arg, m_ch_arg);
+                    }
+                }
+
+                // Clone consumer body ops (excluding terminator):
+                let cons_body_ops: Vec<OpId> = module.blocks[cons_body_blk]
+                    .ops
+                    .iter()
+                    .copied()
+                    .filter(|&id| id != cons_yield_id)
+                    .collect();
+                for old_op_id in cons_body_ops {
+                    let old_op = module.ops[old_op_id].clone();
+                    let new_operands: smallvec::SmallVec<[ValueId; 4]> = old_op
+                        .operands
+                        .iter()
+                        .map(|v| mapping.get(v).copied().unwrap_or(*v))
+                        .collect();
+                    let mut new_results = smallvec::SmallVec::<[ValueId; 2]>::new();
+                    for &old_r in &old_op.results {
+                        let r_ty = module.values[old_r].ty.clone();
+                        let new_r = module.values.insert(Value {
+                            id: ValueId::default(),
+                            ssa_name: None,
+                            ty: r_ty,
+                            def: ValueDef::BlockArgument {
+                                block: merged_blk,
+                                index: 0,
+                            },
+                        });
+                        module.values[new_r].id = new_r;
+                        mapping.insert(old_r, new_r);
+                        new_results.push(new_r);
+                    }
+                    let new_op = module.ops.insert(Operation {
+                        id: OpId::default(),
+                        name: old_op.name,
+                        operands: new_operands,
+                        results: new_results.clone(),
+                        attributes: old_op.attributes,
+                        regions: Vec::new(),
+                        custom_syntax: old_op.custom_syntax,
+                        location: old_op.location,
+                    });
+                    module.ops[new_op].id = new_op;
+                    for (idx, &nr) in new_results.iter().enumerate() {
+                        module.values[nr].def = ValueDef::OpResult {
+                            op: new_op,
+                            index: idx as u32,
+                        };
+                    }
+                    module.blocks[merged_blk].ops.push(new_op);
+                }
+
+                let cons_yield_operands = module.ops[cons_yield_id].operands.clone();
+                let mut merged_yield_operands = smallvec::SmallVec::<[ValueId; 4]>::new();
+                for (i, &dropped) in drop_prod_yield.iter().enumerate() {
+                    if !dropped {
+                        let py = prod_yield_operands[i];
+                        merged_yield_operands.push(mapping.get(&py).copied().unwrap_or(py));
+                    }
+                }
+                for &cy in &cons_yield_operands[..cons_num_bundles] {
+                    merged_yield_operands.push(mapping.get(&cy).copied().unwrap_or(cy));
+                }
+                if merged_in_chain.is_some() {
+                    let ch_src = if consumer_layout.in_chain.is_some() {
+                        cons_yield_operands.last().copied()
+                    } else {
+                        prod_yield_operands.last().copied()
+                    };
+                    if let Some(ch_v) = ch_src {
+                        merged_yield_operands.push(mapping.get(&ch_v).copied().unwrap_or(ch_v));
+                    }
+                }
+                let merged_yield = module.ops.insert(Operation {
+                    id: OpId::default(),
+                    name: OpName::new("mo", "yield"),
+                    operands: merged_yield_operands,
+                    results: smallvec::SmallVec::new(),
+                    attributes: indexmap::IndexMap::new(),
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: Location::Unknown,
+                });
+                module.ops[merged_yield].id = merged_yield;
+                module.blocks[merged_blk].ops.push(merged_yield);
+
+                let merged_reg = module.regions.insert(Region {
+                    id: RegionId::default(),
+                    blocks: vec![merged_blk],
+                });
+                module.regions[merged_reg].id = merged_reg;
+
+                let mut merged_operands = smallvec::SmallVec::<[ValueId; 4]>::new();
+                merged_operands.extend(merged_bundle_inputs);
+                merged_operands.extend(merged_buffers);
+                if let Some(ch_in) = merged_in_chain {
+                    merged_operands.push(ch_in);
+                }
+
+                let mut prod_merged_res = vec![None; prod_num_bundles];
+                let mut merged_results = smallvec::SmallVec::<[ValueId; 2]>::new();
+                for (i, &dropped) in drop_prod_yield.iter().enumerate() {
+                    if !dropped {
+                        let ty = module.values[prod_layout.bundle_results[i]].ty.clone();
+                        let r = module.values.insert(Value {
+                            id: ValueId::default(),
+                            ssa_name: None,
+                            ty,
+                            def: ValueDef::BlockArgument {
+                                block: bid,
+                                index: 0,
+                            },
+                        });
+                        module.values[r].id = r;
+                        prod_merged_res[i] = Some(r);
+                        merged_results.push(r);
+                    }
+                }
+                let mut cons_merged_res = Vec::with_capacity(cons_num_bundles);
+                for &old_cr in &consumer_layout.bundle_results {
+                    let ty = module.values[old_cr].ty.clone();
+                    let r = module.values.insert(Value {
+                        id: ValueId::default(),
+                        ssa_name: None,
+                        ty,
+                        def: ValueDef::BlockArgument {
+                            block: bid,
+                            index: 0,
+                        },
+                    });
+                    module.values[r].id = r;
+                    cons_merged_res.push(r);
+                    merged_results.push(r);
+                }
+                let merged_out_chain = if let Some(ch_in) = merged_in_chain {
+                    let ty = module.values[ch_in].ty.clone();
+                    let r = module.values.insert(Value {
+                        id: ValueId::default(),
+                        ssa_name: None,
+                        ty,
+                        def: ValueDef::BlockArgument {
+                            block: bid,
+                            index: 0,
+                        },
+                    });
+                    module.values[r].id = r;
+                    merged_results.push(r);
+                    Some(r)
+                } else {
+                    None
+                };
+
+                let merged_parallel = module.ops.insert(Operation {
+                    id: OpId::default(),
+                    name: OpName::new("mo", "parallel"),
+                    operands: merged_operands,
+                    results: merged_results.clone(),
+                    attributes: module.ops[prod_id].attributes.clone(),
+                    regions: vec![merged_reg],
+                    custom_syntax: false,
+                    location: Location::Unknown,
+                });
+                module.ops[merged_parallel].id = merged_parallel;
+                for (idx, &mr) in merged_results.iter().enumerate() {
+                    module.values[mr].def = ValueDef::OpResult {
+                        op: merged_parallel,
+                        index: idx as u32,
+                    };
+                }
+
+                // Replace uses across module:
+                let all_ops: Vec<OpId> = module.ops.keys().collect();
+                for (i, maybe_r) in prod_merged_res.iter().enumerate() {
+                    if let Some(new_r) = *maybe_r {
+                        let old_r = prod_layout.bundle_results[i];
+                        for &oid in &all_ops {
+                            for opnd in &mut module.ops[oid].operands {
+                                if *opnd == old_r {
+                                    *opnd = new_r;
+                                }
+                            }
+                        }
+                    }
+                }
+                for (i, &new_cr) in cons_merged_res.iter().enumerate() {
+                    let old_cr = consumer_layout.bundle_results[i];
+                    for &oid in &all_ops {
+                        for opnd in &mut module.ops[oid].operands {
+                            if *opnd == old_cr {
+                                *opnd = new_cr;
+                            }
+                        }
+                    }
+                }
+                if let Some(new_ch) = merged_out_chain {
+                    for old_ch in [prod_layout.out_chain, consumer_layout.out_chain]
+                        .into_iter()
+                        .flatten()
+                    {
+                        for &oid in &all_ops {
+                            for opnd in &mut module.ops[oid].operands {
+                                if *opnd == old_ch {
+                                    *opnd = new_ch;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Replace `consumer_id` in block order with `merged_parallel` and erase `prod_id`:
+                for slot in &mut module.blocks[bid].ops {
+                    if *slot == consumer_id {
+                        *slot = merged_parallel;
+                    }
+                }
+                module.blocks[bid].ops.retain(|&id| id != prod_id);
+                module.ops.remove(prod_id);
+                module.ops.remove(consumer_id);
+
+                merged_count += 1;
+                merged_in_iter = true;
+                break;
+            }
+            if merged_in_iter {
+                break;
+            }
+        }
+        if !merged_in_iter {
+            break;
+        }
+    }
+    merged_count
+}
