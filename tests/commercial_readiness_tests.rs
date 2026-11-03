@@ -36,12 +36,13 @@ use castforge::passes::{
     hoist_symbolic_dim_expressions, is_supported_arch_dtype, legalize_rowwise_reduction_launch,
     longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
     mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops, merge_duplicate_shape_ops,
-    merge_identical_functions, num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve,
-    plan_cacheblend_token_reorder, plan_concat_in_place, plan_dynamic_memory_pool,
-    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
-    promote_narrow_accumulators, re_rope_key_in_place, recalculate_subchunk_blocks_to_skip,
-    reuse_dead_loop_buffers, stamp_fused_provenance, unfold_chunk_range,
-    unique_blend_token_coverage, unpack_token_ids_be, validate_target_device_dtypes,
+    merge_identical_functions, merge_parallel_matmuls, num_packed_tokens, pack_token_ids_be,
+    plan_cacheblend_retrieve, plan_cacheblend_token_reorder, plan_concat_in_place,
+    plan_dynamic_memory_pool, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
+    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
+    recalculate_subchunk_blocks_to_skip, reuse_dead_loop_buffers, stamp_fused_provenance,
+    unfold_chunk_range, unique_blend_token_coverage, unpack_token_ids_be,
+    validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -2631,4 +2632,51 @@ fn test_coordinator_event_gate_incarnation_fencing_dedup_and_gaps() {
         ..b1
     };
     assert_eq!(gate.ingest(&b_l2_after_drop), EventIngestOutcome::Admitted);
+}
+
+#[test]
+fn test_merge_parallel_matmuls_shared_activation_and_transpose_guard() {
+    use castforge::ir::Attribute;
+
+    let mlir = r#"
+module @parallel_matmul {
+  func.func @main(%a: tensor<4x8xf32>, %b: tensor<8x16xf32>, %c: tensor<8x32xf32>) {
+    %c1 = stablehlo.dot %a, %b : (tensor<4x8xf32>, tensor<8x16xf32>) -> tensor<4x16xf32>
+    %c2 = stablehlo.dot %a, %c : (tensor<4x8xf32>, tensor<8x32xf32>) -> tensor<4x32xf32>
+    %act1 = stablehlo.tanh %c1 : tensor<4x16xf32>
+    %act2 = stablehlo.tanh %c2 : tensor<4x32xf32>
+    return %act1 : tensor<4x16xf32>
+  }
+}
+"#;
+    let mut module = parse_mlir(mlir).expect("valid MLIR");
+    let merged = merge_parallel_matmuls(&mut module);
+    assert_eq!(merged, 1);
+
+    let func_id = module.functions()[0];
+    let block_id = module.regions[module.ops[func_id].regions[0]].blocks[0];
+    let ops = &module.blocks[block_id].ops;
+    // Expected: `stablehlo.concatenate`, merged `stablehlo.dot`, `mo.split`,
+    // `stablehlo.tanh`, `stablehlo.tanh`, `func.return`
+    assert_eq!(ops.len(), 6);
+    assert!(module.ops[ops[0]].is_op("stablehlo", "concatenate"));
+    assert!(module.ops[ops[1]].is_op("stablehlo", "dot"));
+    assert!(module.ops[ops[2]].is_op("mo", "split"));
+    assert_eq!(
+        module.ops[ops[2]].attributes.get("split_sizes"),
+        Some(&Attribute::DenseIntArray(vec![16, 32]))
+    );
+
+    // Verify that when all matmul users only feed directly into `func.return`, merging is skipped:
+    let return_only_mlir = r#"
+module @parallel_matmul_return_only {
+  func.func @main(%a: tensor<4x8xf32>, %b: tensor<8x16xf32>, %c: tensor<8x32xf32>) {
+    %c1 = stablehlo.dot %a, %b : (tensor<4x8xf32>, tensor<8x16xf32>) -> tensor<4x16xf32>
+    %c2 = stablehlo.dot %a, %c : (tensor<4x8xf32>, tensor<8x32xf32>) -> tensor<4x32xf32>
+    return %c1, %c2 : tensor<4x16xf32>, tensor<4x32xf32>
+  }
+}
+"#;
+    let mut ret_module = parse_mlir(return_only_mlir).expect("valid MLIR");
+    assert_eq!(merge_parallel_matmuls(&mut ret_module), 0);
 }

@@ -6764,3 +6764,309 @@ impl CoordinatorEventGate {
         &self.fenced_instances
     }
 }
+
+fn is_mergeable_matmul_op(op: &Operation) -> bool {
+    op.is_op("stablehlo", "dot_general")
+        || op.is_op("stablehlo", "dot")
+        || op.is_op("linalg", "matmul")
+        || op.is_op("mo", "matmul")
+        || op.is_op("mo", "batch_matmul")
+        || op.is_op("tosa", "matmul")
+}
+
+/// Merges sibling matrix multiplications (`matmul(A, B1) -> C1`, `matmul(A, B2) -> C2`, ...) that
+/// share the same LHS activation tensor `A` into a single weight concatenation
+/// (`stablehlo.concatenate`), a single combined matmul, and a multi-result `mo.split`, skipping
+/// groups whose RHS weights are produced by a transpose or whose results all feed directly into
+/// `func.return` (inspired by Modular `GraphCompiler/lib/MODialect/Patterns/Algebraic.cpp`
+/// `MergeParallelMatmulPattern`).
+pub fn merge_parallel_matmuls(module: &mut Module) -> usize {
+    let mut merged_groups = 0usize;
+    let func_ids = module.functions();
+
+    for func_id in func_ids {
+        let Some(&reg_id) = module.ops[func_id].regions.first() else {
+            continue;
+        };
+        let Some(&block_id) = module.regions[reg_id].blocks.first() else {
+            continue;
+        };
+        let block_ops = module.blocks[block_id].ops.clone();
+
+        let mut op_pos: std::collections::HashMap<OpId, usize> = std::collections::HashMap::new();
+        let mut val_users: std::collections::HashMap<ValueId, Vec<OpId>> =
+            std::collections::HashMap::new();
+        for (idx, &op_id) in block_ops.iter().enumerate() {
+            op_pos.insert(op_id, idx);
+            if let Some(op) = module.ops.get(op_id) {
+                for &v in &op.operands {
+                    val_users.entry(v).or_default().push(op_id);
+                }
+            }
+        }
+
+        let mut by_lhs: IndexMap<ValueId, Vec<OpId>> = IndexMap::new();
+        for &op_id in &block_ops {
+            let Some(op) = module.ops.get(op_id) else {
+                continue;
+            };
+            if !is_mergeable_matmul_op(op) || op.operands.len() != 2 || op.results.len() != 1 {
+                continue;
+            }
+            by_lhs.entry(op.operands[0]).or_default().push(op_id);
+        }
+
+        let mut to_remove: std::collections::HashSet<OpId> = std::collections::HashSet::new();
+        let mut insertions: Vec<(OpId, Vec<OpId>)> = Vec::new();
+
+        for (lhs_val, matmul_ids) in by_lhs {
+            if matmul_ids.len() < 2 {
+                continue;
+            }
+
+            // Skip if every matmul user in this group only feeds directly into `func.return`
+            // or `mo.output` (outputs would force the split to materialize, which is slower).
+            let all_feed_only_outputs = matmul_ids.iter().all(|&m_id| {
+                let Some(m_op) = module.ops.get(m_id) else {
+                    return false;
+                };
+                let res_val = m_op.results[0];
+                let Some(users) = val_users.get(&res_val) else {
+                    return false;
+                };
+                !users.is_empty()
+                    && users.iter().all(|&u_id| {
+                        module
+                            .ops
+                            .get(u_id)
+                            .is_some_and(|u| u.is_op("func", "return") || u.is_op("mo", "output"))
+                    })
+            });
+            if all_feed_only_outputs {
+                continue;
+            }
+
+            let first_id = matmul_ids[0];
+            let first_pos = op_pos[&first_id];
+            let first_op = module.ops[first_id].clone();
+            let Some(first_res_tt) = module
+                .values
+                .get(first_op.results[0])
+                .and_then(|v| v.ty.as_tensor())
+                .cloned()
+            else {
+                continue;
+            };
+            let Some(first_rhs_tt) = module
+                .values
+                .get(first_op.operands[1])
+                .and_then(|v| v.ty.as_tensor())
+                .cloned()
+            else {
+                continue;
+            };
+            let res_rank = first_res_tt.shape.len();
+            let rhs_rank = first_rhs_tt.shape.len();
+            if res_rank < 2 || rhs_rank < 2 {
+                continue;
+            }
+
+            let mut valid = true;
+            let mut weights_to_concat: smallvec::SmallVec<[ValueId; 4]> = smallvec::SmallVec::new();
+            let mut columns_in_each: Vec<i64> = Vec::with_capacity(matmul_ids.len());
+            let mut total_columns = 0i64;
+            let mut source_locs: Vec<Location> = Vec::with_capacity(matmul_ids.len());
+            let mut orig_results: smallvec::SmallVec<[ValueId; 2]> = smallvec::SmallVec::new();
+
+            for &m_id in &matmul_ids {
+                let Some(m_op) = module.ops.get(m_id) else {
+                    valid = false;
+                    break;
+                };
+                if m_op.name != first_op.name {
+                    valid = false;
+                    break;
+                }
+                let rhs_val = m_op.operands[1];
+                let res_val = m_op.results[0];
+
+                // Reject if RHS is defined by a transpose (`ForceMatmulTransposeBForGPU` hazard)
+                // or defined after `first_pos` in the same block.
+                if let Some(ValueDef::OpResult { op: def_op_id, .. }) =
+                    module.values.get(rhs_val).map(|v| v.def)
+                {
+                    if let Some(def_op) = module.ops.get(def_op_id)
+                        && (def_op.is_op("stablehlo", "transpose")
+                            || def_op.is_op("mo", "transpose"))
+                    {
+                        valid = false;
+                        break;
+                    }
+                    if let Some(&def_pos) = op_pos.get(&def_op_id)
+                        && def_pos > first_pos
+                    {
+                        valid = false;
+                        break;
+                    }
+                }
+
+                let Some(res_tt) = module.values.get(res_val).and_then(|v| v.ty.as_tensor()) else {
+                    valid = false;
+                    break;
+                };
+                let Some(rhs_tt) = module.values.get(rhs_val).and_then(|v| v.ty.as_tensor()) else {
+                    valid = false;
+                    break;
+                };
+                if res_tt.dtype != first_res_tt.dtype
+                    || rhs_tt.dtype != first_rhs_tt.dtype
+                    || res_tt.shape.len() != res_rank
+                    || rhs_tt.shape.len() != rhs_rank
+                    || res_tt.shape[..res_rank - 1] != first_res_tt.shape[..res_rank - 1]
+                    || rhs_tt.shape[..rhs_rank - 1] != first_rhs_tt.shape[..rhs_rank - 1]
+                {
+                    valid = false;
+                    break;
+                }
+                let (Dim::Static(res_cols), Dim::Static(rhs_cols)) =
+                    (&res_tt.shape[res_rank - 1], &rhs_tt.shape[rhs_rank - 1])
+                else {
+                    valid = false;
+                    break;
+                };
+                if *res_cols <= 0 || res_cols != rhs_cols {
+                    valid = false;
+                    break;
+                }
+
+                weights_to_concat.push(rhs_val);
+                columns_in_each.push(*res_cols);
+                total_columns += *res_cols;
+                source_locs.push(m_op.location.clone());
+                orig_results.push(res_val);
+            }
+
+            if !valid {
+                continue;
+            }
+
+            let fused_loc = fuse_locations(&source_locs);
+            let mut concat_shape = first_rhs_tt.shape.clone();
+            concat_shape[rhs_rank - 1] = Dim::Static(total_columns);
+            let concat_ty = Type::Tensor(TensorType {
+                shape: concat_shape,
+                dtype: first_rhs_tt.dtype.clone(),
+                encoding: first_rhs_tt.encoding.clone(),
+            });
+
+            let mut concat_attrs = IndexMap::new();
+            concat_attrs.insert(
+                "dimension".to_string(),
+                Attribute::Int((rhs_rank - 1) as i64),
+            );
+            let concat_op_id = module.ops.insert_with_key(|id| Operation {
+                id,
+                name: crate::ir::OpName::new("stablehlo", "concatenate"),
+                operands: weights_to_concat,
+                results: smallvec::SmallVec::new(),
+                attributes: concat_attrs,
+                regions: Vec::new(),
+                custom_syntax: false,
+                location: fused_loc.clone(),
+            });
+            let concat_val_id = module.values.insert_with_key(|id| crate::ir::Value {
+                id,
+                ssa_name: None,
+                ty: concat_ty,
+                def: ValueDef::OpResult {
+                    op: concat_op_id,
+                    index: 0,
+                },
+            });
+            module.ops[concat_op_id].results.push(concat_val_id);
+
+            let mut merged_res_shape = first_res_tt.shape.clone();
+            merged_res_shape[res_rank - 1] = Dim::Static(total_columns);
+            let merged_res_ty = Type::Tensor(TensorType {
+                shape: merged_res_shape,
+                dtype: first_res_tt.dtype.clone(),
+                encoding: first_res_tt.encoding.clone(),
+            });
+
+            let merged_matmul_id = module.ops.insert_with_key(|id| {
+                let mut op = Operation {
+                    id,
+                    name: first_op.name.clone(),
+                    operands: smallvec::smallvec![lhs_val, concat_val_id],
+                    results: smallvec::SmallVec::new(),
+                    attributes: first_op.attributes.clone(),
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: fused_loc.clone(),
+                };
+                stamp_fused_provenance(&mut op, &source_locs);
+                op
+            });
+            let merged_matmul_val = module.values.insert_with_key(|id| crate::ir::Value {
+                id,
+                ssa_name: None,
+                ty: merged_res_ty,
+                def: ValueDef::OpResult {
+                    op: merged_matmul_id,
+                    index: 0,
+                },
+            });
+            module.ops[merged_matmul_id].results.push(merged_matmul_val);
+
+            let mut split_attrs = IndexMap::new();
+            split_attrs.insert("axis".to_string(), Attribute::Int((res_rank - 1) as i64));
+            split_attrs.insert(
+                "split_sizes".to_string(),
+                Attribute::DenseIntArray(columns_in_each),
+            );
+            let split_op_id = module.ops.insert_with_key(|id| Operation {
+                id,
+                name: crate::ir::OpName::new("mo", "split"),
+                operands: smallvec::smallvec![merged_matmul_val],
+                results: orig_results.clone(),
+                attributes: split_attrs,
+                regions: Vec::new(),
+                custom_syntax: false,
+                location: fused_loc,
+            });
+            for (idx, &res_v) in orig_results.iter().enumerate() {
+                if let Some(v_mut) = module.values.get_mut(res_v) {
+                    v_mut.def = ValueDef::OpResult {
+                        op: split_op_id,
+                        index: idx as u32,
+                    };
+                }
+            }
+
+            insertions.push((first_id, vec![concat_op_id, merged_matmul_id, split_op_id]));
+            for &m_id in &matmul_ids {
+                to_remove.insert(m_id);
+            }
+            merged_groups += 1;
+        }
+
+        if !insertions.is_empty() {
+            let insert_map: std::collections::HashMap<OpId, Vec<OpId>> =
+                insertions.into_iter().collect();
+            let mut new_block_ops = Vec::with_capacity(block_ops.len() + 4);
+            for op_id in block_ops {
+                if let Some(new_ops) = insert_map.get(&op_id) {
+                    new_block_ops.extend_from_slice(new_ops);
+                }
+                if to_remove.contains(&op_id) {
+                    module.ops.remove(op_id);
+                } else {
+                    new_block_ops.push(op_id);
+                }
+            }
+            module.blocks[block_id].ops = new_block_ops;
+        }
+    }
+
+    merged_groups
+}
