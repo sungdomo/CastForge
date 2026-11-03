@@ -28250,3 +28250,215 @@ pub fn validate_multi_serde_group_size<T>(
     }
     Ok(())
 }
+
+/// Checks whether a `map.iter.opaque` kernel contains an accumulating `map.call_opaque`
+/// operation (`concat`, `matmul`, `batch_matmul`, `conv`, or `conv_transpose`).
+fn kernel_contains_accumulating_call(module: &Module, kernel_id: OpId) -> bool {
+    let regions = module.ops[kernel_id].regions.clone();
+    for rid in regions {
+        for &bid in &module.regions[rid].blocks {
+            for &op_id in &module.blocks[bid].ops {
+                let op = &module.ops[op_id];
+                if op.name.full_name() == "map.call_opaque"
+                    && let Some(Attribute::String(kname)) = op
+                        .attributes
+                        .get("kernel_name")
+                        .or_else(|| op.attributes.get("callee"))
+                    && (kname.contains("mo.concat")
+                        || kname.contains("mo.matmul")
+                        || kname.contains("mo.batch_matmul")
+                        || kname.contains("mo.conv")
+                        || kname.contains("mo.conv_transpose"))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Resolves the outer store-target tensor for a `map.iter.epilogue` op by scanning its body's
+/// `map.store` ops and mapping captured block arguments back to the epilogue's capture operands.
+/// Prefers a captured tensor whose element type matches the epilogue's input value element type.
+fn find_epilogue_store_target(
+    module: &Module,
+    epi_id: OpId,
+) -> Option<(ValueId, crate::ir::mlir::DType)> {
+    use crate::ir::mlir::{DType, ValueDef};
+
+    let epi_op = &module.ops[epi_id];
+    let rid = *epi_op.regions.first()?;
+    let bid = *module.regions[rid].blocks.first()?;
+    let block = &module.blocks[bid];
+    if block.arguments.len() < 2 {
+        return None;
+    }
+    let val_arg = block.arguments[0];
+    let val_dtype = match &module.values[val_arg].ty {
+        Type::Scalar(dt) => dt.clone(),
+        Type::Tensor(tt) => tt.dtype.clone(),
+        _ => DType::F32,
+    };
+
+    let mut fallback: Option<(ValueId, DType)> = None;
+    for &op_id in &block.ops {
+        let op = &module.ops[op_id];
+        if op.name.full_name() == "map.store" && op.operands.len() >= 2 {
+            // In `map.store %val, %tensor, %idx`, operand 1 (or operand 0 if 2-operand) is the
+            // target tensor block argument captured by the epilogue closure.
+            let tensor_val = if op.operands.len() >= 3 {
+                op.operands[1]
+            } else {
+                op.operands[0]
+            };
+            if let ValueDef::BlockArgument {
+                block: arg_blk,
+                index: arg_idx,
+            } = module.values[tensor_val].def
+                && arg_blk == bid
+                && (arg_idx as usize) >= 2
+            {
+                let capture_idx = (arg_idx as usize) - 2;
+                if let Some(&outer_capture) = epi_op.operands.get(capture_idx) {
+                    let outer_ty = module.values[outer_capture].ty.clone();
+                    if let Type::Tensor(ref tt) = outer_ty
+                        && tt.dtype == val_dtype
+                    {
+                        return Some((outer_capture, val_dtype));
+                    }
+                    if fallback.is_none() {
+                        fallback = Some((outer_capture, val_dtype.clone()));
+                    }
+                }
+            }
+        }
+    }
+    fallback
+}
+
+/// Assigns a concrete `$intermediateTensor` store-target operand (and `"has_intermediate_tensor"`
+/// attribute) to every fused `map.iter.epilogue` inside `map.iter.opaque` kernels.
+///
+/// When an accumulating kernel (`matmul`, `batch_matmul`, `conv`, `conv_transpose`, `concat`)
+/// has a dtype-changing epilogue (the epilogue body's input element type differs from the store
+/// target tensor's element type), allocates a fresh pre-cast accumulation scratch result on the
+/// enclosing `map.iter.opaque` (inserted before any trailing `!mo.chain` result) plus a matching
+/// trailing block argument on the kernel body, and binds the epilogue's intermediate tensor to
+/// that scratch argument.
+///
+/// Returns `(assigned_epilogues, allocated_scratch_buffers)`.
+pub fn allocate_accumulating_buffers(module: &mut Module) -> (usize, usize) {
+    use crate::ir::mlir::{RegionId, Value, ValueDef};
+
+    let mut assigned_epilogues = 0usize;
+    let mut allocated_scratch = 0usize;
+
+    let region_ids: Vec<RegionId> = module.regions.iter().map(|(r, _)| r).collect();
+    for rid in region_ids {
+        let block_ids = module.regions[rid].blocks.clone();
+        for bid in block_ids {
+            let op_ids = module.blocks[bid].ops.clone();
+            for kernel_id in op_ids {
+                if module.ops[kernel_id].name.full_name() != "map.iter.opaque" {
+                    continue;
+                }
+                let is_accumulating = kernel_contains_accumulating_call(module, kernel_id);
+                let Some(&k_rid) = module.ops[kernel_id].regions.first() else {
+                    continue;
+                };
+                let Some(&k_bid) = module.regions[k_rid].blocks.first() else {
+                    continue;
+                };
+                let k_ops = module.blocks[k_bid].ops.clone();
+                for epi_id in k_ops {
+                    if module.ops[epi_id].name.full_name() != "map.iter.epilogue" {
+                        continue;
+                    }
+                    if module.ops[epi_id]
+                        .attributes
+                        .contains_key("has_intermediate_tensor")
+                    {
+                        continue;
+                    }
+                    let Some((store_target, in_dtype)) = find_epilogue_store_target(module, epi_id)
+                    else {
+                        continue;
+                    };
+                    let target_ty = module.values[store_target].ty.clone();
+                    let dtype_changes = match &target_ty {
+                        Type::Tensor(tt) => tt.dtype != in_dtype,
+                        _ => false,
+                    };
+
+                    let intermediate_val = if dtype_changes && is_accumulating {
+                        let Type::Tensor(ref tt) = target_ty else {
+                            continue;
+                        };
+                        let mut scratch_tt = tt.clone();
+                        scratch_tt.dtype = in_dtype;
+                        let scratch_ty = Type::Tensor(scratch_tt);
+
+                        // Add a new non-chain result on `kernel_id` before any trailing chain.
+                        let existing_results = module.ops[kernel_id].results.clone();
+                        let has_trailing_chain = existing_results.last().is_some_and(|&v| {
+                            matches!(&module.values[v].ty, Type::Opaque(s) if s == "!mo.chain")
+                        });
+                        let insert_pos = if has_trailing_chain {
+                            existing_results.len() - 1
+                        } else {
+                            existing_results.len()
+                        };
+                        let scratch_res = module.values.insert(Value {
+                            id: ValueId::default(),
+                            ssa_name: None,
+                            ty: scratch_ty.clone(),
+                            def: ValueDef::OpResult {
+                                op: kernel_id,
+                                index: insert_pos as u32,
+                            },
+                        });
+                        module.values[scratch_res].id = scratch_res;
+                        module.ops[kernel_id]
+                            .results
+                            .insert(insert_pos, scratch_res);
+                        if has_trailing_chain
+                            && let Some(&chain_v) = module.ops[kernel_id].results.last()
+                        {
+                            module.values[chain_v].def = ValueDef::OpResult {
+                                op: kernel_id,
+                                index: (module.ops[kernel_id].results.len() - 1) as u32,
+                            };
+                        }
+
+                        // Append matching output block argument to the kernel body block.
+                        let arg_idx = module.blocks[k_bid].arguments.len() as u32;
+                        let scratch_arg = module.values.insert(Value {
+                            id: ValueId::default(),
+                            ssa_name: None,
+                            ty: scratch_ty.clone(),
+                            def: ValueDef::BlockArgument {
+                                block: k_bid,
+                                index: arg_idx,
+                            },
+                        });
+                        module.values[scratch_arg].id = scratch_arg;
+                        module.blocks[k_bid].arguments.push(scratch_arg);
+                        allocated_scratch += 1;
+                        scratch_arg
+                    } else {
+                        store_target
+                    };
+
+                    module.ops[epi_id].operands.push(intermediate_val);
+                    module.ops[epi_id]
+                        .attributes
+                        .insert("has_intermediate_tensor".to_string(), Attribute::Bool(true));
+                    assigned_epilogues += 1;
+                }
+            }
+        }
+    }
+
+    (assigned_epilogues, allocated_scratch)
+}

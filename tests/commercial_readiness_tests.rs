@@ -8109,3 +8109,123 @@ fn test_tenant_quota_manager_allowlist_vs_default_semantics_and_multi_serde_arit
         .expect_err("arity mismatch must error");
     assert!(err.contains("MultiSerde dst group length 1 does not match expected 2"));
 }
+
+#[test]
+fn test_allocate_accumulating_buffers_mixed_precision_vs_same_dtype() {
+    use castforge::ir::Attribute;
+    use castforge::ir::mlir::OpName;
+    use castforge::passes::allocate_accumulating_buffers;
+
+    let src = concat!(
+        "module {\n",
+        "  func.func @mixed_and_same(\n",
+        "    %a: tensor<4x4xf32>,\n",
+        "    %out_f16: tensor<4x4xf16>,\n",
+        "    %out_f32: tensor<4x4xf32>,\n",
+        "    %ch0: !mo.chain\n",
+        "  ) -> (tensor<4x4xf16>, tensor<4x4xf32>, !mo.chain) {\n",
+        "    return %out_f16, %out_f32, %ch0",
+        " : tensor<4x4xf16>, tensor<4x4xf32>, !mo.chain\n",
+        "  }\n",
+        "}\n"
+    );
+
+    let mut module = parse_mlir(src).unwrap();
+    let fn_id = module.functions()[0];
+    let fn_blk = module.regions[module.ops[fn_id].regions[0]].blocks[0];
+    let fn_args = module.blocks[fn_blk].arguments.clone();
+    let (a_arg, out_f16_arg, out_f32_arg, ch0_arg) =
+        (fn_args[0], fn_args[1], fn_args[2], fn_args[3]);
+    let f32_scalar = castforge::ir::Type::Scalar(DType::F32);
+    let f16_scalar = castforge::ir::Type::Scalar(DType::F16);
+    let idx_ty = castforge::ir::Type::Scalar(DType::Index);
+    let t_f32 = module.values[a_arg].ty.clone();
+    let t_f16 = module.values[out_f16_arg].ty.clone();
+    let ch_ty = module.values[ch0_arg].ty.clone();
+
+    // Helper to build a `map.iter.opaque` with a `mo.matmul` call and a `map.iter.epilogue`:
+    let build_kernel = |m: &mut castforge::ir::Module,
+                        out_arg: castforge::ir::ValueId,
+                        out_ty: castforge::ir::Type,
+                        store_val_ty: castforge::ir::Type| {
+        let epi_blk = m.create_block(None);
+        let val_in = m.add_block_argument(epi_blk, None, f32_scalar.clone());
+        let idx_in = m.add_block_argument(epi_blk, None, idx_ty.clone());
+        let cap_out = m.add_block_argument(epi_blk, None, out_ty.clone());
+        let store_val = if store_val_ty != f32_scalar {
+            let cast_op = m.add_operation(
+                epi_blk,
+                OpName::new("map", "cast"),
+                smallvec::smallvec![val_in],
+                vec![(None, store_val_ty)],
+                indexmap::IndexMap::new(),
+                vec![],
+                false,
+                Location::Unknown,
+            );
+            m.ops[cast_op].results[0]
+        } else {
+            val_in
+        };
+        m.add_operation(
+            epi_blk,
+            OpName::new("map", "store"),
+            smallvec::smallvec![store_val, cap_out, idx_in],
+            vec![],
+            indexmap::IndexMap::new(),
+            vec![],
+            false,
+            Location::Unknown,
+        );
+        let epi_reg = m.create_region(vec![epi_blk]);
+
+        let k_blk = m.create_block(None);
+        let in_a = m.add_block_argument(k_blk, None, t_f32.clone());
+        let _in_out = m.add_block_argument(k_blk, None, out_ty.clone());
+        let mut call_attrs = indexmap::IndexMap::new();
+        call_attrs.insert(
+            "kernel_name".to_string(),
+            Attribute::String("mo.matmul".to_string()),
+        );
+        m.add_operation(
+            k_blk,
+            OpName::new("map", "call_opaque"),
+            smallvec::smallvec![in_a, in_a],
+            vec![(None, t_f32.clone())],
+            call_attrs,
+            vec![],
+            false,
+            Location::Unknown,
+        );
+        m.add_operation(
+            k_blk,
+            OpName::new("map", "iter.epilogue"),
+            smallvec::smallvec![out_arg],
+            vec![],
+            indexmap::IndexMap::new(),
+            vec![epi_reg],
+            false,
+            Location::Unknown,
+        );
+        let k_reg = m.create_region(vec![k_blk]);
+        m.add_operation(
+            fn_blk,
+            OpName::new("map", "iter.opaque"),
+            smallvec::smallvec![a_arg, out_arg, ch0_arg],
+            vec![(None, out_ty), (None, ch_ty.clone())],
+            indexmap::IndexMap::new(),
+            vec![k_reg],
+            false,
+            Location::Unknown,
+        )
+    };
+
+    let k1 = build_kernel(&mut module, out_f16_arg, t_f16, f16_scalar);
+    let k2 = build_kernel(&mut module, out_f32_arg, t_f32.clone(), f32_scalar.clone());
+
+    let (assigned, scratch) = allocate_accumulating_buffers(&mut module);
+    assert_eq!(assigned, 2);
+    assert_eq!(scratch, 1);
+    assert_eq!(module.ops[k1].results.len(), 3);
+    assert_eq!(module.ops[k2].results.len(), 2);
+}
