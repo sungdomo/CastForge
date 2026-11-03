@@ -5316,3 +5316,46 @@ fn test_fixup_hanging_chain_overhangs_awaits_unused_chains() {
     assert_eq!(m.ops[join_op].name.full_name(), "mo.chain.create");
     assert_eq!(m.ops[join_op].operands.len(), 3);
 }
+
+#[test]
+fn test_outline_structured_kernel_bodies_into_opaque_closure() {
+    use castforge::ir::mlir::Attribute;
+    use castforge::passes::outline_structured_kernel_bodies;
+
+    let mlir = concat!(
+        "module @outline_structured {\n",
+        "  func.func @main(%ch0: tensor<1xi64>, %x: tensor<4xf32>) -> tensor<4xf32> {\n",
+        "    %out = map.iter.elementwise %ch0, %x {has_read_effect = true}",
+        " : (tensor<1xi64>, tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %out : tensor<4xf32>\n",
+        "  }\n",
+        "}\n",
+    );
+
+    let mut m = parse_mlir(mlir).expect("valid MLIR");
+    assert_eq!(outline_structured_kernel_bodies(&mut m), 1);
+
+    let func_id = m.functions()[0];
+    let blk_id = m.regions[m.ops[func_id].regions[0]].blocks[0];
+    let opaque_op = m.blocks[blk_id].ops[0];
+    assert_eq!(m.ops[opaque_op].name.full_name(), "map.iter.opaque");
+    assert_eq!(
+        m.ops[opaque_op].attributes.get("device_ref"),
+        Some(&Attribute::String("cpu:0".to_string()))
+    );
+    assert_eq!(
+        m.ops[opaque_op].attributes.get("has_read_effect"),
+        Some(&Attribute::Bool(true))
+    );
+
+    // Outer opaque block captures the 1 non-chain input (`%x`) + 1 non-chain output (`%out`).
+    let opaque_blk = m.regions[m.ops[opaque_op].regions[0]].blocks[0];
+    assert_eq!(m.blocks[opaque_blk].arguments.len(), 2);
+    let closure_op = m.blocks[opaque_blk].ops[0];
+    assert_eq!(m.ops[closure_op].name.full_name(), "map.closure");
+    assert_eq!(m.ops[closure_op].operands.len(), 2);
+
+    // Inner closure block has its trailing `%idx` (`tensor<1xi64>`) rotated to argument 0.
+    let closure_blk = m.regions[m.ops[closure_op].regions[0]].blocks[0];
+    assert_eq!(m.blocks[closure_blk].arguments.len(), 3);
+}

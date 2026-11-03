@@ -17190,3 +17190,238 @@ pub fn fixup_hanging_chain_overhangs(module: &mut Module) -> usize {
 
     joined_chains
 }
+
+// ============================================================================
+// Batch 20 Step 4: Structured Kernel Body Outliner into Opaque Closure Regions
+// ============================================================================
+
+/// Returns `true` if `full_name` is a structured `map.iter.*` loop operation eligible for
+/// outlining into `map.iter.opaque`.
+fn is_structured_map_iter_op(full_name: &str) -> bool {
+    matches!(
+        full_name,
+        "map.iter.elementwise" | "map.iter.reduction" | "map.iter.foreach"
+    )
+}
+
+/// Wraps structured `map.iter.elementwise`, `map.iter.reduction`, and `map.iter.foreach` loops in
+/// `map.iter.opaque` operations containing a `map.closure` body so sequential setup can reside
+/// outside the structured loop body:
+/// - Preserves `device_ref` (defaulting to `"cpu:0"` if absent), `fusion_info`, `has_read_effect`,
+///   `has_write_effect`, and `dispatch` attributes on `map.iter.opaque`.
+/// - Creates an outer block on `map.iter.opaque` whose block arguments capture all non-chain input
+///   operands and non-chain result types.
+/// - Moves the structured loop's body block into the inner `map.closure` region and rotates its
+///   trailing loop-index block argument (`[inputs..., outputs..., index]`) to position `0`
+///   (`[index, captures...]`).
+/// - Replaces the structured loop with `map.iter.opaque` and returns the count of outlined loops.
+pub fn outline_structured_kernel_bodies(module: &mut Module) -> usize {
+    let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+    let mut outlined_count = 0usize;
+
+    for blk_id in block_ids {
+        let orig_ops = module.blocks[blk_id].ops.clone();
+
+        for &loop_op in &orig_ops {
+            if !module.ops.contains_key(loop_op) {
+                continue;
+            }
+            let full = module.ops[loop_op].name.full_name();
+            if !is_structured_map_iter_op(&full) {
+                continue;
+            }
+            let loc = module.ops[loop_op].location.clone();
+            let operands = module.ops[loop_op].operands.clone();
+            let results = module.ops[loop_op].results.clone();
+
+            let (loop_reg, inner_blk) = if !module.ops[loop_op].regions.is_empty() {
+                let reg = module.ops[loop_op].regions[0];
+                if module.regions[reg].blocks.is_empty() {
+                    continue;
+                }
+                let blk = module.regions[reg].blocks[0];
+                // Rotate trailing `index` block argument (`[inputs..., outputs..., index]`) to
+                // position 0 (`[index, captures...]`).
+                if module.blocks[blk].arguments.len() >= 2 {
+                    let idx_arg = module.blocks[blk].arguments.pop().unwrap();
+                    module.blocks[blk].arguments.insert(0, idx_arg);
+                }
+                (reg, blk)
+            } else {
+                // Synthesize the inner closure region with `[index, captures...]` block arguments.
+                let blk = module.blocks.insert_with_key(|id| crate::ir::Block {
+                    id,
+                    label: None,
+                    arguments: Vec::new(),
+                    ops: Vec::new(),
+                });
+                let idx_ty = Type::Tensor(crate::ir::mlir::TensorType {
+                    shape: vec![Dim::Static(1)],
+                    dtype: DType::I64,
+                    encoding: None,
+                });
+                let idx_arg = module.values.insert_with_key(|id| Value {
+                    id,
+                    ssa_name: None,
+                    ty: idx_ty,
+                    def: ValueDef::BlockArgument {
+                        block: blk,
+                        index: 0,
+                    },
+                });
+                module.blocks[blk].arguments.push(idx_arg);
+                for &opd in &operands {
+                    if !is_chain_tensor_type(&module.values[opd].ty) {
+                        let ty = module.values[opd].ty.clone();
+                        let arg_idx = module.blocks[blk].arguments.len() as u32;
+                        let v = module.values.insert_with_key(|id| Value {
+                            id,
+                            ssa_name: None,
+                            ty,
+                            def: ValueDef::BlockArgument {
+                                block: blk,
+                                index: arg_idx,
+                            },
+                        });
+                        module.blocks[blk].arguments.push(v);
+                    }
+                }
+                for &res in &results {
+                    if !is_chain_tensor_type(&module.values[res].ty) {
+                        let ty = module.values[res].ty.clone();
+                        let arg_idx = module.blocks[blk].arguments.len() as u32;
+                        let v = module.values.insert_with_key(|id| Value {
+                            id,
+                            ssa_name: None,
+                            ty,
+                            def: ValueDef::BlockArgument {
+                                block: blk,
+                                index: arg_idx,
+                            },
+                        });
+                        module.blocks[blk].arguments.push(v);
+                    }
+                }
+                let reg = module.regions.insert_with_key(|id| crate::ir::Region {
+                    id,
+                    blocks: vec![blk],
+                });
+                (reg, blk)
+            };
+
+            // Copy metadata attributes (`device_ref`, `fusion_info`, `has_read_effect`,
+            // `has_write_effect`, `dispatch`), defaulting `device_ref` to `"cpu:0"`.
+            let mut opaque_attrs: IndexMap<String, Attribute> = IndexMap::new();
+            let dev_attr = module.ops[loop_op]
+                .attributes
+                .get("device_ref")
+                .cloned()
+                .unwrap_or_else(|| Attribute::String("cpu:0".to_string()));
+            opaque_attrs.insert("device_ref".to_string(), dev_attr);
+            for key in [
+                "fusion_info",
+                "has_read_effect",
+                "has_write_effect",
+                "dispatch",
+            ] {
+                if let Some(val) = module.ops[loop_op].attributes.get(key).cloned() {
+                    opaque_attrs.insert(key.to_string(), val);
+                }
+            }
+
+            // Create the outer block for `map.iter.opaque` with block arguments for every
+            // non-chain input operand and every non-chain result type.
+            let mut capture_vals: SmallVec<[ValueId; 4]> = SmallVec::new();
+            for &opd in &operands {
+                if !is_chain_tensor_type(&module.values[opd].ty) {
+                    let ty = module.values[opd].ty.clone();
+                    let idx = capture_vals.len() as u32;
+                    let arg_val = module.values.insert_with_key(|id| Value {
+                        id,
+                        ssa_name: None,
+                        ty,
+                        def: ValueDef::BlockArgument {
+                            block: inner_blk,
+                            index: idx,
+                        },
+                    });
+                    capture_vals.push(arg_val);
+                }
+            }
+            for &res in &results {
+                if !is_chain_tensor_type(&module.values[res].ty) {
+                    let ty = module.values[res].ty.clone();
+                    let idx = capture_vals.len() as u32;
+                    let arg_val = module.values.insert_with_key(|id| Value {
+                        id,
+                        ssa_name: None,
+                        ty,
+                        def: ValueDef::BlockArgument {
+                            block: inner_blk,
+                            index: idx,
+                        },
+                    });
+                    capture_vals.push(arg_val);
+                }
+            }
+
+            // Create `map.closure` taking `capture_vals` and owning `loop_reg`.
+            let closure_op = module.ops.insert_with_key(|id| Operation {
+                id,
+                name: OpName::new("map", "closure"),
+                operands: capture_vals.clone(),
+                results: SmallVec::new(),
+                attributes: IndexMap::new(),
+                regions: vec![loop_reg],
+                custom_syntax: false,
+                location: loc.clone(),
+            });
+
+            let opaque_blk = module.blocks.insert_with_key(|id| crate::ir::Block {
+                id,
+                label: None,
+                arguments: capture_vals.to_vec(),
+                ops: vec![closure_op],
+            });
+            for (idx, &arg_val) in module.blocks[opaque_blk].arguments.iter().enumerate() {
+                module.values[arg_val].def = ValueDef::BlockArgument {
+                    block: opaque_blk,
+                    index: idx as u32,
+                };
+            }
+            let opaque_reg = module.regions.insert_with_key(|id| crate::ir::Region {
+                id,
+                blocks: vec![opaque_blk],
+            });
+
+            let opaque_op = module.ops.insert_with_key(|id| Operation {
+                id,
+                name: OpName::new("map", "iter.opaque"),
+                operands,
+                results: results.clone(),
+                attributes: opaque_attrs,
+                regions: vec![opaque_reg],
+                custom_syntax: false,
+                location: loc,
+            });
+            for (idx, &res) in results.iter().enumerate() {
+                module.values[res].def = ValueDef::OpResult {
+                    op: opaque_op,
+                    index: idx as u32,
+                };
+            }
+
+            if let Some(pos) = module.blocks[blk_id]
+                .ops
+                .iter()
+                .position(|&id| id == loop_op)
+            {
+                module.blocks[blk_id].ops[pos] = opaque_op;
+            }
+            module.ops.remove(loop_op);
+            outlined_count += 1;
+        }
+    }
+
+    outlined_count
+}
