@@ -15,39 +15,41 @@ use castforge::ir::{
 };
 use castforge::passes::{
     ArcKvEvictionPolicy, AsymK16V8Codec, BLEND_REORDER_LMIN, BlendMatchSpan, BlendObjectGroupKind,
-    BlendReadGroupSet, BlendTokenRangeMatcher, CBChunkMatch, CBGroupRopeGeometry, CBGroupSpec,
-    CacheBlendRopeSpec, CacheEventBatchSpec, CacheEventTier, CacheGenCdfCodec,
-    ChainedBlockHashConfig, CoordinatorEventGate, DEFAULT_MAX_KERNELS_IN_FUSION_SET,
-    DaxGenerationSlotArena, DaxPutOutcome, DeviceTargetArch, DynamicAllocRequest, EngineKvFormat,
-    EventIngestOutcome, FULL_ATTENTION_WINDOW, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
-    IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
-    KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope,
-    KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy, LayerGroupPayloadSharder,
-    P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable, P2PPeerSpec, PassManager, PassRegistry,
-    ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST, ReshapeDimMapping, TOKEN_WIRE_STRIDE,
-    WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
-    analyze_static_reshape_dim_mapping, annotate_squeeze_unsqueeze_reshapes,
-    anonymize_symbolic_dims, await_hanging_effect_chains, classify_blend_read_groups,
-    coalesce_exhaustive_gathers_to_split, coalesce_partitioning_slices_to_split,
-    compress_splat_constants, compute_cb_group_rope_geometry, decode_kv_fs_filename,
-    decode_kv_storage_key, defer_allocs_to_first_use, direct_copy_format_supported,
-    downsample_subchunk_swa_block_ids, elide_redundant_state_transfers,
-    eliminate_implied_dependencies, encode_kv_fs_filename, encode_kv_storage_key,
-    encode_wide_column_row_key, find_squeeze_axis, find_unsqueeze_axis, flatten_elementwise_chains,
-    fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
-    fuse_sole_use_prologues, group_p2p_lookup_keys, hash_packed_token_blocks_be,
-    hash_prefix_token_blocks, hoist_exec_invariant_ops, hoist_symbolic_dim_expressions,
-    interleave_chunk_major_object_keys, is_supported_arch_dtype, legalize_rowwise_reduction_launch,
-    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
-    map_axis_through_static_reshape, mark_cuda_graph_stable_tensors, merge_adjacent_parallel_loops,
-    merge_duplicate_shape_ops, merge_identical_functions, merge_parallel_matmuls,
-    num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve, plan_cacheblend_token_reorder,
-    plan_concat_in_place, plan_dynamic_memory_pool, plan_jenga_kv_geometry,
-    plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
-    re_rope_key_in_place, recalculate_subchunk_blocks_to_skip, recognize_composite_activations,
-    reuse_dead_loop_buffers, sink_transpose_through_elementwise_and_broadcast,
-    stamp_fused_provenance, unfold_chunk_range, unique_blend_token_coverage, unpack_token_ids_be,
-    unpermute_slice, validate_target_device_dtypes,
+    BlendReadGroupSet, BlendTokenRangeMatcher, BucketHistogram, CBChunkMatch, CBGroupRopeGeometry,
+    CBGroupSpec, CHUNK_COUNT_HISTOGRAM_BOUNDS, CacheBlendRopeSpec, CacheEventBatchSpec,
+    CacheEventEntrySpec, CacheEventOpKind, CacheEventTier, CacheGenCdfCodec,
+    ChainedBlockHashConfig, CoordinatorEventGate, CoordinatorKeyDirectory,
+    DEFAULT_MAX_KERNELS_IN_FUSION_SET, DaxGenerationSlotArena, DaxPutOutcome, DeviceTargetArch,
+    DynamicAllocRequest, EngineKvFormat, EventIngestOutcome, FULL_ATTENTION_WINDOW,
+    GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager, IsolatedLruEvictionPolicy,
+    KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode, KvPageSpec,
+    KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope, KvStorageKeySpec, L2FaultInjectConfig,
+    L2FaultInjectPolicy, LayerGroupPayloadSharder, P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable,
+    P2PPeerSpec, PassManager, PassRegistry, PlacementRecord, ROWWISE_CHEAP_OP_COST,
+    ROWWISE_EXPENSIVE_OP_COST, ReshapeDimMapping, TOKEN_WIRE_STRIDE, WarmPrefetchJobTable,
+    WarmPrefetchStatus, analyze_kv_layer_groups, analyze_static_reshape_dim_mapping,
+    annotate_squeeze_unsqueeze_reshapes, anonymize_symbolic_dims, await_hanging_effect_chains,
+    classify_blend_read_groups, coalesce_exhaustive_gathers_to_split,
+    coalesce_partitioning_slices_to_split, compress_splat_constants,
+    compute_cb_group_rope_geometry, decode_kv_fs_filename, decode_kv_storage_key,
+    defer_allocs_to_first_use, direct_copy_format_supported, downsample_subchunk_swa_block_ids,
+    elide_redundant_state_transfers, eliminate_implied_dependencies, encode_kv_fs_filename,
+    encode_kv_storage_key, encode_wide_column_row_key, find_squeeze_axis, find_unsqueeze_axis,
+    flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
+    fuse_reshape_epilogue, fuse_sole_use_prologues, group_p2p_lookup_keys,
+    hash_packed_token_blocks_be, hash_prefix_token_blocks, hoist_exec_invariant_ops,
+    hoist_symbolic_dim_expressions, interleave_chunk_major_object_keys, is_supported_arch_dtype,
+    legalize_rowwise_reduction_launch, longest_full_attention_hit, longest_joint_prefix_hit,
+    longest_sliding_window_hit, map_axis_through_static_reshape, mark_cuda_graph_stable_tensors,
+    merge_adjacent_parallel_loops, merge_duplicate_shape_ops, merge_identical_functions,
+    merge_parallel_matmuls, num_packed_tokens, pack_token_ids_be, plan_cacheblend_retrieve,
+    plan_cacheblend_token_reorder, plan_concat_in_place, plan_dynamic_memory_pool,
+    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
+    promote_narrow_accumulators, re_rope_key_in_place, recalculate_subchunk_blocks_to_skip,
+    recognize_composite_activations, reuse_dead_loop_buffers,
+    sink_transpose_through_elementwise_and_broadcast, stamp_fused_provenance, unfold_chunk_range,
+    unique_blend_token_coverage, unpack_token_ids_be, unpermute_slice,
+    validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -3097,4 +3099,112 @@ fn test_dax_generation_slot_arena_read_borrows_deferred_reclaim_and_shrink() {
     // while shrinking to 2 slots is rejected because slot 2 is live:
     assert!(arena.can_shrink_to(3));
     assert!(!arena.can_shrink_to(2));
+}
+
+#[test]
+fn test_coordinator_key_directory_l1_fencing_shared_l2_and_histogram() {
+    let mut dir = CoordinatorKeyDirectory::new();
+
+    // Worker A stores keys 10 and 20 in L1 ("cpu") and key 20 in shared L2 ("redis"):
+    dir.consume_batch(
+        "worker-a",
+        1,
+        CacheEventTier::L1,
+        "cpu",
+        false,
+        CacheEventOpKind::Store,
+        100,
+        &[
+            CacheEventEntrySpec {
+                key: 10,
+                size_bytes: 1024,
+            },
+            CacheEventEntrySpec {
+                key: 20,
+                size_bytes: 2048,
+            },
+        ],
+    );
+    dir.consume_batch(
+        "worker-a",
+        1,
+        CacheEventTier::L2,
+        "redis",
+        true,
+        CacheEventOpKind::Store,
+        101,
+        &[CacheEventEntrySpec {
+            key: 20,
+            size_bytes: 2048,
+        }],
+    );
+    // Worker B re-stores key 20 into the same shared L2 ("redis") pool -> upserts in place!
+    dir.consume_batch(
+        "worker-b",
+        1,
+        CacheEventTier::L2,
+        "redis",
+        true,
+        CacheEventOpKind::Store,
+        102,
+        &[CacheEventEntrySpec {
+            key: 20,
+            size_bytes: 2048,
+        }],
+    );
+    dir.consume_batch(
+        "worker-b",
+        1,
+        CacheEventTier::L1,
+        "cpu",
+        false,
+        CacheEventOpKind::Access,
+        105,
+        &[CacheEventEntrySpec {
+            key: 20,
+            size_bytes: 0,
+        }],
+    );
+
+    assert_eq!(dir.num_keys(), 2);
+    assert_eq!(dir.tier_stats(), (2, 3072, 1, 2048));
+    assert_eq!(dir.get_access_counts(&[10, 20, 99]), vec![0, 1, 0]);
+
+    // Fencing `worker-a` drops its 2 L1 placements (removing key 10 completely),
+    // while key 20's L2 placement survives!
+    assert_eq!(dir.fence_instance("worker-a"), 2);
+    assert_eq!(dir.num_keys(), 1);
+    assert_eq!(dir.tier_stats(), (0, 0, 1, 2048));
+    let looked_up = dir.lookup(&[10, 20]);
+    assert!(looked_up[0].is_empty());
+    assert_eq!(
+        looked_up[1],
+        vec![PlacementRecord {
+            instance_id: "worker-b".to_string(),
+            incarnation: 1,
+            tier: CacheEventTier::L2,
+            backend: "redis".to_string(),
+            size_bytes: 2048,
+            shared: true,
+        }]
+    );
+
+    // Verify `BucketHistogram` observation and Prometheus cumulative bucket series:
+    let mut hist = BucketHistogram::with_bounds(&[1.0, 4.0, 16.0]).expect("valid bounds");
+    assert!(BucketHistogram::with_bounds(&[4.0, 2.0]).is_none());
+    assert!(BucketHistogram::with_bounds(CHUNK_COUNT_HISTOGRAM_BOUNDS).is_some());
+    hist.observe(0.5);
+    hist.observe(4.0);
+    hist.observe(32.0);
+    assert_eq!(hist.count(), 3);
+    assert!((hist.sum() - 36.5).abs() < 1e-9);
+    assert_eq!(
+        hist.cumulative_buckets(),
+        vec![
+            ("1".to_string(), 1),
+            ("4".to_string(), 2),
+            ("16".to_string(), 2),
+            ("+Inf".to_string(), 3),
+        ]
+    );
 }

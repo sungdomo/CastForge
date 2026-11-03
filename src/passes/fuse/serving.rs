@@ -8770,3 +8770,335 @@ impl DaxGenerationSlotArena {
         true
     }
 }
+
+/// Default chunk-count histogram upper bounds (`0, 1, 2, 4, ..., 2048`)
+/// (matching LMCache `lmcache/v1/mp_coordinator/utils/histogram.py` `CHUNK_COUNT_BOUNDS`).
+pub const CHUNK_COUNT_HISTOGRAM_BOUNDS: &[f64] = &[
+    0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0,
+];
+
+/// Fixed-bound bucket histogram with Prometheus-compatible cumulative bucket export
+/// (inspired by LMCache `lmcache/v1/mp_coordinator/utils/histogram.py` `Histogram`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BucketHistogram {
+    bounds: Vec<f64>,
+    bucket_counts: Vec<u64>,
+    sum: f64,
+    count: u64,
+}
+
+impl BucketHistogram {
+    /// Creates an empty histogram with strictly ascending `bounds`. Returns `None` if `bounds` is
+    /// empty or not strictly ascending.
+    pub fn with_bounds(bounds: &[f64]) -> Option<Self> {
+        if bounds.is_empty() || bounds.windows(2).any(|w| w[0] >= w[1] || w[0].is_nan()) {
+            return None;
+        }
+        if bounds.last().is_some_and(|b| b.is_nan()) {
+            return None;
+        }
+        Some(Self {
+            bounds: bounds.to_vec(),
+            bucket_counts: vec![0; bounds.len() + 1],
+            sum: 0.0,
+            count: 0,
+        })
+    }
+
+    /// Records one observation of `value` into the first bucket with `bound >= value` (or the
+    /// overflow `+Inf` bucket).
+    pub fn observe(&mut self, value: f64) {
+        let idx = self.bounds.partition_point(|&b| b < value);
+        self.bucket_counts[idx] += 1;
+        self.sum += value;
+        self.count += 1;
+    }
+
+    /// Total number of recorded observations.
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// Sum of all recorded observation values.
+    pub fn sum(&self) -> f64 {
+        self.sum
+    }
+
+    /// Returns cumulative `(le_label, cumulative_count)` pairs followed by `("+Inf", count)`.
+    pub fn cumulative_buckets(&self) -> Vec<(String, u64)> {
+        let mut out = Vec::with_capacity(self.bounds.len() + 1);
+        let mut acc = 0u64;
+        for (&bound, &cnt) in self.bounds.iter().zip(self.bucket_counts.iter()) {
+            acc += cnt;
+            out.push((format!("{bound}"), acc));
+        }
+        out.push(("+Inf".to_string(), self.count));
+        out
+    }
+}
+
+/// Cache event operation kind applied to [`CoordinatorKeyDirectory`]
+/// (inspired by LMCache `lmcache/v1/mp_coordinator/api.py` `CacheEventType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheEventOpKind {
+    /// Inserts or updates a placement for the key.
+    Store,
+    /// Removes a placement for the key.
+    Delete,
+    /// Records a cache hit/access on the key.
+    Access,
+}
+
+/// Live placement of a cached key in the fleet directory
+/// (inspired by LMCache `lmcache/v1/mp_coordinator/views/key_directory.py` `Placement`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementRecord {
+    /// Reporting worker instance identifier.
+    pub instance_id: String,
+    /// Incarnation epoch of the reporting worker.
+    pub incarnation: u64,
+    /// Storage tier (`L1` volatile worker memory vs `L2` persistent storage).
+    pub tier: CacheEventTier,
+    /// Backend name within the tier (e.g., `"cpu"`, `"gds"`, `"redis"`).
+    pub backend: String,
+    /// Reported payload size in bytes.
+    pub size_bytes: u64,
+    /// Whether the backend is a fleet-shared pool (deduplicated across instances).
+    pub shared: bool,
+}
+
+/// Single key mutation entry inside a coordinator event batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheEventEntrySpec {
+    /// Target object key (`chunk_hash`).
+    pub key: u64,
+    /// Payload size in bytes (used on [`CacheEventOpKind::Store`]).
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct KeyDirectoryRecord {
+    placements: Vec<PlacementRecord>,
+    last_access_ts: u64,
+    access_count: u64,
+}
+
+/// Fleet-wide key directory with incremental tier byte accounting and `O(|l1_keys(instance)|)`
+/// reverse-indexed L1 instance fencing
+/// (inspired by LMCache `lmcache/v1/mp_coordinator/views/key_directory.py` `KeyDirectory`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CoordinatorKeyDirectory {
+    directory: IndexMap<u64, KeyDirectoryRecord>,
+    l1_keys_by_instance: IndexMap<String, Vec<u64>>,
+    l1_count: usize,
+    l1_size_bytes: u64,
+    l2_count: usize,
+    l2_size_bytes: u64,
+}
+
+impl CoordinatorKeyDirectory {
+    /// Creates an empty fleet key directory.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of keys with at least one active placement.
+    pub fn num_keys(&self) -> usize {
+        self.directory.len()
+    }
+
+    /// Returns `(l1_count, l1_size_bytes, l2_count, l2_size_bytes)`.
+    pub fn tier_stats(&self) -> (usize, u64, usize, u64) {
+        (
+            self.l1_count,
+            self.l1_size_bytes,
+            self.l2_count,
+            self.l2_size_bytes,
+        )
+    }
+
+    fn adjust_stats(&mut self, tier: CacheEventTier, count_delta: isize, bytes_delta: i64) {
+        match tier {
+            CacheEventTier::L1 => {
+                self.l1_count = (self.l1_count as isize + count_delta).max(0) as usize;
+                self.l1_size_bytes = (self.l1_size_bytes as i64 + bytes_delta).max(0) as u64;
+            }
+            CacheEventTier::L2 => {
+                self.l2_count = (self.l2_count as isize + count_delta).max(0) as usize;
+                self.l2_size_bytes = (self.l2_size_bytes as i64 + bytes_delta).max(0) as u64;
+            }
+        }
+    }
+
+    fn find_placement_index(
+        placements: &[PlacementRecord],
+        instance_id: &str,
+        tier: CacheEventTier,
+        backend: &str,
+        shared: bool,
+    ) -> Option<usize> {
+        placements.iter().position(|p| {
+            p.shared == shared
+                && (shared || p.instance_id == instance_id)
+                && p.tier == tier
+                && p.backend == backend
+        })
+    }
+
+    /// Applies an admitted event batch idempotently (`Store` upserts, `Delete` removes, `Access`
+    /// increments access count and updates `last_access_ts`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn consume_batch(
+        &mut self,
+        instance_id: &str,
+        incarnation: u64,
+        tier: CacheEventTier,
+        backend: &str,
+        shared: bool,
+        op_kind: CacheEventOpKind,
+        ts: u64,
+        entries: &[CacheEventEntrySpec],
+    ) {
+        for entry in entries {
+            match op_kind {
+                CacheEventOpKind::Store => {
+                    let record = self.directory.entry(entry.key).or_default();
+                    let new_p = PlacementRecord {
+                        instance_id: instance_id.to_string(),
+                        incarnation,
+                        tier,
+                        backend: backend.to_string(),
+                        size_bytes: entry.size_bytes,
+                        shared,
+                    };
+                    if let Some(idx) = Self::find_placement_index(
+                        &record.placements,
+                        instance_id,
+                        tier,
+                        backend,
+                        shared,
+                    ) {
+                        let old_bytes = record.placements[idx].size_bytes;
+                        record.placements[idx] = new_p;
+                        let delta = (entry.size_bytes as i64) - (old_bytes as i64);
+                        self.adjust_stats(tier, 0, delta);
+                    } else {
+                        record.placements.push(new_p);
+                        self.adjust_stats(tier, 1, entry.size_bytes as i64);
+                    }
+                    let rec = self.directory.get_mut(&entry.key).unwrap();
+                    rec.last_access_ts = rec.last_access_ts.max(ts);
+                    if tier == CacheEventTier::L1 {
+                        let l1_list = self
+                            .l1_keys_by_instance
+                            .entry(instance_id.to_string())
+                            .or_default();
+                        if !l1_list.contains(&entry.key) {
+                            l1_list.push(entry.key);
+                        }
+                    }
+                }
+                CacheEventOpKind::Delete => {
+                    let Some(record) = self.directory.get_mut(&entry.key) else {
+                        continue;
+                    };
+                    if let Some(idx) = Self::find_placement_index(
+                        &record.placements,
+                        instance_id,
+                        tier,
+                        backend,
+                        shared,
+                    ) {
+                        let removed = record.placements.remove(idx);
+                        let is_empty = record.placements.is_empty();
+                        let still_has_inst_l1 = record
+                            .placements
+                            .iter()
+                            .any(|p| p.tier == CacheEventTier::L1 && p.instance_id == instance_id);
+                        if is_empty {
+                            self.directory.shift_remove(&entry.key);
+                        }
+                        self.adjust_stats(tier, -1, -(removed.size_bytes as i64));
+                        if tier == CacheEventTier::L1
+                            && !still_has_inst_l1
+                            && let Some(l1_list) = self.l1_keys_by_instance.get_mut(instance_id)
+                        {
+                            l1_list.retain(|&k| k != entry.key);
+                        }
+                    }
+                }
+                CacheEventOpKind::Access => {
+                    if let Some(record) = self.directory.get_mut(&entry.key) {
+                        record.last_access_ts = record.last_access_ts.max(ts);
+                        record.access_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drops every `L1` placement reported by `instance_id` using the reverse index while
+    /// preserving all `L2` placements. Returns the number of `L1` placements removed.
+    pub fn fence_instance(&mut self, instance_id: &str) -> usize {
+        let Some(l1_keys) = self.l1_keys_by_instance.shift_remove(instance_id) else {
+            return 0;
+        };
+        let mut removed_count = 0usize;
+        let mut removed_bytes = 0i64;
+        for key in l1_keys {
+            let Some(record) = self.directory.get_mut(&key) else {
+                continue;
+            };
+            let mut i = 0;
+            while i < record.placements.len() {
+                if record.placements[i].tier == CacheEventTier::L1
+                    && record.placements[i].instance_id == instance_id
+                {
+                    let p = record.placements.remove(i);
+                    removed_count += 1;
+                    removed_bytes += p.size_bytes as i64;
+                } else {
+                    i += 1;
+                }
+            }
+            if record.placements.is_empty() {
+                self.directory.shift_remove(&key);
+            }
+        }
+        self.adjust_stats(
+            CacheEventTier::L1,
+            -(removed_count as isize),
+            -removed_bytes,
+        );
+        removed_count
+    }
+
+    /// Looks up placements for `keys`, sorting each key's placement list by
+    /// `(instance_id, tier, backend)`.
+    pub fn lookup(&self, keys: &[u64]) -> Vec<Vec<PlacementRecord>> {
+        keys.iter()
+            .map(|k| {
+                let Some(record) = self.directory.get(k) else {
+                    return Vec::new();
+                };
+                let mut list = record.placements.clone();
+                list.sort_by(|a, b| {
+                    let t_a = matches!(a.tier, CacheEventTier::L2);
+                    let t_b = matches!(b.tier, CacheEventTier::L2);
+                    a.instance_id
+                        .cmp(&b.instance_id)
+                        .then_with(|| t_a.cmp(&t_b))
+                        .then_with(|| a.backend.cmp(&b.backend))
+                });
+                list
+            })
+            .collect()
+    }
+
+    /// Returns the number of [`CacheEventOpKind::Access`] events applied to each key in `keys`.
+    pub fn get_access_counts(&self, keys: &[u64]) -> Vec<u64> {
+        keys.iter()
+            .map(|k| self.directory.get(k).map_or(0, |r| r.access_count))
+            .collect()
+    }
+}
