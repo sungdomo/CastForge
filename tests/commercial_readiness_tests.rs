@@ -43,7 +43,8 @@ use castforge::passes::{
     plan_dynamic_memory_pool, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
     plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
     recalculate_subchunk_blocks_to_skip, recognize_composite_activations, reuse_dead_loop_buffers,
-    stamp_fused_provenance, unfold_chunk_range, unique_blend_token_coverage, unpack_token_ids_be,
+    sink_transpose_through_elementwise_and_broadcast, stamp_fused_provenance, unfold_chunk_range,
+    unique_blend_token_coverage, unpack_token_ids_be, unpermute_slice,
     validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
@@ -2878,5 +2879,84 @@ module @decomposed_gelu_tanh {
         gt_ops
             .iter()
             .any(|&id| gt_mod.ops[id].is_op("mo", "gelu_tanh"))
+    );
+}
+
+#[test]
+fn test_sink_transpose_through_unary_binary_and_rank_increasing_broadcast() {
+    use castforge::ir::Attribute;
+
+    // Verify `unpermute_slice` inverse property (`perm = [2, 0, 1]` -> `inverse = [1, 2, 0]`):
+    assert_eq!(
+        unpermute_slice(&[10, 20, 30], &[2, 0, 1]),
+        Some(vec![20, 30, 10])
+    );
+
+    // 1. Binary + Unary cascade:
+    //    `%t1 = transpose(%x, [1, 0])`, `%t2 = transpose(%y, [1, 0])`
+    //    `%sum = add(%t1, %t2)` -> sinks to `add(%x, %y)` followed by 1 transpose
+    //    `%act = tanh(%sum)`    -> sinks that transpose past `tanh` as well!
+    let bin_unary_mlir = r#"
+module @sink_transpose_bin_unary {
+  func.func @main(%x: tensor<4x8xf32>, %y: tensor<4x8xf32>) -> tensor<8x4xf32> {
+    %t1 = stablehlo.transpose %x {permutation = [1, 0]} : (tensor<4x8xf32>) -> tensor<8x4xf32>
+    %t2 = stablehlo.transpose %y {permutation = [1, 0]} : (tensor<4x8xf32>) -> tensor<8x4xf32>
+    %sum = stablehlo.add %t1, %t2 : tensor<8x4xf32>
+    %act = stablehlo.tanh %sum : tensor<8x4xf32>
+    return %act : tensor<8x4xf32>
+  }
+}
+"#;
+    let mut bu_mod = parse_mlir(bin_unary_mlir).expect("valid MLIR");
+    assert_eq!(
+        sink_transpose_through_elementwise_and_broadcast(&mut bu_mod),
+        2
+    );
+    let func_id = bu_mod.functions()[0];
+    let blk_id = bu_mod.regions[bu_mod.ops[func_id].regions[0]].blocks[0];
+    let ops = &bu_mod.blocks[blk_id].ops;
+    assert_eq!(ops.len(), 4);
+    assert!(bu_mod.ops[ops[0]].is_op("stablehlo", "add"));
+    assert!(bu_mod.ops[ops[1]].is_op("stablehlo", "tanh"));
+    assert!(bu_mod.ops[ops[2]].is_op("stablehlo", "transpose"));
+
+    // 2. Rank-increasing broadcast (`[1, 3, 2]` -> transpose `[0, 2, 1]` -> `[1, 2, 3]`
+    //    -> broadcast `[9, 1, 2, 3]`):
+    //    After sinking transpose: broadcast produces `[9, 1, 3, 2]` and transpose uses
+    //    padded permutation `[0, 1, 3, 2]` to produce `[9, 1, 2, 3]`!
+    let bcast_mlir = r#"
+module @sink_transpose_bcast {
+  func.func @main(%x: tensor<1x3x2xf32>) -> tensor<9x1x2x3xf32> {
+    %t = stablehlo.transpose %x {permutation = [0, 2, 1]}
+      : (tensor<1x3x2xf32>) -> tensor<1x2x3xf32>
+    %b = mo.static.broadcast_to %t : (tensor<1x2x3xf32>) -> tensor<9x1x2x3xf32>
+    return %b : tensor<9x1x2x3xf32>
+  }
+}
+"#;
+    let mut bc_mod = parse_mlir(bcast_mlir).expect("valid MLIR");
+    assert_eq!(
+        sink_transpose_through_elementwise_and_broadcast(&mut bc_mod),
+        1
+    );
+    let b_func = bc_mod.functions()[0];
+    let b_blk = bc_mod.regions[bc_mod.ops[b_func].regions[0]].blocks[0];
+    let b_ops = &bc_mod.blocks[b_blk].ops;
+    assert_eq!(b_ops.len(), 3);
+    assert!(bc_mod.ops[b_ops[0]].is_op("mo", "static.broadcast_to"));
+    assert!(bc_mod.ops[b_ops[1]].is_op("stablehlo", "transpose"));
+    let inter_val = bc_mod.ops[b_ops[0]].results[0];
+    assert_eq!(
+        bc_mod.values[inter_val].ty.as_tensor().unwrap().shape,
+        vec![
+            Dim::Static(9),
+            Dim::Static(1),
+            Dim::Static(3),
+            Dim::Static(2)
+        ]
+    );
+    assert_eq!(
+        bc_mod.ops[b_ops[1]].attributes.get("permutation"),
+        Some(&Attribute::DenseIntArray(vec![0, 1, 3, 2]))
     );
 }

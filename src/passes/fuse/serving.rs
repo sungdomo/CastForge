@@ -7767,3 +7767,419 @@ pub fn recognize_composite_activations(module: &mut Module) -> usize {
 
     folded
 }
+
+/// Applies the inverse of `perm` to `items` (`result[perm[i]] = items[i]`).
+///
+/// Returns `None` if `items.len() != perm.len()` or if `perm` is not a valid permutation of
+/// `0..items.len()`.
+pub fn unpermute_slice<T: Clone>(items: &[T], perm: &[usize]) -> Option<Vec<T>> {
+    let n = items.len();
+    if perm.len() != n {
+        return None;
+    }
+    let mut out: Vec<Option<T>> = vec![None; n];
+    for (idx, &perm_idx) in perm.iter().enumerate() {
+        if perm_idx >= n || out[perm_idx].is_some() {
+            return None;
+        }
+        out[perm_idx] = Some(items[idx].clone());
+    }
+    out.into_iter().collect()
+}
+
+fn extract_transpose_perm(op: &Operation) -> Option<Vec<usize>> {
+    if !matches!(
+        op.name.to_string().as_str(),
+        "stablehlo.transpose" | "mo.transpose" | "onnx.Transpose"
+    ) || op.operands.is_empty()
+        || op.results.len() != 1
+    {
+        return None;
+    }
+    let raw =
+        extract_int_list_attr(op, "permutation").or_else(|| extract_int_list_attr(op, "perm"))?;
+    let mut perm = Vec::with_capacity(raw.len());
+    for v in raw {
+        if v < 0 {
+            return None;
+        }
+        perm.push(v as usize);
+    }
+    let n = perm.len();
+    let mut seen = vec![false; n];
+    for &p in &perm {
+        if p >= n || seen[p] {
+            return None;
+        }
+        seen[p] = true;
+    }
+    Some(perm)
+}
+
+fn is_sinkable_unary_elementwise(op: &Operation) -> bool {
+    op.operands.len() == 1
+        && op.results.len() == 1
+        && matches!(
+            op.name.to_string().as_str(),
+            "stablehlo.tanh"
+                | "stablehlo.exponential"
+                | "stablehlo.negate"
+                | "stablehlo.abs"
+                | "stablehlo.log"
+                | "stablehlo.sqrt"
+                | "stablehlo.rsqrt"
+                | "stablehlo.logistic"
+                | "stablehlo.erf"
+                | "stablehlo.convert"
+                | "mo.relu"
+                | "mo.sigmoid"
+                | "mo.silu"
+                | "mo.gelu"
+                | "mo.gelu_quick"
+                | "mo.gelu_tanh"
+                | "mo.tanh"
+                | "mo.exp"
+                | "mo.negative"
+        )
+}
+
+fn is_sinkable_binary_elementwise(op: &Operation) -> bool {
+    op.operands.len() == 2
+        && op.results.len() == 1
+        && matches!(
+            op.name.to_string().as_str(),
+            "stablehlo.add"
+                | "stablehlo.subtract"
+                | "stablehlo.multiply"
+                | "stablehlo.divide"
+                | "stablehlo.maximum"
+                | "stablehlo.minimum"
+                | "stablehlo.power"
+                | "mo.add"
+                | "mo.sub"
+                | "mo.mul"
+                | "mo.div"
+                | "mo.max"
+                | "mo.min"
+                | "mo.pow"
+        )
+}
+
+fn is_sinkable_broadcast_op(op: &Operation) -> bool {
+    op.operands.len() == 1
+        && op.results.len() == 1
+        && matches!(
+            op.name.to_string().as_str(),
+            "stablehlo.broadcast_in_dim" | "mo.static.broadcast_to" | "mo.broadcast_to"
+        )
+}
+
+/// Sinks sole-use `transpose` operations past unary elementwise ops, matching-permutation binary
+/// elementwise ops (coalescing two input transposes into one output transpose), and static
+/// broadcasts (padding the permutation for leading broadcast dimensions and unpermuting the
+/// intermediate broadcast shape).
+///
+/// Returns the number of transpose-sinking rewrites applied.
+pub fn sink_transpose_through_elementwise_and_broadcast(module: &mut Module) -> usize {
+    let mut sunk_count = 0usize;
+    let block_ids: Vec<_> = module.blocks.keys().collect();
+
+    for block_id in block_ids {
+        loop {
+            let mut changed_in_pass = false;
+            let op_ids = module.blocks[block_id].ops.clone();
+
+            for &op_id in &op_ids {
+                let Some(op) = module.ops.get(op_id).cloned() else {
+                    continue;
+                };
+                if op.results.len() != 1 {
+                    continue;
+                }
+                let orig_res_val = op.results[0];
+                let Some(orig_res_tt) = module
+                    .values
+                    .get(orig_res_val)
+                    .and_then(|v| v.ty.as_tensor())
+                    .cloned()
+                else {
+                    continue;
+                };
+
+                // Case 1: Unary `unary(transpose(x, perm))` -> `transpose(unary(x), perm)`
+                if is_sinkable_unary_elementwise(&op) {
+                    let trans_val = op.operands[0];
+                    if module.use_count(trans_val) != 1 {
+                        continue;
+                    }
+                    let Some(trans_op) = def_op_of(module, trans_val).cloned() else {
+                        continue;
+                    };
+                    if extract_transpose_perm(&trans_op).is_none() {
+                        continue;
+                    }
+                    if trans_op.attributes.get("castforge.device")
+                        != op.attributes.get("castforge.device")
+                    {
+                        continue;
+                    }
+                    let raw_in = trans_op.operands[0];
+                    let Some(raw_in_tt) = module
+                        .values
+                        .get(raw_in)
+                        .and_then(|v| v.ty.as_tensor())
+                        .cloned()
+                    else {
+                        continue;
+                    };
+
+                    let inter_tt = TensorType {
+                        shape: raw_in_tt.shape,
+                        dtype: orig_res_tt.dtype.clone(),
+                        encoding: orig_res_tt.encoding.clone(),
+                    };
+                    let inter_val = module.values.insert_with_key(|vid| Value {
+                        id: vid,
+                        ssa_name: None,
+                        ty: Type::Tensor(inter_tt),
+                        def: ValueDef::OpResult {
+                            op: op_id,
+                            index: 0,
+                        },
+                    });
+
+                    if let Some(u_mut) = module.ops.get_mut(op_id) {
+                        u_mut.operands[0] = raw_in;
+                        u_mut.results[0] = inter_val;
+                    }
+                    if let Some(t_mut) = module.ops.get_mut(trans_op.id) {
+                        t_mut.operands[0] = inter_val;
+                        t_mut.results[0] = orig_res_val;
+                    }
+                    if let Some(v_mut) = module.values.get_mut(orig_res_val) {
+                        v_mut.def = ValueDef::OpResult {
+                            op: trans_op.id,
+                            index: 0,
+                        };
+                    }
+                    module.values.remove(trans_val);
+
+                    let blk = &mut module.blocks[block_id].ops;
+                    blk.retain(|&id| id != trans_op.id);
+                    if let Some(pos) = blk.iter().position(|&id| id == op_id) {
+                        blk.insert(pos + 1, trans_op.id);
+                    }
+
+                    sunk_count += 1;
+                    changed_in_pass = true;
+                    break;
+                }
+
+                // Case 2: Binary elementwise `bin(transpose(x, p), transpose(y, p))`
+                // -> `transpose(bin(x, y), p)`
+                if is_sinkable_binary_elementwise(&op) {
+                    let lhs_val = op.operands[0];
+                    let rhs_val = op.operands[1];
+                    if lhs_val == rhs_val
+                        || module.use_count(lhs_val) != 1
+                        || module.use_count(rhs_val) != 1
+                    {
+                        continue;
+                    }
+                    let (Some(t1_op), Some(t2_op)) = (
+                        def_op_of(module, lhs_val).cloned(),
+                        def_op_of(module, rhs_val).cloned(),
+                    ) else {
+                        continue;
+                    };
+                    let (Some(perm1), Some(perm2)) = (
+                        extract_transpose_perm(&t1_op),
+                        extract_transpose_perm(&t2_op),
+                    ) else {
+                        continue;
+                    };
+                    if perm1 != perm2 {
+                        continue;
+                    }
+                    let dev = op.attributes.get("castforge.device");
+                    if t1_op.attributes.get("castforge.device") != dev
+                        || t2_op.attributes.get("castforge.device") != dev
+                    {
+                        continue;
+                    }
+                    let in1 = t1_op.operands[0];
+                    let in2 = t2_op.operands[0];
+                    let (Some(in1_tt), Some(in2_tt)) = (
+                        module
+                            .values
+                            .get(in1)
+                            .and_then(|v| v.ty.as_tensor())
+                            .cloned(),
+                        module
+                            .values
+                            .get(in2)
+                            .and_then(|v| v.ty.as_tensor())
+                            .cloned(),
+                    ) else {
+                        continue;
+                    };
+                    if in1_tt.shape != in2_tt.shape {
+                        continue;
+                    }
+
+                    let inter_tt = TensorType {
+                        shape: in1_tt.shape,
+                        dtype: orig_res_tt.dtype.clone(),
+                        encoding: orig_res_tt.encoding.clone(),
+                    };
+                    let inter_val = module.values.insert_with_key(|vid| Value {
+                        id: vid,
+                        ssa_name: None,
+                        ty: Type::Tensor(inter_tt),
+                        def: ValueDef::OpResult {
+                            op: op_id,
+                            index: 0,
+                        },
+                    });
+
+                    if let Some(b_mut) = module.ops.get_mut(op_id) {
+                        b_mut.operands[0] = in1;
+                        b_mut.operands[1] = in2;
+                        b_mut.results[0] = inter_val;
+                    }
+                    let locs = vec![t1_op.location.clone(), t2_op.location.clone()];
+                    if let Some(t1_mut) = module.ops.get_mut(t1_op.id) {
+                        t1_mut.operands[0] = inter_val;
+                        t1_mut.results[0] = orig_res_val;
+                        stamp_fused_provenance(t1_mut, &locs);
+                    }
+                    if let Some(v_mut) = module.values.get_mut(orig_res_val) {
+                        v_mut.def = ValueDef::OpResult {
+                            op: t1_op.id,
+                            index: 0,
+                        };
+                    }
+                    module.values.remove(lhs_val);
+                    module.remove_op(block_id, t2_op.id);
+
+                    let blk = &mut module.blocks[block_id].ops;
+                    blk.retain(|&id| id != t1_op.id);
+                    if let Some(pos) = blk.iter().position(|&id| id == op_id) {
+                        blk.insert(pos + 1, t1_op.id);
+                    }
+
+                    sunk_count += 1;
+                    changed_in_pass = true;
+                    break;
+                }
+
+                // Case 3: Static broadcast `broadcast(transpose(x, perm))`
+                // -> `transpose(broadcast(x), padded_perm)`
+                if is_sinkable_broadcast_op(&op) {
+                    let trans_val = op.operands[0];
+                    if module.use_count(trans_val) != 1 {
+                        continue;
+                    }
+                    let Some(trans_op) = def_op_of(module, trans_val).cloned() else {
+                        continue;
+                    };
+                    let Some(perm) = extract_transpose_perm(&trans_op) else {
+                        continue;
+                    };
+                    if trans_op.attributes.get("castforge.device")
+                        != op.attributes.get("castforge.device")
+                    {
+                        continue;
+                    }
+                    let raw_in = trans_op.operands[0];
+                    let Some(trans_tt) = module
+                        .values
+                        .get(trans_val)
+                        .and_then(|v| v.ty.as_tensor())
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    if orig_res_tt.shape.len() < trans_tt.shape.len() {
+                        continue;
+                    }
+                    // If `broadcast_dimensions` is present on `stablehlo.broadcast_in_dim`,
+                    // verify it represents standard right-aligned broadcasting `[extra..out_rank]`.
+                    let extra_dims = orig_res_tt.shape.len() - trans_tt.shape.len();
+                    if let Some(bcast_dims) = extract_int_list_attr(&op, "broadcast_dimensions") {
+                        let expected: Vec<i64> =
+                            (extra_dims as i64..orig_res_tt.shape.len() as i64).collect();
+                        if bcast_dims != expected {
+                            continue;
+                        }
+                    }
+
+                    let mut padded_perm: Vec<usize> = (0..extra_dims).collect();
+                    for p in perm {
+                        padded_perm.push(p + extra_dims);
+                    }
+                    let Some(new_bcast_shape) = unpermute_slice(&orig_res_tt.shape, &padded_perm)
+                    else {
+                        continue;
+                    };
+
+                    let inter_tt = TensorType {
+                        shape: new_bcast_shape,
+                        dtype: orig_res_tt.dtype.clone(),
+                        encoding: orig_res_tt.encoding.clone(),
+                    };
+                    let inter_val = module.values.insert_with_key(|vid| Value {
+                        id: vid,
+                        ssa_name: None,
+                        ty: Type::Tensor(inter_tt),
+                        def: ValueDef::OpResult {
+                            op: op_id,
+                            index: 0,
+                        },
+                    });
+
+                    if let Some(b_mut) = module.ops.get_mut(op_id) {
+                        b_mut.operands[0] = raw_in;
+                        b_mut.results[0] = inter_val;
+                    }
+                    let new_perm_i64: Vec<i64> = padded_perm.iter().map(|&p| p as i64).collect();
+                    if let Some(t_mut) = module.ops.get_mut(trans_op.id) {
+                        t_mut.operands[0] = inter_val;
+                        t_mut.results[0] = orig_res_val;
+                        let key = if t_mut.attributes.contains_key("perm") {
+                            "perm"
+                        } else {
+                            "permutation"
+                        };
+                        t_mut
+                            .attributes
+                            .insert(key.to_string(), Attribute::DenseIntArray(new_perm_i64));
+                    }
+                    if let Some(v_mut) = module.values.get_mut(orig_res_val) {
+                        v_mut.def = ValueDef::OpResult {
+                            op: trans_op.id,
+                            index: 0,
+                        };
+                    }
+                    module.values.remove(trans_val);
+
+                    let blk = &mut module.blocks[block_id].ops;
+                    blk.retain(|&id| id != trans_op.id);
+                    if let Some(pos) = blk.iter().position(|&id| id == op_id) {
+                        blk.insert(pos + 1, trans_op.id);
+                    }
+
+                    sunk_count += 1;
+                    changed_in_pass = true;
+                    break;
+                }
+            }
+
+            if !changed_in_pass {
+                break;
+            }
+        }
+    }
+
+    sunk_count
+}
