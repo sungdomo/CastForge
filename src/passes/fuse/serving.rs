@@ -4045,3 +4045,117 @@ impl WarmPrefetchJobTable {
         }
     }
 }
+
+/// Layer-group KV payload column sharder and reassembler for wide-column L2 storage
+/// (inspired by LMCache `lmcache/v1/distributed/l2_adapters/bigtable_sharder.py`
+/// `BigtablePayloadSharder`).
+///
+/// Slices a contiguous `[kv_size, num_layers, layer_bytes]` byte payload into bounded layer-group
+/// column shards keyed by `layers_{start}_{end}` (where each shard packs all `kv_size` components
+/// for `start..=end` contiguously) and losslessly reassembles them back into contiguous
+/// `[kv_size, num_layers, layer_bytes]` layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerGroupPayloadSharder {
+    pub num_layers: usize,
+    pub layer_group_size: usize,
+    pub kv_size: usize,
+}
+
+impl LayerGroupPayloadSharder {
+    /// Creates a new payload sharder for `num_layers`, `layer_group_size`, and `kv_size` (typically
+    /// `2` for K and V).
+    pub fn new(num_layers: usize, layer_group_size: usize, kv_size: usize) -> Self {
+        Self {
+            num_layers: num_layers.max(1),
+            layer_group_size: layer_group_size.max(1),
+            kv_size: kv_size.max(1),
+        }
+    }
+
+    /// Number of layer groups `ceil(num_layers / layer_group_size)`.
+    pub fn num_groups(&self) -> usize {
+        self.num_layers.div_ceil(self.layer_group_size)
+    }
+
+    /// Column qualifier name (`layers_{start}_{end}`) for `group_idx`.
+    pub fn group_qualifier(&self, group_idx: usize) -> String {
+        let start = group_idx * self.layer_group_size;
+        let end = ((group_idx + 1) * self.layer_group_size)
+            .min(self.num_layers)
+            .saturating_sub(1);
+        format!("layers_{start}_{end}")
+    }
+
+    /// Shards contiguous `[kv_size, num_layers, layer_bytes]` `payload` into an ordered map from
+    /// column qualifier (`layers_{start}_{end}`) to sharded bytes. Returns `None` if
+    /// `payload.len()` is not a multiple of `kv_size * num_layers`.
+    pub fn shard(&self, payload: &[u8]) -> Option<IndexMap<String, Vec<u8>>> {
+        let denom = self.kv_size * self.num_layers;
+        if denom == 0 || !payload.len().is_multiple_of(denom) {
+            return None;
+        }
+        let layer_size = payload.len() / denom;
+        let num_groups = self.num_groups();
+        let mut shards = IndexMap::with_capacity(num_groups);
+
+        for g in 0..num_groups {
+            let start_layer = g * self.layer_group_size;
+            let end_layer = ((g + 1) * self.layer_group_size).min(self.num_layers);
+            let group_layers = end_layer - start_layer;
+            let mut group_bytes = Vec::with_capacity(self.kv_size * group_layers * layer_size);
+            for kv_idx in 0..self.kv_size {
+                let kv_offset = kv_idx * self.num_layers * layer_size;
+                let start = kv_offset + start_layer * layer_size;
+                let end = kv_offset + end_layer * layer_size;
+                group_bytes.extend_from_slice(&payload[start..end]);
+            }
+            shards.insert(self.group_qualifier(g), group_bytes);
+        }
+        Some(shards)
+    }
+
+    /// Reassembles `shards` back into contiguous `[kv_size, num_layers, layer_bytes]` bytes.
+    /// Returns `None` if any expected group qualifier is missing or has an inconsistent byte size.
+    pub fn reassemble(&self, shards: &IndexMap<String, Vec<u8>>) -> Option<Vec<u8>> {
+        if shards.is_empty() {
+            return Some(Vec::new());
+        }
+        let num_groups = self.num_groups();
+        let first_qual = self.group_qualifier(0);
+        let first_data = shards.get(&first_qual)?;
+        let first_layers = self.layer_group_size.min(self.num_layers);
+        let first_denom = self.kv_size * first_layers;
+        if first_denom == 0 || !first_data.len().is_multiple_of(first_denom) {
+            return None;
+        }
+        let layer_size = first_data.len() / first_denom;
+
+        let mut kv_parts: Vec<Vec<u8>> = (0..self.kv_size)
+            .map(|_| Vec::with_capacity(self.num_layers * layer_size))
+            .collect();
+
+        for g in 0..num_groups {
+            let qual = self.group_qualifier(g);
+            let shard_data = shards.get(&qual)?;
+            let start_layer = g * self.layer_group_size;
+            let end_layer = ((g + 1) * self.layer_group_size).min(self.num_layers);
+            let group_layers = end_layer - start_layer;
+            let expected_size = self.kv_size * group_layers * layer_size;
+            if shard_data.len() != expected_size {
+                return None;
+            }
+            let group_part_size = group_layers * layer_size;
+            for (kv_idx, part) in kv_parts.iter_mut().enumerate() {
+                let start = kv_idx * group_part_size;
+                let end = (kv_idx + 1) * group_part_size;
+                part.extend_from_slice(&shard_data[start..end]);
+            }
+        }
+
+        let mut out = Vec::with_capacity(self.kv_size * self.num_layers * layer_size);
+        for part in kv_parts {
+            out.extend_from_slice(&part);
+        }
+        Some(out)
+    }
+}

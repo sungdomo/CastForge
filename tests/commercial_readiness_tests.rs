@@ -19,16 +19,17 @@ use castforge::passes::{
     EngineKvFormat, FULL_ATTENTION_WINDOW, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
     IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
     KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope,
-    PassManager, PassRegistry, WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
-    anonymize_symbolic_dims, compress_splat_constants, defer_allocs_to_first_use,
-    direct_copy_format_supported, elide_redundant_state_transfers, flatten_elementwise_chains,
-    fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
-    fuse_sole_use_prologues, hash_prefix_token_blocks, is_supported_arch_dtype,
-    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
-    mark_cuda_graph_stable_tensors, merge_duplicate_shape_ops, merge_identical_functions,
-    plan_cacheblend_retrieve, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
-    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
-    stamp_fused_provenance, unfold_chunk_range, validate_target_device_dtypes,
+    LayerGroupPayloadSharder, PassManager, PassRegistry, WarmPrefetchJobTable, WarmPrefetchStatus,
+    analyze_kv_layer_groups, anonymize_symbolic_dims, compress_splat_constants,
+    defer_allocs_to_first_use, direct_copy_format_supported, elide_redundant_state_transfers,
+    flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
+    fuse_reshape_epilogue, fuse_sole_use_prologues, hash_prefix_token_blocks,
+    is_supported_arch_dtype, longest_full_attention_hit, longest_joint_prefix_hit,
+    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_duplicate_shape_ops,
+    merge_identical_functions, plan_cacheblend_retrieve, plan_jenga_kv_geometry,
+    plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
+    re_rope_key_in_place, stamp_fused_provenance, unfold_chunk_range,
+    validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -1619,4 +1620,32 @@ fn test_warm_prefetch_job_table_consume_once_lifecycle() {
     assert_eq!(table.active_job_count(), 0);
     // Subsequent poll for the same request_id returns `Unknown` (consume-once semantics)
     assert_eq!(table.poll("req-1"), WarmPrefetchStatus::Unknown);
+}
+
+#[test]
+fn test_layer_group_payload_sharder_qualifiers_and_roundtrip() {
+    // 5 layers, group size 2 -> 3 groups: layers_0_1 (2), layers_2_3 (2), layers_4_4 (1)
+    let sharder = LayerGroupPayloadSharder::new(5, 2, 2);
+    assert_eq!(sharder.num_groups(), 3);
+    assert_eq!(sharder.group_qualifier(0), "layers_0_1");
+    assert_eq!(sharder.group_qualifier(1), "layers_2_3");
+    assert_eq!(sharder.group_qualifier(2), "layers_4_4");
+
+    // 4 bytes per layer per KV component -> total = 2 * 5 * 4 = 40 bytes
+    let payload: Vec<u8> = (0u8..40u8).collect();
+    // Indivisible payload length (39) must be rejected
+    assert!(sharder.shard(&payload[..39]).is_none());
+
+    let mut shards = sharder.shard(&payload).expect("valid payload");
+    assert_eq!(shards.len(), 3);
+    assert_eq!(shards["layers_0_1"].len(), 16);
+    assert_eq!(shards["layers_2_3"].len(), 16);
+    assert_eq!(shards["layers_4_4"].len(), 8);
+
+    let reassembled = sharder.reassemble(&shards).expect("valid shards");
+    assert_eq!(reassembled, payload);
+
+    // Removing a required group shard causes reassembly to fail cleanly
+    shards.shift_remove("layers_2_3");
+    assert!(sharder.reassemble(&shards).is_none());
 }
