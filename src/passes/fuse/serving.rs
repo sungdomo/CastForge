@@ -16869,3 +16869,224 @@ pub fn merge_presence_bitmaps(bitmaps: &[Vec<bool>], num_keys: usize) -> Vec<boo
     }
     merged
 }
+
+// ============================================================================
+// Batch 20 Step 2: In-Place Buffer Concatenation Lowering with Alignment Check
+// ============================================================================
+
+/// Returns `true` if `val` is provably a multiple of `alignment` across `index.constant` /
+/// `arith.constant` (`value` attribute), `index.mul` / `arith.muli`, and `index.add` /
+/// `arith.addi`.
+#[must_use]
+pub fn is_provable_multiple_of(module: &Module, val: ValueId, alignment: u64) -> bool {
+    if alignment <= 1 {
+        return true;
+    }
+    let ValueDef::OpResult { op: def_op, .. } = module.values[val].def else {
+        return false;
+    };
+    let op = &module.ops[def_op];
+    let full = op.name.full_name();
+    match full.as_str() {
+        "index.constant" | "arith.constant" => op
+            .attributes
+            .get("value")
+            .and_then(extract_u64_attr)
+            .is_some_and(|v| v % alignment == 0),
+        "index.mul" | "arith.muli" if op.operands.len() >= 2 => {
+            is_provable_multiple_of(module, op.operands[0], alignment)
+                || is_provable_multiple_of(module, op.operands[1], alignment)
+        }
+        "index.add" | "arith.addi" if op.operands.len() >= 2 => {
+            is_provable_multiple_of(module, op.operands[0], alignment)
+                && is_provable_multiple_of(module, op.operands[1], alignment)
+        }
+        _ => false,
+    }
+}
+
+/// Lowers `mgp.buffer.concat` operations in-place into `mgp.buffer.slice` views of the output
+/// buffer allocation when:
+/// 1. Operand 0 is `in_chain`, operand 1 is `out_buffer` defined by `mgp.buffer.alloc`, and
+///    operands `2..` are distinct `in_buffers` each defined by `mgp.buffer.alloc` whose first
+///    operand is the runtime byte size.
+/// 2. Every input buffer size except the last is provably a multiple of `preferred_alignment`.
+///
+/// Moves the output buffer allocation before the first slice, replaces each input buffer allocation
+/// with `mgp.buffer.slice(out_buffer, offset, slice_size)`, forwards `out_chain` to `in_chain`,
+/// and erases the `mgp.buffer.concat` op. Returns the number of lowered concatenations.
+pub fn lower_buffer_concat_in_place(module: &mut Module, preferred_alignment: u64) -> usize {
+    let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+    let mut lowered_count = 0usize;
+
+    for blk_id in block_ids {
+        let orig_ops = module.blocks[blk_id].ops.clone();
+
+        for &concat_op in &orig_ops {
+            if !module.ops.contains_key(concat_op) {
+                continue;
+            }
+            if module.ops[concat_op].name.full_name() != "mgp.buffer.concat" {
+                continue;
+            }
+            if module.ops[concat_op].operands.len() < 3 || module.ops[concat_op].results.is_empty()
+            {
+                continue;
+            }
+            let in_chain = module.ops[concat_op].operands[0];
+            let out_buffer = module.ops[concat_op].operands[1];
+            let in_buffers: Vec<ValueId> = module.ops[concat_op].operands[2..].to_vec();
+            let out_chain = module.ops[concat_op].results[0];
+
+            // Verify `out_buffer` is defined by `mgp.buffer.alloc`.
+            let ValueDef::OpResult {
+                op: out_alloc_op, ..
+            } = module.values[out_buffer].def
+            else {
+                continue;
+            };
+            if module.ops[out_alloc_op].name.full_name() != "mgp.buffer.alloc" {
+                continue;
+            }
+
+            // Verify all `in_buffers` are distinct and defined by `mgp.buffer.alloc` with a size
+            // operand.
+            let mut distinct_in: IndexSet<ValueId> = IndexSet::new();
+            let mut in_alloc_ops: Vec<OpId> = Vec::with_capacity(in_buffers.len());
+            let mut slice_sizes: Vec<ValueId> = Vec::with_capacity(in_buffers.len());
+            let mut valid = true;
+            for &in_buf in &in_buffers {
+                if !distinct_in.insert(in_buf) {
+                    valid = false;
+                    break;
+                }
+                let ValueDef::OpResult { op: alloc_id, .. } = module.values[in_buf].def else {
+                    valid = false;
+                    break;
+                };
+                if module.ops[alloc_id].name.full_name() != "mgp.buffer.alloc"
+                    || module.ops[alloc_id].operands.is_empty()
+                {
+                    valid = false;
+                    break;
+                }
+                in_alloc_ops.push(alloc_id);
+                slice_sizes.push(module.ops[alloc_id].operands[0]);
+            }
+            if !valid {
+                continue;
+            }
+
+            // Every slice size except the last must be a provable multiple of
+            // `preferred_alignment`.
+            let aligned = slice_sizes[..slice_sizes.len() - 1]
+                .iter()
+                .all(|&sz| is_provable_multiple_of(module, sz, preferred_alignment));
+            if !aligned {
+                continue;
+            }
+
+            // Move `out_alloc_op` before the first `in_alloc_ops` in the block if needed.
+            if let (Some(out_pos), Some(first_in_pos)) = (
+                module.blocks[blk_id]
+                    .ops
+                    .iter()
+                    .position(|&id| id == out_alloc_op),
+                module.blocks[blk_id]
+                    .ops
+                    .iter()
+                    .position(|&id| id == in_alloc_ops[0]),
+            ) && out_pos > first_in_pos
+            {
+                module.blocks[blk_id].ops.remove(out_pos);
+                let new_first_pos = module.blocks[blk_id]
+                    .ops
+                    .iter()
+                    .position(|&id| id == in_alloc_ops[0])
+                    .unwrap();
+                module.blocks[blk_id]
+                    .ops
+                    .insert(new_first_pos, out_alloc_op);
+            }
+
+            // Replace each input allocation with `index.constant` + `mgp.buffer.slice`.
+            let loc = module.ops[concat_op].location.clone();
+            let size_ty = module.values[slice_sizes[0]].ty.clone();
+
+            for (idx, (&in_buf, (&in_alloc_id, &slice_sz))) in in_buffers
+                .iter()
+                .zip(in_alloc_ops.iter().zip(slice_sizes.iter()))
+                .enumerate()
+            {
+                let mut cst_attrs = IndexMap::new();
+                cst_attrs.insert("value".to_string(), Attribute::Int(idx as i64));
+                let cst_op = module.ops.insert_with_key(|id| Operation {
+                    id,
+                    name: OpName::new("index", "constant"),
+                    operands: SmallVec::new(),
+                    results: SmallVec::new(),
+                    attributes: cst_attrs,
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: loc.clone(),
+                });
+                let cst_val = module.values.insert_with_key(|id| Value {
+                    id,
+                    ssa_name: None,
+                    ty: size_ty.clone(),
+                    def: ValueDef::OpResult {
+                        op: cst_op,
+                        index: 0,
+                    },
+                });
+                module.ops[cst_op].results.push(cst_val);
+
+                let mut slice_opds = SmallVec::new();
+                slice_opds.push(out_buffer);
+                slice_opds.push(cst_val);
+                slice_opds.push(slice_sz);
+                let slice_op = module.ops.insert_with_key(|id| Operation {
+                    id,
+                    name: OpName::new("mgp", "buffer.slice"),
+                    operands: slice_opds,
+                    results: SmallVec::from_slice(&[in_buf]),
+                    attributes: IndexMap::new(),
+                    regions: Vec::new(),
+                    custom_syntax: false,
+                    location: loc.clone(),
+                });
+                module.values[in_buf].def = ValueDef::OpResult {
+                    op: slice_op,
+                    index: 0,
+                };
+
+                if let Some(pos) = module.blocks[blk_id]
+                    .ops
+                    .iter()
+                    .position(|&id| id == in_alloc_id)
+                {
+                    module.blocks[blk_id].ops[pos] = cst_op;
+                    module.blocks[blk_id].ops.insert(pos + 1, slice_op);
+                }
+                module.ops.remove(in_alloc_id);
+            }
+
+            // Replace uses of `out_chain` with `in_chain` across the block and erase `concat_op`.
+            for &op_id in &module.blocks[blk_id].ops {
+                if op_id == concat_op {
+                    continue;
+                }
+                for opd in &mut module.ops[op_id].operands {
+                    if *opd == out_chain {
+                        *opd = in_chain;
+                    }
+                }
+            }
+            module.blocks[blk_id].ops.retain(|&id| id != concat_op);
+            module.ops.remove(concat_op);
+            lowered_count += 1;
+        }
+    }
+
+    lowered_count
+}

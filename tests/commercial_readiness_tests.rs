@@ -5240,3 +5240,50 @@ fn test_multi_group_fold_unfold_and_grouped_presence_bitmaps() {
     let merged = merge_presence_bitmaps(&rows, 4);
     assert_eq!(merged, vec![true, true, true, true]);
 }
+
+#[test]
+fn test_lower_buffer_concat_in_place_with_alignment_check() {
+    use castforge::passes::{is_provable_multiple_of, lower_buffer_concat_in_place};
+
+    let mlir = concat!(
+        "module @concat_in_place {\n",
+        "  func.func @main(%ch0: tensor<1xi64>, %dyn: tensor<1xi64>) -> tensor<1xi64> {\n",
+        "    %stride = index.constant {value = 256 : i64} : () -> tensor<1xi64>\n",
+        "    %sz0 = index.mul %dyn, %stride : (tensor<1xi64>, tensor<1xi64>) -> tensor<1xi64>\n",
+        "    %sz1 = index.constant {value = 100 : i64} : () -> tensor<1xi64>\n",
+        "    %tot = index.add %sz0, %sz1 : (tensor<1xi64>, tensor<1xi64>) -> tensor<1xi64>\n",
+        "    %in0 = mgp.buffer.alloc %sz0 : (tensor<1xi64>) -> tensor<4xf32>\n",
+        "    %in1 = mgp.buffer.alloc %sz1 : (tensor<1xi64>) -> tensor<4xf32>\n",
+        "    %out = mgp.buffer.alloc %tot : (tensor<1xi64>) -> tensor<8xf32>\n",
+        "    %ch1 = mgp.buffer.concat %ch0, %out, %in0, %in1",
+        " : (tensor<1xi64>, tensor<8xf32>, tensor<4xf32>, tensor<4xf32>) -> tensor<1xi64>\n",
+        "    return %ch1 : tensor<1xi64>\n",
+        "  }\n",
+        "}\n",
+    );
+
+    let mut m = parse_mlir(mlir).expect("valid MLIR");
+    let func_id = m.functions()[0];
+    let blk_id = m.regions[m.ops[func_id].regions[0]].blocks[0];
+    let sz0_val = m.ops[m.blocks[blk_id].ops[1]].results[0];
+    let sz1_val = m.ops[m.blocks[blk_id].ops[2]].results[0];
+    assert!(is_provable_multiple_of(&m, sz0_val, 256));
+    assert!(!is_provable_multiple_of(&m, sz1_val, 256));
+
+    // Because `sz0` (the only non-final slice size) is a provable multiple of 256, the concat is
+    // lowered in-place into two `mgp.buffer.slice` ops and the `out` alloc is hoisted before them.
+    assert_eq!(lower_buffer_concat_in_place(&mut m, 256), 1);
+
+    let slice_count = m.blocks[blk_id]
+        .ops
+        .iter()
+        .filter(|&&id| m.ops[id].name.full_name() == "mgp.buffer.slice")
+        .count();
+    let alloc_count = m.blocks[blk_id]
+        .ops
+        .iter()
+        .filter(|&&id| m.ops[id].name.full_name() == "mgp.buffer.alloc")
+        .count();
+    assert_eq!(slice_count, 2);
+    assert_eq!(alloc_count, 1);
+}
