@@ -24,10 +24,11 @@ use castforge::passes::{
     flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
     fuse_reshape_epilogue, fuse_sole_use_prologues, hash_prefix_token_blocks,
     is_supported_arch_dtype, longest_full_attention_hit, longest_joint_prefix_hit,
-    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_identical_functions,
-    plan_cacheblend_retrieve, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
-    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
-    stamp_fused_provenance, unfold_chunk_range, validate_target_device_dtypes,
+    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_duplicate_shape_ops,
+    merge_identical_functions, plan_cacheblend_retrieve, plan_jenga_kv_geometry,
+    plan_kernel_sequence_fusion, plan_kv_dma_transfer, promote_narrow_accumulators,
+    re_rope_key_in_place, stamp_fused_provenance, unfold_chunk_range,
+    validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -1527,4 +1528,46 @@ module @chain {
     assert!(matches!(&body[1], LoopStmt::For { .. }));
     assert!(matches!(&body[2], LoopStmt::Alloc { name, .. } if name == "buf_late"));
     assert!(matches!(&body[3], LoopStmt::For { .. }));
+}
+
+#[test]
+fn test_merge_duplicate_shape_materializations_and_provenance() {
+    let mlir = r#"
+module @shape_dedup {
+  func.func @main(%x: tensor<2x4xf32>) -> tensor<8xf32> {
+    %r0 = stablehlo.reshape %x : (tensor<2x4xf32>) -> tensor<8xf32>
+    %r1 = stablehlo.reshape %x : (tensor<2x4xf32>) -> tensor<8xf32>
+    %i0 = stablehlo.iota {iota_dimension = 0 : i64} : tensor<8xf32>
+    %i1 = stablehlo.iota {iota_dimension = 0 : i64} : tensor<8xf32>
+    %sum0 = stablehlo.add %r0, %r1 : tensor<8xf32>
+    %sum1 = stablehlo.add %i0, %i1 : tensor<8xf32>
+    %out = stablehlo.add %sum0, %sum1 : tensor<8xf32>
+    return %out : tensor<8xf32>
+  }
+}
+"#;
+    let mut module = parse_mlir(mlir).expect("valid MLIR");
+    // Assign named locations to the two reshapes so we can verify provenance fusion
+    let func_id = module.functions()[0];
+    let func_reg = module.ops[func_id].regions[0];
+    let func_block = module.regions[func_reg].blocks[0];
+    let op_ids = module.blocks[func_block].ops.clone();
+    module.ops[op_ids[0]].location = Location::Named("reshape_lhs".to_string());
+    module.ops[op_ids[1]].location = Location::Named("reshape_rhs".to_string());
+
+    let merged = merge_duplicate_shape_ops(&mut module);
+    // Both duplicate `%r1` (`stablehlo.reshape`) and duplicate `%i1` (`stablehlo.iota`) are merged!
+    assert_eq!(merged, 2);
+
+    let remaining_ops = &module.blocks[func_block].ops;
+    let primary_reshape = &module.ops[remaining_ops[0]];
+    assert_eq!(primary_reshape.name.to_string(), "stablehlo.reshape");
+    assert_eq!(
+        primary_reshape.location,
+        Location::Named("reshape_lhs+reshape_rhs".to_string())
+    );
+
+    let printed = castforge::ir::print_mlir(&module);
+    assert_eq!(printed.matches("stablehlo.reshape").count(), 1);
+    assert_eq!(printed.matches("stablehlo.iota").count(), 1);
 }

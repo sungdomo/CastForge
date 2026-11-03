@@ -3752,3 +3752,75 @@ pub fn defer_allocs_to_first_use(loop_module: &mut crate::ir::loops::LoopModule)
     }
     moved_or_elided
 }
+
+fn is_shape_materialization_op(name: &str) -> bool {
+    matches!(
+        name,
+        "stablehlo.get_dimension_size"
+            | "stablehlo.iota"
+            | "stablehlo.broadcast_in_dim"
+            | "stablehlo.reshape"
+            | "shape.shape_of"
+            | "tensor.dim"
+    )
+}
+
+type ShapeOpSignature = (String, Vec<ValueId>, Vec<Type>, String);
+
+/// Merges duplicate shape-materialization and broadcast/metadata operations
+/// (`stablehlo.get_dimension_size`, `stablehlo.iota`, `stablehlo.broadcast_in_dim`,
+/// `stablehlo.reshape`, `shape.shape_of`, `tensor.dim`) within each block while fusing their
+/// [`Location`] provenance onto the surviving primary op via [`stamp_fused_provenance`]
+/// (inspired by Modular
+/// `GraphCompiler/lib/MODialect/Transforms/MergeDuplicateShapeMaterializations.cpp`).
+///
+/// Returns the number of duplicate shape/metadata operations merged and eliminated.
+pub fn merge_duplicate_shape_ops(module: &mut Module) -> usize {
+    let mut merged_count = 0usize;
+    let block_ids: Vec<_> = module.blocks.keys().collect();
+
+    for block_id in block_ids {
+        let op_ids = module.blocks[block_id].ops.clone();
+        let mut seen: IndexMap<ShapeOpSignature, (OpId, ValueId)> = IndexMap::new();
+
+        for op_id in op_ids {
+            let Some(op) = module.ops.get(op_id).cloned() else {
+                continue;
+            };
+            let op_name_str = op.name.to_string();
+            if !is_shape_materialization_op(&op_name_str) || op.results.len() != 1 {
+                continue;
+            }
+            let res_val = op.results[0];
+            let res_tys: Vec<Type> = op
+                .results
+                .iter()
+                .filter_map(|&v| module.values.get(v).map(|val| val.ty.clone()))
+                .collect();
+            let mut attr_pairs: Vec<(String, String)> = op
+                .attributes
+                .iter()
+                .filter(|(k, _)| !k.starts_with("castforge.fused_"))
+                .map(|(k, v)| (k.clone(), format!("{v:?}")))
+                .collect();
+            attr_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            let attr_sig = format!("{attr_pairs:?}");
+            let sig: ShapeOpSignature = (op_name_str, op.operands.to_vec(), res_tys, attr_sig);
+
+            if let Some(&(primary_op_id, primary_val)) = seen.get(&sig) {
+                let dup_loc = op.location.clone();
+                if let Some(primary_op) = module.ops.get_mut(primary_op_id) {
+                    let locs = [primary_op.location.clone(), dup_loc];
+                    stamp_fused_provenance(primary_op, &locs);
+                }
+                module.replace_all_uses(res_val, primary_val);
+                module.remove_op(block_id, op_id);
+                merged_count += 1;
+            } else {
+                seen.insert(sig, (op_id, res_val));
+            }
+        }
+    }
+
+    merged_count
+}
