@@ -4545,3 +4545,110 @@ pub fn decode_kv_fs_filename(filename: &str) -> Option<KvStorageKeySpec> {
     spec.model_name = spec.model_name.replace("-SEP-", "/");
     Some(spec)
 }
+
+const FAULT_INJECT_HASH_DENOM: u64 = 1_000_000;
+
+/// Configuration for deterministic L2 load fault injection
+/// (inspired by LMCache `lmcache/v1/distributed/l2_adapters/fault_inject_l2_adapter.py`
+/// `FaultInjectL2AdapterConfig`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct L2FaultInjectConfig {
+    /// Deterministic per-key drop probability in `[0.0, 1.0]`.
+    pub rate: f64,
+    /// Deterministic hash seed so drop decisions reproduce across runs.
+    pub seed: u64,
+    /// Exact head-relative chunk indices to drop unconditionally.
+    pub gap_indices: Vec<usize>,
+    /// Workload-agnostic tail-relative ratios in `[0.0, 1.0]`: drops chunk index
+    /// `round((1.0 - ratio) * (n - 1))` (`0.0` = last chunk, `0.5` = middle, `1.0` = first).
+    pub gap_tail_ratios: Vec<f64>,
+}
+
+/// Deterministic L2 load fault-injection policy that faults load results (leaving lookup bitmaps
+/// untouched) to exercise segmented gapped prefetch and lock-release trim masks
+/// (inspired by LMCache `lmcache/v1/distributed/l2_adapters/fault_inject_l2_adapter.py`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct L2FaultInjectPolicy {
+    pub config: L2FaultInjectConfig,
+}
+
+impl L2FaultInjectPolicy {
+    /// Creates a new L2 load fault-injection policy.
+    pub fn new(config: L2FaultInjectConfig) -> Self {
+        Self { config }
+    }
+
+    /// Returns `true` if `key` falls into the deterministic `(seed, key)` rate-based drop bucket.
+    pub fn should_drop_key(&self, key: &KvStorageKeySpec) -> bool {
+        let rate = self.config.rate.clamp(0.0, 1.0);
+        if rate <= 0.0 {
+            return false;
+        }
+        // Hash stable identity fields directly (`seed`, `chunk_hash`, `model_name`, `kv_rank`,
+        // `object_group_id`, `cache_salt`).
+        let mut h = self.config.seed ^ 0x9E37_79B9_7F4A_7C15;
+        let mix = |acc: u64, val: u64| -> u64 {
+            let mut z = acc.wrapping_add(val).wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        h = mix(h, key.chunk_hash);
+        h = mix(h, key.kv_rank as u64);
+        h = mix(h, key.object_group_id as u64);
+        for b in key.model_name.bytes().chain(key.cache_salt.bytes()) {
+            h = mix(h, b as u64);
+        }
+        let bucket = h % FAULT_INJECT_HASH_DENOM;
+        bucket < ((rate * (FAULT_INJECT_HASH_DENOM as f64)) as u64)
+    }
+
+    /// Returns the sorted positions in `keys` that are dropped at load time (combining
+    /// `gap_tail_ratios`, `gap_indices`, and `should_drop_key`).
+    pub fn drop_positions(&self, keys: &[KvStorageKeySpec]) -> Vec<usize> {
+        let n = keys.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let ratio_positions: std::collections::HashSet<usize> = self
+            .config
+            .gap_tail_ratios
+            .iter()
+            .filter(|&&r| (0.0..=1.0).contains(&r))
+            .map(|&r| ((1.0 - r) * ((n - 1) as f64)).round() as usize)
+            .collect();
+        let explicit_gaps: std::collections::HashSet<usize> =
+            self.config.gap_indices.iter().copied().collect();
+
+        let mut dropped = Vec::new();
+        for (i, key) in keys.iter().enumerate() {
+            if ratio_positions.contains(&i)
+                || explicit_gaps.contains(&i)
+                || self.should_drop_key(key)
+            {
+                dropped.push(i);
+            }
+        }
+        dropped
+    }
+
+    /// Post-processes a lookup bitmap into `(faulted_load_bitmap, failed_lock_trim_mask)`:
+    /// lookup hits at dropped positions are cleared in `faulted_load_bitmap` and set in
+    /// `failed_lock_trim_mask` so the prefetch controller releases their L2 locks.
+    pub fn fault_load_bitmap(
+        &self,
+        keys: &[KvStorageKeySpec],
+        lookup_bitmap: &[bool],
+    ) -> (Vec<bool>, Vec<bool>) {
+        let len = keys.len().min(lookup_bitmap.len());
+        let mut load_bitmap = lookup_bitmap[..len].to_vec();
+        let mut trim_mask = vec![false; len];
+        for pos in self.drop_positions(&keys[..len]) {
+            if pos < len && load_bitmap[pos] {
+                load_bitmap[pos] = false;
+                trim_mask[pos] = true;
+            }
+        }
+        (load_bitmap, trim_mask)
+    }
+}

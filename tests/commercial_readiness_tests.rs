@@ -19,19 +19,20 @@ use castforge::passes::{
     EngineKvFormat, FULL_ATTENTION_WINDOW, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
     IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KvAttentionMaskKind, KvBlockPool,
     KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope,
-    KvStorageKeySpec, LayerGroupPayloadSharder, PassManager, PassRegistry, ROWWISE_CHEAP_OP_COST,
-    ROWWISE_EXPENSIVE_OP_COST, WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups,
-    anonymize_symbolic_dims, compress_splat_constants, decode_kv_fs_filename,
-    decode_kv_storage_key, defer_allocs_to_first_use, direct_copy_format_supported,
-    elide_redundant_state_transfers, encode_kv_fs_filename, encode_kv_storage_key,
-    flatten_elementwise_chains, fold_unfold_hybrid_prefix_bitmaps, fuse_locations,
-    fuse_reshape_epilogue, fuse_sole_use_prologues, hash_prefix_token_blocks,
-    is_supported_arch_dtype, legalize_rowwise_reduction_launch, longest_full_attention_hit,
-    longest_joint_prefix_hit, longest_sliding_window_hit, mark_cuda_graph_stable_tensors,
-    merge_duplicate_shape_ops, merge_identical_functions, plan_cacheblend_retrieve,
-    plan_concat_in_place, plan_jenga_kv_geometry, plan_kernel_sequence_fusion,
-    plan_kv_dma_transfer, promote_narrow_accumulators, re_rope_key_in_place,
-    stamp_fused_provenance, unfold_chunk_range, validate_target_device_dtypes,
+    KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy, LayerGroupPayloadSharder,
+    PassManager, PassRegistry, ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST,
+    WarmPrefetchJobTable, WarmPrefetchStatus, analyze_kv_layer_groups, anonymize_symbolic_dims,
+    compress_splat_constants, decode_kv_fs_filename, decode_kv_storage_key,
+    defer_allocs_to_first_use, direct_copy_format_supported, elide_redundant_state_transfers,
+    encode_kv_fs_filename, encode_kv_storage_key, flatten_elementwise_chains,
+    fold_unfold_hybrid_prefix_bitmaps, fuse_locations, fuse_reshape_epilogue,
+    fuse_sole_use_prologues, hash_prefix_token_blocks, is_supported_arch_dtype,
+    legalize_rowwise_reduction_launch, longest_full_attention_hit, longest_joint_prefix_hit,
+    longest_sliding_window_hit, mark_cuda_graph_stable_tensors, merge_duplicate_shape_ops,
+    merge_identical_functions, plan_cacheblend_retrieve, plan_concat_in_place,
+    plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
+    promote_narrow_accumulators, re_rope_key_in_place, stamp_fused_provenance, unfold_chunk_range,
+    validate_target_device_dtypes,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -1787,4 +1788,34 @@ fn test_reversible_kv_storage_key_and_fs_filename_codec() {
     assert!(salted_fs.ends_with("@tenant-prod.data"));
     assert_eq!(decode_kv_fs_filename(&salted_fs), Some(salted));
     assert!(decode_kv_fs_filename("missing_extension").is_none());
+}
+
+#[test]
+fn test_l2_fault_inject_policy_tail_ratios_and_trim_mask() {
+    let keys: Vec<KvStorageKeySpec> = (0..5)
+        .map(|i| KvStorageKeySpec {
+            model_name: "llama".to_string(),
+            kv_rank: 0,
+            object_group_id: 0,
+            chunk_hash: 1000 + i,
+            cache_salt: String::new(),
+        })
+        .collect();
+
+    // `gap_indices = [1]` (2nd chunk) + `gap_tail_ratios = [0.5, 0.0]`
+    // For n = 5:
+    // - ratio 0.5 -> round((1 - 0.5) * 4) = 2 (middle chunk)
+    // - ratio 0.0 -> round((1 - 0.0) * 4) = 4 (last chunk)
+    let policy = L2FaultInjectPolicy::new(L2FaultInjectConfig {
+        rate: 0.0,
+        seed: 42,
+        gap_indices: vec![1],
+        gap_tail_ratios: vec![0.5, 0.0],
+    });
+    assert_eq!(policy.drop_positions(&keys), vec![1, 2, 4]);
+
+    let lookup_bitmap = vec![true, true, true, true, true];
+    let (load_bitmap, trim_mask) = policy.fault_load_bitmap(&keys, &lookup_bitmap);
+    assert_eq!(load_bitmap, vec![true, false, false, true, false]);
+    assert_eq!(trim_mask, vec![false, true, true, false, true]);
 }
