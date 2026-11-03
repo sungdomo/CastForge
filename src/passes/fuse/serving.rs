@@ -16144,3 +16144,114 @@ impl OptimalBloomFilter {
         self.item_count = 0;
     }
 }
+
+// ============================================================================
+// Batch 19 Step 2: Transitive Device-Graph Dependency Edge Redundancy Eliminator
+// ============================================================================
+
+/// Eliminates node indices in `needles` that are transitively reachable from other node indices in
+/// `needles` via `edges_by_node` (using wave-based BFS with a `visited` set so even malformed
+/// cycles terminate cleanly).
+#[must_use]
+pub fn eliminate_implied_dependency_indices(
+    needles: &[i64],
+    edges_by_node: &IndexMap<i64, Vec<i64>>,
+) -> Vec<i64> {
+    let mut surviving: IndexSet<i64> = needles.iter().copied().collect();
+    let mut visited: IndexSet<i64> = IndexSet::new();
+    let mut current_gen: IndexSet<i64> = IndexSet::new();
+
+    for &needle in &surviving {
+        if let Some(parents) = edges_by_node.get(&needle) {
+            for &p in parents {
+                current_gen.insert(p);
+            }
+        }
+    }
+
+    while !current_gen.is_empty() {
+        for &v in &current_gen {
+            visited.insert(v);
+            surviving.shift_remove(&v);
+        }
+        let mut next_gen: IndexSet<i64> = IndexSet::new();
+        for &v in &current_gen {
+            if let Some(parents) = edges_by_node.get(&v) {
+                for &p in parents {
+                    if !visited.contains(&p) {
+                        next_gen.insert(p);
+                    }
+                }
+            }
+        }
+        current_gen = next_gen;
+    }
+
+    surviving.into_iter().collect()
+}
+
+/// Eliminates transitively implied dependency edges across all `mgp.device_graph.dependencies`
+/// operations in `module`, pruning both `"dep_node_indices"` and any corresponding dependency
+/// token operands. Returns the total number of redundant edges eliminated.
+pub fn simplify_device_graph_dependencies(module: &mut Module) -> usize {
+    let block_ids: Vec<BlockId> = module.blocks.keys().collect();
+    let mut eliminated_total = 0usize;
+
+    for blk_id in block_ids {
+        let deps_ops: Vec<OpId> = module.blocks[blk_id]
+            .ops
+            .iter()
+            .copied()
+            .filter(|&id| module.ops[id].name.full_name() == "mgp.device_graph.dependencies")
+            .collect();
+        if deps_ops.is_empty() {
+            continue;
+        }
+
+        let mut edges_by_node: IndexMap<i64, Vec<i64>> = IndexMap::new();
+        let mut node_token_by_idx: IndexMap<i64, ValueId> = IndexMap::new();
+
+        for (idx, &op_id) in deps_ops.iter().enumerate() {
+            let deps = extract_i64_vec_attr(&module.ops[op_id].attributes, "dep_node_indices")
+                .unwrap_or_default();
+            edges_by_node.insert(idx as i64, deps);
+            if let Some(&last_res) = module.ops[op_id].results.last() {
+                node_token_by_idx.insert(idx as i64, last_res);
+            }
+        }
+
+        for (idx, &op_id) in deps_ops.iter().enumerate() {
+            let orig_deps = edges_by_node
+                .get(&(idx as i64))
+                .cloned()
+                .unwrap_or_default();
+            if orig_deps.len() <= 1 {
+                continue;
+            }
+            let reduced = eliminate_implied_dependency_indices(&orig_deps, &edges_by_node);
+            if reduced.len() < orig_deps.len() {
+                let reduced_set: IndexSet<i64> = reduced.iter().copied().collect();
+                let mut pruned_tokens: IndexSet<ValueId> = IndexSet::new();
+                for &d in &orig_deps {
+                    if !reduced_set.contains(&d)
+                        && let Some(&tok) = node_token_by_idx.get(&d)
+                    {
+                        pruned_tokens.insert(tok);
+                    }
+                }
+                if !pruned_tokens.is_empty() {
+                    module.ops[op_id]
+                        .operands
+                        .retain(|v| !pruned_tokens.contains(v));
+                }
+                eliminated_total += orig_deps.len() - reduced.len();
+                module.ops[op_id].attributes.insert(
+                    "dep_node_indices".to_string(),
+                    Attribute::DenseIntArray(reduced),
+                );
+            }
+        }
+    }
+
+    eliminated_total
+}

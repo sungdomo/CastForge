@@ -5007,3 +5007,44 @@ fn test_optimal_bloom_filter_and_sliding_window_block_downsampler() {
     assert_eq!(bf.item_count(), 3);
     assert!(bf.fill_rate() > 0.0);
 }
+
+#[test]
+fn test_simplify_device_graph_dependencies_transitive_reduction() {
+    use castforge::ir::mlir::Attribute;
+    use castforge::passes::{
+        compute_device_graph_dependencies, simplify_device_graph_dependencies,
+    };
+
+    // Routine 0 -> Routine 1 -> Routine 2, while Routine 2 also directly consumes Routine 0's
+    // output (creating a redundant edge 0 -> 2 implied by 0 -> 1 -> 2).
+    let mlir = concat!(
+        "module @simplify_dev_graph {\n",
+        "  func.func @main(%x: tensor<4xf32>) -> tensor<4xf32> {\n",
+        "    %r0 = mogg.routine.async %x : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %r1 = mogg.routine.async %r0 : (tensor<4xf32>) -> tensor<4xf32>\n",
+        "    %r2 = mogg.routine.async %r0, %r1",
+        " : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>\n",
+        "    return %r2 : tensor<4xf32>\n",
+        "  }\n",
+        "}\n",
+    );
+
+    let mut m = parse_mlir(mlir).expect("valid MLIR");
+    assert_eq!(compute_device_graph_dependencies(&mut m), 3);
+    let eliminated = simplify_device_graph_dependencies(&mut m);
+    assert_eq!(eliminated, 1);
+
+    let func_id = m.functions()[0];
+    let blk_id = m.regions[m.ops[func_id].regions[0]].blocks[0];
+    let deps_ops: Vec<_> = m.blocks[blk_id]
+        .ops
+        .iter()
+        .copied()
+        .filter(|&id| m.ops[id].name.full_name() == "mgp.device_graph.dependencies")
+        .collect();
+    // Node 2's redundant edge to Node 0 was pruned, leaving only `[1]`:
+    assert_eq!(
+        m.ops[deps_ops[2]].attributes.get("dep_node_indices"),
+        Some(&Attribute::DenseIntArray(vec![1]))
+    );
+}
