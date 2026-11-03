@@ -20956,3 +20956,248 @@ pub fn legalize_rowwise_kernels(
 
     Ok(legalized_count)
 }
+
+// ============================================================================
+// Batch 23 Step 1: Dynamic File-Backed Zero-Copy L2 Storage Agent, L1 Page
+// Index Mapper, and 2-Level Hash-Sharded Atomic Publish Planner
+// ============================================================================
+
+/// Computes the registered L1 page indices covering `[raw_addr, raw_addr + mem_size)`
+/// for a zero-copy storage transfer, verifying that both `raw_addr` and `mem_size`
+/// are aligned to `l1_align_bytes`.
+pub fn compute_l1_page_indices(
+    raw_addr: usize,
+    mem_size: usize,
+    l1_align_bytes: usize,
+) -> Result<Vec<usize>, String> {
+    if l1_align_bytes == 0 {
+        return Err("l1_align_bytes must be > 0".to_string());
+    }
+    if !raw_addr.is_multiple_of(l1_align_bytes) {
+        return Err(format!(
+            "raw address {raw_addr} is not aligned to page size {l1_align_bytes}"
+        ));
+    }
+    if mem_size == 0 || !mem_size.is_multiple_of(l1_align_bytes) {
+        return Err(format!(
+            "memory size {mem_size} is not a positive multiple of page size {l1_align_bytes}"
+        ));
+    }
+    let base_page = raw_addr / l1_align_bytes;
+    let num_pages = mem_size / l1_align_bytes;
+    Ok((0..num_pages).map(|i| base_page + i).collect())
+}
+
+/// Formats a deterministic binary storage filename
+/// (`{model}_{rank:08x}_{group:x}_{hash}[@{salt}].bin` with `/` in `model_name`
+/// escaped as `--`).
+pub fn format_dynamic_storage_filename(
+    model_name: &str,
+    kv_rank: u32,
+    group_id: u32,
+    chunk_hash_hex: &str,
+    cache_salt: &str,
+) -> Result<String, String> {
+    if model_name.is_empty() {
+        return Err("model_name must be non-empty".to_string());
+    }
+    if chunk_hash_hex.len() < 4 || !chunk_hash_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("chunk_hash_hex must be at least 4 hex digits".to_string());
+    }
+    let escaped_model = model_name.replace('/', "--");
+    let suffix = if cache_salt.is_empty() {
+        String::new()
+    } else {
+        format!("@{cache_salt}")
+    };
+    Ok(format!(
+        "{escaped_model}_{kv_rank:08x}_{group_id:x}_{chunk_hash_hex}{suffix}.bin"
+    ))
+}
+
+/// Computes the relative storage path (and optional 2-level `<h[0..2]>/<h[2..4]>`
+/// shard subdirectory) for a cache object key. The 2-level shard bucket depends
+/// solely on `chunk_hash_hex`, keeping salted variants colocated in the same
+/// shard directory.
+pub fn object_key_to_sharded_relpath(
+    model_name: &str,
+    kv_rank: u32,
+    group_id: u32,
+    chunk_hash_hex: &str,
+    cache_salt: &str,
+    shard_dirs: bool,
+) -> Result<(Option<String>, String), String> {
+    let filename =
+        format_dynamic_storage_filename(model_name, kv_rank, group_id, chunk_hash_hex, cache_salt)?;
+    if !shard_dirs {
+        return Ok((None, filename));
+    }
+    let l1 = &chunk_hash_hex[0..2];
+    let l2 = &chunk_hash_hex[2..4];
+    let subdir = format!("{l1}/{l2}");
+    let relpath = format!("{subdir}/{filename}");
+    Ok((Some(subdir), relpath))
+}
+
+/// Builds per-page `(file_offset, page_size, fd)` transfer descriptors for a
+/// single file of `file_size` bytes.
+pub fn build_single_file_xfer_descs(
+    fd: i32,
+    file_size: usize,
+    page_size: usize,
+) -> Result<Vec<(usize, usize, i32)>, String> {
+    if page_size == 0 || file_size == 0 || !file_size.is_multiple_of(page_size) {
+        return Err(format!(
+            "file_size {file_size} must be a positive multiple of page_size {page_size}"
+        ));
+    }
+    let num_pages = file_size / page_size;
+    Ok((0..num_pages)
+        .map(|page_idx| (page_idx * page_size, page_size, fd))
+        .collect())
+}
+
+/// Returns `true` if `filename` matches the `<final_name>.tmp.<token>` pattern
+/// created during atomic write-to-temp-then-rename staging.
+#[must_use]
+pub fn is_orphan_temp_storage_file(filename: &str) -> bool {
+    if let Some((prefix, token)) = filename.rsplit_once(".tmp.") {
+        !prefix.is_empty() && !token.is_empty()
+    } else {
+        false
+    }
+}
+
+/// Planned atomic file write operation for a dynamic zero-copy L2 storage agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtomicFileStorePlan {
+    /// Whether the target 2-level shard directory needs to be created first.
+    pub needs_mkdir: Option<String>,
+    /// Temporary staging file path (`<final_path>.tmp.<nonce>`).
+    pub temp_path: String,
+    /// Final published file path renamed atomically after DMA completion.
+    pub final_path: String,
+    /// Total file size in bytes (`mem_indices.len() * l1_align_bytes`).
+    pub file_size: usize,
+}
+
+/// Dynamic file-backed L2 storage agent planner managing L1 memory page
+/// registration, 2-level directory sharding cache, and atomic temp-to-final
+/// store publication.
+#[derive(Debug, Clone)]
+pub struct DynamicFileStorageAgent {
+    base_dir: String,
+    memory_type: String,
+    l1_align_bytes: usize,
+    shard_dirs: bool,
+    use_direct_io: bool,
+    l1_xfer_descs: Vec<(usize, usize, u32)>,
+    created_subdirs: std::collections::BTreeSet<String>,
+}
+
+impl DynamicFileStorageAgent {
+    /// Initializes a dynamic file-backed storage agent for `device` (`"cpu"` ->
+    /// `"DRAM"`, accelerator -> `"VRAM"`) and precomputes L1 page descriptors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        base_dir: &str,
+        device: &str,
+        buffer_ptr: usize,
+        buffer_size: usize,
+        l1_align_bytes: usize,
+        device_id: u32,
+        shard_dirs: bool,
+        use_direct_io: bool,
+    ) -> Result<Self, String> {
+        if base_dir.is_empty() {
+            return Err("base_dir must be non-empty".to_string());
+        }
+        if l1_align_bytes == 0 || buffer_size == 0 || !buffer_size.is_multiple_of(l1_align_bytes) {
+            return Err("buffer_size must be a positive multiple of l1_align_bytes".to_string());
+        }
+        let memory_type = if device.eq_ignore_ascii_case("cpu") {
+            "DRAM".to_string()
+        } else {
+            "VRAM".to_string()
+        };
+        let num_pages = buffer_size / l1_align_bytes;
+        let l1_xfer_descs = (0..num_pages)
+            .map(|i| (buffer_ptr + i * l1_align_bytes, l1_align_bytes, device_id))
+            .collect();
+        Ok(Self {
+            base_dir: base_dir.trim_end_matches('/').to_string(),
+            memory_type,
+            l1_align_bytes,
+            shard_dirs,
+            use_direct_io,
+            l1_xfer_descs,
+            created_subdirs: std::collections::BTreeSet::new(),
+        })
+    }
+
+    /// Returns the registered memory type (`"DRAM"` or `"VRAM"`).
+    #[must_use]
+    pub fn memory_type(&self) -> &str {
+        &self.memory_type
+    }
+
+    /// Returns whether direct I/O (`O_DIRECT`) is enabled for file transfers.
+    #[must_use]
+    pub fn use_direct_io(&self) -> bool {
+        self.use_direct_io
+    }
+
+    /// Returns the number of registered L1 memory pages.
+    #[must_use]
+    pub fn registered_page_count(&self) -> usize {
+        self.l1_xfer_descs.len()
+    }
+
+    /// Plans an atomic write-to-temp-then-rename store operation, caching
+    /// created 2-level shard subdirectories so each bucket is created at most
+    /// once on the store hot path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_atomic_store(
+        &mut self,
+        mem_indices: &[usize],
+        model_name: &str,
+        kv_rank: u32,
+        group_id: u32,
+        chunk_hash_hex: &str,
+        cache_salt: &str,
+        nonce_hex: &str,
+    ) -> Result<AtomicFileStorePlan, String> {
+        if mem_indices.is_empty() {
+            return Err("mem_indices must be non-empty".to_string());
+        }
+        if nonce_hex.is_empty() {
+            return Err("nonce_hex must be non-empty".to_string());
+        }
+        let (subdir_opt, relpath) = object_key_to_sharded_relpath(
+            model_name,
+            kv_rank,
+            group_id,
+            chunk_hash_hex,
+            cache_salt,
+            self.shard_dirs,
+        )?;
+        let final_path = format!("{}/{relpath}", self.base_dir);
+        let temp_path = format!("{final_path}.tmp.{nonce_hex}");
+        let needs_mkdir = if let Some(rel_sub) = subdir_opt {
+            let full_sub = format!("{}/{rel_sub}", self.base_dir);
+            if self.created_subdirs.insert(full_sub.clone()) {
+                Some(full_sub)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok(AtomicFileStorePlan {
+            needs_mkdir,
+            temp_path,
+            final_path,
+            file_size: mem_indices.len() * self.l1_align_bytes,
+        })
+    }
+}

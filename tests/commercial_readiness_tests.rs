@@ -6340,3 +6340,73 @@ fn test_legalize_rowwise_kernels_primary_selection_monoid_binding_and_launch_par
         vec!["mogg.rowwise.reduce", "mogg.rowwise.emit"]
     );
 }
+
+#[test]
+fn test_dynamic_file_storage_agent_l1_pages_and_sharded_atomic_store_plan() {
+    use castforge::passes::{
+        DynamicFileStorageAgent, build_single_file_xfer_descs, compute_l1_page_indices,
+        is_orphan_temp_storage_file,
+    };
+
+    let pages = compute_l1_page_indices(4096 * 10, 4096 * 3, 4096).expect("aligned range");
+    assert_eq!(pages, vec![10, 11, 12]);
+    assert!(compute_l1_page_indices(4097, 4096, 4096).is_err());
+
+    let file_descs = build_single_file_xfer_descs(7, 8192, 4096).expect("valid file xfer descs");
+    assert_eq!(file_descs, vec![(0, 4096, 7), (4096, 4096, 7)]);
+
+    assert!(is_orphan_temp_storage_file("model.bin.tmp.a1b2c3"));
+    assert!(!is_orphan_temp_storage_file("model.bin"));
+
+    let mut agent = DynamicFileStorageAgent::new(
+        "/mnt/kv_store",
+        "cuda",
+        0x2000_0000,
+        4096 * 16,
+        4096,
+        0,
+        true,
+        true,
+    )
+    .expect("valid agent");
+    assert_eq!(agent.memory_type(), "VRAM");
+    assert!(agent.use_direct_io());
+    assert_eq!(agent.registered_page_count(), 16);
+
+    // First store to shard `ab/cd` triggers `needs_mkdir`:
+    let plan1 = agent
+        .plan_atomic_store(
+            &pages,
+            "org/model-7b",
+            1,
+            2,
+            "abcdef012345",
+            "tenantA",
+            "99ff",
+        )
+        .expect("plan 1");
+    assert_eq!(plan1.needs_mkdir, Some("/mnt/kv_store/ab/cd".to_string()));
+    assert_eq!(
+        plan1.final_path,
+        "/mnt/kv_store/ab/cd/org--model-7b_00000001_2_abcdef012345@tenantA.bin"
+    );
+    assert_eq!(
+        plan1.temp_path,
+        "/mnt/kv_store/ab/cd/org--model-7b_00000001_2_abcdef012345@tenantA.bin.tmp.99ff"
+    );
+    assert_eq!(plan1.file_size, 3 * 4096);
+
+    // Second store with the same chunk hash prefix (`ab/cd`) but different salt skips mkdir:
+    let plan2 = agent
+        .plan_atomic_store(
+            &pages,
+            "org/model-7b",
+            1,
+            2,
+            "abcd99999999",
+            "tenantB",
+            "88ee",
+        )
+        .expect("plan 2");
+    assert_eq!(plan2.needs_mkdir, None);
+}
