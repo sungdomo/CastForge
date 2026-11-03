@@ -5181,3 +5181,62 @@ fn test_analyze_exec_invariant_code_motion_fixed_point() {
     );
     assert_eq!(clone_names, vec!["mgp.buffer.view"]);
 }
+
+#[test]
+fn test_multi_group_fold_unfold_and_grouped_presence_bitmaps() {
+    use castforge::passes::{
+        FULL_ATTENTION_GROUP_WINDOW, all_grouped_retain_masks, fold_multi_group_presence,
+        fold_unfold_grouped_presence, highest_servable_prefix_len, merge_presence_bitmaps,
+        unfold_group_chunk_range, unfold_multi_group_retain_mask,
+    };
+
+    assert_eq!(
+        unfold_group_chunk_range(4, FULL_ATTENTION_GROUP_WINDOW),
+        (0, 4)
+    );
+    assert_eq!(unfold_group_chunk_range(4, 2), (2, 4));
+
+    let found = vec![
+        true, false, // chunk 0: g0=true, g1=false
+        true, false, // chunk 1: g0=true, g1=false
+        true, true, // chunk 2: g0=true, g1=true
+        false, true, // chunk 3: g0=false, g1=true
+    ];
+    let windows = [FULL_ATTENTION_GROUP_WINDOW, 1];
+    let servable = fold_multi_group_presence(&found, 4, 1, &windows).expect("valid fold");
+    assert_eq!(servable, vec![true, false, false, true, false]);
+    let hit_len = highest_servable_prefix_len(&servable);
+    assert_eq!(hit_len, 3);
+
+    let retain = unfold_multi_group_retain_mask(hit_len, 4, 1, &windows).expect("valid unfold");
+    assert_eq!(
+        retain,
+        vec![
+            true, false, // chunk 0
+            true, false, // chunk 1
+            true, true, // chunk 2
+            false, false, // chunk 3
+        ]
+    );
+
+    let rows = vec![
+        vec![true, true, true, false],
+        vec![false, false, true, true],
+    ];
+    let (grouped_hit, grouped_retain) =
+        fold_unfold_grouped_presence(&rows, &windows).expect("valid grouped fold_unfold");
+    assert_eq!(grouped_hit, 3);
+    assert_eq!(
+        grouped_retain,
+        vec![
+            vec![true, true, true, false],
+            vec![false, false, true, false],
+        ]
+    );
+
+    let all_ret = all_grouped_retain_masks(&rows).expect("valid all_grouped");
+    assert_eq!(all_ret[0], vec![false, false, true, false]);
+
+    let merged = merge_presence_bitmaps(&rows, 4);
+    assert_eq!(merged, vec![true, true, true, true]);
+}

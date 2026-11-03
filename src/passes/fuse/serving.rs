@@ -16659,3 +16659,213 @@ pub fn analyze_exec_invariant_code_motion(module: &Module) -> ExecInvariantParti
     }
     partition
 }
+
+// ============================================================================
+// Batch 20 Step 1: Multi-Group Fold/Unfold Bitmap & Layer-Group Payload Sharder
+// ============================================================================
+
+/// Sentinel window size indicating a full-attention object group (`<= 0`).
+pub const FULL_ATTENTION_GROUP_WINDOW: i64 = -1;
+
+/// Computes the half-open chunk range `(lo, hi)` required by a single object group to serve a
+/// prefix of `prefix_len` chunks. Full attention (`window <= 0`) requires `(0, prefix_len)`; a
+/// sliding window of `w` chunks (`window > 0`) requires `(max(0, prefix_len - w), prefix_len)`.
+#[must_use]
+pub fn unfold_group_chunk_range(prefix_len: usize, window: i64) -> (usize, usize) {
+    if prefix_len == 0 {
+        return (0, 0);
+    }
+    if window <= 0 {
+        (0, prefix_len)
+    } else {
+        let w = window as usize;
+        (prefix_len.saturating_sub(w), prefix_len)
+    }
+}
+
+/// Folds a flat ranked presence bitmap `found` (of length `num_chunks * group_windows.len() *
+/// num_ranks`, indexed by `j * (num_groups * num_ranks) + g * num_ranks + r`) into a servable
+/// prefix-length bitmap of length `num_chunks + 1`, where index `l` (`0..=num_chunks`) is `true`
+/// iff every object group can serve a prefix of length `l` with all `num_ranks` shards present.
+pub fn fold_multi_group_presence(
+    found: &[bool],
+    num_chunks: usize,
+    num_ranks: usize,
+    group_windows: &[i64],
+) -> Result<Vec<bool>, String> {
+    if num_ranks == 0 {
+        return Err("num_ranks must be >= 1".to_string());
+    }
+    if group_windows.is_empty() {
+        return Err("group_windows must be non-empty".to_string());
+    }
+    let num_groups = group_windows.len();
+    let expected_len = num_chunks * num_groups * num_ranks;
+    if found.len() != expected_len {
+        return Err(format!(
+            "found bitmap length mismatch: expected {expected_len}, got {}",
+            found.len()
+        ));
+    }
+
+    let chunk_stride = num_groups * num_ranks;
+    let mut servable = vec![true; num_chunks + 1];
+    for (group_idx, &window) in group_windows.iter().enumerate() {
+        let gbase = group_idx * num_ranks;
+        let effective_window = if window <= 0 {
+            num_chunks
+        } else {
+            window as usize
+        };
+        let mut run = 0usize;
+        for (prefix_len, slot) in servable.iter_mut().enumerate().skip(1) {
+            let cbase = (prefix_len - 1) * chunk_stride + gbase;
+            let present = (0..num_ranks).all(|r| found[cbase + r]);
+            run = if present { run + 1 } else { 0 };
+            if *slot && run < effective_window.min(prefix_len) {
+                *slot = false;
+            }
+        }
+    }
+    Ok(servable)
+}
+
+/// Returns the model-wide servable prefix hit length in chunks (the highest index `l` where
+/// `servable[l]` is `true`, or `0` if none).
+#[must_use]
+pub fn highest_servable_prefix_len(servable: &[bool]) -> usize {
+    servable.iter().rposition(|&b| b).unwrap_or(0)
+}
+
+/// Expands `hit_length` (clamped to `num_chunks`) into the flat ranked retain mask of length
+/// `num_chunks * group_windows.len() * num_ranks`.
+pub fn unfold_multi_group_retain_mask(
+    hit_length: usize,
+    num_chunks: usize,
+    num_ranks: usize,
+    group_windows: &[i64],
+) -> Result<Vec<bool>, String> {
+    if num_ranks == 0 {
+        return Err("num_ranks must be >= 1".to_string());
+    }
+    if group_windows.is_empty() {
+        return Err("group_windows must be non-empty".to_string());
+    }
+    let clamped = hit_length.min(num_chunks);
+    let num_groups = group_windows.len();
+    let mut mask = vec![false; num_chunks * num_groups * num_ranks];
+    for (g, &win) in group_windows.iter().enumerate() {
+        let (lo, hi) = unfold_group_chunk_range(clamped, win);
+        for j in lo..hi {
+            let base = j * (num_groups * num_ranks) + g * num_ranks;
+            for r in 0..num_ranks {
+                mask[base + r] = true;
+            }
+        }
+    }
+    Ok(mask)
+}
+
+/// Folds per-row presence bitmaps `rows` (each of length `num_chunks`) paired with `windows`
+/// into a servable prefix-length bitmap of length `num_chunks + 1` using an `O(rows * chunks)`
+/// consecutive-run scan.
+pub fn fold_grouped_presence(rows: &[Vec<bool>], windows: &[i64]) -> Result<Vec<bool>, String> {
+    if windows.is_empty() {
+        return Err("windows must be non-empty".to_string());
+    }
+    if rows.len() != windows.len() {
+        return Err(format!(
+            "rows and windows length mismatch: {} vs {}",
+            rows.len(),
+            windows.len()
+        ));
+    }
+    let num_chunks = rows[0].len();
+    if rows.iter().any(|r| r.len() != num_chunks) {
+        return Err("all rows in fold_grouped_presence must have equal length".to_string());
+    }
+
+    let mut servable = vec![true; num_chunks + 1];
+    for (row, &window) in rows.iter().zip(windows.iter()) {
+        let effective_window = if window <= 0 {
+            num_chunks
+        } else {
+            window as usize
+        };
+        let mut run = 0usize;
+        for (prefix_len, slot) in servable.iter_mut().enumerate().skip(1) {
+            run = if row[prefix_len - 1] { run + 1 } else { 0 };
+            if *slot && run < effective_window.min(prefix_len) {
+                *slot = false;
+            }
+        }
+    }
+    Ok(servable)
+}
+
+/// Expands `hit_length` (clamped to `num_chunks`) into per-row retain bitmaps of length
+/// `num_chunks`, parallel to `windows`.
+pub fn unfold_grouped_retain_masks(
+    hit_length: usize,
+    num_chunks: usize,
+    windows: &[i64],
+) -> Result<Vec<Vec<bool>>, String> {
+    if windows.is_empty() {
+        return Err("windows must be non-empty".to_string());
+    }
+    let clamped = hit_length.min(num_chunks);
+    let mut out = Vec::with_capacity(windows.len());
+    for &win in windows {
+        let mut row = vec![false; num_chunks];
+        let (lo, hi) = unfold_group_chunk_range(clamped, win);
+        for cell in &mut row[lo..hi] {
+            *cell = true;
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
+/// Composes `fold_grouped_presence` -> `highest_servable_prefix_len` ->
+/// `unfold_grouped_retain_masks`, returning `(hit_length, retain_rows)`.
+pub fn fold_unfold_grouped_presence(
+    rows: &[Vec<bool>],
+    windows: &[i64],
+) -> Result<(usize, Vec<Vec<bool>>), String> {
+    let servable = fold_grouped_presence(rows, windows)?;
+    let num_chunks = rows.first().map_or(0, Vec::len);
+    let hit_len = highest_servable_prefix_len(&servable);
+    let retain = unfold_grouped_retain_masks(hit_len, num_chunks, windows)?;
+    Ok((hit_len, retain))
+}
+
+/// Restricts every row to the columns present across all rows (full-blend intersection policy
+/// without prefix or window folding).
+pub fn all_grouped_retain_masks(rows: &[Vec<bool>]) -> Result<Vec<Vec<bool>>, String> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let num_chunks = rows[0].len();
+    if rows.iter().any(|r| r.len() != num_chunks) {
+        return Err("all rows in all_grouped_retain_masks must have equal length".to_string());
+    }
+    let mut common = rows[0].clone();
+    for row in &rows[1..] {
+        for (c, &b) in common.iter_mut().zip(row.iter()) {
+            *c = *c && b;
+        }
+    }
+    Ok(vec![common; rows.len()])
+}
+
+/// Merges multiple presence bitmaps with a bitwise OR into a `num_keys`-sized bitmap.
+#[must_use]
+pub fn merge_presence_bitmaps(bitmaps: &[Vec<bool>], num_keys: usize) -> Vec<bool> {
+    let mut merged = vec![false; num_keys];
+    for bm in bitmaps {
+        for (dst, &src) in merged.iter_mut().zip(bm.iter()) {
+            *dst = *dst || src;
+        }
+    }
+    merged
+}
