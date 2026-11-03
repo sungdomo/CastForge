@@ -14,23 +14,25 @@ use castforge::ir::{
     DType, Dim, Location, TensorBacking, TensorEntry, TensorStore, TensorType, parse_mlir,
 };
 use castforge::passes::{
-    AffinitySlotRouter, ArcKvEvictionPolicy, AsymK16V8Codec, BLEND_REORDER_LMIN, BlendMatchSpan,
-    BlendObjectGroupKind, BlendReadGroupSet, BlendTokenRangeMatcher, BucketHistogram, CBChunkMatch,
-    CBGroupRopeGeometry, CBGroupSpec, CHUNK_COUNT_HISTOGRAM_BOUNDS, COORDINATOR_CHECKPOINT_MAGIC,
-    CacheBlendRopeSpec, CacheEventBatchSpec, CacheEventEntrySpec, CacheEventOpKind, CacheEventTier,
-    CacheGenCdfCodec, ChainedBlockHashConfig, CollectiveGraphNodeSpec, ContiguousViewPlan,
-    CoordinatorEventGate, CoordinatorKeyDirectory, DEFAULT_MAX_KERNELS_IN_FUSION_SET,
-    DaxGenerationSlotArena, DaxPutOutcome, DeviceGraphStage, DeviceTargetArch, DynamicAllocRequest,
-    EXCLUDED_ENGINE_GROUP, EngineGroupInfoSpec, EngineKvFormat, EventIngestOutcome,
-    FULL_ATTENTION_WINDOW, FdpRawBlockSlotManager, FleetCacheUsageView, FleetInstanceRegistry,
-    FleetMembershipCounters, FleetWatermarkEvictionController, GDS_DEFAULT_ALIGN_BYTES,
-    GdsSlabAddressManager, IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL,
-    KafkaStreamPositionTable, KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode, KvPageSpec,
-    KvPrefixBloomFilter, KvSaltQuotaRegistry, KvScaleScope, KvStorageKeySpec, L2FaultInjectConfig,
-    L2FaultInjectPolicy, LayerGroupPayloadSharder, MpInstanceSpec, P2P_DEFAULT_MAX_MISSES,
-    P2PPeerDiscoveryTable, P2PPeerSpec, PassManager, PassRegistry, PlacementRecord,
-    QuiesceStateMachine, RAW_BLOCK_META_MAGIC, RAW_BLOCK_SLOT_MAGIC, ROWWISE_CHEAP_OP_COST,
-    ROWWISE_EXPENSIVE_OP_COST, RawBlockMetaCheckpointHeader, ReshapeDimMapping, TOKEN_WIRE_STRIDE,
+    AffinitySlotRouter, ArcKvEvictionPolicy, AsymK16V8Codec, BLEND_REORDER_LMIN, Bitmap2D,
+    BlendMatchSpan, BlendObjectGroupKind, BlendReadGroupSet, BlendTokenRangeMatcher,
+    BucketHistogram, CBChunkMatch, CBGroupRopeGeometry, CBGroupSpec, CHUNK_COUNT_HISTOGRAM_BOUNDS,
+    COORDINATOR_CHECKPOINT_MAGIC, CacheBlendRopeSpec, CacheEventBatchSpec, CacheEventEntrySpec,
+    CacheEventOpKind, CacheEventTier, CacheGenCdfCodec, ChainedBlockHashConfig,
+    CollectiveGraphNodeSpec, ContiguousViewPlan, CoordinatorEventGate, CoordinatorKeyDirectory,
+    DEFAULT_MAX_KERNELS_IN_FUSION_SET, DaxGenerationSlotArena, DaxPutOutcome, DeviceGraphStage,
+    DeviceTargetArch, DynamicAllocRequest, EXCLUDED_ENGINE_GROUP, EngineGroupInfoSpec,
+    EngineKvFormat, EventIngestOutcome, FULL_ATTENTION_WINDOW, FdpRawBlockSlotManager,
+    FleetCacheUsageView, FleetInstanceRegistry, FleetMembershipCounters,
+    FleetWatermarkEvictionController, GDS_DEFAULT_ALIGN_BYTES, GdsSlabAddressManager,
+    IsolatedLruEvictionPolicy, KV_ZERO_SCALE_SENTINEL, KafkaStreamPositionTable,
+    KvAttentionMaskKind, KvBlockPool, KvDmaTransferMode, KvPageSpec, KvPrefixBloomFilter,
+    KvSaltQuotaRegistry, KvScaleScope, KvStorageKeySpec, L2FaultInjectConfig, L2FaultInjectPolicy,
+    LayerGroupPayloadSharder, MemoryTagSpec, MpInstanceSpec, MultiTierPrefetchPlan,
+    P2P_DEFAULT_MAX_MISSES, P2PPeerDiscoveryTable, P2PPeerSpec, PassManager, PassRegistry,
+    PlacementRecord, PrefetchFetchingPolicy, QuiesceStateMachine, RAW_BLOCK_META_MAGIC,
+    RAW_BLOCK_SLOT_MAGIC, ROWWISE_CHEAP_OP_COST, ROWWISE_EXPENSIVE_OP_COST,
+    RawBlockMetaCheckpointHeader, ReshapeDimMapping, TOKEN_WIRE_STRIDE, TierMapState,
     TurboQuantPreset, TurboQuantSerdeConfig, WarmPrefetchJobTable, WarmPrefetchStatus,
     analyze_kv_layer_groups, analyze_static_reshape_dim_mapping,
     annotate_squeeze_unsqueeze_reshapes, anonymize_symbolic_dims, await_hanging_effect_chains,
@@ -57,9 +59,10 @@ use castforge::passes::{
     pack_token_ids_be, plan_cacheblend_retrieve, plan_cacheblend_token_reorder,
     plan_concat_in_place, plan_device_graph_collective_partition, plan_dynamic_memory_pool,
     plan_jenga_kv_geometry, plan_kernel_sequence_fusion, plan_kv_dma_transfer,
-    promote_narrow_accumulators, re_rope_key_in_place, recalculate_subchunk_blocks_to_skip,
-    recognize_composite_activations, recover_contiguous_or_dim0_padded_view,
-    reuse_dead_loop_buffers, select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
+    plan_l1_prefetch_retention, plan_multi_tier_prefetch_load, promote_narrow_accumulators,
+    re_rope_key_in_place, recalculate_subchunk_blocks_to_skip, recognize_composite_activations,
+    recover_contiguous_or_dim0_padded_view, resolve_l1_memory_affinity, reuse_dead_loop_buffers,
+    select_latest_valid_meta_checkpoint, sink_broadcast_through_reduction,
     sink_split_through_reshape, sink_transpose_through_elementwise_and_broadcast,
     slice_block_ids_per_group, solve_lloyd_max_gaussian, stamp_fused_provenance,
     swim_reshape_through_slice, unfold_chunk_range, unique_blend_token_coverage,
@@ -4093,4 +4096,96 @@ fn test_coalesce_unbundle_consumers_to_parallel() {
     );
     let mut m_shared = parse_mlir(mlir_shared).expect("valid MLIR");
     assert_eq!(coalesce_unbundle_consumers_to_parallel(&mut m_shared), 0);
+}
+
+#[test]
+fn test_multi_tier_prefetch_planner_bitmap2d_and_l1_affinity() {
+    // 1. L1 memory tag affinity resolution:
+    let wanted = vec![
+        MemoryTagSpec::new("dax", "persistent"),
+        MemoryTagSpec::new("cpu", "pinned"),
+    ];
+    let l1_mgrs = vec![
+        (10, MemoryTagSpec::new("cpu", "pageable")),
+        (20, MemoryTagSpec::new("cpu", "pinned")),
+        (30, MemoryTagSpec::new("dax", "persistent")),
+    ];
+    // Prefers "dax/persistent" (manager 30) even though manager 20 appears earlier in list.
+    assert_eq!(resolve_l1_memory_affinity(&wanted, &l1_mgrs), Some(30));
+
+    // 2. Multi-tier grouped prefetch planning (2 groups, 4 chunks):
+    // Group 0: full attention (`0`), Group 1: sliding window of `2` chunks (`2`).
+    let group_windows = vec![FULL_ATTENTION_WINDOW, 2];
+    let mut l1_locked = TierMapState::new();
+    // L1 manager 0 holds chunks 0, 1 for group 0 and chunk 2 for group 1.
+    assert!(
+        l1_locked.insert(
+            0,
+            Bitmap2D::new(vec![
+                vec![true, true, false, false],
+                vec![false, false, true, false],
+            ])
+            .unwrap()
+        )
+    );
+
+    let mut l2_locked = TierMapState::new();
+    // L2 adapter 0 holds chunks 1, 2, 3 for group 0 and chunks 2, 3 for group 1.
+    // Note: chunk 0, 1 for group 1 were evicted, but because group 1 has sliding window = 2,
+    // prefix length 4 only needs chunks [2, 3] for group 1 and [0..4] for group 0!
+    assert!(
+        l2_locked.insert(
+            0,
+            Bitmap2D::new(vec![
+                vec![false, true, true, true],
+                vec![false, false, true, true],
+            ])
+            .unwrap()
+        )
+    );
+
+    // Full mode rejects sliding-window groups (`2 > 0`).
+    let full_plan = plan_multi_tier_prefetch_load(
+        &group_windows,
+        4,
+        &l1_locked,
+        &l2_locked,
+        &[0],
+        &[0],
+        PrefetchFetchingPolicy::Full,
+    );
+    assert_eq!(full_plan, MultiTierPrefetchPlan::default());
+
+    // Prefix mode recovers full 4-chunk hit, serves overlaps from L1 first, and loads only the
+    // remaining needed cells from L2:
+    let prefix_plan = plan_multi_tier_prefetch_load(
+        &group_windows,
+        4,
+        &l1_locked,
+        &l2_locked,
+        &[0],
+        &[0],
+        PrefetchFetchingPolicy::Prefix,
+    );
+    let l1_grid = prefix_plan.l1_planned_keys.get(0).expect("l1 planned");
+    let l2_grid = prefix_plan.l2_planned_keys.get(0).expect("l2 planned");
+    assert_eq!(
+        l1_grid.rows(),
+        &[
+            vec![true, true, false, false],
+            vec![false, false, true, false],
+        ]
+    );
+    // Chunk 1 of group 0 and chunk 2 of group 1 were already planned in L1, so L2 only loads
+    // chunks [2, 3] of group 0 and chunk [3] of group 1!
+    assert_eq!(
+        l2_grid.rows(),
+        &[
+            vec![false, false, true, true],
+            vec![false, false, false, true],
+        ]
+    );
+    assert_eq!(l1_grid.intersect(l2_grid).unwrap().popcount(), 0);
+    assert_eq!(plan_l1_prefetch_retention(3, false), vec![false; 3]);
+    assert_eq!(plan_l1_prefetch_retention(3, true), vec![true; 3]);
 }

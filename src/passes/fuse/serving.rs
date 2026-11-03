@@ -12248,3 +12248,342 @@ pub fn coalesce_unbundle_consumers_to_parallel(module: &mut Module) -> usize {
 
     created
 }
+
+// ============================================================================
+// Multi-Tier Grouped Prefetch Planner, 2D Bitmap Grid & L1 Memory Affinity
+// (inspired by LMCache `lmcache/v1/distributed/storage_controllers/prefetch_policy.py`
+// and `lmcache/v1/distributed/storage_controllers/utils.py`)
+// ============================================================================
+
+/// Memory tag pair identifying an L1 manager's backing segment and residency
+/// (e.g., `segment = "cpu"`, `residency = "pinned"`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MemoryTagSpec {
+    /// Memory segment identifier (e.g., `"cpu"`, `"gpu"`, `"dax"`).
+    pub segment: String,
+    /// Residency mode (e.g., `"pinned"`, `"pageable"`, `"persistent"`).
+    pub residency: String,
+}
+
+impl MemoryTagSpec {
+    /// Creates a new [`MemoryTagSpec`].
+    #[must_use]
+    pub fn new(segment: impl Into<String>, residency: impl Into<String>) -> Self {
+        Self {
+            segment: segment.into(),
+            residency: residency.into(),
+        }
+    }
+}
+
+/// Resolves the L1 manager ID whose memory tags match the L2 adapter's highest-priority
+/// wanted [`MemoryTagSpec`], breaking ties by L1 write-placement order.
+///
+/// Pure function: returns `None` if no L1 manager matches any wanted tag.
+#[must_use]
+pub fn resolve_l1_memory_affinity(
+    wanted_l1_tags: &[MemoryTagSpec],
+    l1_managers_in_placement_order: &[(usize, MemoryTagSpec)],
+) -> Option<usize> {
+    for wanted in wanted_l1_tags {
+        for (l1_id, tags) in l1_managers_in_placement_order {
+            if tags == wanted {
+                return Some(*l1_id);
+            }
+        }
+    }
+    None
+}
+
+/// Rectangular 2D bitmap grid where row `i` represents key group `i` and column `j`
+/// represents chunk `j`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bitmap2D {
+    rows: Vec<Vec<bool>>,
+}
+
+impl Bitmap2D {
+    /// Creates a new `Bitmap2D` from rows of identical width.
+    ///
+    /// Returns `None` if rows have inconsistent column counts.
+    #[must_use]
+    pub fn new(rows: Vec<Vec<bool>>) -> Option<Self> {
+        if let Some(first) = rows.first() {
+            let width = first.len();
+            if rows.iter().any(|r| r.len() != width) {
+                return None;
+            }
+        }
+        Some(Self { rows })
+    }
+
+    /// Creates an all-false `Bitmap2D` of shape `(num_rows, num_cols)`.
+    #[must_use]
+    pub fn zeros(num_rows: usize, num_cols: usize) -> Self {
+        Self {
+            rows: vec![vec![false; num_cols]; num_rows],
+        }
+    }
+
+    /// Returns `(num_rows, num_cols)`, or `(0, 0)` when empty.
+    #[must_use]
+    pub fn size(&self) -> (usize, usize) {
+        if self.rows.is_empty() {
+            (0, 0)
+        } else {
+            (self.rows.len(), self.rows[0].len())
+        }
+    }
+
+    /// Returns the total number of set (`true`) bits across all rows.
+    #[must_use]
+    pub fn popcount(&self) -> usize {
+        self.rows
+            .iter()
+            .flat_map(|r| r.iter())
+            .filter(|&&b| b)
+            .count()
+    }
+
+    /// Returns the underlying row bitmaps.
+    #[must_use]
+    pub fn rows(&self) -> &[Vec<bool>] {
+        &self.rows
+    }
+
+    /// Row-wise bitwise OR (`self | other`). Returns `None` if shapes differ.
+    #[must_use]
+    pub fn union(&self, other: &Self) -> Option<Self> {
+        if self.size() != other.size() {
+            return None;
+        }
+        let rows = self
+            .rows
+            .iter()
+            .zip(&other.rows)
+            .map(|(a, b)| a.iter().zip(b).map(|(&x, &y)| x || y).collect())
+            .collect();
+        Some(Self { rows })
+    }
+
+    /// Row-wise bitwise AND (`self & other`). Returns `None` if shapes differ.
+    #[must_use]
+    pub fn intersect(&self, other: &Self) -> Option<Self> {
+        if self.size() != other.size() {
+            return None;
+        }
+        let rows = self
+            .rows
+            .iter()
+            .zip(&other.rows)
+            .map(|(a, b)| a.iter().zip(b).map(|(&x, &y)| x && y).collect())
+            .collect();
+        Some(Self { rows })
+    }
+
+    /// Row-wise bitwise difference (`self & !other`). Returns `None` if shapes differ.
+    #[must_use]
+    pub fn difference(&self, other: &Self) -> Option<Self> {
+        if self.size() != other.size() {
+            return None;
+        }
+        let rows = self
+            .rows
+            .iter()
+            .zip(&other.rows)
+            .map(|(a, b)| a.iter().zip(b).map(|(&x, &y)| x && !y).collect())
+            .collect();
+        Some(Self { rows })
+    }
+}
+
+/// Maps tier manager/adapter index (`usize`) to a shared-shape [`Bitmap2D`] grid.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TierMapState {
+    state: IndexMap<usize, Bitmap2D>,
+    shape: Option<(usize, usize)>,
+}
+
+impl TierMapState {
+    /// Creates an empty [`TierMapState`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Inserts a [`Bitmap2D`] for `tier_idx`. Rejects empty grids or shape mismatches.
+    pub fn insert(&mut self, tier_idx: usize, grid: Bitmap2D) -> bool {
+        let (r, c) = grid.size();
+        if r == 0 {
+            return false;
+        }
+        if let Some(expected) = self.shape {
+            if expected != (r, c) {
+                return false;
+            }
+        } else {
+            self.shape = Some((r, c));
+        }
+        self.state.insert(tier_idx, grid);
+        true
+    }
+
+    /// Gets the [`Bitmap2D`] for `tier_idx`.
+    #[must_use]
+    pub fn get(&self, tier_idx: usize) -> Option<&Bitmap2D> {
+        self.state.get(&tier_idx)
+    }
+
+    /// Returns the number of populated tier indices.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.state.len()
+    }
+
+    /// Returns `true` if no tier indices are present.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.state.is_empty()
+    }
+
+    /// Unions the grids of all stored tier indices, or returns an all-zero `(num_rows, num_cols)`
+    /// grid when empty.
+    #[must_use]
+    pub fn merge_or_zeros(&self, num_rows: usize, num_cols: usize) -> Bitmap2D {
+        let mut merged = Bitmap2D::zeros(num_rows, num_cols);
+        for grid in self.state.values() {
+            if let Some(u) = merged.union(grid) {
+                merged = u;
+            }
+        }
+        merged
+    }
+}
+
+/// Prefetch fetching mode (`"prefix"` vs `"full"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefetchFetchingPolicy {
+    /// Prefix mode: applies `fold -> highest_set_bit -> unfold` with per-group sliding windows.
+    Prefix,
+    /// Full mode: requires all groups to use full attention (`window <= 0`) and fetches all hits.
+    Full,
+}
+
+/// Multi-tier prefetch plan partitioning needed `(group, chunk)` cells across L1 managers
+/// and L2 adapters so each cell is planned at most once.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MultiTierPrefetchPlan {
+    /// Cells served directly from resident L1 managers (`l1_id -> Bitmap2D`).
+    pub l1_planned_keys: TierMapState,
+    /// Cells loaded from L2 adapters into L1 (`l2_id -> Bitmap2D`).
+    pub l2_planned_keys: TierMapState,
+}
+
+fn plan_tier_greedy(
+    needed: &Bitmap2D,
+    locked_keys: &TierMapState,
+    sorted_indices: &[usize],
+) -> (TierMapState, Bitmap2D) {
+    let mut plan = TierMapState::new();
+    let mut remaining = needed.clone();
+    for &idx in sorted_indices {
+        let Some(locked_grid) = locked_keys.get(idx) else {
+            continue;
+        };
+        let Some(local) = remaining.intersect(locked_grid) else {
+            continue;
+        };
+        if local.popcount() == 0 {
+            continue;
+        }
+        if let Some(next_rem) = remaining.difference(&local) {
+            remaining = next_rem;
+        }
+        plan.insert(idx, local);
+    }
+    (plan, remaining)
+}
+
+/// Plans multi-tier grouped prefetch loads across L1 managers and L2 adapters:
+/// 1. Validates that `l1_locked_keys` and `l2_locked_keys` match
+///    `(group_windows.len(), num_chunks)`.
+/// 2. Computes `found = l1_found | l2_found`.
+/// 3. Under [`PrefetchFetchingPolicy::Full`], returns an empty plan if any group has a positive
+///    sliding window (`w > FULL_ATTENTION_WINDOW`); otherwise `needed = found`.
+/// 4. Under [`PrefetchFetchingPolicy::Prefix`], runs [`fold_unfold_hybrid_prefix_bitmaps`] and
+///    intersects `retain & found`.
+/// 5. Greedily assigns `needed` cells to L1 managers (in ascending index order) first, then to
+///    L2 adapters (in ascending index order), ensuring no cell is planned more than once.
+#[must_use]
+pub fn plan_multi_tier_prefetch_load(
+    group_windows: &[i32],
+    num_chunks: usize,
+    l1_locked_keys: &TierMapState,
+    l2_locked_keys: &TierMapState,
+    l1_manager_ids: &[usize],
+    l2_adapter_ids: &[usize],
+    fetching_policy: PrefetchFetchingPolicy,
+) -> MultiTierPrefetchPlan {
+    let num_groups = group_windows.len();
+    if num_groups == 0 || num_chunks == 0 {
+        return MultiTierPrefetchPlan::default();
+    }
+    if l1_locked_keys
+        .shape
+        .is_some_and(|s| s != (num_groups, num_chunks))
+        || l2_locked_keys
+            .shape
+            .is_some_and(|s| s != (num_groups, num_chunks))
+    {
+        return MultiTierPrefetchPlan::default();
+    }
+
+    let l1_found = l1_locked_keys.merge_or_zeros(num_groups, num_chunks);
+    let l2_found = l2_locked_keys.merge_or_zeros(num_groups, num_chunks);
+    let Some(found) = l1_found.union(&l2_found) else {
+        return MultiTierPrefetchPlan::default();
+    };
+
+    let needed = match fetching_policy {
+        PrefetchFetchingPolicy::Full => {
+            if group_windows.iter().any(|&w| w > FULL_ATTENTION_WINDOW) {
+                return MultiTierPrefetchPlan::default();
+            }
+            found
+        }
+        PrefetchFetchingPolicy::Prefix => {
+            let (_hit_len, _servable, retain_rows) =
+                fold_unfold_hybrid_prefix_bitmaps(found.rows(), group_windows);
+            let Some(retain_grid) = Bitmap2D::new(retain_rows) else {
+                return MultiTierPrefetchPlan::default();
+            };
+            let Some(masked) = retain_grid.intersect(&found) else {
+                return MultiTierPrefetchPlan::default();
+            };
+            masked
+        }
+    };
+
+    let mut sorted_l1 = l1_manager_ids.to_vec();
+    sorted_l1.sort_unstable();
+    sorted_l1.dedup();
+
+    let mut sorted_l2 = l2_adapter_ids.to_vec();
+    sorted_l2.sort_unstable();
+    sorted_l2.dedup();
+
+    let (l1_plan, rem_after_l1) = plan_tier_greedy(&needed, l1_locked_keys, &sorted_l1);
+    let (l2_plan, _rem_after_l2) = plan_tier_greedy(&rem_after_l1, l2_locked_keys, &sorted_l2);
+
+    MultiTierPrefetchPlan {
+        l1_planned_keys: l1_plan,
+        l2_planned_keys: l2_plan,
+    }
+}
+
+/// Computes per-key L1 retention flags (`false` = temporary / delete after L1->L0 retrieve,
+/// `true` = keep resident in L1 for reuse across requests).
+#[must_use]
+pub fn plan_l1_prefetch_retention(num_keys: usize, retain_in_l1: bool) -> Vec<bool> {
+    vec![retain_in_l1; num_keys]
+}
