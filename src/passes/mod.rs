@@ -13,6 +13,7 @@ pub mod memory;
 pub mod normalize;
 pub mod quantize;
 pub mod registry;
+pub mod serving;
 pub mod shapes;
 pub mod weights;
 
@@ -24,5 +25,6 @@ pub use memory::*;
 pub use normalize::*;
 pub use quantize::*;
 pub use registry::*;
+pub use serving::*;
 pub use shapes::*;
 pub use weights::*;
