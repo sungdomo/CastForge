@@ -1305,8 +1305,8 @@ pub fn coalesce_partitioning_slices_to_split(module: &mut Module) -> usize {
                 }
 
                 let mut diff_dims = Vec::new();
-                for d in 0..rank {
-                    if in_tt.shape[d] != res_tt.shape[d] || starts[d] != 0 {
+                for (d, &start_d) in starts.iter().enumerate().take(rank) {
+                    if in_tt.shape[d] != res_tt.shape[d] || start_d != 0 {
                         diff_dims.push(d);
                     }
                 }

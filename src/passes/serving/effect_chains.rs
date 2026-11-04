@@ -492,7 +492,11 @@ pub fn create_parallel_from_unbundle(module: &mut Module) -> usize {
                 let mut bundles: Vec<Vec<ValueId>> = vec![unbundle_op.results.to_vec()];
                 let mut operand_to_block_arg = vec![0usize; num_operands];
                 let mut plan_ok = true;
-                for idx in 0..num_operands {
+                for (idx, slot) in operand_to_block_arg
+                    .iter_mut()
+                    .enumerate()
+                    .take(num_operands)
+                {
                     if idx == driving_idx {
                         continue;
                     }
@@ -509,7 +513,7 @@ pub fn create_parallel_from_unbundle(module: &mut Module) -> usize {
                         break;
                     }
                     bundles.push(outer_vals);
-                    operand_to_block_arg[idx] = bundles.len() - 1;
+                    *slot = bundles.len() - 1;
                 }
                 if !plan_ok {
                     continue;
