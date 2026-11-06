@@ -19,6 +19,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Check 100-column line length limit
@@ -26,9 +27,30 @@ jobs:
           git ls-files | xargs awk 'length($0) > 100 {
             print FILENAME ":" FNR ":" length($0) ":" $0; exit 1
           }'
+      - name: Check library with --no-default-features
+        run: cargo check --lib --no-default-features
       - name: Run Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Check Rustdoc
         run: cargo doc --no-deps
       - name: Run test suite
         run: cargo test
+      - name: Smoke test C FFI and Python SDK
+        run: |
+          cargo build --lib
+          CASTFORGE_LIB_PATH=target/debug/libcastforge.so python3 -c "
+          import sys
+          sys.path.insert(0, 'bindings/python')
+          from castforge import CastForge
+          cf = CastForge()
+          src = (
+              'module @m {\n'
+              '  func.func @f(%x: tensor<4xf32>) -> tensor<4xf32> {\n'
+              '    func.return %x : tensor<4xf32>\n'
+              '  }\n'
+              '}\n'
+          )
+          opt_mlir, tel = cf.optimize(src, 'O1')
+          assert 'func.func @f' in opt_mlir
+          assert 'void f(' in cf.compile(src, 'c', 'O1')
+          "

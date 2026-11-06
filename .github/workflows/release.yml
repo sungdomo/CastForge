@@ -30,6 +30,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Run release test suite
+        run: cargo test --release --target ${{ matrix.target }}
       - name: Build release artifacts
         run: cargo build --release --target ${{ matrix.target }}
       - name: Package Unix archive
@@ -37,22 +40,39 @@ jobs:
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/castforge dist/
+          for lib in libcastforge.so libcastforge.dylib libcastforge.a; do
+            if [ -f "target/${{ matrix.target }}/release/$lib" ]; then
+              cp "target/${{ matrix.target }}/release/$lib" dist/
+            fi
+          done
           cp include/castforge.h dist/
+          cp bindings/python/castforge.py dist/
           cp README.md LICENSE-MIT LICENSE-APACHE dist/
-          tar -czf castforge-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C dist .
+          ARCHIVE="castforge-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          tar -czf "$ARCHIVE" -C dist .
+          shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
       - name: Package Windows archive
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target/${{ matrix.target }}/release/castforge.exe dist/
+          foreach ($lib in @("castforge.dll", "castforge.dll.lib", "castforge.lib")) {
+            $path = "target/${{ matrix.target }}/release/$lib"
+            if (Test-Path $path) { Copy-Item $path dist/ }
+          }
           Copy-Item include/castforge.h dist/
+          Copy-Item bindings/python/castforge.py dist/
           Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE dist/
-          Compress-Archive -Path dist/* `
-            -DestinationPath castforge-${{ github.ref_name }}-${{ matrix.target }}.zip
+          $archive = "castforge-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          Compress-Archive -Path dist/* -DestinationPath $archive
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
+          "$hash  $archive" | Out-File -Encoding ascii "$archive.sha256"
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
           files: |
             castforge-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+            castforge-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
             castforge-${{ github.ref_name }}-${{ matrix.target }}.zip
+            castforge-${{ github.ref_name }}-${{ matrix.target }}.zip.sha256

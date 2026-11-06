@@ -16,8 +16,17 @@ pub mod tensor_store;
 pub mod translator;
 pub mod viz;
 
-pub use crate::passes::normalize::verify::*;
-pub use crate::passes::registry::manager::*;
+pub use crate::passes::normalize::verify::{
+    BisectPassesPass, HashIrPass, InstrumentProfilingPass, PrintOpStatsPass, RooflineSummary,
+    SanitizeNumericsPass, VerifyEquivPass, VerifyIrPass, VerifyShapesPass, analyze_roofline,
+    compute_structural_hash,
+};
+pub use crate::passes::registry::manager::{
+    Pass, PassCatalog, PassCatalogEntry, PassDescriptor, PassFactory, PassManager, PassOptionSpec,
+    PassOptions, PassRegistry, PassResult, PassStepConfig, PassTelemetry, PassTraceStep,
+    PassTranslator, PipelineConfig, PipelineSettings, parse_pass_spec_item, pass_catalog,
+    split_pipeline_spec,
+};
 pub use formats::{
     GgmlType, GgufExportTranslator, GgufImportTranslator, HfConfigImportTranslator, HfModelConfig,
     OnnxExportTranslator, OnnxImportTranslator, OnnxJsonInitializer, OnnxJsonModel, OnnxJsonNode,
@@ -28,7 +37,10 @@ pub use formats::{
     import_safetensors_file,
 };
 pub use loops::{LoopKernel, LoopModule, LoopStmt};
-pub use mlir::*;
+pub use mlir::{
+    Attribute, Block, BlockId, DType, Dim, Location, Module, OpId, OpName, Operation, Region,
+    RegionId, TensorType, Type, Value, ValueDef, ValueId, VerifyError,
+};
 pub use parser::{MlirParseTranslator, MlirParser, ParseError, parse_mlir, parse_type};
 pub use printer::{
     MlirPrintTranslator, MlirPrinter, PrintOptions, print_mlir, print_mlir_with_options,
@@ -38,5 +50,9 @@ pub use tensor_store::{
     TensorBacking, TensorEntry, TensorStore, bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits,
     f32_to_f16_bits, format_dense_f32_literal, format_dense_i8_literal, parse_dense_f32_literal,
 };
-pub use translator::*;
-pub use viz::*;
+pub use translator::{Payload, Translator, TranslatorChain};
+pub use viz::{
+    GraphEdgeJson, GraphJson, GraphNodeJson, IrDiffTranslator, SnapshotIrTranslator, TimelineFrame,
+    VizFormat, VizTranslator, build_graph_json, diff_mlir_strings, diff_modules, render_dot,
+    render_json, render_mermaid, render_module, render_timeline_html,
+};

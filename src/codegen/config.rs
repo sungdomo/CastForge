@@ -162,6 +162,66 @@ impl crate::ir::Translator for MemoryPlanTranslator {
     }
 }
 
+pub(crate) fn is_codegen_reserved_word(s: &str) -> bool {
+    matches!(
+        s,
+        "arena"
+            | "out_buf"
+            | "output_0"
+            | "idx"
+            | "gid"
+            | "for"
+            | "while"
+            | "if"
+            | "else"
+            | "return"
+            | "let"
+            | "mut"
+            | "fn"
+            | "var"
+            | "const"
+            | "int"
+            | "float"
+            | "double"
+            | "void"
+            | "struct"
+            | "enum"
+            | "match"
+            | "loop"
+            | "break"
+            | "continue"
+            | "in"
+            | "type"
+            | "pub"
+            | "use"
+            | "mod"
+            | "crate"
+            | "self"
+            | "super"
+            | "true"
+            | "false"
+            | "switch"
+            | "case"
+            | "default"
+            | "do"
+            | "goto"
+            | "sizeof"
+            | "static"
+            | "extern"
+            | "inline"
+            | "restrict"
+            | "volatile"
+            | "register"
+            | "auto"
+            | "signed"
+            | "unsigned"
+            | "short"
+            | "long"
+            | "char"
+            | "bool"
+    )
+}
+
 pub(crate) fn sanitize_ident(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
@@ -175,7 +235,8 @@ pub(crate) fn sanitize_ident(raw: &str) -> String {
         .collect();
     if cleaned.is_empty() {
         "v_anon".to_string()
-    } else if cleaned.chars().next().unwrap().is_ascii_digit() {
+    } else if cleaned.chars().next().unwrap().is_ascii_digit() || is_codegen_reserved_word(&cleaned)
+    {
         format!("v_{cleaned}")
     } else {
         cleaned
@@ -209,11 +270,17 @@ pub(crate) fn value_ident(
     if let Some(existing) = names.get(&val_id) {
         return existing.clone();
     }
-    let ident = if let Some(ssa) = &module.values[val_id].ssa_name {
+    let base = if let Some(ssa) = &module.values[val_id].ssa_name {
         sanitize_ident(ssa)
     } else {
         *counter += 1;
         format!("v_{counter}")
+    };
+    let ident = if names.values().any(|existing| existing == &base) {
+        *counter += 1;
+        format!("{base}_{counter}")
+    } else {
+        base
     };
     names.insert(val_id, ident.clone());
     ident
@@ -457,5 +524,22 @@ mod tests {
         // 4. Symmetric integer quantization bounds
         assert_eq!(symmetric_int_quant_bounds(4), (4, -8.0, 7.0));
         assert_eq!(symmetric_int_quant_bounds(8), (8, -128.0, 127.0));
+
+        // 5. Reserved keyword escaping and colliding SSA identifier deduplication
+        assert_eq!(sanitize_ident("for"), "v_for");
+        assert_eq!(sanitize_ident("arena"), "v_arena");
+        let kw_src = concat!(
+            "module @kw_ident {\n",
+            "  func.func @forward(%for: tensor<4xf32>) -> tensor<4xf32> {\n",
+            "    %a.1 = stablehlo.negate %for : tensor<4xf32>\n",
+            "    %a_1 = stablehlo.exponential %a.1 : tensor<4xf32>\n",
+            "    func.return %a_1 : tensor<4xf32>\n",
+            "  }\n",
+            "}\n",
+        );
+        let kw_mod = parse_mlir(kw_src).unwrap();
+        let kw_c = emit_c_module(&kw_mod).unwrap();
+        assert!(kw_c.contains("v_for"));
+        assert!(kw_c.contains("a_1_"));
     }
 }
