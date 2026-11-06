@@ -194,7 +194,7 @@ fn run_smoothquant(
     num_samples: usize,
 ) -> Result<PassResult> {
     let alpha = alpha.clamp(0.05, 0.95);
-    let qmax = if bits == 4 { 7.0_f32 } else { 127.0_f32 };
+    let (bits, qmin, qmax) = symmetric_int_quant_bounds(bits);
     let ranges = calibrate_value_ranges(module, num_samples.max(1));
     let mut modified = 0usize;
     let blocks: Vec<BlockId> = module.blocks.keys().collect();
@@ -236,7 +236,7 @@ fn run_smoothquant(
 
             for v in &mut raw_f32 {
                 let migrated = *v * smooth_scale;
-                let q = (migrated / eff_qscale).round().clamp(-qmax - 1.0, qmax);
+                let q = (migrated / eff_qscale).round().clamp(qmin, qmax);
                 *v = (q * eff_qscale) / smooth_scale;
             }
 
@@ -482,8 +482,7 @@ impl Pass for QuantizeGroupwisePass {
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
         let mut modified = 0usize;
-        let bits = if self.bits == 8 { 8 } else { 4 };
-        let qmax = if bits == 8 { 127.0_f32 } else { 7.0_f32 };
+        let (bits, qmin, qmax) = symmetric_int_quant_bounds(self.bits);
         let group_size = self.group_size.max(2);
         let ratio = self.salient_ratio.clamp(0.001, 0.5);
 
@@ -544,7 +543,7 @@ impl Pass for QuantizeGroupwisePass {
                         } else {
                             scale
                         };
-                        let q = (v / eff_scale).round().clamp(-qmax - 1.0, qmax);
+                        let q = (v / eff_scale).round().clamp(qmin, qmax);
                         deq_f32.push(q * eff_scale);
                     }
                 }

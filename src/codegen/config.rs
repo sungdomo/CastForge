@@ -386,4 +386,76 @@ mod tests {
         assert!(wgsl_comp.contains("let mean = sum / f32(4u);"));
         assert!(wgsl_comp.contains("o_acc[d] / l_prev"));
     }
+
+    #[test]
+    fn test_phase2_memory_plan_nd_codegen_autodiff_and_quant_bounds() {
+        use crate::passes::Pass;
+        use crate::passes::distributed::AutodiffPass;
+        use crate::passes::quantize::symmetric_int_quant_bounds;
+
+        // 1. Sub-32-bit intermediate tensors allocate full f32 arena slots
+        let cmp_src = concat!(
+            "module @cmp_arena {\n",
+            "  func.func @forward(%x: tensor<8xf32>, %y: tensor<8xf32>) -> tensor<8xf32> {\n",
+            "    %pred = stablehlo.compare %x, %y {comparison_direction = \"GT\"} ",
+            ": (tensor<8xf32>, tensor<8xf32>) -> tensor<8xi1>\n",
+            "    %out = stablehlo.select %pred, %x, %y ",
+            ": (tensor<8xi1>, tensor<8xf32>, tensor<8xf32>) -> tensor<8xf32>\n",
+            "    func.return %out : tensor<8xf32>\n",
+            "  }\n",
+            "}\n",
+        );
+        let cmp_mod = parse_mlir(cmp_src).unwrap();
+        let cmp_plan = build_memory_plan(&cmp_mod);
+        assert!(cmp_plan.arena_f32_len() >= 8);
+
+        // 2. 3D Transpose, multi-axis BroadcastInDim, and batched DotGeneral
+        let nd_src = concat!(
+            "module @nd_ops {\n",
+            "  func.func @forward(%x: tensor<2x2x3xf32>, ",
+            "%b: tensor<2x3xf32>) -> tensor<2x2x2xf32> {\n",
+            "    %b3 = stablehlo.broadcast_in_dim %b {broadcast_dimensions = [0, 2]} ",
+            ": (tensor<2x3xf32>) -> tensor<2x2x3xf32>\n",
+            "    %s = stablehlo.add %x, %b3 : tensor<2x2x3xf32>\n",
+            "    %t = stablehlo.transpose %s, dims = [0, 2, 1] ",
+            ": (tensor<2x2x3xf32>) -> tensor<2x3x2xf32>\n",
+            "    %mm = stablehlo.dot_general %s, %t, ",
+            "batching_dims = [0] x [0], contracting_dims = [2] x [1] ",
+            ": (tensor<2x2x3xf32>, tensor<2x3x2xf32>) -> tensor<2x2x2xf32>\n",
+            "    func.return %mm : tensor<2x2x2xf32>\n",
+            "  }\n",
+            "}\n",
+        );
+        let nd_mod = parse_mlir(nd_src).unwrap();
+        let x_val: Vec<f32> = (1..=12).map(|v| v as f32).collect();
+        let b_val: Vec<f32> = vec![1.0, 2.0, 3.0, 0.5, 1.5, 2.5];
+        let eval_out = evaluate_module(&nd_mod, &[x_val, b_val]).unwrap();
+        assert_eq!(eval_out[0].len(), 8);
+        let rust_nd = emit_rust_module(&nd_mod).unwrap();
+        assert!(rust_nd.contains("for batch in 0..2"));
+        let c_nd = emit_c_module(&nd_mod).unwrap();
+        assert!(c_nd.contains("for (int batch = 0; batch < 2; ++batch)"));
+
+        // 3. Autodiff inserts stablehlo.reduce for broadcast operands
+        let ad_src = concat!(
+            "module @ad_bcast {\n",
+            "  func.func @forward(%x: tensor<2x4xf32>, ",
+            "%bias: tensor<4xf32>) -> tensor<2x4xf32> {\n",
+            "    %b = stablehlo.broadcast_in_dim %bias {broadcast_dimensions = [1]} ",
+            ": (tensor<4xf32>) -> tensor<2x4xf32>\n",
+            "    %y = stablehlo.add %x, %b : tensor<2x4xf32>\n",
+            "    func.return %y : tensor<2x4xf32>\n",
+            "  }\n",
+            "}\n",
+        );
+        let mut ad_mod = parse_mlir(ad_src).unwrap();
+        let res = AutodiffPass::default().run(&mut ad_mod).unwrap();
+        assert!(res.changed);
+        let printed_ad = crate::ir::print_mlir(&ad_mod);
+        assert!(printed_ad.contains("stablehlo.reduce"));
+
+        // 4. Symmetric integer quantization bounds
+        assert_eq!(symmetric_int_quant_bounds(4), (4, -8.0, 7.0));
+        assert_eq!(symmetric_int_quant_bounds(8), (8, -128.0, 127.0));
+    }
 }

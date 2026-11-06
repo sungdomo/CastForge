@@ -296,7 +296,7 @@ fn build_memory_plan_from_liveness(
             continue;
         };
         let elems = t_ty.num_elements().unwrap_or(1).max(1) as usize;
-        let bytes = (elems * t_ty.dtype.bit_width()).div_ceil(8);
+        let storage_bytes = (elems * t_ty.dtype.bit_width()).div_ceil(8);
 
         let name = val
             .ssa_name
@@ -304,12 +304,12 @@ fn build_memory_plan_from_liveness(
             .unwrap_or_else(|| format!("v_{:?}", val_id));
 
         if iv.is_constant {
-            plan.total_constant_bytes += bytes;
+            plan.total_constant_bytes += storage_bytes;
             plan.push_allocation(BufferAllocation {
                 value_id: Some(val_id),
                 name,
                 num_elements: elems,
-                byte_size: bytes,
+                byte_size: storage_bytes,
                 is_constant: true,
                 first_def: iv.first_def,
                 last_use: iv.last_use,
@@ -320,6 +320,9 @@ fn build_memory_plan_from_liveness(
             continue;
         }
 
+        // Intermediate activation buffers in the C/Rust/WGSL arena store at least one 32-bit
+        // scalar (`f32`) per element, so size arena slots to `max(storage_bytes, elems * 4)`.
+        let bytes = storage_bytes.max(elems * 4);
         plan.naive_activation_bytes += bytes;
 
         // Block arguments are caller-provided inputs; intermediate SSA op results share the arena

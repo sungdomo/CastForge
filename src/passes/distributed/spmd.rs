@@ -252,9 +252,41 @@ fn shard_tp_ring_and_coalesce_single_traversal(
                     }
                     if let Some(&src) = op.operands.first()
                         && let ValueDef::OpResult { op: prod_id, .. } = module.values[src].def
-                        && module.ops.get(prod_id).is_some_and(is_all_reduce)
+                        && let Some(prod_op) = module.ops.get(prod_id)
+                        && is_all_reduce(prod_op)
                     {
                         let res = op.results[0];
+                        let is_sum_ar = prod_op
+                            .attributes
+                            .get("reduction")
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("sum")
+                            == "sum"
+                            && op
+                                .attributes
+                                .get("reduction")
+                                .and_then(|a| a.as_str())
+                                .unwrap_or("sum")
+                                == "sum";
+                        let n_devs = op
+                            .attributes
+                            .get("num_devices")
+                            .or_else(|| prod_op.attributes.get("num_devices"))
+                            .and_then(|a| match a {
+                                Attribute::Int(n) => Some(*n),
+                                _ => None,
+                            })
+                            .unwrap_or(devices);
+                        if is_sum_ar && n_devs > 1 {
+                            if let Some(op_mut) = module.ops.get_mut(op_id) {
+                                op_mut.attributes.insert(
+                                    "castforge.coalesced_ar_scale".to_string(),
+                                    Attribute::Int(n_devs),
+                                );
+                            }
+                            modified += 1;
+                            continue;
+                        }
                         module.replace_all_uses(res, src);
                         module.remove_op(block_id, op_id);
                         removed += 1;

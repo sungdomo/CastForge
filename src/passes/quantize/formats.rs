@@ -36,7 +36,8 @@ impl Pass for CalibrateQuantizePass {
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
-        let qmax = if self.bits == 4 { 7.0_f64 } else { 127.0_f64 };
+        let (eff_bits, _qmin, qmax_f32) = symmetric_int_quant_bounds(self.bits);
+        let qmax = qmax_f32 as f64;
         let ranges = calibrate_value_ranges(module, self.num_samples.max(1));
         let mut created = 0usize;
         let mut modified = 0usize;
@@ -78,13 +79,13 @@ impl Pass for CalibrateQuantizePass {
                     op_id,
                     lhs,
                     lhs_scale,
-                    self.bits as i64,
+                    eff_bits as i64,
                 );
                 let op_mut = &mut module.ops[op_id];
                 op_mut.operands[0] = lhs_q;
                 op_mut.attributes.insert(
                     "quant_mode".to_string(),
-                    Attribute::String(format!("w{}a{}_static", self.bits, self.bits)),
+                    Attribute::String(format!("w{eff_bits}a{eff_bits}_static")),
                 );
                 op_mut
                     .attributes
@@ -648,6 +649,16 @@ fn insert_convert_before(
     val_id
 }
 
+/// Returns `(effective_bits, qmin, qmax)` for symmetric signed `i4` (`4`) or `i8` (`8`)
+/// quantization.
+pub const fn symmetric_int_quant_bounds(bits: u8) -> (u8, f32, f32) {
+    if bits == 4 {
+        (4, -8.0_f32, 7.0_f32)
+    } else {
+        (8, -128.0_f32, 127.0_f32)
+    }
+}
+
 /// Symmetric per-tensor quantization of `f32` weights to `i8` or `i4`.
 /// Returns `(quantized_values, scale, zero_point, quantized_dtype)`.
 pub fn quantize_symmetric_f32(
@@ -655,8 +666,7 @@ pub fn quantize_symmetric_f32(
     bits: u8,
     expressed_dtype: DType,
 ) -> (Vec<i8>, f32, i64, DType) {
-    let qmax = if bits == 4 { 7.0f32 } else { 127.0f32 };
-    let qmin = if bits == 4 { -8.0f32 } else { -128.0f32 };
+    let (eff_bits, qmin, qmax) = symmetric_int_quant_bounds(bits);
 
     let max_abs = values.iter().fold(0.0f32, |acc, &v| acc.max(v.abs()));
     let scale = if max_abs < 1e-12 { 1.0 } else { max_abs / qmax };
@@ -666,7 +676,7 @@ pub fn quantize_symmetric_f32(
         .map(|&v| (v / scale).round().clamp(qmin, qmax) as i8)
         .collect();
 
-    let storage_type = if bits == 4 { DType::I4 } else { DType::I8 };
+    let storage_type = if eff_bits == 4 { DType::I4 } else { DType::I8 };
     let scale_str = format!("{:.6}", scale)
         .trim_end_matches('0')
         .trim_end_matches('.')
@@ -713,9 +723,7 @@ impl Pass for InsertQatStePass {
 }
 
 pub(super) fn run_qat_ste(module: &mut Module, bits: u8) -> Result<PassResult> {
-    let eff_bits = if bits == 4 { 4 } else { 8 };
-    let qmax = if eff_bits == 4 { 7.0_f32 } else { 127.0_f32 };
-    let qmin = if eff_bits == 4 { -8.0_f32 } else { -128.0_f32 };
+    let (eff_bits, qmin, qmax) = symmetric_int_quant_bounds(bits);
     let mut modified = 0usize;
     let blocks: Vec<BlockId> = module.blocks.keys().collect();
 

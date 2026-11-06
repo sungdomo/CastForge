@@ -617,6 +617,17 @@ impl Pass for AutodiffPass {
                             &mut created,
                         );
                     }
+                    StableHloOp::BroadcastInDim { operand, .. } => {
+                        accumulate_grad(
+                            module,
+                            block_id,
+                            ret_op_id,
+                            &mut grads,
+                            operand,
+                            dy,
+                            &mut created,
+                        );
+                    }
                     StableHloOp::Reshape { operand, .. } => {
                         let in_ty = module.values[operand].ty.clone();
                         let dx = insert_vjp_op(
@@ -974,14 +985,93 @@ fn accumulate_grad(
     before_op: OpId,
     grads: &mut HashMap<ValueId, ValueId>,
     target: ValueId,
-    contrib: ValueId,
+    mut contrib: ValueId,
     created: &mut usize,
 ) {
-    if module.values[target].ty != module.values[contrib].ty {
-        return;
+    let target_ty = module.values[target].ty.clone();
+    let contrib_ty = module.values[contrib].ty.clone();
+    if target_ty != contrib_ty {
+        let Some(t_tens) = target_ty.as_tensor() else {
+            return;
+        };
+        let Some(c_tens) = contrib_ty.as_tensor() else {
+            return;
+        };
+        let t_dims = tensor_dims(&target_ty);
+        let c_dims = tensor_dims(&contrib_ty);
+        if c_dims.is_empty() || t_dims.len() > c_dims.len() {
+            return;
+        }
+        let rank_diff = c_dims.len() - t_dims.len();
+        let mut red_dims = Vec::new();
+        for (ax, &cd) in c_dims.iter().enumerate() {
+            if ax < rank_diff {
+                red_dims.push(ax as i64);
+            } else {
+                let td = t_dims[ax - rank_diff];
+                if td == 1 && cd > 1 {
+                    red_dims.push(ax as i64);
+                } else if td != cd {
+                    return;
+                }
+            }
+        }
+        if !red_dims.is_empty() {
+            let scalar_ty = Type::Tensor(TensorType::new(vec![], c_tens.dtype.clone()));
+            let zero_init = insert_splat_const_before(module, block_id, before_op, &scalar_ty, 0.0);
+            let mut r_attrs = IndexMap::new();
+            r_attrs.insert(
+                "reducer".to_string(),
+                Attribute::String("stablehlo.add".to_string()),
+            );
+            r_attrs.insert("dimensions".to_string(), Attribute::DenseIntArray(red_dims));
+            let reduced_dims: Vec<Dim> = c_dims
+                .iter()
+                .enumerate()
+                .filter_map(|(ax, &d)| {
+                    let is_red = if ax < rank_diff {
+                        true
+                    } else {
+                        t_dims[ax - rank_diff] == 1 && d > 1
+                    };
+                    if is_red { None } else { Some(Dim::Static(d)) }
+                })
+                .collect();
+            let red_ty = if reduced_dims == t_tens.shape {
+                target_ty.clone()
+            } else {
+                Type::Tensor(TensorType::new(reduced_dims, t_tens.dtype.clone()))
+            };
+            let red_val = insert_vjp_op(
+                module,
+                block_id,
+                before_op,
+                OpName::new("stablehlo", "reduce"),
+                &[contrib, zero_init],
+                r_attrs,
+                red_ty.clone(),
+            );
+            *created += 2;
+            contrib = if red_ty != target_ty {
+                let r_val = insert_vjp_op(
+                    module,
+                    block_id,
+                    before_op,
+                    OpName::new("stablehlo", "reshape"),
+                    &[red_val],
+                    IndexMap::new(),
+                    target_ty.clone(),
+                );
+                *created += 1;
+                r_val
+            } else {
+                red_val
+            };
+        } else {
+            return;
+        }
     }
     if let Some(&existing) = grads.get(&target) {
-        let ty = module.values[target].ty.clone();
         let sum = insert_vjp_op(
             module,
             block_id,
@@ -989,7 +1079,7 @@ fn accumulate_grad(
             OpName::new("stablehlo", "add"),
             &[existing, contrib],
             IndexMap::new(),
-            ty,
+            target_ty,
         );
         *created += 1;
         grads.insert(target, sum);

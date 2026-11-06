@@ -562,7 +562,13 @@ fn emit_rust_hlo_op(
                 .as_tensor()
                 .map(tensor_shape_dims)
                 .unwrap_or_else(|| vec![res_len]);
-            if in_dims.len() == 2 && permutation == vec![1, 0] {
+            let out_dims = module.values[res_val]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![res_len]);
+            let rank = in_dims.len();
+            if rank == 2 && permutation == vec![1, 0] {
                 let (r, c) = (in_dims[0], in_dims[1]);
                 let src = r_idx(
                     module,
@@ -585,6 +591,26 @@ fn emit_rust_hlo_op(
                 writeln!(out, "            {dst} = {src};")?;
                 writeln!(out, "        }}")?;
                 writeln!(out, "    }}")?;
+            } else if rank >= 2 && permutation.len() == rank && out_dims.len() == rank {
+                let mut in_strides = vec![1usize; rank];
+                let mut out_strides = vec![1usize; rank];
+                for d in (0..rank - 1).rev() {
+                    in_strides[d] = in_strides[d + 1] * in_dims[d + 1].max(1);
+                    out_strides[d] = out_strides[d + 1] * out_dims[d + 1].max(1);
+                }
+                let mut terms = Vec::with_capacity(rank);
+                for (out_axis, &in_axis) in permutation.iter().enumerate() {
+                    let ost = out_strides[out_axis];
+                    let odim = out_dims[out_axis].max(1);
+                    let ist = in_strides.get(in_axis as usize).copied().unwrap_or(1);
+                    terms.push(format!("((i / {ost}) % {odim}) * {ist}"));
+                }
+                let idx_expr = terms.join(" + ");
+                let src = r_idx(module, plan, operand, &idx_expr, names, counter);
+                let dst = r_idx(module, plan, res_val, "i", names, counter);
+                writeln!(out, "    for i in 0..{res_len} {{")?;
+                writeln!(out, "        {dst} = {src};")?;
+                writeln!(out, "    }}")?;
             } else {
                 let src = r_idx(module, plan, operand, "i", names, counter);
                 let dst = r_idx(module, plan, res_val, "i", names, counter);
@@ -593,17 +619,56 @@ fn emit_rust_hlo_op(
                 writeln!(out, "    }}")?;
             }
         }
-        StableHloOp::BroadcastInDim { operand, .. } => {
-            let in_len = tensor_len(module, operand).max(1);
-            let stride = (res_len / in_len).max(1);
-            let src = r_idx(
-                module,
-                plan,
-                operand,
-                &format!("(i / {stride}) % {in_len}"),
-                names,
-                counter,
-            );
+        StableHloOp::BroadcastInDim {
+            operand,
+            broadcast_dimensions,
+            ..
+        } => {
+            let in_dims = module.values[operand]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![tensor_len(module, operand).max(1)]);
+            let out_dims = module.values[res_val]
+                .ty
+                .as_tensor()
+                .map(tensor_shape_dims)
+                .unwrap_or_else(|| vec![res_len]);
+            let idx_expr = if !broadcast_dimensions.is_empty()
+                && broadcast_dimensions.len() == in_dims.len()
+                && out_dims.len() >= in_dims.len()
+            {
+                let out_rank = out_dims.len();
+                let in_rank = in_dims.len();
+                let mut out_strides = vec![1usize; out_rank];
+                for d in (0..out_rank.saturating_sub(1)).rev() {
+                    out_strides[d] = out_strides[d + 1] * out_dims[d + 1].max(1);
+                }
+                let mut in_strides = vec![1usize; in_rank];
+                for d in (0..in_rank.saturating_sub(1)).rev() {
+                    in_strides[d] = in_strides[d + 1] * in_dims[d + 1].max(1);
+                }
+                let mut terms = Vec::new();
+                for (in_axis, &out_axis) in broadcast_dimensions.iter().enumerate() {
+                    if in_dims[in_axis] > 1
+                        && let Some(&ost) = out_strides.get(out_axis as usize)
+                    {
+                        let odim = out_dims.get(out_axis as usize).copied().unwrap_or(1).max(1);
+                        let ist = in_strides[in_axis];
+                        terms.push(format!("((i / {ost}) % {odim}) * {ist}"));
+                    }
+                }
+                if terms.is_empty() {
+                    "0".to_string()
+                } else {
+                    terms.join(" + ")
+                }
+            } else {
+                let in_len = tensor_len(module, operand).max(1);
+                let stride = (res_len / in_len).max(1);
+                format!("(i / {stride}) % {in_len}")
+            };
+            let src = r_idx(module, plan, operand, &idx_expr, names, counter);
             let dst = r_idx(module, plan, res_val, "i", names, counter);
             writeln!(out, "    for i in 0..{res_len} {{")?;
             writeln!(out, "        {dst} = {src};")?;
@@ -655,7 +720,6 @@ fn emit_rust_hlo_op(
             dimension_numbers: dims,
             ..
         } => {
-            let packed = dims.rhs_contracting_dimensions == [1];
             let lhs_dims = module.values[lhs]
                 .ty
                 .as_tensor()
@@ -666,285 +730,347 @@ fn emit_rust_hlo_op(
                 .as_tensor()
                 .map(tensor_shape_dims)
                 .unwrap_or_else(|| vec![1, 1]);
-            let m = *lhs_dims.first().unwrap_or(&1);
-            let k = *lhs_dims.get(1).unwrap_or(&1);
-            let n = if packed {
-                *rhs_dims.first().unwrap_or(&1)
-            } else {
-                *rhs_dims.get(1).unwrap_or(&1)
-            };
-            let b_idx = if packed {
-                format!("n * {k} + k")
-            } else {
-                format!("k * {n} + n")
-            };
-            let a = r_idx(module, plan, lhs, &format!("m * {k} + k"), names, counter);
-            let b = r_idx(module, plan, rhs, &b_idx, names, counter);
-            let dst = r_idx(
-                module,
-                plan,
-                res_val,
-                &format!("m * {n} + n"),
-                names,
-                counter,
-            );
-            if config.parallel {
-                writeln!(out, "    // [loop:parallel(collapse=2, schedule=static)]")?;
-            }
-            if config.l2_tile_size > 0 {
-                let l2 = config.l2_tile_size;
-                let l1 = config.tile_m.max(1);
-                writeln!(out, "    // [loop:l2_tile(L2={l2}, L1={l1})]")?;
-            }
-            if config.prefetch_distance > 0 {
-                let pd = config.prefetch_distance;
-                writeln!(out, "    // [loop:software_pipeline(prefetch_dist={pd})]")?;
-            }
-            if config.split_k > 1 {
-                let sk = config.split_k;
-                let chunk = k.div_ceil(sk).max(1);
-                writeln!(out, "    // [loop:split_k(splits={sk}, chunk={chunk})]")?;
-                writeln!(out, "    for m in 0..{m} {{")?;
-                writeln!(out, "        for n in 0..{n} {{")?;
-                writeln!(out, "            let mut acc_parts = [0.0_f32; {sk}];")?;
-                writeln!(out, "            for s in 0..{sk} {{")?;
-                writeln!(out, "                let k_start = (s * {chunk}).min({k});")?;
+            let batch_count: usize = dims
+                .lhs_batching_dimensions
+                .iter()
+                .filter_map(|&ax| lhs_dims.get(ax as usize).copied())
+                .product::<usize>()
+                .max(1);
+            if batch_count > 1 || !dims.lhs_batching_dimensions.is_empty() {
+                let k: usize = dims
+                    .lhs_contracting_dimensions
+                    .iter()
+                    .filter_map(|&ax| lhs_dims.get(ax as usize).copied())
+                    .product::<usize>()
+                    .max(1);
+                let lhs_total: usize = lhs_dims.iter().product::<usize>().max(1);
+                let rhs_total: usize = rhs_dims.iter().product::<usize>().max(1);
+                let m = (lhs_total / (batch_count * k).max(1)).max(1);
+                let n = (rhs_total / (batch_count * k).max(1)).max(1);
+                let rhs_contract_last = dims
+                    .rhs_contracting_dimensions
+                    .last()
+                    .copied()
+                    .is_some_and(|d| (d as usize) + 1 == rhs_dims.len());
+                let a_bs = m * k;
+                let b_bs = k * n;
+                let c_bs = m * n;
+                let b_idx = if rhs_contract_last {
+                    format!("batch * {b_bs} + n * {k} + k")
+                } else {
+                    format!("batch * {b_bs} + k * {n} + n")
+                };
+                let a = r_idx(
+                    module,
+                    plan,
+                    lhs,
+                    &format!("batch * {a_bs} + m * {k} + k"),
+                    names,
+                    counter,
+                );
+                let b = r_idx(module, plan, rhs, &b_idx, names, counter);
+                let dst = r_idx(
+                    module,
+                    plan,
+                    res_val,
+                    &format!("batch * {c_bs} + m * {n} + n"),
+                    names,
+                    counter,
+                );
+                writeln!(out, "    for batch in 0..{batch_count} {{")?;
+                writeln!(out, "        for m in 0..{m} {{")?;
+                writeln!(out, "            for n in 0..{n} {{")?;
+                writeln!(out, "                let mut acc = 0.0_f32;")?;
                 writeln!(
                     out,
-                    "                let k_end = ((s + 1) * {chunk}).min({k});"
+                    "                for k in 0..{k} {{ acc += {a} * {b}; }}"
                 )?;
-                writeln!(out, "                for k in k_start..k_end {{")?;
-                writeln!(out, "                    acc_parts[s] += {a} * {b};")?;
-                writeln!(out, "                }}")?;
+                writeln!(out, "                {dst} = acc;")?;
                 writeln!(out, "            }}")?;
-                writeln!(
-                    out,
-                    "            {dst} = acc_parts.iter().copied().sum::<f32>();"
-                )?;
                 writeln!(out, "        }}")?;
                 writeln!(out, "    }}")?;
-            } else if config.loop_skew {
-                let waves = (m + n).saturating_sub(1).max(1);
-                writeln!(out, "    // [loop:skew(wavefront=\"w = m + n\")]")?;
-                writeln!(out, "    for w in 0..{waves} {{")?;
-                writeln!(out, "        let m_min = w.saturating_sub({n} - 1);")?;
-                writeln!(out, "        let m_max = (w + 1).min({m});")?;
-                writeln!(out, "        for m in m_min..m_max {{")?;
-                writeln!(out, "            let n = w - m;")?;
-                writeln!(out, "            let mut acc = 0.0_f32;")?;
-                writeln!(out, "            for k in 0..{k} {{")?;
-                writeln!(out, "                acc += {a} * {b};")?;
-                writeln!(out, "            }}")?;
-                writeln!(out, "            {dst} = acc;")?;
-                writeln!(out, "        }}")?;
-                writeln!(out, "    }}")?;
-            } else if config.is_register_tiled() {
-                let (mr, nr) = (config.reg_tile_m, config.reg_tile_n);
-                let (m_main, n_main) = ((m / mr) * mr, (n / nr) * nr);
-                writeln!(out, "    // [loop:unroll_and_jam(mr={mr}, nr={nr})]")?;
-                writeln!(out, "    for m0 in (0..{m_main}).step_by({mr}) {{")?;
-                writeln!(out, "        for n0 in (0..{n_main}).step_by({nr}) {{")?;
-                writeln!(out, "            let mut acc = [[0.0_f32; {nr}]; {mr}];")?;
-                writeln!(out, "            for k in 0..{k} {{")?;
-                for mi in 0..mr {
-                    let a_mi = r_idx(
-                        module,
-                        plan,
-                        lhs,
-                        &format!("(m0 + {mi}) * {k} + k"),
-                        names,
-                        counter,
-                    );
-                    for nj in 0..nr {
-                        let b_nj_idx = if packed {
-                            format!("(n0 + {nj}) * {k} + k")
-                        } else {
-                            format!("k * {n} + n0 + {nj}")
-                        };
-                        let b_nj = r_idx(module, plan, rhs, &b_nj_idx, names, counter);
-                        writeln!(out, "                acc[{mi}][{nj}] += {a_mi} * {b_nj};")?;
-                    }
+            } else {
+                let packed = dims.rhs_contracting_dimensions == [1];
+                let m = *lhs_dims.first().unwrap_or(&1);
+                let k = *lhs_dims.get(1).unwrap_or(&1);
+                let n = if packed {
+                    *rhs_dims.first().unwrap_or(&1)
+                } else {
+                    *rhs_dims.get(1).unwrap_or(&1)
+                };
+                let b_idx = if packed {
+                    format!("n * {k} + k")
+                } else {
+                    format!("k * {n} + n")
+                };
+                let a = r_idx(module, plan, lhs, &format!("m * {k} + k"), names, counter);
+                let b = r_idx(module, plan, rhs, &b_idx, names, counter);
+                let dst = r_idx(
+                    module,
+                    plan,
+                    res_val,
+                    &format!("m * {n} + n"),
+                    names,
+                    counter,
+                );
+                if config.parallel {
+                    writeln!(out, "    // [loop:parallel(collapse=2, schedule=static)]")?;
                 }
-                writeln!(out, "            }}")?;
-                for mi in 0..mr {
-                    for nj in 0..nr {
-                        let dst_ij = r_idx(
+                if config.l2_tile_size > 0 {
+                    let l2 = config.l2_tile_size;
+                    let l1 = config.tile_m.max(1);
+                    writeln!(out, "    // [loop:l2_tile(L2={l2}, L1={l1})]")?;
+                }
+                if config.prefetch_distance > 0 {
+                    let pd = config.prefetch_distance;
+                    writeln!(out, "    // [loop:software_pipeline(prefetch_dist={pd})]")?;
+                }
+                if config.split_k > 1 {
+                    let sk = config.split_k;
+                    let chunk = k.div_ceil(sk).max(1);
+                    writeln!(out, "    // [loop:split_k(splits={sk}, chunk={chunk})]")?;
+                    writeln!(out, "    for m in 0..{m} {{")?;
+                    writeln!(out, "        for n in 0..{n} {{")?;
+                    writeln!(out, "            let mut acc_parts = [0.0_f32; {sk}];")?;
+                    writeln!(out, "            for s in 0..{sk} {{")?;
+                    writeln!(out, "                let k_start = (s * {chunk}).min({k});")?;
+                    writeln!(
+                        out,
+                        "                let k_end = ((s + 1) * {chunk}).min({k});"
+                    )?;
+                    writeln!(out, "                for k in k_start..k_end {{")?;
+                    writeln!(out, "                    acc_parts[s] += {a} * {b};")?;
+                    writeln!(out, "                }}")?;
+                    writeln!(out, "            }}")?;
+                    writeln!(
+                        out,
+                        "            {dst} = acc_parts.iter().copied().sum::<f32>();"
+                    )?;
+                    writeln!(out, "        }}")?;
+                    writeln!(out, "    }}")?;
+                } else if config.loop_skew {
+                    let waves = (m + n).saturating_sub(1).max(1);
+                    writeln!(out, "    // [loop:skew(wavefront=\"w = m + n\")]")?;
+                    writeln!(out, "    for w in 0..{waves} {{")?;
+                    writeln!(out, "        let m_min = w.saturating_sub({n} - 1);")?;
+                    writeln!(out, "        let m_max = (w + 1).min({m});")?;
+                    writeln!(out, "        for m in m_min..m_max {{")?;
+                    writeln!(out, "            let n = w - m;")?;
+                    writeln!(out, "            let mut acc = 0.0_f32;")?;
+                    writeln!(out, "            for k in 0..{k} {{")?;
+                    writeln!(out, "                acc += {a} * {b};")?;
+                    writeln!(out, "            }}")?;
+                    writeln!(out, "            {dst} = acc;")?;
+                    writeln!(out, "        }}")?;
+                    writeln!(out, "    }}")?;
+                } else if config.is_register_tiled() {
+                    let (mr, nr) = (config.reg_tile_m, config.reg_tile_n);
+                    let (m_main, n_main) = ((m / mr) * mr, (n / nr) * nr);
+                    writeln!(out, "    // [loop:unroll_and_jam(mr={mr}, nr={nr})]")?;
+                    writeln!(out, "    for m0 in (0..{m_main}).step_by({mr}) {{")?;
+                    writeln!(out, "        for n0 in (0..{n_main}).step_by({nr}) {{")?;
+                    writeln!(out, "            let mut acc = [[0.0_f32; {nr}]; {mr}];")?;
+                    writeln!(out, "            for k in 0..{k} {{")?;
+                    for mi in 0..mr {
+                        let a_mi = r_idx(
                             module,
                             plan,
-                            res_val,
-                            &format!("(m0 + {mi}) * {n} + n0 + {nj}"),
+                            lhs,
+                            &format!("(m0 + {mi}) * {k} + k"),
                             names,
                             counter,
                         );
-                        writeln!(out, "            {dst_ij} = acc[{mi}][{nj}];")?;
+                        for nj in 0..nr {
+                            let b_nj_idx = if packed {
+                                format!("(n0 + {nj}) * {k} + k")
+                            } else {
+                                format!("k * {n} + n0 + {nj}")
+                            };
+                            let b_nj = r_idx(module, plan, rhs, &b_nj_idx, names, counter);
+                            writeln!(out, "                acc[{mi}][{nj}] += {a_mi} * {b_nj};")?;
+                        }
                     }
-                }
-                writeln!(out, "        }}")?;
-                writeln!(out, "    }}")?;
-                if n_main < n {
-                    writeln!(out, "    for m in 0..{m_main} {{")?;
-                    writeln!(out, "        for n in {n_main}..{n} {{")?;
-                    writeln!(out, "            let mut acc = 0.0_f32;")?;
-                    writeln!(out, "            for k in 0..{k} {{ acc += {a} * {b}; }}")?;
-                    writeln!(out, "            {dst} = acc;")?;
+                    writeln!(out, "            }}")?;
+                    for mi in 0..mr {
+                        for nj in 0..nr {
+                            let dst_ij = r_idx(
+                                module,
+                                plan,
+                                res_val,
+                                &format!("(m0 + {mi}) * {n} + n0 + {nj}"),
+                                names,
+                                counter,
+                            );
+                            writeln!(out, "            {dst_ij} = acc[{mi}][{nj}];")?;
+                        }
+                    }
                     writeln!(out, "        }}")?;
                     writeln!(out, "    }}")?;
-                }
-                if m_main < m {
-                    writeln!(out, "    for m in {m_main}..{m} {{")?;
+                    if n_main < n {
+                        writeln!(out, "    for m in 0..{m_main} {{")?;
+                        writeln!(out, "        for n in {n_main}..{n} {{")?;
+                        writeln!(out, "            let mut acc = 0.0_f32;")?;
+                        writeln!(out, "            for k in 0..{k} {{ acc += {a} * {b}; }}")?;
+                        writeln!(out, "            {dst} = acc;")?;
+                        writeln!(out, "        }}")?;
+                        writeln!(out, "    }}")?;
+                    }
+                    if m_main < m {
+                        writeln!(out, "    for m in {m_main}..{m} {{")?;
+                        writeln!(out, "        for n in 0..{n} {{")?;
+                        writeln!(out, "            let mut acc = 0.0_f32;")?;
+                        writeln!(out, "            for k in 0..{k} {{ acc += {a} * {b}; }}")?;
+                        writeln!(out, "            {dst} = acc;")?;
+                        writeln!(out, "        }}")?;
+                        writeln!(out, "    }}")?;
+                    }
+                } else if config.is_tiled() {
+                    let (tm, tn, tk) = (config.tile_m, config.tile_n, config.tile_k);
+                    if config.double_buffer {
+                        writeln!(
+                            out,
+                            "    // [loop:double_buffer(stages=2, ping_pong, tile_k={tk})]"
+                        )?;
+                    }
+                    writeln!(out, "    for m0 in (0..{m}).step_by({tm}) {{")?;
+                    writeln!(out, "        for n0 in (0..{n}).step_by({tn}) {{")?;
+                    if config.double_buffer {
+                        writeln!(out, "            let mut stage_a = [[0.0_f32; {tk}]; 2];")?;
+                    }
+                    writeln!(out, "            for m in m0..(m0 + {tm}).min({m}) {{")?;
+                    writeln!(out, "                for n in n0..(n0 + {tn}).min({n}) {{")?;
+                    writeln!(out, "                    let mut acc = 0.0_f32;")?;
+                    if config.double_buffer {
+                        writeln!(out, "                    let mut stage = 0usize;")?;
+                    }
+                    writeln!(
+                        out,
+                        "                    for k0 in (0..{k}).step_by({tk}) {{"
+                    )?;
+                    if config.double_buffer {
+                        writeln!(out, "                        let _ = &mut stage_a[stage];")?;
+                        writeln!(out, "                        stage ^= 1;")?;
+                    }
+                    writeln!(
+                        out,
+                        "                        for k in k0..(k0 + {tk}).min({k}) {{"
+                    )?;
+                    writeln!(out, "                            acc += {a} * {b};")?;
+                    writeln!(out, "                        }}")?;
+                    writeln!(out, "                    }}")?;
+                    writeln!(out, "                    {dst} = acc;")?;
+                    writeln!(out, "                }}")?;
+                    writeln!(out, "            }}")?;
+                    writeln!(out, "        }}")?;
+                    writeln!(out, "    }}")?;
+                } else if config.loop_order == GemmLoopOrder::Mkn {
+                    writeln!(
+                        out,
+                        "    // [loop:interchange(MKN)] Broadcast-A row-streaming"
+                    )?;
+                    writeln!(out, "    for m in 0..{m} {{")?;
+                    writeln!(out, "        for n in 0..{n} {{ {dst} = 0.0_f32; }}")?;
+                    writeln!(out, "        for k in 0..{k} {{")?;
+                    writeln!(out, "            let a_val = {a};")?;
+                    if config.vectorize {
+                        writeln!(
+                            out,
+                            "            // [simd:vectorize(width={})]",
+                            config.simd_width
+                        )?;
+                    }
+                    writeln!(
+                        out,
+                        "            for n in 0..{n} {{ {dst} += a_val * {b}; }}"
+                    )?;
+                    writeln!(out, "        }}")?;
+                    writeln!(out, "    }}")?;
+                } else if config.loop_order == GemmLoopOrder::Nkm {
+                    writeln!(out, "    // [loop:interchange(NKM)] Column-stationary")?;
+                    writeln!(out, "    for n in 0..{n} {{")?;
+                    writeln!(out, "        for m in 0..{m} {{ {dst} = 0.0_f32; }}")?;
+                    writeln!(out, "        for k in 0..{k} {{")?;
+                    writeln!(out, "            for m in 0..{m} {{ {dst} += {a} * {b}; }}")?;
+                    writeln!(out, "        }}")?;
+                    writeln!(out, "    }}")?;
+                } else if config.unroll_factor > 1 {
+                    let uf = config.unroll_factor;
+                    let k_main = (k / uf) * uf;
+                    writeln!(out, "    // [loop:unroll(factor={uf})]")?;
+                    writeln!(out, "    for m in 0..{m} {{")?;
                     writeln!(out, "        for n in 0..{n} {{")?;
                     writeln!(out, "            let mut acc = 0.0_f32;")?;
-                    writeln!(out, "            for k in 0..{k} {{ acc += {a} * {b}; }}")?;
+                    writeln!(
+                        out,
+                        "            for k_base in (0..{k_main}).step_by({uf}) {{"
+                    )?;
+                    for u in 0..uf {
+                        let a_u = r_idx(
+                            module,
+                            plan,
+                            lhs,
+                            &format!("m * {k} + k_base + {u}"),
+                            names,
+                            counter,
+                        );
+                        let b_u_idx = if packed {
+                            format!("n * {k} + k_base + {u}")
+                        } else {
+                            format!("(k_base + {u}) * {n} + n")
+                        };
+                        let b_u = r_idx(module, plan, rhs, &b_u_idx, names, counter);
+                        writeln!(out, "                acc += {a_u} * {b_u};")?;
+                    }
+                    writeln!(out, "            }}")?;
+                    writeln!(
+                        out,
+                        "            for k in {k_main}..{k} {{ acc += {a} * {b}; }}"
+                    )?;
+                    writeln!(out, "            {dst} = acc;")?;
+                    writeln!(out, "        }}")?;
+                    writeln!(out, "    }}")?;
+                } else {
+                    match config.simd_isa {
+                        SimdIsa::Avx2 => {
+                            writeln!(
+                                out,
+                                "    // [simd:isa(avx2, intrinsic=\"_mm256_fmadd_ps\", width=8)]"
+                            )?;
+                        }
+                        SimdIsa::Neon => {
+                            writeln!(
+                                out,
+                                "    // [simd:isa(neon, intrinsic=\"vfmaq_f32\", width=4)]"
+                            )?;
+                        }
+                        SimdIsa::Avx512 | SimdIsa::Sve | SimdIsa::Rvv | SimdIsa::WasmSimd128 => {
+                            writeln!(
+                                out,
+                                "    // [simd:isa({}, intrinsic=\"{}\", width={})]",
+                                config.simd_isa.as_str(),
+                                config.simd_isa.intrinsic_name(),
+                                config.simd_isa.default_lanes()
+                            )?;
+                        }
+                        SimdIsa::Scalar => {}
+                    }
+                    if config.vectorize {
+                        writeln!(out, "    // [simd:vectorize(width={})]", config.simd_width)?;
+                    }
+                    writeln!(out, "    for m in 0..{m} {{")?;
+                    writeln!(out, "        for n in 0..{n} {{")?;
+                    writeln!(out, "            let mut acc = 0.0_f32;")?;
+                    writeln!(out, "            for k in 0..{k} {{")?;
+                    if config.simd_isa != SimdIsa::Scalar {
+                        writeln!(out, "                acc = ({a}).mul_add({b}, acc);")?;
+                    } else {
+                        writeln!(out, "                acc += {a} * {b};")?;
+                    }
+                    writeln!(out, "            }}")?;
                     writeln!(out, "            {dst} = acc;")?;
                     writeln!(out, "        }}")?;
                     writeln!(out, "    }}")?;
                 }
-            } else if config.is_tiled() {
-                let (tm, tn, tk) = (config.tile_m, config.tile_n, config.tile_k);
-                if config.double_buffer {
-                    writeln!(
-                        out,
-                        "    // [loop:double_buffer(stages=2, ping_pong, tile_k={tk})]"
-                    )?;
-                }
-                writeln!(out, "    for m0 in (0..{m}).step_by({tm}) {{")?;
-                writeln!(out, "        for n0 in (0..{n}).step_by({tn}) {{")?;
-                if config.double_buffer {
-                    writeln!(out, "            let mut stage_a = [[0.0_f32; {tk}]; 2];")?;
-                }
-                writeln!(out, "            for m in m0..(m0 + {tm}).min({m}) {{")?;
-                writeln!(out, "                for n in n0..(n0 + {tn}).min({n}) {{")?;
-                writeln!(out, "                    let mut acc = 0.0_f32;")?;
-                if config.double_buffer {
-                    writeln!(out, "                    let mut stage = 0usize;")?;
-                }
-                writeln!(
-                    out,
-                    "                    for k0 in (0..{k}).step_by({tk}) {{"
-                )?;
-                if config.double_buffer {
-                    writeln!(out, "                        let _ = &mut stage_a[stage];")?;
-                    writeln!(out, "                        stage ^= 1;")?;
-                }
-                writeln!(
-                    out,
-                    "                        for k in k0..(k0 + {tk}).min({k}) {{"
-                )?;
-                writeln!(out, "                            acc += {a} * {b};")?;
-                writeln!(out, "                        }}")?;
-                writeln!(out, "                    }}")?;
-                writeln!(out, "                    {dst} = acc;")?;
-                writeln!(out, "                }}")?;
-                writeln!(out, "            }}")?;
-                writeln!(out, "        }}")?;
-                writeln!(out, "    }}")?;
-            } else if config.loop_order == GemmLoopOrder::Mkn {
-                writeln!(
-                    out,
-                    "    // [loop:interchange(MKN)] Broadcast-A row-streaming"
-                )?;
-                writeln!(out, "    for m in 0..{m} {{")?;
-                writeln!(out, "        for n in 0..{n} {{ {dst} = 0.0_f32; }}")?;
-                writeln!(out, "        for k in 0..{k} {{")?;
-                writeln!(out, "            let a_val = {a};")?;
-                if config.vectorize {
-                    writeln!(
-                        out,
-                        "            // [simd:vectorize(width={})]",
-                        config.simd_width
-                    )?;
-                }
-                writeln!(
-                    out,
-                    "            for n in 0..{n} {{ {dst} += a_val * {b}; }}"
-                )?;
-                writeln!(out, "        }}")?;
-                writeln!(out, "    }}")?;
-            } else if config.loop_order == GemmLoopOrder::Nkm {
-                writeln!(out, "    // [loop:interchange(NKM)] Column-stationary")?;
-                writeln!(out, "    for n in 0..{n} {{")?;
-                writeln!(out, "        for m in 0..{m} {{ {dst} = 0.0_f32; }}")?;
-                writeln!(out, "        for k in 0..{k} {{")?;
-                writeln!(out, "            for m in 0..{m} {{ {dst} += {a} * {b}; }}")?;
-                writeln!(out, "        }}")?;
-                writeln!(out, "    }}")?;
-            } else if config.unroll_factor > 1 {
-                let uf = config.unroll_factor;
-                let k_main = (k / uf) * uf;
-                writeln!(out, "    // [loop:unroll(factor={uf})]")?;
-                writeln!(out, "    for m in 0..{m} {{")?;
-                writeln!(out, "        for n in 0..{n} {{")?;
-                writeln!(out, "            let mut acc = 0.0_f32;")?;
-                writeln!(
-                    out,
-                    "            for k_base in (0..{k_main}).step_by({uf}) {{"
-                )?;
-                for u in 0..uf {
-                    let a_u = r_idx(
-                        module,
-                        plan,
-                        lhs,
-                        &format!("m * {k} + k_base + {u}"),
-                        names,
-                        counter,
-                    );
-                    let b_u_idx = if packed {
-                        format!("n * {k} + k_base + {u}")
-                    } else {
-                        format!("(k_base + {u}) * {n} + n")
-                    };
-                    let b_u = r_idx(module, plan, rhs, &b_u_idx, names, counter);
-                    writeln!(out, "                acc += {a_u} * {b_u};")?;
-                }
-                writeln!(out, "            }}")?;
-                writeln!(
-                    out,
-                    "            for k in {k_main}..{k} {{ acc += {a} * {b}; }}"
-                )?;
-                writeln!(out, "            {dst} = acc;")?;
-                writeln!(out, "        }}")?;
-                writeln!(out, "    }}")?;
-            } else {
-                match config.simd_isa {
-                    SimdIsa::Avx2 => {
-                        writeln!(
-                            out,
-                            "    // [simd:isa(avx2, intrinsic=\"_mm256_fmadd_ps\", width=8)]"
-                        )?;
-                    }
-                    SimdIsa::Neon => {
-                        writeln!(
-                            out,
-                            "    // [simd:isa(neon, intrinsic=\"vfmaq_f32\", width=4)]"
-                        )?;
-                    }
-                    SimdIsa::Avx512 | SimdIsa::Sve | SimdIsa::Rvv | SimdIsa::WasmSimd128 => {
-                        writeln!(
-                            out,
-                            "    // [simd:isa({}, intrinsic=\"{}\", width={})]",
-                            config.simd_isa.as_str(),
-                            config.simd_isa.intrinsic_name(),
-                            config.simd_isa.default_lanes()
-                        )?;
-                    }
-                    SimdIsa::Scalar => {}
-                }
-                if config.vectorize {
-                    writeln!(out, "    // [simd:vectorize(width={})]", config.simd_width)?;
-                }
-                writeln!(out, "    for m in 0..{m} {{")?;
-                writeln!(out, "        for n in 0..{n} {{")?;
-                writeln!(out, "            let mut acc = 0.0_f32;")?;
-                writeln!(out, "            for k in 0..{k} {{")?;
-                if config.simd_isa != SimdIsa::Scalar {
-                    writeln!(out, "                acc = ({a}).mul_add({b}, acc);")?;
-                } else {
-                    writeln!(out, "                acc += {a} * {b};")?;
-                }
-                writeln!(out, "            }}")?;
-                writeln!(out, "            {dst} = acc;")?;
-                writeln!(out, "        }}")?;
-                writeln!(out, "    }}")?;
             }
         }
         StableHloOp::Composite { name, inputs, .. } => {
