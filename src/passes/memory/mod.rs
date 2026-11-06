@@ -4,5 +4,5 @@
 pub mod bufferize;
 pub mod remat;
 
-pub use bufferize::*;
-pub use remat::*;
+pub use bufferize::{BufferizeInplacePass, EliminateConcatCopiesPass, OptimizeMemoryPass};
+pub use remat::{OffloadActivationsPass, RematerializePass};

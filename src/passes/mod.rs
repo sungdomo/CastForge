@@ -13,6 +13,7 @@ pub mod memory;
 pub mod normalize;
 pub mod quantize;
 pub mod registry;
+#[cfg(feature = "serving")]
 pub mod serving;
 pub mod shapes;
 pub mod weights;
@@ -28,12 +29,16 @@ pub use distributed::{
     ShardSpmdPass,
 };
 pub use fuse::{
-    DecomposeCompositesPass, FuseActivationsPass, FuseAddMaxPass, FuseAttentionPass,
-    FuseDequantMatmulPass, FuseElementwisePass, FuseFmaPass, FuseGatedMlpPass, FuseGeluPass,
-    FuseGemmPass, FuseHorizontalDotPass, FuseLayerNormPass, FuseLinearCrossEntropyPass,
-    FuseLoopsPass, FuseMapReducePass, FuseMatmulEpiloguePass, FuseMegakernelPass, FuseMlaPass,
-    FuseMoePass, FuseNormPass, FuseResidualNormPass, FuseRmsNormPass, FuseRopePass,
-    FuseSoftmaxPass, FuseSwiGluPass, SplitLoopsPass, match_gelu_op, match_gelu_val, match_silu_val,
+    DecomposeCompositesPass, EngineKvFormat, FuseActivationsPass, FuseAddMaxPass,
+    FuseAttentionPass, FuseDequantMatmulPass, FuseElementwisePass, FuseFmaPass, FuseGatedMlpPass,
+    FuseGeluPass, FuseGemmPass, FuseHorizontalDotPass, FuseLayerNormPass,
+    FuseLinearCrossEntropyPass, FuseLoopsPass, FuseMapReducePass, FuseMatmulEpiloguePass,
+    FuseMegakernelPass, FuseMlaPass, FuseMoePass, FuseNormPass, FuseResidualNormPass,
+    FuseRmsNormPass, FuseRopePass, FuseSoftmaxPass, FuseSwiGluPass, InjectKvCachePass,
+    JengaPoolGeometry, KvAttentionMaskKind, KvLayerGroup, KvPageSpec, LowerFlashDecodingPass,
+    LowerPagedAttentionPass, LowerTreeAttentionPass, SplitLoopsPass, analyze_kv_layer_groups,
+    longest_full_attention_hit, longest_joint_prefix_hit, longest_sliding_window_hit,
+    match_gelu_op, match_gelu_val, match_silu_val, plan_jenga_kv_geometry,
 };
 pub use loops::{
     LoopPass, LowerConvToGemmPass, LowerTensorCoresPass, OptimizeLoopIrPass,
@@ -64,6 +69,7 @@ pub use registry::{
     PassStepConfig, PassTelemetry, PassTraceStep, PassTranslator, PipelineConfig, PipelineSettings,
     parse_pass_spec_item, pass_catalog, split_pipeline_spec,
 };
+#[cfg(feature = "serving")]
 pub use serving::*;
 pub use shapes::{BucketShapesPass, PruneTokensPass, ResizeBatchPass, SpecializeShapesPass};
 pub use weights::{

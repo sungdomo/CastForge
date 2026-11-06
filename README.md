@@ -89,7 +89,7 @@ CastForge organizes its 115 passes into 11 domain packages plus 3 optimization p
 CastForge/
 ├── src/
 │   ├── ir/             # MLIR/StableHLO AST, parser/printer, TensorStore, LoopModule
-│   ├── passes/         # 9 pass packages + PassRegistry, PassManager, O1/O2/O3 presets
+│   ├── passes/         # 11 pass packages + PassRegistry, PassManager, O1/O2/O3 presets
 │   ├── codegen/        # Liveness arena planner, Roofline model, interpreter, 7 backends
 │   ├── cli/            # CLI parser, stage chain runner, and inspection commands
 │   └── ffi.rs          # Panic-safe C ABI (`extern "C"`)
@@ -98,7 +98,7 @@ CastForge/
 ├── config/             # Pass catalog (`passes.toml`) & hardware profiles (`targets.toml`)
 ├── docs/               # Architecture (`DESIGN.md`) and pass reference (`PASSES.md`)
 ├── examples/           # Sample `.mlir` workloads and pipeline configs
-├── tests/              # 10 integration, property, fuzz, negative, and scaling test suites
+├── tests/              # 13 integration, property, fuzz, negative, and scaling test suites
 └── benches/            # Compiler micro-benchmark suite (`compiler_bench.rs`)
 ```
 

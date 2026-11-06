@@ -20,6 +20,13 @@ pub mod tenant_quotas;
 pub mod tiered_storage;
 pub mod transpose_sinking;
 
+pub(crate) use crate::passes::fuse::kv_serving::checked_lcm_u64;
+pub use crate::passes::fuse::{
+    EngineKvFormat, InjectKvCachePass, JengaPoolGeometry, KvAttentionMaskKind, KvLayerGroup,
+    KvPageSpec, LowerFlashDecodingPass, LowerPagedAttentionPass, LowerTreeAttentionPass,
+    analyze_kv_layer_groups, longest_full_attention_hit, longest_joint_prefix_hit,
+    longest_sliding_window_hit, plan_jenga_kv_geometry,
+};
 pub use cacheblend::*;
 pub use collectives::*;
 pub use dependencies::*;
@@ -39,11 +46,3 @@ pub use shape_fallbacks::*;
 pub use tenant_quotas::*;
 pub use tiered_storage::*;
 pub use transpose_sinking::*;
-
-use cacheblend::extract_single_int_attr;
-use effect_chains::is_chain_type;
-use kv_attention::checked_lcm_u64;
-use loop_buffers::extract_int_list_attr;
-use memory_pools::{expr_contains_ident, stmt_references_buffer};
-use mutable_loads::{count_value_uses_in_block, extract_u64_attr};
-use transpose_sinking::{is_sinkable_binary_elementwise, is_sinkable_unary_elementwise};

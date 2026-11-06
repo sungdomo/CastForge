@@ -26,7 +26,13 @@ pub use backend::{
     compute_function_structural_hashes, compute_module_structural_hash,
     compute_region_structural_hash, emit_c_like_loop_stmt,
 };
-pub use config::*;
+pub use config::{
+    CodegenTarget, CodegenTranslator, MemoryPlanTranslator, RooflineReportTranslator,
+    generate_code, generate_code_with_config,
+};
+pub(crate) use config::{
+    matmul_dims_ex, sanitize_ident, sanitize_label, tensor_len, tensor_shape_dims, value_ident,
+};
 pub use cost_model::{
     BottleneckKind, GemmLoopOrder, HardwareRoofline, ModuleCostReport, OpCostProfile, SimdIsa,
     TargetConfig, analyze_module_cost, analyze_module_cost_with_roofline,

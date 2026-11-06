@@ -1,8 +1,10 @@
 //! Target-specific code emitters (`c`, `gpu_c`, `rust`, `wgsl`).
 
 pub mod c;
+mod c_composites;
 pub mod gpu_c;
 pub mod rust;
+mod rust_composites;
 pub mod wgsl;
 
 pub use c::{

@@ -4,5 +4,8 @@
 pub mod autodiff;
 pub mod spmd;
 
-pub use autodiff::*;
-pub use spmd::*;
+pub use autodiff::AutodiffPass;
+pub use spmd::{
+    CoalesceAllReducePass, ScheduleStreamsPass, ShardDistributedPass, ShardExpertsPass,
+    ShardFsdpPass, ShardPipelineParallelPass, ShardRingAttentionPass, ShardSpmdPass,
+};

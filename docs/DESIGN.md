@@ -48,10 +48,11 @@ optimizer, and multi-target code generator written in pure Rust.
                      +---------------+---------------+
                                      |
                +---------------------+---------------------+
-               |     9 Optimization Packages (115 Passes)  |
+               |    11 Optimization Packages (115 Passes)  |
                |  canonicalize | shapes | weights          |
                |  quantize     | fuse   | memory           |
                |  distributed  | loops  | normalize        |
+               |  serving      | registry (O1/O2/O3)       |
                +---------------------+---------------------+
                                      |
                                      v

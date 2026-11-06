@@ -1,8 +1,10 @@
 //! Unified Attention, MLA, RoPE & Serving KV-Cache Optimization (`fuse-attention`).
 
+use super::kv_serving::{
+    LowerFlashDecodingPass, LowerPagedAttentionPass, LowerTreeAttentionPass, insert_kv_cache_op,
+};
 use super::layernorm_softmax::try_fuse_softmax_at_op;
 use crate::ir::{Attribute, BlockId, Module, OpName, ValueDef, ValueId};
-use crate::passes::serving::*;
 use crate::passes::{DeadCodeEliminationPass, FoldConstantsPass, Pass, PassResult};
 use crate::stablehlo::StableHloOp;
 use anyhow::Result;
