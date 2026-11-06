@@ -12,16 +12,24 @@ use castforge::ir::{
     TensorType, Type, Value, ValueDef, ValueId,
 };
 use castforge::passes::serving::{
-    AsyncDataflowAnalysis, AsyncLaunchDispatch, ExtentSpec, KvLoadContext, ObjectFieldSpec,
-    ObjectGroupFrame, OrchestratorReplyWindow, REGION_CONTRACT_VERSION, RegionContract,
-    ReplyWindowOutcome, RowwiseReductionMonoid, SharedRegionState, WriteReserveStatus,
-    classify_view_foreach, evaluate_kv_load_policy, finalize_device_graphs, fuse_view_producers,
-    is_compatible_shape, legalize_rmo_ops, lower_map_kernels_to_routines,
+    AdapterLifecycleController, AdapterLifecycleState, AsyncDataflowAnalysis,
+    AsyncEngineDrivenStoreCoordinator, AsyncLaunchDispatch, CacheControlObjectService,
+    CacheDeleteTier, DebugAllocPoisonTracker, ExtentSpec, KvLoadContext, L1ManagerTargetSpec,
+    L1WritePolicy, ObjectFieldSpec, ObjectGroupFrame, OrchestratorReplyWindow, PhysicalMemoryRange,
+    RDMA_GET_MISS, REGION_CONTRACT_VERSION, RdmaArenaWindowPool, RegionContract,
+    RelocatablePipelineKeyOptions, ReplyWindowOutcome, RowwiseReductionMonoid,
+    SelectionFileVersion, SharedRegionState, StagingBufferSignature, WriteReserveStatus,
+    ZERO_FILL_PATTERN, classify_view_foreach, collect_sorted_graph_devices,
+    compute_relocatable_module_cache_key, evaluate_kv_load_policy, fill_poison_buffer,
+    finalize_device_graphs, form_graph_blobs, fuse_view_producers, get_poison_pattern_for_dtype,
+    is_compatible_shape, legalize_rmo_ops, lower_graph_to_mgp_model, lower_map_kernels_to_routines,
     lower_primitives_to_async_routines, lower_tensor_ops_to_map_kernels,
-    optimize_async_dataflow_dependencies, optimize_symbolic_dims, promote_rmo_dtypes,
+    normalize_call_operands_to_callee, optimize_async_dataflow_dependencies,
+    optimize_symbolic_dims, promote_rmo_dtypes, remove_dead_param_declares,
+    resolve_token_chunk_object_keys, select_l1_write_targets, staticize_shape_and_tensor_ops,
 };
 use indexmap::IndexMap;
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 
 fn make_test_module_with_block() -> (Module, BlockId) {
     let mut module = Module::new(Some("test_module".to_string()));
@@ -1226,4 +1234,484 @@ fn test_kv_load_policy_and_object_group_frame_roundtrip() {
         ],
     };
     assert!(bad_frame.encode().is_err());
+}
+
+// ===========================================================================
+// Batch #32–#34 Integration Tests
+// ===========================================================================
+
+#[test]
+fn test_form_graph_blobs_relocatable_cache_key_and_debug_poison() {
+    let mut module = Module::new(Some("blob_module".to_string()));
+    let root_block = module.body_block();
+
+    // 1. Add a declarative kernel declaration (`mogg.kernel_decl` with `execute_device = true`).
+    let mut decl_attrs = IndexMap::new();
+    decl_attrs.insert(
+        "sym_name".to_string(),
+        Attribute::String("rms_norm_k".to_string()),
+    );
+    decl_attrs.insert("execute_device".to_string(), Attribute::Bool(true));
+    module.add_operation(
+        root_block,
+        OpName::new("mogg", "kernel_decl"),
+        SmallVec::new(),
+        Vec::new(),
+        decl_attrs,
+        Vec::new(),
+        false,
+        Location::Unknown,
+    );
+
+    // 2. Build a `func.func` with two declarative `mogg.routine` ops on `"gpu:0"` that fuse
+    //    into a single `mogg.graph_blob` routine.
+    let tensor_ty = Type::Tensor(TensorType {
+        shape: vec![Dim::Static(4), Dim::Static(8)],
+        dtype: DType::F32,
+        encoding: Some("gpu:0".to_string()),
+    });
+
+    let fn_blk = module.create_block(None);
+    let fn_arg = module.add_block_argument(fn_blk, Some("x".to_string()), tensor_ty.clone());
+
+    let make_routine = |m: &mut Module, parent_blk, input| -> ValueId {
+        let r_blk = m.create_block(None);
+        let _r_arg = m.add_block_argument(r_blk, Some("in0".to_string()), tensor_ty.clone());
+        let mut call_attrs = IndexMap::new();
+        call_attrs.insert(
+            "callee".to_string(),
+            Attribute::String("rms_norm_k".to_string()),
+        );
+        m.add_operation(
+            r_blk,
+            OpName::new("mogg", "call.opaque"),
+            SmallVec::new(),
+            Vec::new(),
+            call_attrs,
+            Vec::new(),
+            false,
+            Location::Unknown,
+        );
+        let r_reg = m.create_region(vec![r_blk]);
+        let mut r_attrs = IndexMap::new();
+        r_attrs.insert(
+            "device_ref".to_string(),
+            Attribute::String("gpu:0".to_string()),
+        );
+        let r_op = m.add_operation(
+            parent_blk,
+            OpName::new("mogg", "routine"),
+            smallvec![input],
+            vec![(None, tensor_ty.clone())],
+            r_attrs,
+            vec![r_reg],
+            false,
+            Location::Unknown,
+        );
+        m.ops[r_op].results[0]
+    };
+
+    let r1_out = make_routine(&mut module, fn_blk, fn_arg);
+    let r2_out = make_routine(&mut module, fn_blk, r1_out);
+    module.add_operation(
+        fn_blk,
+        OpName::new("func", "return"),
+        smallvec![r2_out],
+        Vec::new(),
+        IndexMap::new(),
+        Vec::new(),
+        false,
+        Location::Unknown,
+    );
+    let fn_reg = module.create_region(vec![fn_blk]);
+    let mut fn_attrs = IndexMap::new();
+    fn_attrs.insert(
+        "sym_name".to_string(),
+        Attribute::String("main".to_string()),
+    );
+    module.add_operation(
+        root_block,
+        OpName::new("func", "func"),
+        SmallVec::new(),
+        Vec::new(),
+        fn_attrs,
+        vec![fn_reg],
+        false,
+        Location::Unknown,
+    );
+
+    let blobs_formed = form_graph_blobs(&mut module);
+    assert_eq!(blobs_formed, 1);
+
+    // Verify Relocatable Module Cache Key strips local paths while staying sensitive to pipeline.
+    let opts_a = RelocatablePipelineKeyOptions {
+        textual_pipeline: "canonicalize,cse".to_string(),
+        target_descriptor: "x86_64-unknown-linux-gnu".to_string(),
+        compile_defines: vec![("ARCH".to_string(), "sm90".to_string())],
+        cache_dir: Some("/local/machine_a/cache".to_string()),
+        kernel_library_paths: vec!["/local/machine_a/libk.so".to_string()],
+        save_temp_prefix: "/tmp/a".to_string(),
+        timing_out_dir: "/tmp/timing_a".to_string(),
+        source_tracebacks: false,
+    };
+    let mut opts_same_reloc = opts_a.clone();
+    opts_same_reloc.cache_dir = Some("/different/machine_b/cache".to_string());
+    opts_same_reloc.kernel_library_paths = vec!["/different/machine_b/libk.so".to_string()];
+
+    let key_a =
+        compute_relocatable_module_cache_key(&module, &opts_a, &[b"kernel_bytes"]).expect("key a");
+    let key_same =
+        compute_relocatable_module_cache_key(&module, &opts_same_reloc, &[b"kernel_bytes"])
+            .expect("key same");
+    assert_eq!(key_a, key_same);
+
+    let mut opts_diff = opts_a;
+    opts_diff.textual_pipeline = "canonicalize".to_string();
+    let key_diff = compute_relocatable_module_cache_key(&module, &opts_diff, &[b"kernel_bytes"])
+        .expect("key diff");
+    assert_ne!(key_a, key_diff);
+
+    // Verify DebugAllocPoisonTracker range selection and largest-finite bit-patterns.
+    let pat_f32 = get_poison_pattern_for_dtype(&DType::F32).expect("f32 poison pattern");
+    assert_eq!(pat_f32.bits, 0x7F7F_FFFF);
+    let mut buf = [0u8; 8];
+    fill_poison_buffer(&mut buf, &pat_f32);
+    assert_eq!(&buf[0..4], &0x7F7F_FFFFu32.to_le_bytes());
+
+    let mut tracker = DebugAllocPoisonTracker::new("dtype=bf16&ord=1-2");
+    let d0 = tracker.decide_for_allocation(&DType::BF16);
+    let d1 = tracker.decide_for_allocation(&DType::BF16);
+    assert_eq!(d0.fill, Some(ZERO_FILL_PATTERN));
+    assert_eq!(d1.fill.map(|p| p.bits), Some(0x7F7F));
+
+    let v1 = SelectionFileVersion {
+        unique_id: 1,
+        mtime_ns: 100,
+        size_bytes: 16,
+    };
+    tracker.refresh_from_file_version(v1, "dtype=bf16&ord=0-0");
+    assert_eq!(tracker.epoch(), 1);
+    assert_eq!(tracker.next_ordinal(), 0);
+}
+
+#[test]
+fn test_shape_staticization_and_multi_device_mgp_model_lowering() {
+    let mut module = Module::new(Some("staticize_and_lower".to_string()));
+    let root_block = module.body_block();
+
+    // 1. Create a callee `func.func @kernel(%arg0: tensor<batch x 8 x f32, "gpu:0">)`
+    let expected_ty = Type::Tensor(TensorType {
+        shape: vec![Dim::Symbolic("batch".to_string()), Dim::Static(8)],
+        dtype: DType::F32,
+        encoding: Some("gpu:0".to_string()),
+    });
+    let callee_block = module.create_block(Some("entry".to_string()));
+    let _callee_arg = module.add_block_argument(callee_block, None, expected_ty);
+    let callee_region = module.create_region(vec![callee_block]);
+    let mut callee_attrs = IndexMap::new();
+    callee_attrs.insert(
+        "sym_name".to_string(),
+        Attribute::String("kernel".to_string()),
+    );
+    module.add_operation(
+        root_block,
+        OpName::new("func", "func"),
+        SmallVec::new(),
+        Vec::new(),
+        callee_attrs,
+        vec![callee_region],
+        false,
+        Location::Unknown,
+    );
+
+    // 2. Create a `mo.graph` calling `@kernel` twice with dynamic shape
+    //    `tensor<? x 8 x f32, "gpu:0">`, plus dead/live `kgen.param.declare` ops
+    //    and staticizable `mo.broadcast_to`.
+    let dyn_ty = Type::Tensor(TensorType {
+        shape: vec![Dim::Dynamic, Dim::Static(8)],
+        dtype: DType::F32,
+        encoding: Some("gpu:0".to_string()),
+    });
+    let graph_block = module.create_block(Some("entry".to_string()));
+    let graph_arg = module.add_block_argument(graph_block, None, dyn_ty);
+
+    // Dead param declare vs impure `apply` param declare.
+    let mut dead_attrs = IndexMap::new();
+    dead_attrs.insert(
+        "sym_name".to_string(),
+        Attribute::String("unused_sym".to_string()),
+    );
+    let dead_decl_id = module.add_operation(
+        graph_block,
+        OpName::new("kgen", "param.declare"),
+        SmallVec::new(),
+        Vec::new(),
+        dead_attrs,
+        Vec::new(),
+        false,
+        Location::Unknown,
+    );
+
+    let mut apply_attrs = IndexMap::new();
+    apply_attrs.insert(
+        "sym_name".to_string(),
+        Attribute::String("impure_sym".to_string()),
+    );
+    apply_attrs.insert("opcode".to_string(), Attribute::String("apply".to_string()));
+    let apply_decl_id = module.add_operation(
+        graph_block,
+        OpName::new("kgen", "param.declare"),
+        SmallVec::new(),
+        Vec::new(),
+        apply_attrs,
+        Vec::new(),
+        false,
+        Location::Unknown,
+    );
+
+    let mut call_attrs = IndexMap::new();
+    call_attrs.insert(
+        "callee".to_string(),
+        Attribute::String("kernel".to_string()),
+    );
+    module.add_operation(
+        graph_block,
+        OpName::new("mo", "call"),
+        smallvec![graph_arg],
+        Vec::new(),
+        call_attrs.clone(),
+        Vec::new(),
+        false,
+        Location::Unknown,
+    );
+    module.add_operation(
+        graph_block,
+        OpName::new("mo", "call"),
+        smallvec![graph_arg],
+        Vec::new(),
+        call_attrs,
+        Vec::new(),
+        false,
+        Location::Unknown,
+    );
+
+    // Compile-time shape ops: scalar [5] broadcast to [3] -> [5, 5, 5], plus mo.output.
+    let mut c_attrs = IndexMap::new();
+    c_attrs.insert(
+        "shape_attr".to_string(),
+        Attribute::Array(vec![Attribute::Int(5)]),
+    );
+    c_attrs.insert(
+        "device_ref".to_string(),
+        Attribute::String("gpu:1".to_string()),
+    );
+    let c_id = module.add_operation(
+        graph_block,
+        OpName::new("mo", "constant"),
+        SmallVec::new(),
+        vec![(
+            None,
+            Type::Tensor(TensorType {
+                shape: vec![Dim::Static(1)],
+                dtype: DType::I64,
+                encoding: None,
+            }),
+        )],
+        c_attrs,
+        Vec::new(),
+        false,
+        Location::Unknown,
+    );
+    let c_val = module.ops[c_id].results[0];
+
+    let bcast_id = module.add_operation(
+        graph_block,
+        OpName::new("mo", "broadcast_to"),
+        smallvec![c_val],
+        vec![(
+            None,
+            Type::Tensor(TensorType {
+                shape: vec![Dim::Static(3)],
+                dtype: DType::I64,
+                encoding: None,
+            }),
+        )],
+        IndexMap::new(),
+        Vec::new(),
+        false,
+        Location::Unknown,
+    );
+    let bcast_val = module.ops[bcast_id].results[0];
+
+    let out_id = module.add_operation(
+        graph_block,
+        OpName::new("mo", "output"),
+        smallvec![bcast_val],
+        Vec::new(),
+        IndexMap::new(),
+        Vec::new(),
+        false,
+        Location::Unknown,
+    );
+
+    let graph_region = module.create_region(vec![graph_block]);
+    let graph_id = module.add_operation(
+        root_block,
+        OpName::new("mo", "graph"),
+        SmallVec::new(),
+        Vec::new(),
+        IndexMap::new(),
+        vec![graph_region],
+        false,
+        Location::Unknown,
+    );
+
+    // Run call-site normalization: 2 rebinds inserted, only first declares "batch".
+    let rebinds = normalize_call_operands_to_callee(&mut module);
+    assert_eq!(rebinds, 2);
+
+    // Run dead param DCE: `unused_sym` removed, `impure_sym` (opcode == "apply") kept.
+    let removed_decls = remove_dead_param_declares(&mut module);
+    assert_eq!(removed_decls, 1);
+    assert!(!module.ops.contains_key(dead_decl_id));
+    assert!(module.ops.contains_key(apply_decl_id));
+
+    // Run staticization: `mo.broadcast_to` folds `shape_attr = [5, 5, 5]`.
+    let folded = staticize_shape_and_tensor_ops(&mut module).expect("staticize ok");
+    assert_eq!(folded, 1);
+    assert_eq!(
+        module.ops[bcast_id].attributes.get("shape_attr"),
+        Some(&Attribute::Array(vec![
+            Attribute::Int(5),
+            Attribute::Int(5),
+            Attribute::Int(5),
+        ]))
+    );
+
+    // Verify sorted graph devices ("cpu:0" first, then "gpu:0", "gpu:1") and lower to mgp.model.
+    let devices = collect_sorted_graph_devices(&module, graph_id);
+    assert_eq!(devices, vec!["cpu:0", "gpu:0", "gpu:1"]);
+
+    let models = lower_graph_to_mgp_model(&mut module, 64);
+    assert_eq!(models, 1);
+    assert_eq!(module.ops[graph_id].name.full_name(), "mgp.model");
+    assert_eq!(module.ops[graph_id].regions.len(), 2);
+    assert_eq!(
+        module.ops[c_id].attributes.get("alignment"),
+        Some(&Attribute::Int(64))
+    );
+    assert_eq!(module.ops[out_id].name.full_name(), "mgp.yield");
+}
+
+#[test]
+fn test_rdma_window_async_store_and_cache_control_lifecycle() {
+    // 1. RDMA arena window validation & revoked-key retry recovery.
+    let mut rdma = RdmaArenaWindowPool::new(
+        0x4000_0000,
+        0x10_0000,
+        "efa-direct",
+        Some("efa0".to_string()),
+    )
+    .expect("pool init");
+    assert!(rdma.rdma_set("empty", &[], 0, None).is_err());
+    rdma.inject_revoked_faults(1);
+    rdma.rdma_set("kv_block_1", &[0x42; 16], 100, Some(30))
+        .expect("set after single revoked retry");
+    assert_eq!(rdma.registration_epoch(), 2);
+
+    let mut buf = [0u8; 16];
+    let read_bytes = rdma
+        .rdma_get_into("kv_block_1", 0x4000_0200, 16, false, 110, &mut buf)
+        .expect("get_into hit");
+    assert_eq!(read_bytes, 16);
+    assert_eq!(buf, [0x42; 16]);
+
+    // Expired at t = 135 -> RDMA_GET_MISS (-1).
+    let expired = rdma
+        .rdma_get_into("kv_block_1", 0x4000_0200, 16, false, 135, &mut buf)
+        .expect("get_into expired");
+    assert_eq!(expired, RDMA_GET_MISS);
+
+    // 2. Three-phase async store coordinator + pinned staging pool.
+    let mut coord = AsyncEngineDrivenStoreCoordinator::new();
+    let sig = StagingBufferSignature {
+        shape: vec![8, 128],
+        dtype: DType::F16,
+    };
+    let b1 = coord.submit_store(10, sig.clone()).expect("submit 10");
+    let _b2 = coord.submit_store(11, sig.clone()).expect("submit 11");
+    coord.record_gather_launched(10, 7001).expect("gather 10");
+    let synced = coord.flush_inflight_stores(8001).expect("flush stores");
+    assert_eq!(synced, vec![7001, 8001]);
+
+    // Subsequent store reuses pooled staging buffer.
+    let b3 = coord.submit_store(12, sig).expect("submit 12");
+    assert_eq!(b3, b1);
+    coord.close().expect("close coordinator");
+
+    // 3. Online L2 adapter lifecycle, overlap check, write policy, and cache-control service.
+    let mut ctrl = AdapterLifecycleController::new();
+    let r0 = PhysicalMemoryRange {
+        device_id: 0,
+        base_addr: 0x1000,
+        byte_len: 0x2000,
+    };
+    let r_overlap = PhysicalMemoryRange {
+        device_id: 0,
+        base_addr: 0x2000,
+        byte_len: 0x1000,
+    };
+    ctrl.add_adapter("nvme_0", r0).expect("add nvme_0");
+    assert!(ctrl.add_adapter("nvme_1", r_overlap).is_err());
+
+    ctrl.acquire_task("nvme_0").expect("acquire task");
+    assert_eq!(
+        ctrl.remove_adapter("nvme_0").expect("begin drain"),
+        AdapterLifecycleState::Draining
+    );
+    assert!(ctrl.acquire_task("nvme_0").is_err());
+    assert_eq!(
+        ctrl.release_task("nvme_0").expect("finish drain"),
+        AdapterLifecycleState::Removed
+    );
+
+    let targets = vec![
+        L1ManagerTargetSpec {
+            manager_id: "l1_numa0".to_string(),
+            tags: vec!["numa0".to_string()],
+            used_bytes: 800,
+            capacity_bytes: 1000,
+            healthy: true,
+        },
+        L1ManagerTargetSpec {
+            manager_id: "l1_numa1".to_string(),
+            tags: vec!["numa1".to_string()],
+            used_bytes: 200,
+            capacity_bytes: 1000,
+            healthy: true,
+        },
+    ];
+    assert_eq!(
+        select_l1_write_targets(&targets, &L1WritePolicy::LeastUtilized).expect("least utilized"),
+        "l1_numa1"
+    );
+
+    let keys = resolve_token_chunk_object_keys("llama-70b", 8, 0, &[1, 2, 3, 4, 5], 2)
+        .expect("resolve keys");
+    assert_eq!(keys.len(), 2);
+
+    let mut svc = CacheControlObjectService::new();
+    svc.insert_object(&keys[0], true, true, true);
+    svc.insert_object(&keys[1], true, false, true);
+
+    let (page, cursor) = svc.list_l2_keys_paginated("llama-70b@", None, 1);
+    assert_eq!(page.len(), 1);
+    assert!(cursor.is_some());
+
+    let summary = svc
+        .delete_objects(&keys, CacheDeleteTier::AllTiers, false)
+        .expect("delete non-force");
+    assert_eq!(summary.deleted_l1, 1);
+    assert_eq!(summary.deleted_l2, 2);
+    assert_eq!(summary.skipped_locked, vec![keys[0].clone()]);
 }
