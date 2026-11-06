@@ -91,16 +91,78 @@ impl MlirParser {
                 continue;
             }
 
-            if line == "}" {
-                if block_stack.len() > 1 {
+            if let Some(after_close) = line.strip_prefix('}') {
+                let (after_close, _loc) = extract_trailing_loc(after_close);
+                let after_close = after_close.trim();
+                if after_close == "{" {
+                    if block_stack.len() <= 1 {
+                        return Err(ParseError::Syntax {
+                            line: line_no,
+                            message: "Unexpected `} {` without enclosing operation".to_string(),
+                        });
+                    }
                     block_stack.pop();
-                } else if module_brace_open {
-                    module_brace_open = false;
+                    let parent_blk = *block_stack.last().unwrap_or(&module.body_block());
+                    if let Some(&op_id) = module.blocks[parent_blk].ops.last() {
+                        let sub_blk = module.create_block(None);
+                        let sub_reg = module.create_region(vec![sub_blk]);
+                        module.ops[op_id].regions.push(sub_reg);
+                        block_stack.push(sub_blk);
+                    }
+                    continue;
+                } else if after_close.is_empty() {
+                    if block_stack.len() > 1 {
+                        block_stack.pop();
+                    } else if module_brace_open {
+                        module_brace_open = false;
+                    } else {
+                        return Err(ParseError::Syntax {
+                            line: line_no,
+                            message: "Unmatched closing brace `}`".to_string(),
+                        });
+                    }
+                    continue;
+                }
+            }
+
+            if let Some(caret_rest) = line.strip_prefix('^')
+                && caret_rest.ends_with(':')
+            {
+                let header = caret_rest[..caret_rest.len() - 1].trim();
+                let current_blk = *block_stack.last().unwrap_or(&module.body_block());
+                let (label, args_str) = if let Some(open_p) = header.find('(') {
+                    let close_p =
+                        find_matching_delim(&header[open_p + 1..], '(', ')').ok_or_else(|| {
+                            ParseError::Syntax {
+                                line: line_no,
+                                message: format!("Unclosed `(` in block header `^{header}:`"),
+                            }
+                        })? + open_p
+                            + 1;
+                    (
+                        header[..open_p].trim().to_string(),
+                        Some(&header[open_p + 1..close_p]),
+                    )
                 } else {
-                    return Err(ParseError::Syntax {
-                        line: line_no,
-                        message: "Unmatched closing brace `}`".to_string(),
-                    });
+                    (header.to_string(), None)
+                };
+                module.blocks[current_blk].label = Some(label);
+                if let Some(args_inner) = args_str {
+                    for arg_item in split_top_level(args_inner, ',') {
+                        let arg_item = arg_item.trim();
+                        if arg_item.is_empty() {
+                            continue;
+                        }
+                        let (val_str, ty_str) =
+                            arg_item.split_once(':').ok_or_else(|| ParseError::Syntax {
+                                line: line_no,
+                                message: format!("Invalid block argument `{arg_item}`"),
+                            })?;
+                        let ssa = val_str.trim().trim_start_matches('%').to_string();
+                        let ty = parse_type(ty_str.trim(), line_no)?;
+                        let val_id = module.add_block_argument(current_blk, Some(ssa.clone()), ty);
+                        self.value_map.insert(ssa, val_id);
+                    }
                 }
                 continue;
             }
@@ -183,7 +245,7 @@ impl MlirParser {
             ));
         }
 
-        // 2. Check `return` / `func.return`
+        // 2. Check `return` / `func.return` / `stablehlo.return`
         if let Some(rest) = rhs
             .strip_prefix("func.return")
             .or_else(|| rhs.strip_prefix("return"))
@@ -210,6 +272,39 @@ impl MlirParser {
             module.add_operation(
                 block,
                 OpName::new("func", "return"),
+                operands,
+                Vec::new(),
+                IndexMap::new(),
+                Vec::new(),
+                true,
+                location,
+            );
+            return Ok(None);
+        }
+
+        if let Some(rest) = rhs.strip_prefix("stablehlo.return") {
+            let rest = rest.trim();
+            let mut operands = SmallVec::new();
+            if !rest.is_empty() {
+                let (ops_part, _tys_part) = rest.split_once(':').unwrap_or((rest, ""));
+                for op_tok in split_top_level(ops_part, ',') {
+                    let ssa = op_tok.trim().trim_start_matches('%');
+                    if !ssa.is_empty() {
+                        let val_id =
+                            *self
+                                .value_map
+                                .get(ssa)
+                                .ok_or_else(|| ParseError::UndefinedValue {
+                                    line: line_no,
+                                    name: ssa.to_string(),
+                                })?;
+                        operands.push(val_id);
+                    }
+                }
+            }
+            module.add_operation(
+                block,
+                OpName::new("stablehlo", "return"),
                 operands,
                 Vec::new(),
                 IndexMap::new(),
@@ -409,10 +504,19 @@ impl MlirParser {
                     "broadcast_dimensions"
                 };
                 attrs.insert(attr_key.to_string(), Attribute::DenseIntArray(nums));
-            } else if let Some(dim_rest) = item.strip_prefix("dim") {
+            } else if let Some(dim_rest) = item
+                .strip_prefix("dimension")
+                .or_else(|| item.strip_prefix("dim"))
+            {
                 let dim_rest = dim_rest.trim().trim_start_matches('=').trim();
-                if let Ok(d) = dim_rest.parse::<i64>() {
-                    attrs.insert("iota_dimension".to_string(), Attribute::Int(d));
+                let dim_num = dim_rest.split(':').next().unwrap_or(dim_rest).trim();
+                if let Ok(d) = dim_num.parse::<i64>() {
+                    let attr_key = if op_name.name == "concatenate" {
+                        "dimension"
+                    } else {
+                        "iota_dimension"
+                    };
+                    attrs.insert(attr_key.to_string(), Attribute::Int(d));
                 }
             } else if let Some(cd_rest) = item.strip_prefix("contracting_dims") {
                 let cd_rest = cd_rest.trim().trim_start_matches('=').trim();
@@ -466,17 +570,22 @@ impl MlirParser {
             }
         }
 
-        let parsed_ty = parse_type(after_colon, line_no)?;
-        let result_types: Vec<Type> = match parsed_ty {
-            Type::Function { results, .. } => results,
-            other => vec![other],
+        let is_terminator_op = matches!(op_name.name.as_str(), "return" | "yield");
+        let named_results: Vec<(Option<String>, Type)> = if lhs_names.is_empty() && is_terminator_op
+        {
+            Vec::new()
+        } else {
+            let parsed_ty = parse_type(after_colon, line_no)?;
+            let result_types: Vec<Type> = match parsed_ty {
+                Type::Function { results, .. } => results,
+                other => vec![other],
+            };
+            result_types
+                .into_iter()
+                .enumerate()
+                .map(|(i, t)| (lhs_names.get(i).cloned(), t))
+                .collect()
         };
-
-        let named_results: Vec<(Option<String>, Type)> = result_types
-            .into_iter()
-            .enumerate()
-            .map(|(i, t)| (lhs_names.get(i).cloned(), t))
-            .collect();
 
         let op_id = module.add_operation(
             block,
@@ -1062,6 +1171,24 @@ pub(crate) fn parse_attribute_value(val_str: &str) -> Attribute {
         Attribute::Int(i)
     } else if let Ok(f) = val_str.parse::<f64>() {
         Attribute::Float(f)
+    } else if let Some((num_part, ty_part)) = val_str.rsplit_once(':') {
+        let num_part = num_part.trim();
+        let ty_part = ty_part.trim();
+        if matches!(
+            ty_part,
+            "i1" | "i4" | "i8" | "i16" | "i32" | "i64" | "ui8" | "ui16" | "ui32" | "ui64" | "index"
+        ) && let Ok(i) = num_part.parse::<i64>()
+        {
+            return Attribute::Int(i);
+        }
+        if matches!(
+            ty_part,
+            "f8E4M3FN" | "f8E5M2" | "f16" | "bf16" | "f32" | "f64"
+        ) && let Ok(f) = num_part.parse::<f64>()
+        {
+            return Attribute::Float(f);
+        }
+        Attribute::Opaque(val_str.to_string())
     } else {
         Attribute::Opaque(val_str.to_string())
     }

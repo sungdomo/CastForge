@@ -1,4 +1,4 @@
-use crate::ir::{BlockId, Module, OpId, RegionId, ValueId};
+use crate::ir::{Attribute, BlockId, Module, OpId, RegionId, ValueId};
 use crate::passes::{Pass, PassResult};
 use anyhow::Result;
 use std::collections::HashSet;
@@ -105,8 +105,6 @@ impl Pass for DeadCodeEliminationPass {
             }
             for fn_op_id in private_funcs {
                 if !swept_priv.contains(&fn_op_id) {
-                    let regions = module.ops[fn_op_id].regions.clone();
-                    purge_regions_recursively(module, &regions, &mut visited_blocks);
                     dead_fns.insert(fn_op_id);
                 }
             }
@@ -132,7 +130,10 @@ impl Pass for DeadCodeEliminationPass {
                 .ops
                 .retain(|id| !dead_fns.contains(id));
             for fn_id in dead_fns {
-                module.ops.remove(fn_id);
+                if let Some(op) = module.ops.get(fn_id) {
+                    mark_regions_visited(module, &op.regions.clone(), &mut visited_blocks);
+                }
+                module.remove_op_unlinked(fn_id);
             }
         }
 
@@ -207,11 +208,12 @@ fn sweep_block_reverse(
         let Some(op) = module.ops.get(op_id).cloned() else {
             continue;
         };
-        let is_dead = op.is_pure()
+        let is_dead = !op.is_terminator()
+            && op.is_pure()
             && !op.results.is_empty()
             && op.results.iter().all(|res| !live_values.contains(res));
         if is_dead {
-            purge_regions_recursively(module, &op.regions, visited_blocks);
+            mark_regions_visited(module, &op.regions, visited_blocks);
             dead_in_block.insert(op_id);
             continue;
         }
@@ -220,6 +222,7 @@ fn sweep_block_reverse(
             live_values.insert(operand);
         }
         if include_symbols {
+            collect_referenced_symbols(&op.attributes, referenced_symbols);
             if op.is_op("func", "call")
                 && let Some(c) = op.attributes.get("callee").and_then(|a| a.as_str())
             {
@@ -249,27 +252,53 @@ fn sweep_block_reverse(
             .ops
             .retain(|id| !dead_in_block.contains(id));
         for dead_id in dead_in_block {
-            module.ops.remove(dead_id);
+            module.remove_op_unlinked(dead_id);
         }
     }
     removed
 }
 
-fn purge_regions_recursively(
-    module: &mut Module,
+fn collect_referenced_symbols(
+    attrs: &indexmap::IndexMap<String, Attribute>,
+    referenced_symbols: &mut HashSet<String>,
+) {
+    for attr in attrs.values() {
+        collect_symbol_from_attr(attr, referenced_symbols);
+    }
+}
+
+fn collect_symbol_from_attr(attr: &Attribute, referenced_symbols: &mut HashSet<String>) {
+    match attr {
+        Attribute::SymbolRef(s) => {
+            referenced_symbols.insert(s.clone());
+        }
+        Attribute::Array(items) => {
+            for item in items {
+                collect_symbol_from_attr(item, referenced_symbols);
+            }
+        }
+        Attribute::Dictionary(dict) => {
+            collect_referenced_symbols(dict, referenced_symbols);
+        }
+        _ => {}
+    }
+}
+
+fn mark_regions_visited(
+    module: &Module,
     regions: &[RegionId],
     visited_blocks: &mut HashSet<BlockId>,
 ) {
     for &reg_id in regions {
-        let Some(reg) = module.regions.remove(reg_id) else {
+        let Some(reg) = module.regions.get(reg_id) else {
             continue;
         };
-        for blk_id in reg.blocks {
+        for &blk_id in &reg.blocks {
             visited_blocks.insert(blk_id);
-            if let Some(blk) = module.blocks.remove(blk_id) {
-                for inner_op_id in blk.ops {
-                    if let Some(inner_op) = module.ops.remove(inner_op_id) {
-                        purge_regions_recursively(module, &inner_op.regions, visited_blocks);
+            if let Some(blk) = module.blocks.get(blk_id) {
+                for &inner_op_id in &blk.ops {
+                    if let Some(inner_op) = module.ops.get(inner_op_id) {
+                        mark_regions_visited(module, &inner_op.regions, visited_blocks);
                     }
                 }
             }

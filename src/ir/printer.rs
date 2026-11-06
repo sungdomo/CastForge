@@ -137,6 +137,18 @@ impl<'a> MlirPrinter<'a> {
                     types_str.join(", ")
                 )?;
             }
+        } else if op.is_op("stablehlo", "return") {
+            if operand_names.is_empty() {
+                write!(out, "stablehlo.return")?;
+            } else {
+                let types_str: Vec<String> = operand_types.iter().map(|t| t.to_string()).collect();
+                write!(
+                    out,
+                    "stablehlo.return {} : {}",
+                    operand_names.join(", "),
+                    types_str.join(", ")
+                )?;
+            }
         } else if op.is_op("func", "call") {
             let callee = op
                 .attributes
@@ -299,10 +311,30 @@ impl<'a> MlirPrinter<'a> {
         let op_loc = op.location.clone();
         if !op_regions.is_empty() {
             writeln!(out, " {{")?;
-            for reg_id in op_regions {
+            for (reg_idx, reg_id) in op_regions.into_iter().enumerate() {
+                if reg_idx > 0 {
+                    writeln!(out, "{pad}}} {{")?;
+                }
                 if let Some(reg) = self.module.regions.get(reg_id) {
                     let blocks = reg.blocks.clone();
                     for blk_id in blocks {
+                        let blk_label = self.module.blocks[blk_id].label.clone();
+                        let blk_args = self.module.blocks[blk_id].arguments.clone();
+                        if blk_label.is_some() || !blk_args.is_empty() {
+                            let label = blk_label.unwrap_or_else(|| "bb0".to_string());
+                            let mut arg_strs = Vec::with_capacity(blk_args.len());
+                            for arg_id in blk_args {
+                                let name = self.assign_value_name(arg_id);
+                                let ty = &self.module.values[arg_id].ty;
+                                arg_strs.push(format!("{name}: {ty}"));
+                            }
+                            let inner_pad = "  ".repeat(indent + 1);
+                            if arg_strs.is_empty() {
+                                writeln!(out, "{inner_pad}^{label}:")?;
+                            } else {
+                                writeln!(out, "{inner_pad}^{label}({}):", arg_strs.join(", "))?;
+                            }
+                        }
                         let ops = self.module.blocks[blk_id].ops.clone();
                         for child_op in ops {
                             self.print_op(out, child_op, indent + 1)?;

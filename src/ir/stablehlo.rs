@@ -473,7 +473,11 @@ impl StableHloOp {
                 })
             }
             "concatenate" => {
-                let dimension = match op.attributes.get("dimension") {
+                let dimension = match op
+                    .attributes
+                    .get("dimension")
+                    .or_else(|| op.attributes.get("iota_dimension"))
+                {
                     Some(Attribute::Int(d)) => *d,
                     _ => 0,
                 };

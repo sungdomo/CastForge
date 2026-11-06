@@ -377,5 +377,60 @@ mod tests {
         let st_mod = import_safetensors_bytes(&st_bytes).expect("import st");
         assert_eq!(st_mod.tensor_store.len(), 2);
         assert!(st_mod.verify().is_ok());
+
+        // 16. Terminators, multi-region `{ ... } { ... }`, `^bb0(%arg: ty):`, and typed attributes
+        let multi_region_mlir = concat!(
+            "module @mr {\n",
+            "  func.func @main(%x: tensor<2x4xf32>, %y: tensor<2x2xf32>)",
+            " -> tensor<2x6xf32> {\n",
+            "    %cat = stablehlo.concatenate %x, %y, dimension = 1 : i64",
+            " : (tensor<2x4xf32>, tensor<2x2xf32>) -> tensor<2x6xf32>\n",
+            "    %w = stablehlo.while %cat : (tensor<2x6xf32>) -> tensor<2x6xf32> {\n",
+            "    ^bb0(%arg0: tensor<2x6xf32>):\n",
+            "      %c = stablehlo.compare %arg0, %arg0, EQ",
+            " : (tensor<2x6xf32>, tensor<2x6xf32>) -> tensor<2x6xi1>\n",
+            "      stablehlo.return %c : tensor<2x6xi1>\n",
+            "    } {\n",
+            "    ^bb0(%arg1: tensor<2x6xf32>):\n",
+            "      %inv = stablehlo.add %x, %x : tensor<2x4xf32>\n",
+            "      %next = stablehlo.add %arg1, %arg1 : tensor<2x6xf32>\n",
+            "      stablehlo.return %next : tensor<2x6xf32>\n",
+            "    }\n",
+            "    return %w : tensor<2x6xf32>\n",
+            "  }\n",
+            "}\n"
+        );
+        let mut mr_mod = parse_mlir(multi_region_mlir).expect("multi_region_mlir parses");
+        assert!(mr_mod.verify().is_ok());
+        let mr_fn = mr_mod.functions()[0];
+        let mr_blk = mr_mod.regions[mr_mod.ops[mr_fn].regions[0]].blocks[0];
+        let cat_op = &mr_mod.ops[mr_mod.blocks[mr_blk].ops[0]];
+        assert_eq!(cat_op.attributes.get("dimension"), Some(&Attribute::Int(1)));
+        assert!(verify_stablehlo_shapes(&mr_mod, cat_op.id).is_ok());
+        let while_op = &mr_mod.ops[mr_mod.blocks[mr_blk].ops[1]];
+        assert_eq!(while_op.regions.len(), 2);
+
+        let mr_printed = print_mlir(&mr_mod);
+        assert!(mr_printed.contains("} {"));
+        assert!(mr_printed.contains("^bb0("));
+        assert!(mr_printed.contains("stablehlo.return"));
+        let mr_reparsed = parse_mlir(&mr_printed).expect("mr_printed reparses");
+        assert_eq!(
+            mr_reparsed.ops[mr_reparsed.blocks[mr_reparsed.regions
+                [mr_reparsed.ops[mr_reparsed.functions()[0]].regions[0]]
+                .blocks[0]]
+                .ops[1]]
+                .regions
+                .len(),
+            2
+        );
+
+        // DCE must preserve `stablehlo.return` terminators inside nested regions
+        use crate::passes::Pass;
+        crate::passes::DeadCodeEliminationPass::default()
+            .run(&mut mr_mod)
+            .expect("dce runs");
+        let after_dce = print_mlir(&mr_mod);
+        assert_eq!(after_dce.matches("stablehlo.return").count(), 2);
     }
 }

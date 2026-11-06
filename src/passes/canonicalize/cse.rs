@@ -90,11 +90,7 @@ impl CsePass {
                     continue;
                 };
 
-                if self.licm
-                    && !op.regions.is_empty()
-                    && !op.is_op("builtin", "module")
-                    && !op.is_op("func", "func")
-                {
+                if self.licm && !op.regions.is_empty() && !op.is_isolated_from_above() {
                     let hoisted = extract_region_invariant_ops(module, &op.regions);
                     for hoisted_op_id in hoisted {
                         modified += 1;
@@ -120,8 +116,13 @@ impl CsePass {
                     }
                 }
 
+                let is_isolated = op.is_isolated_from_above();
                 for &nested_reg in &op.regions {
-                    let mut child_env = block_env.clone();
+                    let mut child_env = if is_isolated {
+                        HashMap::new()
+                    } else {
+                        block_env.clone()
+                    };
                     let (rem, modif) =
                         self.process_region(module, nested_reg, &mut child_env, value_leader);
                     removed += rem;
@@ -157,7 +158,7 @@ impl CsePass {
                 }
                 module.blocks[block_id].ops = new_order;
                 for dead_id in dead_ops {
-                    module.ops.remove(dead_id);
+                    module.remove_op_unlinked(dead_id);
                 }
             }
 
@@ -229,7 +230,11 @@ fn extract_region_invariant_ops(module: &mut Module, regions: &[RegionId]) -> Ve
             let Some(inner_op) = module.ops.get(inner_op_id) else {
                 continue;
             };
-            if !inner_op.is_pure() || !inner_op.regions.is_empty() {
+            if !inner_op.is_pure()
+                || inner_op.is_terminator()
+                || inner_op.results.is_empty()
+                || !inner_op.regions.is_empty()
+            {
                 continue;
             };
             let is_invariant = inner_op

@@ -538,8 +538,29 @@ impl Operation {
         self.name.dialect == dialect && self.name.name == name
     }
 
+    /// Returns true if this operation is a block/region terminator (`return` or `yield`).
+    pub fn is_terminator(&self) -> bool {
+        matches!(self.name.name.as_str(), "return" | "yield")
+    }
+
+    /// Returns true if nested regions of this operation are isolated from the enclosing SSA scope.
+    pub fn is_isolated_from_above(&self) -> bool {
+        matches!(
+            (self.name.dialect.as_str(), self.name.name.as_str()),
+            ("builtin", "module")
+                | ("func", "func")
+                | ("stablehlo", "reduce")
+                | ("stablehlo", "sort")
+                | ("stablehlo", "scatter")
+                | ("stablehlo", "map")
+        )
+    }
+
     /// Returns true if this operation has no side effects and can be safely eliminated when unused.
     pub fn is_pure(&self) -> bool {
+        if self.is_terminator() {
+            return false;
+        }
         match (self.name.dialect.as_str(), self.name.name.as_str()) {
             ("func", "return") | ("func", "func") | ("func", "call") => false,
             ("stablehlo", "custom_call") => {
@@ -549,7 +570,21 @@ impl Operation {
                     Some(Attribute::Bool(true))
                 )
             }
-            ("stablehlo", _) => true,
+            ("stablehlo", name) => !matches!(
+                name,
+                "send"
+                    | "recv"
+                    | "infeed"
+                    | "outfeed"
+                    | "after_all"
+                    | "all_reduce"
+                    | "all_gather"
+                    | "reduce_scatter"
+                    | "all_to_all"
+                    | "collective_permute"
+                    | "rng"
+                    | "rng_bit_generator"
+            ),
             ("castforge", name) => !matches!(
                 name,
                 "kv_cache_update"
@@ -758,7 +793,9 @@ impl Module {
         self.remove_op_unlinked(op_id);
     }
 
-    fn remove_op_unlinked(&mut self, op_id: OpId) {
+    /// Removes `op_id` (and its results and nested regions) from the module arenas assuming it has
+    /// already been unlinked from its parent block.
+    pub fn remove_op_unlinked(&mut self, op_id: OpId) {
         if let Some(op) = self.ops.remove(op_id) {
             for res in op.results {
                 self.values.remove(res);
@@ -769,7 +806,9 @@ impl Module {
         }
     }
 
-    fn remove_region(&mut self, region_id: RegionId) {
+    /// Removes `region_id` (and all blocks, block arguments, and operations inside it) from the
+    /// module arenas.
+    pub fn remove_region(&mut self, region_id: RegionId) {
         if let Some(region) = self.regions.remove(region_id) {
             for blk_id in region.blocks {
                 if let Some(blk) = self.blocks.remove(blk_id) {

@@ -476,7 +476,7 @@ pub(crate) fn fold_all_views_single_pass(module: &mut Module) -> Result<(usize, 
                 .ops
                 .retain(|id| !dead_ops.contains(id));
             for dead_id in dead_ops {
-                module.ops.remove(dead_id);
+                module.remove_op_unlinked(dead_id);
             }
         }
     }
