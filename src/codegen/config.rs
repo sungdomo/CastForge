@@ -235,7 +235,8 @@ pub(crate) fn sanitize_ident(raw: &str) -> String {
         .collect();
     if cleaned.is_empty() {
         "v_anon".to_string()
-    } else if cleaned.chars().next().unwrap().is_ascii_digit() || is_codegen_reserved_word(&cleaned)
+    } else if cleaned.chars().next().is_some_and(|c| c.is_ascii_digit())
+        || is_codegen_reserved_word(&cleaned)
     {
         format!("v_{cleaned}")
     } else {

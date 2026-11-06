@@ -1,5 +1,6 @@
 //! Integration tests for tiered KV storage, AEAD frame codecs, CacheBlend fingerprint indexing,
 //! fleet instance routing, P2P discovery, and view/transpose sinking passes.
+#![cfg(feature = "serving")]
 
 use castforge::ir::{Dim, parse_mlir};
 use castforge::passes::{

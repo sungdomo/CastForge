@@ -283,7 +283,9 @@ fn schedule_min_memory(module: &Module, orig_ops: &[OpId]) -> Vec<OpId> {
                     preds.insert(prod_op);
                 }
             }
-            *in_degree.get_mut(&op_id).unwrap() = preds.len();
+            if let Some(deg) = in_degree.get_mut(&op_id) {
+                *deg = preds.len();
+            }
             for p in preds {
                 users.entry(p).or_default().push(op_id);
             }

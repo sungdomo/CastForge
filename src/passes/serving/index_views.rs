@@ -115,8 +115,9 @@ pub fn hoist_loop_invariant_index_views(module: &mut Module) -> usize {
                 continue;
             }
             chain.truncate(prefix);
-
-            let outermost_op = *chain.last().unwrap();
+            let Some(&outermost_op) = chain.last() else {
+                continue;
+            };
             let outermost_index = module.ops[outermost_op].operands[0];
             let tensor_ty = module.values[tensor_val].ty.clone();
 
@@ -1143,11 +1144,13 @@ pub fn defer_buffer_allocations_to_mutators(module: &mut Module) -> usize {
 
             // Move `alloc_op` right before `mutator_op`.
             module.blocks[blk_id].ops.remove(alloc_pos);
-            let new_mut_pos = module.blocks[blk_id]
+            let Some(new_mut_pos) = module.blocks[blk_id]
                 .ops
                 .iter()
                 .position(|&id| id == mutator_op)
-                .unwrap();
+            else {
+                continue;
+            };
 
             if !extra_chains.is_empty() {
                 let mut join_opds = SmallVec::new();

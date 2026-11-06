@@ -1,6 +1,7 @@
 //! Commercial-readiness integration tests covering the C FFI ABI (`src/ffi.rs`), untrusted input
 //! hardening & resource quotas, lazy `.safetensors` indexing, structured pass telemetry, and
 //! extended ONNX operators (`Einsum`, `Tile`, `TopK`, negative-axis ops).
+#![cfg(feature = "serving")]
 
 use castforge::codegen::{
     BackendRegistry, CompilationCache, TargetConfig, compute_function_structural_hashes,

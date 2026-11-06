@@ -1,5 +1,6 @@
 //! Integration tests for model callable outlining, kernel body outlining, mutable load fusion,
 //! tenant quota management, and device-graph verification passes.
+#![cfg(feature = "serving")]
 
 use castforge::ir::{DType, Location, parse_mlir};
 

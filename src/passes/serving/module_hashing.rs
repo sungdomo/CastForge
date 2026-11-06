@@ -518,12 +518,10 @@ pub fn outline_routines(module: &mut Module) -> usize {
                     // Check if stub_ops ends with a terminator (`mogg.output`, `castforge.output`,
                     // or `func.return`), or cap it with `castforge.output`.
                     let mut stub_res_types: Vec<Type> = Vec::new();
-                    let has_terminator = stub_ops.last().is_some_and(|&last_op| {
+                    if let Some(&term) = stub_ops.last().filter(|&&last_op| {
                         let n = module.ops[last_op].name.full_name();
                         n == "mogg.output" || n == "castforge.output" || n == "func.return"
-                    });
-                    if has_terminator {
-                        let term = *stub_ops.last().unwrap();
+                    }) {
                         stub_res_types = module.ops[term]
                             .operands
                             .iter()

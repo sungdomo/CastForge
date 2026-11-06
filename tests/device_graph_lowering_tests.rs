@@ -1,5 +1,6 @@
 //! Integration tests for device-graph staging, layout propagation, collective partitioning,
 //! async lifetime folding, and buffer dependency analyses.
+#![cfg(feature = "serving")]
 
 use castforge::ir::parse_mlir;
 

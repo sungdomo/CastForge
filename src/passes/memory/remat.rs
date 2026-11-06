@@ -57,11 +57,9 @@ impl Pass for RematerializePass {
                         use_positions.push((u_pos, u_op_id));
                     }
                 }
-                if use_positions.is_empty() {
+                let Some(&(last_pos, last_user_op)) = use_positions.last() else {
                     continue;
-                }
-
-                let &(last_pos, last_user_op) = use_positions.last().unwrap();
+                };
                 let dist = last_pos.saturating_sub(def_pos);
                 let crosses_heavy = ops[def_pos + 1..last_pos]
                     .iter()
