@@ -1,7 +1,5 @@
 //! Device-graph build stubs, model subgraph inlining, and rowwise legalization.
 
-#[allow(unused_imports)]
-use super::*;
 use crate::ir::{
     Attribute, BlockId, DType, Dim, Module, OpId, OpName, Operation, TensorType, Type, Value,
     ValueDef, ValueId,
@@ -11,7 +9,7 @@ use indexmap::IndexMap;
 use smallvec::SmallVec;
 
 // ============================================================================
-// Batch 22 Step 3: Device-Graph Recording Stub Generator & Builder Pool Alloc
+// Device-Graph Recording Stub Generator & Builder Pool Alloc
 // Lowering
 // ============================================================================
 
@@ -402,7 +400,7 @@ pub fn generate_device_graph_build_stubs(module: &mut Module) -> Result<usize, S
 }
 
 // ============================================================================
-// Batch 22 Step 4: Bottom-Up Model Call-Graph Slot Globalization & Subgraph
+// Bottom-Up Model Call-Graph Slot Globalization & Subgraph
 // Inlining
 // ============================================================================
 
@@ -866,7 +864,7 @@ pub fn globalize_and_inline_model_subgraphs(
 }
 
 // ============================================================================
-// Batch 22 Step 5: Rowwise Kernel Legalizer (Primary Input Selection, Monoid
+// Rowwise Kernel Legalizer (Primary Input Selection, Monoid
 // Binding, Row Store Grouping, and Launch Parameter Synthesis)
 // ============================================================================
 
@@ -1169,7 +1167,7 @@ pub fn legalize_rowwise_kernels(
 }
 
 // ============================================================================
-// Batch 23 Step 1: Dynamic File-Backed Zero-Copy L2 Storage Agent, L1 Page
+// Dynamic File-Backed Zero-Copy L2 Storage Agent, L1 Page
 // Index Mapper, and 2-Level Hash-Sharded Atomic Publish Planner
 // ============================================================================
 

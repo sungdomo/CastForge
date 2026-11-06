@@ -1,7 +1,5 @@
 //! Chain sequence canonicalization, parallel unbundling, and layout inference.
 
-#[allow(unused_imports)]
-use super::*;
 use crate::ir::{Attribute, BlockId, Module, OpId, Type, ValueId};
 
 pub(super) fn is_chain_type(ty: &Type) -> bool {

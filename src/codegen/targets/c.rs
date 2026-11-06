@@ -367,7 +367,7 @@ fn emit_c_hlo_op(
         }
     });
     let Some(hlo) = hlo_opt else {
-        return Ok(());
+        bail!("Unsupported operation `{}` in C99 codegen", op.name);
     };
 
     match hlo {
@@ -1409,11 +1409,12 @@ fn emit_c_hlo_op(
                     Some(Attribute::Int(v)) => *v,
                     _ => 0,
                 };
-                let label = op
-                    .attributes
-                    .get("profile_label")
-                    .and_then(|a| a.as_str())
-                    .unwrap_or("op");
+                let label = crate::codegen::sanitize_label(
+                    op.attributes
+                        .get("profile_label")
+                        .and_then(|a| a.as_str())
+                        .unwrap_or("op"),
+                );
                 let src = value_ident(module, inputs[0], names, counter);
                 writeln!(
                     out,
@@ -1768,7 +1769,44 @@ fn emit_c_hlo_op(
                 writeln!(out, "    }}")?;
             }
         }
-        _ => {}
+        StableHloOp::CustomCall { inputs, .. } => {
+            if let Some(&src_id) = inputs.first() {
+                let src = value_ident(module, src_id, names, counter);
+                let src_len = tensor_len(module, src_id).max(1);
+                writeln!(
+                    out,
+                    "    for (int i = 0; i < {res_len}; ++i) {res_name}[i] = {src}[i % {src_len}];"
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "    for (int i = 0; i < {res_len}; ++i) {res_name}[i] = 0.0f;"
+                )?;
+            }
+        }
+        StableHloOp::Other { op_name } => match op_name.as_str() {
+            "reverse" if !op.operands.is_empty() => {
+                let src = value_ident(module, op.operands[0], names, counter);
+                let src_len = tensor_len(module, op.operands[0]).max(1);
+                writeln!(
+                    out,
+                    "    for (int i = 0; i < {res_len}; ++i) \
+                     {res_name}[i] = {src}[({src_len} - 1 - (i % {src_len}))];"
+                )?;
+            }
+            "all_reduce" | "all_gather" | "reduce_scatter" | "collective_permute"
+                if !op.operands.is_empty() =>
+            {
+                let src = value_ident(module, op.operands[0], names, counter);
+                let src_len = tensor_len(module, op.operands[0]).max(1);
+                writeln!(
+                    out,
+                    "    for (int i = 0; i < {res_len}; ++i) {res_name}[i] = {src}[i % {src_len}];"
+                )?;
+            }
+            other => bail!("Unsupported operation `stablehlo.{other}` in C99 codegen"),
+        },
+        _ => bail!("Unsupported operation `{}` in C99 codegen", op.name),
     }
 
     Ok(())
@@ -1879,8 +1917,13 @@ fn emit_c_fused_loop_chain(
             .split(',')
             .filter(|s| !s.is_empty())
             .map(|tok| {
-                if tok.starts_with('s') {
-                    tok.to_string()
+                let tok = tok.trim();
+                if let Some(step_idx) = tok
+                    .strip_prefix('s')
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .filter(|&k| k < idx)
+                {
+                    format!("s{step_idx}")
                 } else {
                     tok.parse::<usize>()
                         .ok()

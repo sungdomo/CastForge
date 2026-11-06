@@ -1,7 +1,5 @@
 //! Call operand conformance, routine outlining, and module content hashing.
 
-#[allow(unused_imports)]
-use super::*;
 use crate::ir::{Attribute, Module, OpId, Operation, Type, Value, ValueDef, ValueId};
 use indexmap::IndexMap;
 use smallvec::SmallVec;

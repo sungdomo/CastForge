@@ -1,7 +1,10 @@
 //! TurboQuant compression, GDS slab allocation, and horizontal fusion passes.
 
-#[allow(unused_imports)]
-use super::*;
+use super::{
+    CacheEventEntrySpec, CacheEventOpKind, CacheEventTier, IsolatedLruEvictionPolicy,
+    KvSaltQuotaRegistry, is_sinkable_binary_elementwise, is_sinkable_unary_elementwise,
+    stamp_fused_provenance,
+};
 use crate::ir::{Attribute, BlockId, Module, OpId, OpName, Operation, Value, ValueDef, ValueId};
 use indexmap::{IndexMap, IndexSet};
 use smallvec::SmallVec;

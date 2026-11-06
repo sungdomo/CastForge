@@ -447,7 +447,7 @@ impl Pass for BisectPassesPass {
 
 /// Numerical Sanitizer Pass (`sanitize-numerics`).
 ///
-/// Supports strided sampling (`stride >= 1`, inspired by Modular `NanCheckPass`) so large
+/// Supports strided sampling (`stride >= 1`) so large
 /// multi-layer models can instrument every `stride`-th floating-point tensor without
 /// blowing up kernel launch count.
 #[derive(Debug, Clone)]

@@ -1,7 +1,6 @@
 //! Elementwise chain flattening, state transfer elision, and rowwise launch passes.
 
-#[allow(unused_imports)]
-use super::*;
+use super::stamp_fused_provenance;
 use crate::ir::{
     Attribute, DType, Dim, Location, Module, OpId, OpName, Operation, TensorType, Type, ValueDef,
     ValueId,
@@ -39,8 +38,7 @@ pub(super) fn is_flattenable_elemwise_op(op: &Operation) -> bool {
 
 /// Flattens connected chains of high-rank (`rank >= 2`) elementwise operations and intervening
 /// `stablehlo.reshape` views to 1D (`tensor<Nxdtype>`), eliminating interior reshapes so
-/// downstream loop fusion can merge the entire elementwise subgraph into a single 1D kernel
-/// (inspired by Modular `FlattenElementwise.cpp`).
+/// downstream loop fusion can merge the entire elementwise subgraph into a single 1D kernel.
 ///
 /// Returns the number of high-rank elementwise operations flattened to rank 1.
 pub fn flatten_elementwise_chains(module: &mut Module) -> usize {
@@ -228,7 +226,7 @@ pub(super) fn is_named_state_op(op: &Operation, short_name: &str) -> bool {
 /// Elides redundant store-to-load roundtrips (`kv_offload -> kv_reload` and exact
 /// `dynamic_update_slice -> dynamic_slice` read-after-write pairs) and dead overwritten stores
 /// (`dynamic_update_slice -> dynamic_update_slice` writing the exact same slice when the first
-/// store has a single use) (inspired by Modular `ElideRedundantMutableOps.cpp`).
+/// store has a single use).
 ///
 /// Returns the number of redundant state transfer / slice operations elided.
 pub fn elide_redundant_state_transfers(module: &mut Module) -> usize {
@@ -340,15 +338,14 @@ pub fn elide_redundant_state_transfers(module: &mut Module) -> usize {
     elided
 }
 
-/// Target hardware architecture profile for device/dtype validation
-/// (inspired by Modular `ValidateDevicesPass.cpp`).
+/// Target hardware architecture profile for device/dtype validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceTargetArch {
     /// x86_64 CPU: supports `f32`/`f64`, integers, `bf16`, and `f16`; rejects sub-16-bit floats
     /// (`f8E4M3FN`, `f8E5M2`).
     X86_64,
     /// AArch64 CPU: supports `f32`/`f64`, integers, and `bf16`; rejects `f16` and sub-16-bit
-    /// floats (`f8E4M3FN`, `f8E5M2`) per Modular `isSupportedArchDTypeCombination`.
+    /// floats (`f8E4M3FN`, `f8E5M2`) for the target architecture.
     AArch64,
     /// WebGPU WGSL: supports `f32`, `f16`, `i32`, `ui32`; rejects `bf16`, `f8`, and `f64`.
     Wgsl,
@@ -368,8 +365,7 @@ impl DeviceTargetArch {
     }
 }
 
-/// Returns `true` if `dtype` is natively supported on `arch`
-/// (inspired by Modular `ValidateDevicesPass.cpp` `isSupportedArchDTypeCombination`).
+/// Returns `true` if `dtype` is natively supported on `arch`.
 pub fn is_supported_arch_dtype(arch: DeviceTargetArch, dtype: &DType) -> bool {
     match arch {
         DeviceTargetArch::X86_64 => {
@@ -404,7 +400,7 @@ pub struct DeviceDTypeDiagnostic {
 }
 
 /// Validates that all function arguments and operation result tensor [`DType`]s in `module` are
-/// supported on `arch` (inspired by Modular `ValidateDevicesPass.cpp`).
+/// supported on `arch`.
 pub fn validate_target_device_dtypes(
     module: &Module,
     arch: DeviceTargetArch,
@@ -474,7 +470,7 @@ pub fn validate_target_device_dtypes(
 }
 
 /// Sentinel window value (`-1`) marking a full-attention KV object group that requires the
-/// entire `[0, prefix_len)` chunk prefix (inspired by LMCache `bitmap_ops/fold.py`).
+/// entire `[0, prefix_len)` chunk prefix.
 pub const FULL_ATTENTION_WINDOW: i32 = -1;
 
 /// Half-open chunk range `[lo, hi)` that an object group with `window_chunks` (`<= 0` for full
@@ -491,8 +487,7 @@ pub fn unfold_chunk_range(prefix_len: usize, window_chunks: i32) -> (usize, usiz
     (lo, prefix_len)
 }
 
-/// Three-stage `fold -> highest_set_bit -> unfold` multi-object-group prefix-cache hit planner
-/// (inspired by LMCache `lmcache/v1/distributed/bitmap_ops/fold.py` `fold_unfold_grouped`).
+/// Three-stage `fold -> highest_set_bit -> unfold` multi-object-group prefix-cache hit planner.
 ///
 /// Given `group_presence` (`[num_groups][num_chunks]` booleans) and `group_windows` (`<= 0` for
 /// full attention, `w > 0` for sliding window of `w` chunks):
@@ -546,8 +541,7 @@ pub fn fold_unfold_hybrid_prefix_bitmaps(
     (hit_length, servable, retain_masks)
 }
 
-/// Per-tenant isolated LRU eviction policy partitioned by `cache_salt`
-/// (inspired by LMCache `lmcache/v1/distributed/eviction_policy/isolated_lru.py`).
+/// Per-tenant isolated LRU eviction policy partitioned by `cache_salt`.
 ///
 /// Maintains an independent ordered LRU bucket per tenant `cache_salt`. Keys created within a
 /// single request batch are inserted in **reverse order** so that later sequence chunks (which are
@@ -663,8 +657,7 @@ impl IsolatedLruEvictionPolicy {
 /// Default GPUDirect Storage (`cuFile` / `O_DIRECT`) filesystem block alignment (`4096` bytes).
 pub const GDS_DEFAULT_ALIGN_BYTES: u64 = 4096;
 
-/// Aligned physical slab region in a GPUDirect Storage (GDS) L1 backing file
-/// (inspired by LMCache `lmcache/v1/distributed/memory_manager/gds_l1_memory_manager.py`).
+/// Aligned physical slab region in a GPUDirect Storage (GDS) L1 backing file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GdsSlabRegion {
     /// Aligned starting byte offset in the backing file.
@@ -674,8 +667,7 @@ pub struct GdsSlabRegion {
 }
 
 /// GPUDirect Storage (GDS) 4 KiB-aligned all-or-nothing slab address allocator with sorted
-/// free-interval coalescing
-/// (inspired by LMCache `lmcache/v1/distributed/memory_manager/gds_l1_memory_manager.py`).
+/// free-interval coalescing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GdsSlabAddressManager {
     total_size_bytes: u64,
@@ -824,8 +816,7 @@ pub(super) fn stmt_references_buffer(stmt: &crate::ir::loops::LoopStmt, buf_name
 
 /// Defers `LoopStmt::Alloc` buffer declarations in each [`crate::ir::loops::LoopKernel`] to
 /// immediately precede their first use (and eliminates dead unused allocations), shrinking buffer
-/// live ranges to reduce peak scratchpad memory
-/// (inspired by Modular `GraphCompiler/lib/MGPDialect/Transforms/DeferAllocsPass.cpp`).
+/// live ranges to reduce peak scratchpad memory.
 ///
 /// Returns the number of `Alloc` statements that were deferred across computational statements or
 /// eliminated as dead.
@@ -895,9 +886,7 @@ pub(super) type ShapeOpSignature = (String, Vec<ValueId>, Vec<Type>, String);
 /// Merges duplicate shape-materialization and broadcast/metadata operations
 /// (`stablehlo.get_dimension_size`, `stablehlo.iota`, `stablehlo.broadcast_in_dim`,
 /// `stablehlo.reshape`, `shape.shape_of`, `tensor.dim`) within each block while fusing their
-/// [`Location`] provenance onto the surviving primary op via [`stamp_fused_provenance`]
-/// (inspired by Modular
-/// `GraphCompiler/lib/MODialect/Transforms/MergeDuplicateShapeMaterializations.cpp`).
+/// [`Location`] provenance onto the surviving primary op via [`stamp_fused_provenance`].
 ///
 /// Returns the number of duplicate shape/metadata operations merged and eliminated.
 pub fn merge_duplicate_shape_ops(module: &mut Module) -> usize {
@@ -951,7 +940,7 @@ pub fn merge_duplicate_shape_ops(module: &mut Module) -> usize {
 }
 
 /// Memory-efficient optimal-parameter Bloom filter for fast KV prefix-chunk membership testing
-/// and unique-chunk counting (inspired by LMCache `lmcache/v1/utils/bloom_filter.py`).
+/// and unique-chunk counting.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KvPrefixBloomFilter {
     bit_size: usize,
@@ -1079,8 +1068,7 @@ impl KvPrefixBloomFilter {
     }
 }
 
-/// Status of an asynchronous L2-to-L1 no-lock warm prefetch job
-/// (inspired by LMCache `lmcache/v1/multiprocess/warm_prefetch.py` `WarmStatus`).
+/// Status of an asynchronous L2-to-L1 no-lock warm prefetch job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WarmPrefetchStatus {
     /// Load is still in flight.
@@ -1101,8 +1089,7 @@ pub(super) struct WarmPrefetchEntry {
 }
 
 /// Table of in-flight no-lock L2-to-L1 warm-prefetch jobs with **exactly-once** completion
-/// consumption on `poll`
-/// (inspired by LMCache `lmcache/v1/multiprocess/warm_prefetch.py` `WarmPrefetchJobs`).
+/// consumption on `poll`.
 ///
 /// A warm prefetch loads keys from L2 into L1 without holding L1 read pins. While in flight,
 /// `poll(request_id)` returns [`WarmPrefetchStatus::Pending`]. Once `record_completion` marks the
@@ -1171,9 +1158,7 @@ impl WarmPrefetchJobTable {
     }
 }
 
-/// Layer-group KV payload column sharder and reassembler for wide-column L2 storage
-/// (inspired by LMCache `lmcache/v1/distributed/l2_adapters/bigtable_sharder.py`
-/// `BigtablePayloadSharder`).
+/// Layer-group KV payload column sharder and reassembler for wide-column L2 storage.
 ///
 /// Slices a contiguous `[kv_size, num_layers, layer_bytes]` byte payload into bounded layer-group
 /// column shards keyed by `layers_{start}_{end}` (where each shard packs all `kv_size` components
@@ -1287,9 +1272,7 @@ impl LayerGroupPayloadSharder {
 
 /// Returns `(provable_factor_bytes, static_total_bytes)` for a tensor type `ty`:
 /// - `provable_factor_bytes` is the product of all static dimension extents times the element byte
-///   width (matching Modular `isProvableMultipleOf`: a dynamic extent times a static row byte
-///   stride is provably a multiple of `alignment` whenever the static factor is a multiple of
-///   `alignment`),
+///   width,
 /// - `static_total_bytes` is `Some(total_bytes)` when all dimensions are static.
 pub(super) fn tensor_provable_byte_factor(ty: &Type) -> Option<(u64, Option<u64>)> {
     let Type::Tensor(tt) = ty else {
@@ -1316,8 +1299,7 @@ pub(super) fn tensor_provable_byte_factor(ty: &Type) -> Option<(u64, Option<u64>
     Some((static_factor, total))
 }
 
-/// Plans alignment-aware in-place buffer concatenation (`stablehlo.concatenate`)
-/// (inspired by Modular `GraphCompiler/lib/MGPDialect/Transforms/ConcatInPlacePass.cpp`).
+/// Plans alignment-aware in-place buffer concatenation (`stablehlo.concatenate`).
 ///
 /// A `stablehlo.concatenate` along outer dimension `0` can alias its distinct producer input
 /// buffers directly into subviews of the output buffer iff:
@@ -1435,12 +1417,10 @@ pub fn plan_concat_in_place(module: &mut Module, alignment_bytes: u64) -> usize 
 /// Cost weight of a cheap arithmetic/comparison op in a rowwise reduction body (`1`).
 pub const ROWWISE_CHEAP_OP_COST: u32 = 1;
 
-/// Cost weight of a division or transcendental op in a rowwise reduction body (`16`)
-/// (matching Modular `LegalizeRowwiseKernels.cpp`: `kExpensiveOpCost = 16`).
+/// Cost weight of a division or transcendental op in a rowwise reduction body (`16`).
 pub const ROWWISE_EXPENSIVE_OP_COST: u32 = 16;
 
-/// Legalized launch parameters for a rowwise reduction or normalization kernel
-/// (inspired by Modular `GraphCompiler/lib/MOGGDialect/Transforms/LegalizeRowwiseKernels.cpp`).
+/// Legalized launch parameters for a rowwise reduction or normalization kernel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowwiseLaunchPlan {
     /// Operation arena ID in the [`Module`].
@@ -1474,9 +1454,7 @@ pub(super) fn elementwise_op_cost(op: &Operation) -> Option<u32> {
 
 /// Scores per-element arithmetic vs. transcendental cost for rowwise reduction and normalization
 /// kernels (`castforge.softmax`, `castforge.log_softmax`, `castforge.rmsnorm`,
-/// `castforge.layernorm`, `stablehlo.reduce`) and stamps launch parameters onto each op
-/// (inspired by Modular `GraphCompiler/lib/MOGGDialect/Transforms/LegalizeRowwiseKernels.cpp`
-/// `setLaunchParams` and `bindMonoids`).
+/// `castforge.layernorm`, `stablehlo.reduce`) and stamps launch parameters onto each op.
 pub fn legalize_rowwise_reduction_launch(
     module: &mut Module,
     expensive_cost_threshold: u32,

@@ -97,7 +97,7 @@ pub(crate) fn insert_kv_cache_op(
 }
 
 /// Physical KV-cache memory layout handed to or emitted for a serving engine (vLLM, SGLang,
-/// TensorRT-LLM, LMCache).
+/// TensorRT-LLM).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EngineKvFormat {
     /// `[2, num_blocks, block_size, num_heads, head_size]` (vLLM FlashAttention default NHD).
@@ -292,7 +292,7 @@ impl Pass for LowerPagedAttentionPass {
     }
 
     fn description(&self) -> &'static str {
-        "Lowers fused_attention to vLLM/LMCache PagedAttention with physical KV layout descriptors"
+        "Lowers fused_attention to vLLM PagedAttention with physical KV layout descriptors"
     }
 
     fn run(&mut self, module: &mut Module) -> Result<PassResult> {
@@ -748,7 +748,7 @@ pub enum KvScaleScope {
     PerPageHead,
 }
 
-/// Asymmetric K16/V8 encoded KV-cache payload (inspired by LMCache `asym_k16_v8`).
+/// Asymmetric K16/V8 encoded KV-cache payload.
 ///
 /// Keys (`K`) are preserved in 16-bit IEEE-754 half precision (`u16` bits) to protect RoPE phase
 /// and exponential $\text{softmax}(Q K^T / \sqrt{d_k})$ logits, while Values (`V`) are quantized
@@ -949,8 +949,7 @@ impl AsymK16V8Codec {
     }
 }
 
-/// Geometry and rotary embedding parameters for CacheBlend in-place delta re-RoPE
-/// (inspired by LMCache `csrc/cuda/pos_kernels.cuh` and `blend_kernels.cuh`).
+/// Geometry and rotary embedding parameters for CacheBlend in-place delta re-RoPE.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CacheBlendRopeSpec {
     /// Number of KV heads per token.
@@ -1043,8 +1042,7 @@ pub fn re_rope_key_in_place(
     Ok(())
 }
 
-/// Configuration for chained prefix-cache token-block hashing
-/// (inspired by Modular `rust_kv/kv-core/src/hash.rs`).
+/// Configuration for chained prefix-cache token-block hashing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainedBlockHashConfig<'a> {
     /// Number of tokens per KV-cache page block (`> 0`). Trailing ragged tokens
@@ -1127,8 +1125,7 @@ pub fn hash_prefix_token_blocks(
 }
 
 /// Compresses large uniform `stablehlo.constant` tensors with `>= min_elements` (`>= 2`) into a
-/// 1-element scalar constant (`tensor<1xdtype>`) followed by `stablehlo.broadcast_in_dim`
-/// (inspired by Modular `SplatLargeConstants.cpp`).
+/// 1-element scalar constant (`tensor<1xdtype>`) followed by `stablehlo.broadcast_in_dim`.
 ///
 /// Also evicts any unreferenced uniform tensor entries from `module.tensor_store`, returning the
 /// number of large constants compressed.
@@ -1258,8 +1255,7 @@ pub fn compress_splat_constants(module: &mut Module, min_elements: usize) -> usi
     compressed
 }
 
-/// Summary report of CUDA Graph / HIP Graph capture stability analysis
-/// (inspired by Modular `MarkStableTensorsPass.cpp`).
+/// Summary report of CUDA Graph / HIP Graph capture stability analysis.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CudaGraphCaptureReport {
     /// `true` if every operation in the module has static shapes and no host-blocking sync ops.
@@ -1356,8 +1352,7 @@ pub fn mark_cuda_graph_stable_tensors(module: &mut Module) -> CudaGraphCaptureRe
     }
 }
 
-/// Intrusive doubly-linked LRU free-list links stored inline inside each [`KvPoolBlock`]
-/// (inspired by Modular `rust_kv/kv-core/src/pool/free_list.rs`).
+/// Intrusive doubly-linked LRU free-list links stored inline inside each [`KvPoolBlock`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KvFreeLinks {
     pub prev: Option<usize>,
@@ -1375,7 +1370,7 @@ pub struct KvPoolBlock {
 }
 
 /// $O(1)$ Intrusive LRU KV-Cache Block Pool with prefix-hit revival, uncommitted front-recycle,
-/// and reverse-chain eviction ordering (inspired by Modular `rust_kv/kv-core/src/pool`).
+/// and reverse-chain eviction ordering.
 #[derive(Debug, Clone)]
 pub struct KvBlockPool {
     blocks: Vec<KvPoolBlock>,
@@ -1544,8 +1539,7 @@ impl KvBlockPool {
     }
 }
 
-/// Hardware transfer execution path for moving KV-cache pages between host memory and GPU VRAM
-/// (inspired by LMCache `csrc/cuda/mp_mem_kernels.cuh` and `transfer_plan_types.cuh`).
+/// Hardware transfer execution path for moving KV-cache pages between host memory and GPU VRAM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KvDmaTransferMode {
     /// Direct 1D Copy-Engine batch DMA (`cudaMemcpyBatchAsync`), bypassing SM kernels.
@@ -1667,7 +1661,7 @@ pub fn plan_kv_dma_transfer(
 
 /// Fuses sole-use unary elementwise producers (`negate`, `abs`, `tanh`, `exponential`, `log`,
 /// `sqrt`, `rsqrt`, `logistic`, `convert`) into the data-operand prologue of a `dot_general`,
-/// `gather`, or `reduce` consumer (inspired by Modular `PrologueFuser.cpp` & `InputFusion.cpp`).
+/// `gather`, or `reduce` consumer.
 ///
 /// Eliminates the intermediate producer buffer and evaluates the unary transform on-the-fly
 /// during the consumer's load. Returns the number of prologues fused.
@@ -1769,8 +1763,7 @@ pub fn fuse_sole_use_prologues(module: &mut Module) -> usize {
     fused_count
 }
 
-/// Default maximum number of kernels allowed in a single fused launch sequence
-/// (inspired by Modular `SequenceFusion.cpp` `kMaxKernelsInFusionSet = 16`, `GEX-2986`).
+/// Default maximum number of kernels allowed in a single fused launch sequence.
 pub const DEFAULT_MAX_KERNELS_IN_FUSION_SET: usize = 16;
 
 /// A bounded group of consecutive device operations sharing the same execution context
@@ -1785,9 +1778,7 @@ pub struct SequenceFusionSet {
     pub op_names: Vec<String>,
 }
 
-/// Partitions consecutive device kernels into bounded [`SequenceFusionSet`]s (inspired by
-/// Modular `SequenceFusion.cpp`: `useSameContexts` (`GEX-2590`) and `kMaxKernelsInFusionSet`
-/// (`GEX-2986`)).
+/// Partitions consecutive device kernels into bounded [`SequenceFusionSet`]s.
 ///
 /// Breaks the active fusion set whenever:
 /// 1. A collective, host-offload, or explicit barrier operation is encountered (`all_reduce`,
@@ -1895,8 +1886,7 @@ pub fn plan_kernel_sequence_fusion(
 }
 
 /// Combines multiple constituent [`Location`]s into a single deduplicated fused location
-/// (`Location::Named("op1+op2+...")`), preserving source provenance across operator fusions
-/// (inspired by Modular `GraphCompiler/AGENTS.md` `QA-C1` `getFusedLoc` & `FuseMutableLoads.cpp`).
+/// (`Location::Named("op1+op2+...")`), preserving source provenance across operator fusions.
 pub fn fuse_locations(locs: &[Location]) -> Location {
     let mut parts: Vec<String> = Vec::new();
     let mut single_flc: Option<Location> = None;
@@ -1985,8 +1975,7 @@ fn anonymize_type_dims(ty: &mut Type) -> usize {
 }
 
 /// Strips symbolic dimension names (`Dim::Symbolic(name)` -> `Dim::Dynamic`) across all SSA
-/// values and function signatures in `module` (inspired by Modular `AnonymizeDimNames.cpp`
-/// `stripStubDimNames`).
+/// values and function signatures in `module`.
 ///
 /// Idempotent: returns the number of symbolic dimension slots anonymized.
 pub fn anonymize_symbolic_dims(module: &mut Module) -> usize {
@@ -2005,7 +1994,7 @@ pub fn anonymize_symbolic_dims(module: &mut Module) -> usize {
 }
 
 /// Deduplicates structurally identical `func.func` definitions in `module` modulo `@sym_name`,
-/// SSA value numbering, and source locations (inspired by Modular `MergeIdenticalFuncs.cpp`).
+/// SSA value numbering, and source locations.
 ///
 /// For each equivalence class of 2 or more functions:
 /// 1. Selects a deterministic canonical symbol (`@main` / `@forward` if present, otherwise the
@@ -2114,8 +2103,7 @@ pub fn merge_identical_functions(module: &mut Module) -> usize {
 }
 
 /// Fuses elementwise epilogue consumers across an intervening `stablehlo.reshape` into a
-/// preceding `dot_general` or `fused_matmul_epilogue` (inspired by Modular
-/// `ReshapeEpilogueFuser.cpp`).
+/// preceding `dot_general` or `fused_matmul_epilogue`.
 ///
 /// Moves the bijective `reshape` past sole-use unary (`tanh`, `abs`, `negate`, `exponential`,
 /// `log`, `logistic`, `sqrt`, `rsqrt`) or binary (`add`, `multiply`, `maximum`) elementwise
@@ -2262,8 +2250,7 @@ pub fn fuse_reshape_epilogue(module: &mut Module) -> usize {
 }
 
 /// CacheGen 16-bit strictly monotonic Cumulative Distribution Function (CDF) and lossless
-/// arithmetic range codec for quantized KV-cache token streams (inspired by LMCache
-/// `csrc/cuda/cal_cdf.cu`, `ac_enc.cu`, and `ac_dec.cu`).
+/// arithmetic range codec for quantized KV-cache token streams.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheGenCdfCodec {
     pub max_bins: usize,
@@ -2280,7 +2267,7 @@ impl CacheGenCdfCodec {
     }
 
     /// Computes the normalized 16-bit strictly monotonic CDF of length `max_bins + 1` across
-    /// `symbols` in a single `(layer, channel)` stream using LMCache's `normalize_cdf_value`
+    /// `symbols` in a single `(layer, channel)` stream using monotonic `normalize_cdf_value`
     /// (`floor((0xFFFF - max_bins) * cum / ntokens) + i`), guaranteeing every bin has width
     /// `>= 1`.
     pub fn compute_channel_cdf(&self, symbols: &[u8]) -> Vec<u16> {
@@ -2470,8 +2457,7 @@ impl CacheGenCdfCodec {
     }
 }
 
-/// Per-layer-group invariants for CacheBlend non-block-aligned KV retrieval
-/// (inspired by LMCache `csrc/cuda/blend_kernels.cuh` `CBGroupSpec`).
+/// Per-layer-group invariants for CacheBlend non-block-aligned KV retrieval.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CBGroupSpec {
     pub group_idx: usize,
@@ -2492,8 +2478,7 @@ pub struct CBChunkMatch {
     pub slot_mapping_offset: usize,
 }
 
-/// K-only in-place delta re-RoPE launch descriptor for one temporary staging slot
-/// (inspired by LMCache `csrc/cuda/blend_kernels.cuh` `CBRopeVar`).
+/// K-only in-place delta re-RoPE launch descriptor for one temporary staging slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CBRopeVar {
     pub group_idx: usize,
@@ -2503,8 +2488,7 @@ pub struct CBRopeVar {
 }
 
 /// Per-token scatter launch descriptor writing `n_tok` tokens from temporary staging slot
-/// `slot_idx` into paged KV slots starting at `slot_mapping_offset`
-/// (inspired by LMCache `csrc/cuda/blend_kernels.cuh` `CBScatterVar`).
+/// `slot_idx` into paged KV slots starting at `slot_mapping_offset`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CBScatterVar {
     pub group_idx: usize,
@@ -2514,8 +2498,7 @@ pub struct CBScatterVar {
 }
 
 /// One batched wave of CacheBlend temporary staging slots: H2D staging copies, then K-only
-/// delta re-RoPE launches, then per-token paged KV scatters
-/// (inspired by LMCache `csrc/cuda/blend_kernels.cuh` `CBRetrieveStep`).
+/// delta re-RoPE launches, then per-token paged KV scatters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CBRetrieveStep {
     pub step_idx: usize,
@@ -2527,7 +2510,7 @@ pub struct CBRetrieveStep {
 /// Builds a batched plan-then-execute CacheBlend retrieve schedule (`Vec<CBRetrieveStep>`)
 /// over `groups` and `chunks`, partitioning chunks into waves sized by the available temporary
 /// GPU staging slots (`num_temp_slots`) and splitting H2D staging copies at `host_buffer_alignment`
-/// pin-chunk boundaries (inspired by LMCache `blend_kernels.cuh` `execute_cb_retrieve_plan`).
+/// pin-chunk boundaries.
 pub fn plan_cacheblend_retrieve(
     groups: &[CBGroupSpec],
     chunks: &[CBChunkMatch],
@@ -2621,8 +2604,7 @@ fn is_narrow_float_dtype(dt: &DType) -> bool {
 
 /// Ensures accumulating operations (`dot_general`, `convolution`, `reduce`, and fused GEMM
 /// composites) with narrow floating-point operands or outputs (`f16`, `bf16`, `f8E4M3FN`,
-/// `f8E5M2`) accumulate in `f32` before downcasting on epilogue store (inspired by Modular
-/// `AllocateAccumulatingBuffers.cpp`).
+/// `f8E5M2`) accumulate in `f32` before downcasting on epilogue store.
 ///
 /// Stamps `castforge.accumulator_dtype = "f32"` (and `castforge.epilogue_downcast = "<dtype>"`
 /// when the output tensor is narrow) and returns the number of accumulating ops promoted.
@@ -2709,8 +2691,7 @@ pub fn promote_narrow_accumulators(module: &mut Module) -> usize {
 }
 
 /// Adaptive Replacement Cache (ARC) KV eviction policy with `T1` (recent), `T2` (frequent),
-/// and `B1`/`B2` ghost-history feedback (inspired by LMCache
-/// `lmcache/v1/distributed/eviction_policy/arc.py`).
+/// and `B1`/`B2` ghost-history feedback.
 #[derive(Debug, Clone, Default)]
 pub struct ArcKvEvictionPolicy {
     t1: IndexMap<u64, ()>,
@@ -2814,7 +2795,7 @@ impl ArcKvEvictionPolicy {
     }
 
     /// Selects and evicts `expected_ratio` of resident keys into ghost history (`B1` or `B2`)
-    /// using LMCache's request-independent adaptive boundary rule (`|T1| >= int(p)`).
+    /// using the request-independent adaptive boundary rule (`|T1| >= int(p)`).
     pub fn select_and_evict_victims(&mut self, expected_ratio: f64) -> Vec<u64> {
         let resident = self.resident_len();
         if resident == 0 {
@@ -2855,8 +2836,7 @@ impl ArcKvEvictionPolicy {
 
 /// Multi-tenant `cache_salt` byte-budget quota registry supporting both strict allowlist
 /// (`get_limit_bytes` -> `0` for unknown tenants) and coordinator bootstrap-exempt
-/// (`effective_limit_bytes` -> `None` until armed) resolution lenses (inspired by LMCache
-/// `lmcache/v1/distributed/quota_manager.py`).
+/// (`effective_limit_bytes` -> `None` until armed) resolution lenses.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KvSaltQuotaRegistry {
     limits: IndexMap<String, u64>,

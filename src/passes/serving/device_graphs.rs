@@ -1,7 +1,5 @@
 //! Device-graph region staging, collective partitioning, and profile scope tracing.
 
-#[allow(unused_imports)]
-use super::*;
 use crate::ir::{
     Attribute, BlockId, DType, Dim, Module, OpId, OpName, Operation, TensorType, Type, Value,
     ValueDef, ValueId,
@@ -10,7 +8,7 @@ use indexmap::{IndexMap, IndexSet};
 use smallvec::SmallVec;
 
 // ============================================================================
-// Batch 21 Step 3: Device-Graph Guard Lowering & Isolated Region Staging
+// Device-Graph Guard Lowering & Isolated Region Staging
 // ============================================================================
 
 /// Rewrites every `mgp.guard` operation in `module` into a forwarding `mgp.routine.async`
@@ -225,7 +223,7 @@ pub fn stage_device_graph_regions(module: &mut Module) -> usize {
 }
 
 // ============================================================================
-// Batch 21 Step 4: Multi-Device Collective Graph Partitioner
+// Multi-Device Collective Graph Partitioner
 // ============================================================================
 
 /// Returns the device label (`device_ref` attribute, defaulting to `"cpu:0"`) of an operation.
@@ -870,7 +868,7 @@ pub fn reconcile_and_resolve_device_graph_builder_casts(
 }
 
 // ============================================================================
-// Batch 22 Step 1: Raw-Block Storage Engine Layout, FDP Placement-Affinity
+// Raw-Block Storage Engine Layout, FDP Placement-Affinity
 // Slot Allocator, and Dual-Container CRC32 Checkpoint Recovery
 // ============================================================================
 
@@ -1373,7 +1371,7 @@ impl RawBlockSlotAllocator {
 }
 
 // ============================================================================
-// Batch 22 Step 2: Device Primitive Specialization & Hierarchical Profile
+// Device Primitive Specialization & Hierarchical Profile
 // Scope Range Tracing
 // ============================================================================
 

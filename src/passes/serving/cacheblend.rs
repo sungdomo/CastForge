@@ -1,18 +1,15 @@
 //! P2P peer discovery, CacheBlend token reordering, and parallel matmul merging.
 
-#[allow(unused_imports)]
-use super::*;
+use super::{KvStorageKeySpec, fuse_locations, stamp_fused_provenance};
 use crate::ir::{
     Attribute, Dim, Location, Module, OpId, Operation, TensorType, Type, ValueDef, ValueId,
 };
 use indexmap::IndexMap;
 
-/// Default consecutive missed coordinator polls before a peer P2P adapter is removed (`3`)
-/// (matching LMCache `lmcache/v1/multiprocess/modules/p2p_controller.py` `_MAX_MISSES = 3`).
+/// Default consecutive missed coordinator polls before a peer P2P adapter is removed (`3`).
 pub const P2P_DEFAULT_MAX_MISSES: u32 = 3;
 
-/// Peer KV instance connection metadata parsed from coordinator discovery
-/// (inspired by LMCache `lmcache/v1/multiprocess/modules/p2p_controller.py` `_PeerInstance`).
+/// Peer KV instance connection metadata parsed from coordinator discovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct P2PPeerSpec {
     pub instance_id: String,
@@ -28,8 +25,7 @@ pub(super) struct P2PPeerAdapterEntry {
     consecutive_misses: u32,
 }
 
-/// P2P peer discovery and adapter lifecycle table with consecutive-miss tolerance
-/// (inspired by LMCache `lmcache/v1/multiprocess/modules/p2p_controller.py` `P2PController`).
+/// P2P peer discovery and adapter lifecycle table with consecutive-miss tolerance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct P2PPeerDiscoveryTable {
     self_instance_id: String,
@@ -121,9 +117,7 @@ impl P2PPeerDiscoveryTable {
 
 /// Buckets a flat RPC `keys` list into one `(object_group_id, group_keys)` row per object group in
 /// first-seen order, returning an empty `Vec` when `keys` is empty, when object groups receive
-/// different numbers of keys, or when any key's `object_group_id` is not in `registered_groups`
-/// (inspired by LMCache `lmcache/v1/multiprocess/modules/p2p_controller.py`
-/// `_group_keys_by_object_group`).
+/// different numbers of keys, or when any key's `object_group_id` is not in `registered_groups`.
 pub fn group_p2p_lookup_keys(
     keys: &[KvStorageKeySpec],
     registered_groups: &[u32],
@@ -154,9 +148,7 @@ pub fn group_p2p_lookup_keys(
 
 /// Encodes a [`KvStorageKeySpec`] into a 4-hex-character hash-prefixed wide-column row key
 /// (`"{hash_prefix:04x}@{model}[@lg{lg}]@{rank:08x}@{group:x}@{hash:016x}[@{salt}][@layer_{id}]"`)
-/// so tablet servers distribute rows uniformly across keyspace prefixes
-/// (inspired by LMCache `lmcache/v1/distributed/l2_adapters/bigtable_key_encoder.py`
-/// `BigtableL2KeyEncoder`).
+/// so tablet servers distribute rows uniformly across keyspace prefixes.
 pub fn encode_wide_column_row_key(
     key: &KvStorageKeySpec,
     layer_group_size: usize,
@@ -184,14 +176,12 @@ pub fn encode_wide_column_row_key(
 }
 
 /// Fibonacci-hashing polynomial base (`0x9E3779B97F4A7C15`) used for 64-bit chunk and rolling
-/// token window fingerprints (inspired by LMCache
-/// `lmcache/v1/multiprocess/modules/blend/matcher.py` `BlendTokenRangeMatcher._BASE`).
+/// token window fingerprints.
 pub const BLEND_HASH_BASE: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Computes 64-bit polynomial hashes (modulo $2^{64}$ via wrapping arithmetic) over
 /// non-overlapping windows of length `chunk_size`, ignoring trailing tokens that do not fill a
-/// complete chunk (inspired by LMCache `lmcache/v1/multiprocess/token_hasher.py`
-/// `chunk_hash_windows_numba`).
+/// complete chunk.
 pub fn chunk_poly_hash_windows(token_ids: &[u64], chunk_size: usize, base: u64) -> Vec<u64> {
     if chunk_size == 0 || token_ids.len() < chunk_size {
         return Vec::new();
@@ -210,8 +200,7 @@ pub fn chunk_poly_hash_windows(token_ids: &[u64], chunk_size: usize, base: u64) 
 }
 
 /// Computes $O(1)$ sliding-window 64-bit polynomial hashes (modulo $2^{64}$ via wrapping
-/// arithmetic) across all `token_ids.len() - window_size + 1` positions (inspired by LMCache
-/// `lmcache/v1/multiprocess/token_hasher.py` `rolling_hash_windows_numba`).
+/// arithmetic) across all `token_ids.len() - window_size + 1` positions.
 pub fn rolling_poly_hash_windows(token_ids: &[u64], window_size: usize, base: u64) -> Vec<u64> {
     if window_size == 0 || token_ids.len() < window_size {
         return Vec::new();
@@ -237,8 +226,7 @@ pub fn rolling_poly_hash_windows(token_ids: &[u64], window_size: usize, base: u6
     out
 }
 
-/// A matched sub-sequence chunk span returned by [`BlendTokenRangeMatcher::match_sub_sequence`]
-/// (inspired by LMCache `lmcache/v1/multiprocess/custom_types.py` `CBMatchResult`).
+/// A matched sub-sequence chunk span returned by [`BlendTokenRangeMatcher::match_sub_sequence`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlendMatchSpan {
     /// Start token index in the originally indexed sequence (`old_st`).
@@ -254,9 +242,7 @@ pub struct BlendMatchSpan {
 }
 
 /// Token-level sliding-window fingerprint matcher over a power-of-two direct-address table of
-/// 64-bit chunk polynomial hashes with full-hash collision rejection and content deduplication
-/// (inspired by LMCache `lmcache/v1/multiprocess/modules/blend/matcher.py`
-/// `BlendTokenRangeMatcher`).
+/// 64-bit chunk polynomial hashes with full-hash collision rejection and content deduplication.
 #[derive(Debug, Clone)]
 pub struct BlendTokenRangeMatcher {
     chunk_size: usize,
@@ -419,9 +405,7 @@ impl BlendTokenRangeMatcher {
 }
 
 /// Computes the total unique token coverage across `spans` by sorting and merging overlapping
-/// `[cur_st, cur_ed)` intervals so overlapping sliding-window matches are not double-counted
-/// (inspired by LMCache `lmcache/v1/multiprocess/modules/blend/matcher.py`
-/// `_unique_token_coverage`).
+/// `[cur_st, cur_ed)` intervals so overlapping sliding-window matches are not double-counted.
 #[must_use]
 pub fn unique_blend_token_coverage(spans: &[BlendMatchSpan]) -> usize {
     if spans.is_empty() {
@@ -445,12 +429,11 @@ pub fn unique_blend_token_coverage(spans: &[BlendMatchSpan]) -> usize {
 }
 
 /// Shortest contiguous run of incoming prompt tokens copied as a piece during CacheBlend prompt
-/// reordering; the last `BLEND_REORDER_LMIN` tokens of the prompt are also pinned at the tail
-/// (inspired by LMCache `lmcache/v1/multiprocess/modules/blend/reorder.py` `LMIN`).
+/// reordering; the last `BLEND_REORDER_LMIN` tokens of the prompt are also pinned at the tail.
 pub const BLEND_REORDER_LMIN: usize = 16;
 
 /// Maximum short separator run copied between two matched pieces during CacheBlend prompt
-/// reordering (inspired by LMCache `lmcache/v1/multiprocess/modules/blend/reorder.py` `GLUE`).
+/// reordering.
 pub const BLEND_REORDER_GLUE: usize = 3;
 
 pub(super) struct BlendReorderCopier<'a> {
@@ -615,8 +598,7 @@ impl<'a> BlendReorderCopier<'a> {
 /// Plans a permutation of incoming `prompt` token indices so that `prompt` begins with the
 /// longest possible exact-prefix reconstruction of one of `candidates` (followed by all remaining
 /// tokens of `prompt` in original order), keeping the first `keep_prefix` tokens in place and
-/// pinning the final [`BLEND_REORDER_LMIN`] tokens at the tail (inspired by LMCache
-/// `lmcache/v1/multiprocess/modules/blend/reorder.py` `plan`).
+/// pinning the final [`BLEND_REORDER_LMIN`] tokens at the tail.
 #[must_use]
 pub fn plan_cacheblend_token_reorder(
     prompt: &[u32],
@@ -680,8 +662,7 @@ pub fn plan_cacheblend_token_reorder(
     if is_identity { None } else { Some(perm) }
 }
 
-/// Storage tier reported by a cache event batch (inspired by LMCache
-/// `lmcache/v1/distributed/api.py` `Tier`).
+/// Storage tier reported by a cache event batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CacheEventTier {
     /// Volatile host/device L1 cache tier (tied to emitter incarnation).
@@ -690,8 +671,7 @@ pub enum CacheEventTier {
     L2,
 }
 
-/// Metadata header of an emitter's cache event batch offered to [`CoordinatorEventGate`]
-/// (inspired by LMCache `lmcache/v1/mp_coordinator/api.py` `CacheEventBatch`).
+/// Metadata header of an emitter's cache event batch offered to [`CoordinatorEventGate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheEventBatchSpec {
     /// Unique identifier of the emitting worker instance.
@@ -706,8 +686,7 @@ pub struct CacheEventBatchSpec {
     pub tier: CacheEventTier,
 }
 
-/// Admission outcome returned by [`CoordinatorEventGate::ingest`] (inspired by LMCache
-/// `lmcache/v1/mp_coordinator/ingest/event_gate.py` `IngestResult`).
+/// Admission outcome returned by [`CoordinatorEventGate::ingest`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventIngestOutcome {
     /// Batch was admitted and forwarded to downstream state views.
@@ -718,8 +697,7 @@ pub enum EventIngestOutcome {
     StaleIncarnation,
 }
 
-/// Per-emitter stream cursor state maintained by [`CoordinatorEventGate`] (inspired by LMCache
-/// `lmcache/v1/mp_coordinator/ingest/event_gate.py` `_StreamCursor`).
+/// Per-emitter stream cursor state maintained by [`CoordinatorEventGate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamCursorState {
     /// Emitter incarnation tracked by this cursor.
@@ -738,8 +716,7 @@ pub struct StreamCursorState {
 }
 
 /// Ordering, sequence-deduplication, gap-detection, and incarnation-fencing gate for distributed
-/// cache event streams (inspired by LMCache `lmcache/v1/mp_coordinator/ingest/event_gate.py`
-/// `EventGate`).
+/// cache event streams.
 #[derive(Debug, Clone, Default)]
 pub struct CoordinatorEventGate {
     cursors: IndexMap<String, StreamCursorState>,
@@ -870,8 +847,7 @@ pub(super) fn is_mergeable_matmul_op(op: &Operation) -> bool {
 /// share the same LHS activation tensor `A` into a single weight concatenation
 /// (`stablehlo.concatenate`), a single combined matmul, and a multi-result `mo.split`, skipping
 /// groups whose RHS weights are produced by a transpose or whose results all feed directly into
-/// `func.return` (inspired by Modular `GraphCompiler/lib/MODialect/Patterns/Algebraic.cpp`
-/// `MergeParallelMatmulPattern`).
+/// `func.return`.
 pub fn merge_parallel_matmuls(module: &mut Module) -> usize {
     let mut merged_groups = 0usize;
     let func_ids = module.functions();

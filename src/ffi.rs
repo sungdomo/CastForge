@@ -7,9 +7,9 @@ use crate::passes::{PassManager, PassRegistry};
 use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-const VERSION_CSTR: &[u8] = b"1.0.0\0";
+const VERSION_CSTR: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
 
-/// Returns a static NUL-terminated version string (`"1.0.0"`).
+/// Returns a static NUL-terminated version string matching `CARGO_PKG_VERSION`.
 #[unsafe(no_mangle)]
 pub extern "C" fn castforge_version() -> *const c_char {
     VERSION_CSTR.as_ptr().cast::<c_char>()

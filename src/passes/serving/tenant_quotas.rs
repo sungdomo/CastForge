@@ -1,7 +1,6 @@
 //! Tenant quota management, accumulating buffer allocation, and tensor wire envelopes.
 
-#[allow(unused_imports)]
-use super::*;
+use super::format_expected_tensor_shape;
 use crate::ir::{Attribute, BlockId, Module, OpId, Type, ValueId};
 
 /// Snapshot entry for a single tenant's (`cache_salt`) byte quota.

@@ -4,7 +4,7 @@
 use crate::codegen::{tensor_len, tensor_shape_dims};
 use crate::ir::{DType, Module, OpId, ValueId};
 use crate::stablehlo::StableHloOp;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use std::collections::HashMap;
 
 /// Numerical comparison report between two IR evaluations (e.g. before vs. after optimization).
@@ -408,8 +408,7 @@ fn eval_stablehlo_op(
         }
     });
     let Some(hlo) = hlo_opt else {
-        env.insert(res_val, vec![0.0; res_len]);
-        return Ok(());
+        bail!("Unsupported operation `{}` in reference evaluator", op.name);
     };
 
     let eval_bin = |lhs: ValueId, rhs: ValueId, f: fn(f32, f32) -> f32| -> Vec<f32> {
@@ -1447,18 +1446,16 @@ fn eval_stablehlo_op(
                 v.reverse();
                 v
             }
-            "all_reduce" if !op.operands.is_empty() => get_v(op.operands[0]),
-            _ => op
-                .operands
-                .first()
-                .map(|&v| {
-                    let mut out = get_v(v);
-                    out.resize(res_len, 0.0);
-                    out
-                })
-                .unwrap_or_else(|| vec![0.0; res_len]),
+            "all_reduce" | "all_gather" | "reduce_scatter" | "collective_permute"
+                if !op.operands.is_empty() =>
+            {
+                let mut out = get_v(op.operands[0]);
+                out.resize(res_len, 0.0);
+                out
+            }
+            other => bail!("Unsupported operation `stablehlo.{other}` in reference evaluator"),
         },
-        _ => vec![0.0; res_len],
+        _ => bail!("Unsupported operation `{}` in reference evaluator", op.name),
     };
 
     env.insert(res_val, out);

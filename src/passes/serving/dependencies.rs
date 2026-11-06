@@ -1,7 +1,6 @@
 //! Multi-group presence bitmaps, buffer concat lowering, and parametric sorting.
 
-#[allow(unused_imports)]
-use super::*;
+use super::{expected_contiguous_shape_from_strides, extract_u64_attr};
 use crate::ir::{
     Attribute, BlockId, DType, Dim, Module, OpId, OpName, Operation, Type, Value, ValueDef, ValueId,
 };
@@ -9,7 +8,7 @@ use indexmap::{IndexMap, IndexSet};
 use smallvec::SmallVec;
 
 // ============================================================================
-// Batch 20 Step 1: Multi-Group Fold/Unfold Bitmap & Layer-Group Payload Sharder
+// Multi-Group Fold/Unfold Bitmap & Layer-Group Payload Sharder
 // ============================================================================
 
 /// Sentinel window size indicating a full-attention object group (`<= 0`).
@@ -219,7 +218,7 @@ pub fn merge_presence_bitmaps(bitmaps: &[Vec<bool>], num_keys: usize) -> Vec<boo
 }
 
 // ============================================================================
-// Batch 20 Step 2: In-Place Buffer Concatenation Lowering with Alignment Check
+// In-Place Buffer Concatenation Lowering with Alignment Check
 // ============================================================================
 
 /// Returns `true` if `val` is provably a multiple of `alignment` across `index.constant` /
@@ -440,7 +439,7 @@ pub fn lower_buffer_concat_in_place(module: &mut Module, preferred_alignment: u6
 }
 
 // ============================================================================
-// Batch 20 Step 3: Hanging Chain Overhang Terminator Joiner
+// Hanging Chain Overhang Terminator Joiner
 // ============================================================================
 
 /// Returns `true` if `ty` represents a 1-D `i64` execution chain (`tensor<1xi64>`).
@@ -540,7 +539,7 @@ pub fn fixup_hanging_chain_overhangs(module: &mut Module) -> usize {
 }
 
 // ============================================================================
-// Batch 20 Step 4: Structured Kernel Body Outliner into Opaque Closure Regions
+// Structured Kernel Body Outliner into Opaque Closure Regions
 // ============================================================================
 
 /// Returns `true` if `full_name` is a structured `map.iter.*` loop operation eligible for
@@ -775,7 +774,7 @@ pub fn outline_structured_kernel_bodies(module: &mut Module) -> usize {
 }
 
 // ============================================================================
-// Batch 20 Step 5: Parametric Dependency Topological Sorter & Rooted Components
+// Parametric Dependency Topological Sorter & Rooted Components
 // ============================================================================
 
 /// Tracks combined SSA def-use and symbolic parameter (`decl_param` / `use_params`) dependencies
@@ -967,7 +966,7 @@ pub fn extract_rooted_parametric_components(
 }
 
 // ============================================================================
-// Batch 21 Step 1: Strided KV Contiguous View Recovery & Sub-Byte Serde Layout
+// Strided KV Contiguous View Recovery & Sub-Byte Serde Layout
 // ============================================================================
 
 /// Computes the dimension permutation that sorts dimensions by descending stride magnitude,
@@ -1187,7 +1186,7 @@ impl SubByteKvSerdeSpec {
 }
 
 // ============================================================================
-// Batch 21 Step 2: Model Input Argument Static Shape Verifier
+// Model Input Argument Static Shape Verifier
 // ============================================================================
 
 /// Formats a tensor shape `[Dim]` into a comma-separated diagnostic string where `Dim::Static(d)`

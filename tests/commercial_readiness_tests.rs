@@ -956,7 +956,7 @@ module @sequence_fusion {
     // Cap at max_kernels_per_set = 2:
     // - Set 0: [%0 (abs), %1 (tanh)] on ("gpu:0", stream 0) -> capped at 2
     // - Set 1: [%2 (negate)] on ("gpu:0", stream 0)
-    // - Set 2: [%3 (exponential)] on ("gpu:0", stream 1) -> context switch (GEX-2590)
+    // - Set 2: [%3 (exponential)] on ("gpu:0", stream 1) -> context switch
     // - %4 (all_reduce) is a collective barrier -> breaks active set and is excluded
     // - Set 3: [%5 (log)] on ("gpu:1", stream 0) -> device context switch
     let sets = plan_kernel_sequence_fusion(&mut module, 2);
@@ -2037,7 +2037,7 @@ module @param_expr {
 
 #[test]
 fn test_subchunk_swa_block_id_downsampling_and_skip_recalculation() {
-    // Example from LMCache `downsample_and_stage_block_ids`:
+    // Example for `downsample_and_stage_block_ids`:
     // block_size = 32, chunk_tokens = 128 (4 blocks/chunk), 2 chunks (8 blocks total):
     // - Full attention (subchunk_sw = 128): keeps all [1..=8]
     // - SWA (subchunk_sw = 64 -> 2 blocks/chunk): keeps trailing 2 blocks -> [13, 14, 17, 18]
@@ -2361,7 +2361,7 @@ module @slice_to_split {
 fn test_find_squeeze_unsqueeze_axis_and_reshape_annotation() {
     use castforge::ir::Attribute;
 
-    // Symbolic + static dims example from Modular `ShapeOpSinking.cpp`:
+    // Symbolic + static dims example for `sink_reshape_and_rebind_symbolic_dims`:
     // `[D1, 2, 1, D3]` -> `[D1, 2, D3]` => `Some(2)`
     let in_dims = vec![
         Dim::Symbolic("D1".to_string()),
@@ -3851,7 +3851,7 @@ module @hoist_subgraph_invariant {
 
 #[test]
 fn test_hybrid_engine_group_view_and_token_range_block_slicer() {
-    // 3 LMCache groups over 2 engine groups (engine group 0 split into two physical views `[0, 2]`
+    // 3 storage groups over 2 engine groups (engine group 0 split into two physical views `[0, 2]`
     // and `[1]`, engine group 1 holding `[3]` with layer `4` excluded as a KV-sharing layer):
     let groups = vec![
         EngineGroupInfoSpec {
@@ -7756,7 +7756,7 @@ fn test_aesgcm_frame_serde_tenant_isolation_and_fp8_quantization_serde() {
     let provider = HkdfTenantKeyProvider::new(
         b"0123456789abcdef0123456789abcdef".to_vec(),
         256,
-        b"lmcache-l2-aesgcm-v1".to_vec(),
+        b"castforge-l2-aesgcm-v1".to_vec(),
     )
     .expect("valid 256-bit HKDF provider");
     let mut serde = AesGcmFrameSerde::new(provider);

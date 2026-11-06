@@ -523,7 +523,10 @@ impl crate::ir::Translator for IrDiffTranslator {
 /// Renders a self-contained, zero-dependency interactive HTML Pass Debugger
 /// allowing users to scrub through each pass step, inspect the DAG, and diff MLIR code.
 pub fn render_timeline_html(frames: &[TimelineFrame]) -> String {
-    let raw_json = serde_json::to_string(frames).unwrap_or_else(|_| "[]".to_string());
+    let raw_json = serde_json::to_string(frames)
+        .unwrap_or_else(|_| "[]".to_string())
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e");
     // Escape backslashes and quotes so we can wrap the JSON across <=80-col JS string lines
     let escaped: String = raw_json
         .chars()
@@ -725,6 +728,14 @@ pub fn render_timeline_html(frames: &[TimelineFrame]) -> String {
 const FRAMES = {frames_expr};
 let currentIdx = FRAMES.length - 1;
 
+function esc(s) {{
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}}
+
 function selectStep(idx) {{
   currentIdx = Math.max(0, Math.min(FRAMES.length - 1, idx));
   renderSidebar();
@@ -742,7 +753,7 @@ function renderSidebar() {{
     const statusTxt = f.changed ? 'CHANGED' : 'NO-OP';
     div.innerHTML = `
       <div class="step-title">
-        <span>#${{f.step_index}} ${{f.pass_name}}</span>
+        <span>#${{f.step_index}} ${{esc(f.pass_name)}}</span>
         <span>${{f.graph.nodes.length}} nodes</span>
       </div>
       <div class="badges">
@@ -785,21 +796,23 @@ function renderMain() {{
       canvas.appendChild(arrow);
     }}
     const card = document.createElement('div');
-    card.className = `node-card cat-${{n.category}}`;
+    card.className = `node-card cat-${{esc(n.category)}}`;
     card.innerHTML = `
-      <div class="node-op">${{n.label}}</div>
-      <div class="node-ty">${{n.result_type}}</div>
+      <div class="node-op">${{esc(n.label)}}</div>
+      <div class="node-ty">${{esc(n.result_type)}}</div>
     `;
     card.onclick = () => {{
       const attrs = Object.entries(n.attributes)
-        .map(([k, v]) => `<div><b>${{k}}</b>: <code>${{v}}</code></div>`)
+        .map(([k, v]) => `<div><b>${{esc(k)}}</b>: <code>${{esc(v)}}</code></div>`)
         .join('');
       const fallback = '<div style="color:var(--muted)">No attributes</div>';
       document.getElementById('inspector').innerHTML = `
         <div style="margin-bottom:6px;">
-          <b>Op:</b> <code>${{n.op_name}}</code> (${{n.category}})
+          <b>Op:</b> <code>${{esc(n.op_name)}}</code> (${{esc(n.category)}})
         </div>
-        <div style="margin-bottom:6px;"><b>Result Type:</b> <code>${{n.result_type}}</code></div>
+        <div style="margin-bottom:6px;">
+          <b>Result Type:</b> <code>${{esc(n.result_type)}}</code>
+        </div>
         ${{attrs || fallback}}
       `;
     }};

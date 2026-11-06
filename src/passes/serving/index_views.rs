@@ -1,7 +1,6 @@
 //! Map index view hoisting, contiguous view raising, and device-graph dependencies.
 
-#[allow(unused_imports)]
-use super::*;
+use super::{count_value_uses_in_block, extract_u64_attr};
 use crate::ir::{
     Attribute, BlockId, DType, Dim, Module, OpId, OpName, Operation, TensorType, Type, Value,
     ValueDef, ValueId,
@@ -11,7 +10,7 @@ use indexmap::{IndexMap, IndexSet};
 use smallvec::SmallVec;
 
 // ============================================================================
-// Batch 18 Step 2: Loop-Invariant Index-Transform View Hoister
+// Loop-Invariant Index-Transform View Hoister
 // ============================================================================
 
 /// Returns `true` if `op_name` is a `map.index.*` coordinate transform operation.
@@ -214,7 +213,7 @@ pub fn hoist_loop_invariant_index_views(module: &mut Module) -> usize {
 }
 
 // ============================================================================
-// Batch 18 Step 3: Contiguous View Chain Raiser
+// Contiguous View Chain Raiser
 // ============================================================================
 
 /// Returns the first input dimension index `k` of `in_dims` with extent `!= 1`, or `in_dims.len()`
@@ -426,7 +425,7 @@ pub fn raise_back_contiguous_views(module: &mut Module) -> (usize, usize) {
 }
 
 // ============================================================================
-// Batch 18 Step 4: Mixed-Precision Accumulating Epilogue Buffer Allocator
+// Mixed-Precision Accumulating Epilogue Buffer Allocator
 // ============================================================================
 
 /// Returns `true` if `kernel_name` names an accumulating opaque operation (`mo.concat`,
@@ -558,7 +557,7 @@ pub fn allocate_accumulating_epilogue_buffers(module: &mut Module) -> (usize, us
 }
 
 // ============================================================================
-// Batch 18 Step 5: Staged Device-Graph Dependency Synthesizer
+// Staged Device-Graph Dependency Synthesizer
 // ============================================================================
 
 /// Returns the ordering source value for `operand`: if `operand` is produced by
@@ -673,7 +672,7 @@ pub fn compute_device_graph_dependencies(module: &mut Module) -> usize {
 }
 
 // ============================================================================
-// Batch 19 Step 1: Optimal Bloom Filter & Sub-Chunk Sliding-Window Block Downsampler
+// Optimal Bloom Filter & Sub-Chunk Sliding-Window Block Downsampler
 // ============================================================================
 
 /// Downsamples `block_ids` for a kernel group when `keep_blocks_per_chunk < total_blocks_per_chunk`
@@ -867,7 +866,7 @@ impl OptimalBloomFilter {
 }
 
 // ============================================================================
-// Batch 19 Step 2: Transitive Device-Graph Dependency Edge Redundancy Eliminator
+// Transitive Device-Graph Dependency Edge Redundancy Eliminator
 // ============================================================================
 
 /// Eliminates node indices in `needles` that are transitively reachable from other node indices in
@@ -978,7 +977,7 @@ pub fn simplify_device_graph_dependencies(module: &mut Module) -> usize {
 }
 
 // ============================================================================
-// Batch 19 Step 3: Async Routine Lifetime Extension Absorber
+// Async Routine Lifetime Extension Absorber
 // ============================================================================
 
 /// Absorbs `mgp.extend_lifetime` operations whose `gate` chain (`operands[0]`) is produced by a
@@ -1047,7 +1046,7 @@ pub fn simplify_extend_lifetimes(module: &mut Module) -> usize {
 }
 
 // ============================================================================
-// Batch 19 Step 4: Unique-Mutator Buffer Allocation Deferrer
+// Unique-Mutator Buffer Allocation Deferrer
 // ============================================================================
 
 /// Returns `true` if `op` mutates buffer operand `buf_val`.
@@ -1193,7 +1192,7 @@ pub fn defer_buffer_allocations_to_mutators(module: &mut Module) -> usize {
 }
 
 // ============================================================================
-// Batch 19 Step 5: Execute-Invariant Code Motion Fixed-Point Partitioner
+// Execute-Invariant Code Motion Fixed-Point Partitioner
 // ============================================================================
 
 /// Result of the fixed-point execute-invariant code motion analysis over a function block.

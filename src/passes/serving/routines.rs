@@ -1,7 +1,6 @@
 //! Device ref canonicalization, kernel stub merging, and model callable outlining.
 
-#[allow(unused_imports)]
-use super::*;
+use super::{AsymK16V8Codec, EncodedAsymKvPage, KvScaleScope, stamp_fused_provenance};
 use crate::ir::{Attribute, Location, Module, OpId, Operation, Type, Value, ValueDef, ValueId};
 use indexmap::IndexMap;
 use smallvec::SmallVec;

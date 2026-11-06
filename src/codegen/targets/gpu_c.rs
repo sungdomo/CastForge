@@ -19,12 +19,14 @@ fn collect_kernel_profile_labels(stmts: &[LoopStmt]) -> Vec<String> {
     for stmt in stmts {
         if let LoopStmt::Comment(c) = stmt {
             if let Some(lbl) = c.strip_prefix("PROF_PUSH:") {
-                labels.push(lbl.to_string());
+                labels.push(crate::codegen::sanitize_label(lbl));
             } else if let Some(rest) = c.strip_prefix("PROF_MARK:")
                 && let Some((_, lbl)) = rest.split_once(':')
-                && !labels.contains(&lbl.to_string())
             {
-                labels.push(lbl.to_string());
+                let clean = crate::codegen::sanitize_label(lbl);
+                if !labels.contains(&clean) {
+                    labels.push(clean);
+                }
             }
         }
     }

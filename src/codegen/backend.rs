@@ -544,8 +544,7 @@ pub fn compute_function_structural_hashes(module: &Module) -> Vec<(String, u64)>
 
 /// Incremental Subgraph & Module Compilation Cache keyed by `(structural_hash, target_config_key)`.
 ///
-/// Inspired by Modular's GraphCompiler incremental compilation architecture (`Principle 8` &
-/// `QA-S2`): structurally identical modules or repeated compilations with the same target and
+/// Structurally identical modules or repeated compilations with the same target and
 /// [`TargetConfig`] short-circuit in $O(1)$ on warm cache hits.
 #[derive(Debug, Default, Clone)]
 pub struct CompilationCache {

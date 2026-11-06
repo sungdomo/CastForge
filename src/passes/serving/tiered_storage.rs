@@ -1,7 +1,6 @@
 //! L1 memory affinity, tiered prefetch, L2 KV frames, and buffer free insertion.
 
-#[allow(unused_imports)]
-use super::*;
+use super::{FULL_ATTENTION_WINDOW, fold_unfold_hybrid_prefix_bitmaps};
 use crate::ir::{
     Attribute, BlockId, DType, Dim, Module, OpId, OpName, Operation, Value, ValueDef, ValueId,
 };
@@ -10,8 +9,7 @@ use smallvec::SmallVec;
 
 // ============================================================================
 // Multi-Tier Grouped Prefetch Planner, 2D Bitmap Grid & L1 Memory Affinity
-// (inspired by LMCache `lmcache/v1/distributed/storage_controllers/prefetch_policy.py`
-// and `lmcache/v1/distributed/storage_controllers/utils.py`)
+//
 // ============================================================================
 
 /// Memory tag pair identifying an L1 manager's backing segment and residency
@@ -349,7 +347,7 @@ pub fn plan_l1_prefetch_retention(num_keys: usize, retain_in_l1: bool) -> Vec<bo
 
 // ============================================================================
 // Per-Salt Key Provider & L2 Authenticated KV Frame Codec
-// (inspired by LMCache `lmcache/v1/distributed/serde/aesgcm.py` and `key_provider.py`)
+//
 // ============================================================================
 
 /// Wire frame version byte for L2-at-rest authenticated KV chunks.
@@ -368,26 +366,7 @@ pub const L2_AEAD_HDR_LEN: usize = 1 + L2_AEAD_IV_LEN;
 pub const L2_AEAD_FRAME_OVERHEAD: usize = L2_AEAD_HDR_LEN + L2_AEAD_TAG_LEN;
 
 /// Domain-separation prefix for L2 per-salt key derivation.
-pub const L2_HKDF_INFO_PREFIX: &[u8] = b"lmcache-l2-aesgcm-v1";
-
-pub(super) fn keyed_splitmix_round(mut z: u64) -> u64 {
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
-}
-
-pub(super) fn absorb_bytes_into_state(state: &mut [u64; 4], domain: u64, bytes: &[u8]) {
-    state[0] = keyed_splitmix_round(state[0] ^ domain ^ (bytes.len() as u64));
-    for (idx, chunk) in bytes.chunks(8).enumerate() {
-        let mut word = [0u8; 8];
-        word[..chunk.len()].copy_from_slice(chunk);
-        let v = u64::from_le_bytes(word);
-        let lane = idx & 3;
-        state[lane] = keyed_splitmix_round(state[lane].wrapping_add(v ^ (idx as u64)));
-        let next = (lane + 1) & 3;
-        state[next] ^= state[lane].rotate_left(19);
-    }
-}
+pub const L2_HKDF_INFO_PREFIX: &[u8] = b"castforge-l2-aesgcm-v1";
 
 /// Memoizing per-`cache_salt` key provider deriving tenant-isolated `16`-byte (`128`-bit) or
 /// `32`-byte (`256`-bit) data encryption keys (DEKs) from a master key and domain prefix.
@@ -428,33 +407,20 @@ impl SaltKeyProvider {
         self.cache.len()
     }
 
-    /// Derives (or retrieves from the memoization cache) the tenant DEK for `cache_salt`.
+    /// Derives (or retrieves from the memoization cache) the tenant DEK for `cache_salt`
+    /// using RFC 5869 HKDF-SHA256.
     pub fn get_key(&mut self, cache_salt: &str) -> Vec<u8> {
         if let Some(existing) = self.cache.get(cache_salt) {
             return existing.clone();
         }
-        let mut state = [
-            0x243f_6a88_85a3_08d3,
-            0x1319_8a2e_0370_7344,
-            0xa409_3822_299f_31d0,
-            0x082e_fa98_ec4e_6c89,
-        ];
-        absorb_bytes_into_state(&mut state, 0x01, &self.master_key);
-        absorb_bytes_into_state(&mut state, 0x02, &self.info_prefix);
-        absorb_bytes_into_state(&mut state, 0x03, cache_salt.as_bytes());
-
-        let mut derived = Vec::with_capacity(self.key_len);
-        let mut counter = 0u64;
-        while derived.len() < self.key_len {
-            let word = keyed_splitmix_round(
-                state[(counter as usize) & 3]
-                    .wrapping_add(counter.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
-            );
-            let bytes = word.to_le_bytes();
-            let take = (self.key_len - derived.len()).min(8);
-            derived.extend_from_slice(&bytes[..take]);
-            counter += 1;
-        }
+        let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(cache_salt.as_bytes()), &self.master_key);
+        let mut derived = vec![0u8; self.key_len];
+        let mut info = Vec::with_capacity(self.info_prefix.len() + 1 + cache_salt.len());
+        info.extend_from_slice(&self.info_prefix);
+        info.push(b':');
+        info.extend_from_slice(cache_salt.as_bytes());
+        hk.expand(&info, &mut derived)
+            .expect("HKDF-SHA256 output length (16 or 32 bytes) is always valid");
         self.cache.insert(cache_salt.to_string(), derived.clone());
         derived
     }
@@ -471,51 +437,6 @@ pub fn estimate_l2_framed_size(layout_shapes_and_elem_bytes: &[(usize, usize)]) 
     plaintext_bytes.saturating_add(L2_AEAD_FRAME_OVERHEAD)
 }
 
-pub(super) fn xor_keystream_in_place(dek: &[u8], iv: &[u8; L2_AEAD_IV_LEN], buf: &mut [u8]) {
-    let mut state = [
-        0x6a09_e667_f3bc_c908,
-        0xbb67_ae85_84ca_a73b,
-        0x3c6e_f372_fe94_f82b,
-        0xa54f_f53a_5f1d_36f1,
-    ];
-    absorb_bytes_into_state(&mut state, 0x10, dek);
-    absorb_bytes_into_state(&mut state, 0x20, iv);
-    for (block_idx, chunk) in buf.chunks_mut(8).enumerate() {
-        let ks = keyed_splitmix_round(
-            state[block_idx & 3]
-                .wrapping_add((block_idx as u64).wrapping_mul(0x517c_c1b7_2722_0a95)),
-        )
-        .to_le_bytes();
-        for (b, &k) in chunk.iter_mut().zip(&ks) {
-            *b ^= k;
-        }
-    }
-}
-
-pub(super) fn compute_frame_tag(
-    version: u8,
-    dek: &[u8],
-    iv: &[u8; L2_AEAD_IV_LEN],
-    ciphertext: &[u8],
-) -> [u8; L2_AEAD_TAG_LEN] {
-    let mut state = [
-        0x510e_527f_ade6_82d1,
-        0x9b05_688c_2b3e_6c1f,
-        0x1f83_d9ab_fb41_bd6b,
-        0x5be0_cd19_137e_2179,
-    ];
-    absorb_bytes_into_state(&mut state, 0x30, &[version]);
-    absorb_bytes_into_state(&mut state, 0x31, dek);
-    absorb_bytes_into_state(&mut state, 0x32, iv);
-    absorb_bytes_into_state(&mut state, 0x33, ciphertext);
-    let w0 = keyed_splitmix_round(state[0] ^ state[2].rotate_left(17));
-    let w1 = keyed_splitmix_round(state[1] ^ state[3].rotate_left(29));
-    let mut tag = [0u8; L2_AEAD_TAG_LEN];
-    tag[..8].copy_from_slice(&w0.to_le_bytes());
-    tag[8..16].copy_from_slice(&w1.to_le_bytes());
-    tag
-}
-
 /// Seals `plaintext` into an authenticated L2 KV wire frame
 /// `[1B version = 1][12B iv][ciphertext || 16B tag]` keyed by `cache_salt`.
 pub fn seal_l2_kv_frame(
@@ -524,14 +445,26 @@ pub fn seal_l2_kv_frame(
     iv: &[u8; L2_AEAD_IV_LEN],
     plaintext: &[u8],
 ) -> Vec<u8> {
+    use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, Nonce, aead::AeadInPlace};
     let dek = provider.get_key(cache_salt);
     let mut frame = Vec::with_capacity(plaintext.len() + L2_AEAD_FRAME_OVERHEAD);
     frame.push(L2_AEAD_VERSION);
     frame.extend_from_slice(iv);
     frame.extend_from_slice(plaintext);
-    xor_keystream_in_place(&dek, iv, &mut frame[L2_AEAD_HDR_LEN..]);
-    let tag = compute_frame_tag(L2_AEAD_VERSION, &dek, iv, &frame[L2_AEAD_HDR_LEN..]);
-    frame.extend_from_slice(&tag);
+    let nonce = Nonce::from_slice(iv);
+    let aad = &[L2_AEAD_VERSION];
+    let tag = if dek.len() == 16 {
+        let cipher = Aes128Gcm::new_from_slice(&dek).expect("16-byte AES-128 key");
+        cipher
+            .encrypt_in_place_detached(nonce, aad, &mut frame[L2_AEAD_HDR_LEN..])
+            .expect("AES-128-GCM in-place encryption should not fail")
+    } else {
+        let cipher = Aes256Gcm::new_from_slice(&dek).expect("32-byte AES-256 key");
+        cipher
+            .encrypt_in_place_detached(nonce, aad, &mut frame[L2_AEAD_HDR_LEN..])
+            .expect("AES-256-GCM in-place encryption should not fail")
+    };
+    frame.extend_from_slice(tag.as_slice());
     frame
 }
 
@@ -547,35 +480,37 @@ pub fn open_l2_kv_frame(
     src_blob: &[u8],
     expected_plaintext_len: usize,
 ) -> Option<Vec<u8>> {
+    use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, Nonce, Tag, aead::AeadInPlace};
     let frame_end = L2_AEAD_HDR_LEN
         .checked_add(expected_plaintext_len)?
         .checked_add(L2_AEAD_TAG_LEN)?;
     if src_blob.len() < frame_end || src_blob[0] != L2_AEAD_VERSION {
         return None;
     }
-    let mut iv = [0u8; L2_AEAD_IV_LEN];
-    iv.copy_from_slice(&src_blob[1..L2_AEAD_HDR_LEN]);
+    let iv = &src_blob[1..L2_AEAD_HDR_LEN];
     let ct_end = L2_AEAD_HDR_LEN + expected_plaintext_len;
     let ciphertext = &src_blob[L2_AEAD_HDR_LEN..ct_end];
     let stored_tag = &src_blob[ct_end..frame_end];
 
     let dek = provider.get_key(cache_salt);
-    let expected_tag = compute_frame_tag(L2_AEAD_VERSION, &dek, &iv, ciphertext);
-    let mut diff = 0u8;
-    for (&a, &b) in stored_tag.iter().zip(&expected_tag) {
-        diff |= a ^ b;
-    }
-    if diff != 0 {
-        return None;
-    }
     let mut plaintext = ciphertext.to_vec();
-    xor_keystream_in_place(&dek, &iv, &mut plaintext);
+    let nonce = Nonce::from_slice(iv);
+    let tag = Tag::from_slice(stored_tag);
+    let aad = &[L2_AEAD_VERSION];
+    let res = if dek.len() == 16 {
+        let cipher = Aes128Gcm::new_from_slice(&dek).expect("16-byte AES-128 key");
+        cipher.decrypt_in_place_detached(nonce, aad, &mut plaintext, tag)
+    } else {
+        let cipher = Aes256Gcm::new_from_slice(&dek).expect("32-byte AES-256 key");
+        cipher.decrypt_in_place_detached(nonce, aad, &mut plaintext, tag)
+    };
+    res.ok()?;
     Some(plaintext)
 }
 
 // ============================================================================
 // Non-Aliasing Mutable Buffer Chain Sequence Relaxation
-// (inspired by Modular `GraphCompiler/lib/MODialect/Transforms/CanonicalizeChainSequences.cpp`)
+//
 // ============================================================================
 
 #[derive(Debug, Clone, Copy)]
@@ -878,8 +813,7 @@ pub fn relax_non_aliasing_mutable_chain_sequences(module: &mut Module) -> usize 
 
 // ============================================================================
 // Post-Dominator `runsAfter` Dependency Tree & LCA Explicit Buffer Lifetimes
-// (inspired by Modular `GraphCompiler/lib/MGPDialect/Dialect/MGPBufferLifetimeAnalysis.cpp`
-// and `GraphCompiler/lib/MGPDialect/Transforms/ExplicitBufferLifetimes.cpp`)
+//
 // ============================================================================
 
 /// DAG post-dominator dependency tree for a basic block, rooted at the block terminator.
@@ -1312,8 +1246,7 @@ pub fn insert_explicit_buffer_frees(module: &mut Module) -> usize {
 
 // ============================================================================
 // Assert-Dependency Chain Predication Pass
-// (inspired by Modular
-//  `GraphCompiler/lib/MGPDialect/Transforms/PredicateAssertDependenciesPass.cpp`)
+//
 // ============================================================================
 
 pub(super) fn is_chain_value(module: &Module, val_id: ValueId) -> bool {

@@ -182,6 +182,24 @@ pub(crate) fn sanitize_ident(raw: &str) -> String {
     }
 }
 
+pub(crate) fn sanitize_label(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-' | '/' | '+') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "op".to_string()
+    } else {
+        cleaned
+    }
+}
+
 pub(crate) fn value_ident(
     module: &Module,
     val_id: ValueId,

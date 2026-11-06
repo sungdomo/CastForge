@@ -695,11 +695,12 @@ pub fn lower_to_loop_ir(module: &Module, base_config: &TargetConfig) -> LoopModu
                             Some(Attribute::Int(v)) => *v,
                             _ => 0,
                         };
-                        let label = op
-                            .attributes
-                            .get("profile_label")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("op");
+                        let label = crate::codegen::sanitize_label(
+                            op.attributes
+                                .get("profile_label")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("op"),
+                        );
                         body.push(LoopStmt::Comment(format!("PROF_MARK:{pid}:{label}")));
                         a.clone()
                     }

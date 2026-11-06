@@ -1,7 +1,5 @@
 //! Structured loop outlining, traceback attachment, reduction fusion, and shape fallbacks.
 
-#[allow(unused_imports)]
-use super::*;
 use crate::ir::{Attribute, BlockId, Dim, Module, OpId, OpName, Operation, Type, ValueId};
 
 pub(super) fn structured_loop_body_closure_op_name(loop_op_name: &str) -> Option<&'static str> {

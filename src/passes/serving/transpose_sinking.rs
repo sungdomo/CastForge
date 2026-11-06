@@ -1,7 +1,6 @@
 //! Composite activation recognition, transpose sinking, and DAX slot arenas.
 
-#[allow(unused_imports)]
-use super::*;
+use super::{extract_int_list_attr, stamp_fused_provenance};
 use crate::ir::{
     Attribute, Module, OpId, OpName, Operation, TensorType, Type, Value, ValueDef, ValueId,
 };
@@ -784,8 +783,7 @@ pub fn sink_transpose_through_elementwise_and_broadcast(module: &mut Module) -> 
     sunk_count
 }
 
-/// Object-group role in a hybrid CacheBlend registration
-/// (inspired by LMCache `lmcache/v1/multiprocess/modules/blend/read_set.py`).
+/// Object-group role in a hybrid CacheBlend registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlendObjectGroupKind {
     /// Full-attention KV object group read by both the prefix and non-prefix blend legs.
@@ -796,8 +794,7 @@ pub enum BlendObjectGroupKind {
     Recurrent,
 }
 
-/// Per-leg object-group read routing for CacheBlend hybrid lookups
-/// (inspired by LMCache `lmcache/v1/multiprocess/modules/blend/read_set.py` `_BlendReadGroups`).
+/// Per-leg object-group read routing for CacheBlend hybrid lookups.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlendReadGroupSet {
     /// Ascending group IDs read by the relocatable blend leg (`attention + aux`).
@@ -810,9 +807,7 @@ pub struct BlendReadGroupSet {
     pub attn_gid: usize,
 }
 
-/// Classifies a registration's `num_object_groups` and `group_kinds` into per-leg read sets
-/// (inspired by LMCache `lmcache/v1/multiprocess/modules/blend/read_set.py`
-/// `_classify_cb_read_groups`).
+/// Classifies a registration's `num_object_groups` and `group_kinds` into per-leg read sets.
 ///
 /// Single-group (`<= 1`) fused layouts map both legs to group `0`. Multi-group layouts must
 /// contain exactly one [`BlendObjectGroupKind::Attention`] group and at most one
@@ -863,9 +858,7 @@ pub fn classify_blend_read_groups(
 }
 
 /// Interleaves per-group expanded object keys into a chunk-major key sequence with uniform stride
-/// `per_group_keys.len() * expansion` per chunk so prefix bitmaps stay leading-ones-aligned
-/// (inspired by LMCache `lmcache/v1/multiprocess/modules/blend/read_set.py`
-/// `_cb_chunk_major_object_keys`).
+/// `per_group_keys.len() * expansion` per chunk so prefix bitmaps stay leading-ones-aligned.
 pub fn interleave_chunk_major_object_keys<T: Clone>(
     per_group_keys: &[Vec<T>],
     num_chunks: usize,
@@ -892,9 +885,7 @@ pub fn interleave_chunk_major_object_keys<T: Clone>(
     Some(out)
 }
 
-/// Resolved per-group RoPE geometry for CacheBlend in-place key rotation
-/// (inspired by LMCache `lmcache/v1/multiprocess/modules/blend/rope.py`
-/// `_cb_group_rope_geometry`).
+/// Resolved per-group RoPE geometry for CacheBlend in-place key rotation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CBGroupRopeGeometry {
     /// Whether K and V are fused-packed into a doubled `2 * head_size` per-head stride.
@@ -909,9 +900,7 @@ pub struct CBGroupRopeGeometry {
 }
 
 /// Computes the per-group CacheBlend RoPE geometry across split K/V, fused-packed K/V, and
-/// Multi-head Latent Attention (MLA `[content | rope]`) layouts
-/// (inspired by LMCache `lmcache/v1/multiprocess/modules/blend/rope.py`
-/// `_cb_group_rope_geometry`).
+/// Multi-head Latent Attention (MLA `[content | rope]`) layouts.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_cb_group_rope_geometry(
     tokens_per_block: usize,
@@ -960,8 +949,7 @@ pub fn compute_cb_group_rope_geometry(
     })
 }
 
-/// Outcome of reserving or committing a payload in [`DaxGenerationSlotArena`]
-/// (inspired by LMCache `lmcache/v1/distributed/l2_adapters/dax/core.py` `DaxPutFromPtrResult`).
+/// Outcome of reserving or committing a payload in [`DaxGenerationSlotArena`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaxPutOutcome {
     /// Payload was newly reserved/committed into a slot.
@@ -976,8 +964,7 @@ pub enum DaxPutOutcome {
     InvalidSize,
 }
 
-/// Read reservation pinning a committed DAX slot generation against concurrent recycling
-/// (inspired by LMCache `lmcache/v1/distributed/l2_adapters/dax/core.py` `DaxReadReservation`).
+/// Read reservation pinning a committed DAX slot generation against concurrent recycling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DaxReadReservation {
     /// Position of the key in the caller's request slice.
@@ -1020,8 +1007,7 @@ pub(super) struct DaxSlotState {
 }
 
 /// Generational fixed-slot persistent memory (DAX) arena manager with read-borrow reference
-/// counting and deferred `pending_free` slot reclamation
-/// (inspired by LMCache `lmcache/v1/distributed/l2_adapters/dax/core.py` `DaxCore`).
+/// counting and deferred `pending_free` slot reclamation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaxGenerationSlotArena {
     slot_bytes: u64,
@@ -1371,14 +1357,12 @@ impl DaxGenerationSlotArena {
     }
 }
 
-/// Default chunk-count histogram upper bounds (`0, 1, 2, 4, ..., 2048`)
-/// (matching LMCache `lmcache/v1/mp_coordinator/utils/histogram.py` `CHUNK_COUNT_BOUNDS`).
+/// Default chunk-count histogram upper bounds (`0, 1, 2, 4, ..., 2048`).
 pub const CHUNK_COUNT_HISTOGRAM_BOUNDS: &[f64] = &[
     0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0,
 ];
 
-/// Fixed-bound bucket histogram with Prometheus-compatible cumulative bucket export
-/// (inspired by LMCache `lmcache/v1/mp_coordinator/utils/histogram.py` `Histogram`).
+/// Fixed-bound bucket histogram with Prometheus-compatible cumulative bucket export.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BucketHistogram {
     bounds: Vec<f64>,

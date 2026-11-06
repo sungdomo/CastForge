@@ -107,7 +107,7 @@ unroll_factor = 4
 
 [[arch_profile]]
 arch = "apple-m-series"
-aliases = ["metal-apple", "metal", "msl"]
+aliases = ["metal-apple", "metal", "msl", "m1", "m2", "m3", "m3-max", "m4"]
 peak_gflops = 14000.0
 peak_bandwidth_gbps = 400.0
 simd_isa = "neon"
@@ -118,7 +118,7 @@ unroll_factor = 4
 
 [[arch_profile]]
 arch = "cuda-sm80"
-aliases = ["nvidia-ampere", "cuda"]
+aliases = ["nvidia-ampere", "cuda", "a100", "sm80"]
 peak_gflops = 19500.0
 peak_bandwidth_gbps = 1555.0
 simd_isa = "scalar"
@@ -129,7 +129,7 @@ unroll_factor = 4
 
 [[arch_profile]]
 arch = "nvidia-hopper"
-aliases = ["hopper", "sm90"]
+aliases = ["hopper", "sm90", "h100"]
 peak_gflops = 67000.0
 peak_bandwidth_gbps = 3350.0
 simd_isa = "scalar"
@@ -140,7 +140,7 @@ unroll_factor = 4
 
 [[arch_profile]]
 arch = "nvidia-blackwell"
-aliases = ["blackwell", "sm100"]
+aliases = ["blackwell", "sm100", "b200"]
 peak_gflops = 140000.0
 peak_bandwidth_gbps = 8000.0
 simd_isa = "scalar"
@@ -151,7 +151,7 @@ unroll_factor = 8
 
 [[arch_profile]]
 arch = "rocm-gfx90a"
-aliases = ["amd-cdna3", "hip", "rocm"]
+aliases = ["amd-cdna3", "hip", "rocm", "mi250", "mi300", "mi300x"]
 peak_gflops = 45000.0
 peak_bandwidth_gbps = 3200.0
 simd_isa = "scalar"

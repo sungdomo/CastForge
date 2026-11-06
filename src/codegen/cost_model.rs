@@ -40,15 +40,18 @@ impl HardwareRoofline {
     /// Creates a pre-configured [`HardwareRoofline`] for a named CPU or GPU architecture profile.
     pub fn for_arch(arch: &str) -> Self {
         match arch.trim().to_ascii_lowercase().as_str() {
-            "x86_64-avx512" | "avx512" => Self::new(2048.0, 200.0),
+            "x86_64-avx512" | "avx512" | "avx-512" => Self::new(2048.0, 200.0),
             "x86_64-avx2" | "x86_64" | "avx2" => Self::new(1024.0, 100.0),
-            "aarch64-sve" | "sve" => Self::new(1536.0, 160.0),
+            "aarch64-sve" | "sve" | "sve2" | "armv9" => Self::new(1536.0, 160.0),
             "aarch64-neon" | "aarch64" | "arm64" | "neon" => Self::new(768.0, 100.0),
-            "metal-apple" | "apple-m-series" | "metal" | "msl" => Self::new(14000.0, 400.0),
-            "cuda-sm80" | "nvidia-ampere" | "cuda" => Self::new(19500.0, 1555.0),
-            "nvidia-hopper" | "hopper" | "sm90" => Self::new(67000.0, 3350.0),
-            "nvidia-blackwell" | "blackwell" | "sm100" => Self::new(140000.0, 8000.0),
-            "rocm-gfx90a" | "amd-cdna3" | "hip" | "rocm" => Self::new(45000.0, 3200.0),
+            "metal-apple" | "apple-m-series" | "metal" | "msl" | "m1" | "m2" | "m3" | "m3-max"
+            | "m4" => Self::new(14000.0, 400.0),
+            "cuda-sm80" | "nvidia-ampere" | "cuda" | "a100" | "sm80" => Self::new(19500.0, 1555.0),
+            "nvidia-hopper" | "hopper" | "sm90" | "h100" => Self::new(67000.0, 3350.0),
+            "nvidia-blackwell" | "blackwell" | "sm100" | "b200" => Self::new(140000.0, 8000.0),
+            "rocm-gfx90a" | "amd-cdna3" | "hip" | "rocm" | "mi250" | "mi300" | "mi300x" => {
+                Self::new(45000.0, 3200.0)
+            }
             "riscv64-rvv" | "riscv64" | "rvv" => Self::new(512.0, 64.0),
             "wasm32-simd128" | "wasm32" | "wasm" => Self::new(256.0, 32.0),
             _ => Self::default(),
@@ -845,10 +848,13 @@ impl TargetConfig {
             "wasm32-simd128" | "wasm32" | "wasm" => Self::cpu_tiled(8)
                 .with_simd_isa(SimdIsa::WasmSimd128)
                 .with_loop_order(GemmLoopOrder::Mkn),
-            "cuda-sm80" | "cuda" | "rocm-gfx90a" | "hip" => Self::gpu_workgroup(16, 256),
-            "metal-apple" | "metal" | "msl" | "opencl" | "webgpu" | "wgsl" => {
-                Self::gpu_workgroup(16, 64)
+            "cuda-sm80" | "nvidia-ampere" | "cuda" | "a100" | "sm80" | "nvidia-hopper"
+            | "hopper" | "sm90" | "h100" | "nvidia-blackwell" | "blackwell" | "sm100" | "b200"
+            | "rocm-gfx90a" | "amd-cdna3" | "hip" | "rocm" | "mi250" | "mi300" | "mi300x" => {
+                Self::gpu_workgroup(16, 256)
             }
+            "metal-apple" | "apple-m-series" | "metal" | "msl" | "m1" | "m2" | "m3" | "m3-max"
+            | "m4" | "opencl" | "webgpu" | "wgsl" => Self::gpu_workgroup(16, 64),
             _ => Self::default(),
         }
     }
@@ -869,22 +875,22 @@ impl TargetConfig {
         let attrs = &op.attributes;
         let mut cfg = *self;
         if let Some(Attribute::Int(v)) = attrs.get("loop_tile_m") {
-            cfg.tile_m = (*v).max(0) as usize;
+            cfg.tile_m = (*v).clamp(0, 4096) as usize;
         }
         if let Some(Attribute::Int(v)) = attrs.get("loop_tile_n") {
-            cfg.tile_n = (*v).max(0) as usize;
+            cfg.tile_n = (*v).clamp(0, 4096) as usize;
         }
         if let Some(Attribute::Int(v)) = attrs.get("loop_tile_k") {
-            cfg.tile_k = (*v).max(0) as usize;
+            cfg.tile_k = (*v).clamp(0, 4096) as usize;
         }
         if let Some(Attribute::Int(v)) = attrs.get("loop_l2_tile") {
-            cfg.l2_tile_size = (*v).max(0) as usize;
+            cfg.l2_tile_size = (*v).clamp(0, 16384) as usize;
         }
         if let Some(Attribute::Int(v)) = attrs.get("loop_reg_m") {
-            cfg.reg_tile_m = (*v).max(0) as usize;
+            cfg.reg_tile_m = (*v).clamp(0, 32) as usize;
         }
         if let Some(Attribute::Int(v)) = attrs.get("loop_reg_n") {
-            cfg.reg_tile_n = (*v).max(0) as usize;
+            cfg.reg_tile_n = (*v).clamp(0, 32) as usize;
         }
         if let Some(Attribute::String(s)) = attrs.get("loop_order") {
             cfg.loop_order = GemmLoopOrder::parse(s);
@@ -896,13 +902,13 @@ impl TargetConfig {
             cfg.loop_skew = *b;
         }
         if let Some(Attribute::Int(v)) = attrs.get("loop_unroll") {
-            cfg.unroll_factor = (*v).max(1) as usize;
+            cfg.unroll_factor = (*v).clamp(1, 64) as usize;
         }
         if let Some(Attribute::Int(v)) = attrs.get("loop_prefetch") {
-            cfg.prefetch_distance = (*v).max(0) as usize;
+            cfg.prefetch_distance = (*v).clamp(0, 1024) as usize;
         }
         if let Some(Attribute::Int(v)) = attrs.get("loop_split_k") {
-            cfg.split_k = (*v).max(1) as usize;
+            cfg.split_k = (*v).clamp(1, 64) as usize;
         }
         if let Some(Attribute::Bool(b)) = attrs.get("loop_double_buffer") {
             cfg.double_buffer = *b;
@@ -911,7 +917,7 @@ impl TargetConfig {
             cfg.vectorize = *b;
         }
         if let Some(Attribute::Int(v)) = attrs.get("simd_width") {
-            cfg.simd_width = (*v).max(1) as usize;
+            cfg.simd_width = (*v).clamp(1, 64) as usize;
         }
         if let Some(Attribute::String(s)) = attrs.get("simd_isa") {
             cfg = cfg.with_simd_isa(SimdIsa::parse(s));

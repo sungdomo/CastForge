@@ -1249,8 +1249,13 @@ fn emit_wgsl_composite(
                 .split(',')
                 .filter(|s| !s.is_empty())
                 .map(|tok| {
-                    if tok.starts_with('s') {
-                        tok.to_string()
+                    let tok = tok.trim();
+                    if let Some(step_idx) = tok
+                        .strip_prefix('s')
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .filter(|&k| k < idx)
+                    {
+                        format!("s{step_idx}")
                     } else {
                         tok.parse::<usize>()
                             .ok()

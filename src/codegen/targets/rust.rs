@@ -7,7 +7,7 @@ use crate::codegen::{
 };
 use crate::ir::{Attribute, DType, Module, OpId, ValueId};
 use crate::stablehlo::StableHloOp;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -385,7 +385,7 @@ fn emit_rust_hlo_op(
     } else if let Some(h) = StableHloOp::from_op(op) {
         h
     } else {
-        return Ok(());
+        bail!("Unsupported operation `{}` in Rust codegen", op.name);
     };
 
     match hlo {
@@ -1575,11 +1575,12 @@ fn emit_rust_hlo_op(
                     Some(Attribute::Int(v)) => *v,
                     _ => 0,
                 };
-                let label = op
-                    .attributes
-                    .get("profile_label")
-                    .and_then(|a| a.as_str())
-                    .unwrap_or("op");
+                let label = crate::codegen::sanitize_label(
+                    op.attributes
+                        .get("profile_label")
+                        .and_then(|a| a.as_str())
+                        .unwrap_or("op"),
+                );
                 let src = r_idx(module, plan, inputs[0], "i", names, counter);
                 let dst = r_idx(module, plan, res_val, "i", names, counter);
                 writeln!(out, "    // [profile:region(id={pid}, label=\"{label}\")]")?;
@@ -1937,7 +1938,40 @@ fn emit_rust_hlo_op(
                 writeln!(out, "    }}")?;
             }
         }
-        _ => {}
+        StableHloOp::CustomCall { inputs, .. } => {
+            if let Some(&src_id) = inputs.first() {
+                let src = r_bcast_idx(module, plan, src_id, "i", res_len, names, counter);
+                let dst = r_idx(module, plan, res_val, "i", names, counter);
+                writeln!(out, "    for i in 0..{res_len} {{ {dst} = {src}; }}")?;
+            } else {
+                let dst = r_idx(module, plan, res_val, "i", names, counter);
+                writeln!(out, "    for i in 0..{res_len} {{ {dst} = 0.0_f32; }}")?;
+            }
+        }
+        StableHloOp::Other { op_name } => match op_name.as_str() {
+            "reverse" if !op.operands.is_empty() => {
+                let src_len = tensor_len(module, op.operands[0]).max(1);
+                let src = r_idx(
+                    module,
+                    plan,
+                    op.operands[0],
+                    &format!("{src_len} - 1 - (i % {src_len})"),
+                    names,
+                    counter,
+                );
+                let dst = r_idx(module, plan, res_val, "i", names, counter);
+                writeln!(out, "    for i in 0..{res_len} {{ {dst} = {src}; }}")?;
+            }
+            "all_reduce" | "all_gather" | "reduce_scatter" | "collective_permute"
+                if !op.operands.is_empty() =>
+            {
+                let src = r_bcast_idx(module, plan, op.operands[0], "i", res_len, names, counter);
+                let dst = r_idx(module, plan, res_val, "i", names, counter);
+                writeln!(out, "    for i in 0..{res_len} {{ {dst} = {src}; }}")?;
+            }
+            other => bail!("Unsupported operation `stablehlo.{other}` in Rust codegen"),
+        },
+        _ => bail!("Unsupported operation `{}` in Rust codegen", op.name),
     }
 
     Ok(())
@@ -2069,8 +2103,13 @@ fn emit_rust_fused_loop_chain(
             .split(',')
             .filter(|s| !s.is_empty())
             .map(|tok| {
-                if tok.starts_with('s') {
-                    tok.to_string()
+                let tok = tok.trim();
+                if let Some(step_idx) = tok
+                    .strip_prefix('s')
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .filter(|&k| k < idx)
+                {
+                    format!("s{step_idx}")
                 } else {
                     tok.parse::<usize>()
                         .ok()

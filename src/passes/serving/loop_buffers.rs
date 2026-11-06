@@ -1,12 +1,13 @@
 //! KV storage key codecs, loop buffer reuse, memory pool planning, and slice passes.
 
-#[allow(unused_imports)]
-use super::*;
+use super::{
+    checked_lcm_u64, expr_contains_ident, fuse_locations, stamp_fused_provenance,
+    stmt_references_buffer,
+};
 use crate::ir::{Attribute, Dim, Location, Module, OpId, Operation, Type, ValueDef, ValueId};
 use indexmap::IndexMap;
 
-/// Canonical L2 object key identity shared across storage and filesystem adapters
-/// (inspired by LMCache `lmcache/v1/distributed/key_codec.py` `ObjectKey`).
+/// Canonical L2 object key identity shared across storage and filesystem adapters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvStorageKeySpec {
     /// Model identifier (may contain `/` separators, e.g., `"meta-llama/Llama-3-8B"`).
@@ -23,7 +24,7 @@ pub struct KvStorageKeySpec {
 
 /// Encodes `key` into the canonical reversible L2 wire key
 /// `"{model}@{rank:08x}@{group:x}@{hash:016x}[@{salt}]"` (omitting trailing `@{salt}` when
-/// `cache_salt` is empty, matching LMCache `encode_storage_key`).
+/// `cache_salt` is empty).
 pub fn encode_kv_storage_key(key: &KvStorageKeySpec) -> String {
     if key.cache_salt.is_empty() {
         format!(
@@ -40,7 +41,7 @@ pub fn encode_kv_storage_key(key: &KvStorageKeySpec) -> String {
 
 /// Encodes `key` into the filesystem L2 adapter filename
 /// `"{model_sep}@0x{rank:08x}@{group:x}@{hash:016x}[@{salt}].data"` where `'/'` in `model_name` is
-/// escaped as `"-SEP-"` (matching LMCache `encode_fs_filename`).
+/// escaped as `"-SEP-"`.
 pub fn encode_kv_fs_filename(key: &KvStorageKeySpec) -> String {
     let escaped_model = key.model_name.replace('/', "-SEP-");
     if key.cache_salt.is_empty() {
@@ -57,7 +58,7 @@ pub fn encode_kv_fs_filename(key: &KvStorageKeySpec) -> String {
 }
 
 /// Decodes a canonical L2 wire key (`model@rank@group@hash[@salt]`) back into a
-/// [`KvStorageKeySpec`] (matching LMCache `decode_storage_key`).
+/// [`KvStorageKeySpec`].
 pub fn decode_kv_storage_key(encoded: &str) -> Option<KvStorageKeySpec> {
     let parts: Vec<&str> = encoded.split('@').collect();
     let (model, rank_str, group_str, hash_str, salt) = match parts.as_slice() {
@@ -85,7 +86,7 @@ pub fn decode_kv_storage_key(encoded: &str) -> Option<KvStorageKeySpec> {
 }
 
 /// Decodes a filesystem L2 filename (`*.data`) back into a [`KvStorageKeySpec`], unescaping
-/// `"-SEP-"` back to `'/'` (matching LMCache `decode_fs_filename`).
+/// `"-SEP-"` back to `'/'`.
 pub fn decode_kv_fs_filename(filename: &str) -> Option<KvStorageKeySpec> {
     let stem = filename.strip_suffix(".data")?;
     let mut spec = decode_kv_storage_key(stem)?;
@@ -95,9 +96,7 @@ pub fn decode_kv_fs_filename(filename: &str) -> Option<KvStorageKeySpec> {
 
 pub(super) const FAULT_INJECT_HASH_DENOM: u64 = 1_000_000;
 
-/// Configuration for deterministic L2 load fault injection
-/// (inspired by LMCache `lmcache/v1/distributed/l2_adapters/fault_inject_l2_adapter.py`
-/// `FaultInjectL2AdapterConfig`).
+/// Configuration for deterministic L2 load fault injection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct L2FaultInjectConfig {
     /// Deterministic per-key drop probability in `[0.0, 1.0]`.
@@ -112,8 +111,7 @@ pub struct L2FaultInjectConfig {
 }
 
 /// Deterministic L2 load fault-injection policy that faults load results (leaving lookup bitmaps
-/// untouched) to exercise segmented gapped prefetch and lock-release trim masks
-/// (inspired by LMCache `lmcache/v1/distributed/l2_adapters/fault_inject_l2_adapter.py`).
+/// untouched) to exercise segmented gapped prefetch and lock-release trim masks.
 #[derive(Debug, Clone, PartialEq)]
 pub struct L2FaultInjectPolicy {
     pub config: L2FaultInjectConfig,
@@ -250,8 +248,7 @@ pub(super) fn rewrite_stmt_buffer_name(
 }
 
 /// Aliases non-overlapping `LoopStmt::Alloc` scratchpad buffers of identical length within each
-/// [`crate::ir::loops::LoopKernel`], prioritizing buffers with higher use counts first
-/// (inspired by Modular `GraphCompiler/lib/MGPDialect/Transforms/SimpleBufferReusePass.cpp`).
+/// [`crate::ir::loops::LoopKernel`], prioritizing buffers with higher use counts first.
 ///
 /// Returns the number of redundant `LoopStmt::Alloc` declarations merged and eliminated.
 pub fn reuse_dead_loop_buffers(loop_module: &mut crate::ir::loops::LoopModule) -> usize {
@@ -382,8 +379,7 @@ pub(super) fn is_terminator_or_side_effecting(op: &Operation) -> bool {
 /// Identifies execution-invariant weight/constant subgraphs, filters out standalone trivial ops
 /// (`isLiftableTrivialOp`) that do not feed any non-trivial invariant compute op, assigns
 /// `castforge.exec_invariant_slot` cache indices to non-trivial invariant ops, and hoists the
-/// lifted subgraph to the entry of the block
-/// (inspired by Modular `GraphCompiler/lib/MGPDialect/Transforms/ExecInvariantCodeMotionPass.cpp`).
+/// lifted subgraph to the entry of the block.
 ///
 /// Returns the number of non-trivial execution-invariant operations assigned cache slots.
 pub fn hoist_exec_invariant_ops(module: &mut Module) -> usize {
@@ -425,7 +421,7 @@ pub fn hoist_exec_invariant_ops(module: &mut Module) -> usize {
         }
 
         // Backward pass from non-trivial invariant ops: trivial ops are only lifted if they feed
-        // at least one non-trivial invariant op (`isLiftableTrivialOp` in Modular).
+        // at least one non-trivial invariant op (`is_liftable_trivial_op`).
         let mut lifted_ops: std::collections::HashSet<OpId> = std::collections::HashSet::new();
         for &op_id in op_ids.iter().rev() {
             if !invariant_ops.contains(&op_id) {
@@ -564,9 +560,7 @@ pub(super) fn collect_type_symbolic_exprs(ty: &Type, expr_to_alias: &mut IndexMa
 /// Hoists compound symbolic dimension expressions (e.g., `Dim::Symbolic("batch*seq")`,
 /// `Dim::Symbolic("seq+1")`) out of tensor types into deduplicated function-level parameter
 /// declarations (`param_expr_0`, `param_expr_1`, ...) stored in `castforge.param_expr_decls`,
-/// rewriting all tensor shapes in the function to reference the hoisted parameter aliases
-/// (inspired by Modular
-/// `GraphCompiler/lib/MODialect/Transforms/HoistParameterExpressionsPass.cpp`).
+/// rewriting all tensor shapes in the function to reference the hoisted parameter aliases.
 ///
 /// Returns the total number of distinct symbolic parameter expressions hoisted across the module.
 pub fn hoist_symbolic_dim_expressions(module: &mut Module) -> usize {
@@ -633,9 +627,7 @@ pub fn hoist_symbolic_dim_expressions(module: &mut Module) -> usize {
     total_hoisted
 }
 
-/// Downsamples per-group paged KV `block_ids` for sub-chunk sliding-window attention (SWA) groups
-/// (inspired by LMCache `lmcache/v1/multiprocess/object_group_transfer.py`
-/// `downsample_and_stage_block_ids`).
+/// Downsamples per-group paged KV `block_ids` for sub-chunk sliding-window attention (SWA) groups.
 ///
 /// For a kernel group with `block_size_tokens`, `chunk_tokens`, and `subchunk_sw_tokens` (`0` or
 /// `>= chunk_tokens` for full attention; `< chunk_tokens` for sub-chunk SWA such as DeepSeek-V4):
@@ -678,8 +670,7 @@ pub fn downsample_subchunk_swa_block_ids(
 }
 
 /// Recalculates the number of downsampled blocks to skip when `blocks_per_window <=
-/// blocks_per_chunk` (inspired by LMCache `lmcache/v1/multiprocess/object_group_transfer.py`
-/// `recalculate_blocks_to_skip`).
+/// blocks_per_chunk`.
 pub fn recalculate_subchunk_blocks_to_skip(
     blocks_per_chunk: usize,
     blocks_per_window: usize,
@@ -695,12 +686,11 @@ pub fn recalculate_subchunk_blocks_to_skip(
     full_windows_to_skip * blocks_per_window + tail_blocks_to_skip
 }
 
-/// Bytes per packed wire token ID (big-endian `u32`, matching LMCache `TOKEN_STRIDE = 4`).
+/// Bytes per packed wire token ID (big-endian `u32`).
 pub const TOKEN_WIRE_STRIDE: usize = 4;
 
 /// Packs `token_ids` into a big-endian `u32` wire byte buffer (`TOKEN_WIRE_STRIDE * len(tokens)`)
-/// so token sequences cross process boundaries via a single `memcpy` and hash without unpacking
-/// (inspired by LMCache `lmcache/v1/multiprocess/token_codec.py` `pack_token_ids`).
+/// so token sequences cross process boundaries via a single `memcpy` and hash without unpacking.
 pub fn pack_token_ids_be(token_ids: &[u32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(token_ids.len() * TOKEN_WIRE_STRIDE);
     for &tok in token_ids {
@@ -715,8 +705,7 @@ pub fn num_packed_tokens(packed: &[u8]) -> usize {
 }
 
 /// Unpacks a big-endian `u32` wire buffer back into token IDs, returning `None` if `packed.len()`
-/// is not an exact multiple of [`TOKEN_WIRE_STRIDE`]
-/// (matching LMCache `lmcache/v1/multiprocess/token_codec.py` `unpack_token_ids`).
+/// is not an exact multiple of [`TOKEN_WIRE_STRIDE`].
 pub fn unpack_token_ids_be(packed: &[u8]) -> Option<Vec<u32>> {
     if !packed.len().is_multiple_of(TOKEN_WIRE_STRIDE) {
         return None;
@@ -729,8 +718,7 @@ pub fn unpack_token_ids_be(packed: &[u8]) -> Option<Vec<u32>> {
 }
 
 /// Computes chained prefix-chunk hashes directly over a big-endian packed token wire buffer
-/// without unpacking into `Vec<u32>`, producing hashes identical to hashing `[u32]` chunks
-/// (inspired by LMCache `lmcache/v1/multiprocess/token_codec.py` & `token_hasher.py`).
+/// without unpacking into `Vec<u32>`, producing hashes identical to hashing `[u32]` chunks.
 pub fn hash_packed_token_blocks_be(packed: &[u8], chunk_tokens: usize, seed: u64) -> Vec<u64> {
     let stride_bytes = chunk_tokens.saturating_mul(TOKEN_WIRE_STRIDE);
     if stride_bytes == 0 || packed.len() < stride_bytes {
@@ -753,9 +741,7 @@ pub fn hash_packed_token_blocks_be(packed: &[u8], chunk_tokens: usize, seed: u64
     hashes
 }
 
-/// Descriptor for an intermediate buffer allocation input to [`plan_dynamic_memory_pool`]
-/// (inspired by Modular `GraphCompiler/lib/MGPDialect/Transforms/DynamicMemoryPlanningPass.cpp`
-/// `AllocInfo`).
+/// Descriptor for an intermediate buffer allocation input to [`plan_dynamic_memory_pool`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DynamicAllocRequest {
     /// Buffer symbol / identifier.
@@ -772,8 +758,7 @@ pub struct DynamicAllocRequest {
     pub location: Location,
 }
 
-/// Bulk-slice memory pool plan produced by [`plan_dynamic_memory_pool`]
-/// (inspired by Modular `DynamicMemoryPlanningPass.cpp` `BufferPlanOp` + `BufferBulkSliceOp`).
+/// Bulk-slice memory pool plan produced by [`plan_dynamic_memory_pool`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DynamicMemoryPoolPlan {
     /// Allocations ordered by ascending `first_use_idx`.
@@ -793,8 +778,7 @@ pub struct DynamicMemoryPoolPlan {
 }
 
 /// Plans a consolidated LCM-aligned memory pool and single `BufferBulkSliceOp` layout for
-/// intermediate buffer allocations
-/// (inspired by Modular `GraphCompiler/lib/MGPDialect/Transforms/DynamicMemoryPlanningPass.cpp`).
+/// intermediate buffer allocations.
 ///
 /// 1. Sorts allocations by earliest topological use (`first_use_idx`),
 /// 2. Computes `pool_alignment_bytes = LCM(alignments)`,
@@ -894,8 +878,7 @@ pub(super) fn stmt_has_non_pointwise_access(
 /// Merges adjacent parallel `LoopStmt::For` regions sharing identical `(lower, upper, step)`
 /// bounds when all shared producer-to-consumer buffer accesses are strictly pointwise at `[var]`,
 /// forwarding sole-use producer yields directly into the consumer body and dropping dead producer
-/// intermediate stores and allocations
-/// (inspired by Modular `GraphCompiler/lib/MODialect/Transforms/MergeAdjacentParallels.cpp`).
+/// intermediate stores and allocations.
 ///
 /// Returns the number of adjacent parallel loop pairs merged.
 pub fn merge_adjacent_parallel_loops(loop_module: &mut crate::ir::loops::LoopModule) -> usize {
@@ -1063,8 +1046,7 @@ pub(super) fn is_effectful_chain_producer(op: &Operation) -> bool {
 
 /// Awaits unused ("hanging") asynchronous/effectful operation results before each block's
 /// terminator (`func.return` / `return`) by inserting a `castforge.chain_await` barrier operation
-/// and recording `castforge.awaited_hanging_chains` on the terminator
-/// (inspired by Modular `GraphCompiler/lib/MGPDialect/Transforms/FixupOverhangsPass.cpp`).
+/// and recording `castforge.awaited_hanging_chains` on the terminator.
 ///
 /// Matching `FixupOverhangsPass`: at most one unused result per hanging op is collected ("A
 /// failing op sets all its results to error, so one per op suffices"). Returns the total number of
@@ -1143,10 +1125,7 @@ pub fn await_hanging_effect_chains(module: &mut Module) -> usize {
 
 /// Eliminates direct dependency edges of each node in `dag_edges` (`dag_edges[u]` = list of
 /// prerequisite nodes that `u` depends on) that are transitively implied by `u`'s other
-/// prerequisites (`u -> w ->+ v`), using a cycle-safe breadth-first generation walk
-/// (inspired by Modular
-/// `GraphCompiler/lib/MGPDialect/Transforms/SimplifyDeviceGraphDependenciesPass.cpp`
-/// `eliminateImpliedDependencies`).
+/// prerequisites (`u -> w ->+ v`), using a cycle-safe breadth-first generation walk.
 ///
 /// Returns `(reduced_dag_edges, num_eliminated_edges)`.
 pub fn eliminate_implied_dependencies(dag_edges: &[Vec<usize>]) -> (Vec<Vec<usize>>, usize) {
@@ -1218,10 +1197,7 @@ pub(super) fn extract_int_list_attr(op: &Operation, key: &str) -> Option<Vec<i64
 }
 
 /// Coalesces groups of `stablehlo.slice` operations that partition a single static axis of a
-/// common input tensor with unit stride (`step == 1`) into a unified split specification
-/// (inspired by Modular
-/// `GraphCompiler/include/GraphCompiler/MOGGDialect/Support/SplitSlicePatterns.h`
-/// `SliceToSplitPattern`).
+/// common input tensor with unit stride (`step == 1`) into a unified split specification.
 ///
 /// Verifies that:
 /// 1. At least 2 `stablehlo.slice` ops consume the same input tensor `X`,
@@ -1390,8 +1366,7 @@ pub fn coalesce_partitioning_slices_to_split(module: &mut Module) -> usize {
 
 /// Returns `Some(axis)` if reshaping from `input_dims` to `output_dims` drops exactly one size-1
 /// dimension at `axis` while leaving all other (static, symbolic, or dynamic) dimensions
-/// unchanged (inspired by Modular `GraphCompiler/lib/MODialect/Patterns/ShapeOpSinking.cpp`
-/// `findSqueezeAxis`).
+/// unchanged.
 pub fn find_squeeze_axis(input_dims: &[Dim], output_dims: &[Dim]) -> Option<usize> {
     if input_dims.len() != output_dims.len() + 1 {
         return None;
@@ -1418,8 +1393,7 @@ pub fn find_unsqueeze_axis(input_dims: &[Dim], output_dims: &[Dim]) -> Option<us
 }
 
 /// Annotates `stablehlo.reshape` operations that drop or insert a single size-1 dimension with
-/// `castforge.squeeze_axis` or `castforge.unsqueeze_axis`
-/// (inspired by Modular `GraphCompiler/lib/MODialect/Patterns/ShapeOpSinking.cpp`).
+/// `castforge.squeeze_axis` or `castforge.unsqueeze_axis`.
 ///
 /// Returns the number of squeeze/unsqueeze reshapes annotated.
 pub fn annotate_squeeze_unsqueeze_reshapes(module: &mut Module) -> usize {

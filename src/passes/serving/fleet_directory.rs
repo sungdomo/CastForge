@@ -1,13 +1,14 @@
 //! Coordinator key directory, FDP slot management, and algebraic sink/swim passes.
 
-#[allow(unused_imports)]
-use super::*;
+use super::{
+    CacheEventTier, analyze_static_reshape_dim_mapping, extract_int_list_attr,
+    extract_single_int_attr, map_axis_through_static_reshape,
+};
 use crate::ir::{Attribute, Dim, Module, OpId, OpName, TensorType, Type, ValueDef, ValueId};
 use indexmap::{IndexMap, IndexSet};
 use smallvec::SmallVec;
 
-/// Cache event operation kind applied to [`CoordinatorKeyDirectory`]
-/// (inspired by LMCache `lmcache/v1/mp_coordinator/api.py` `CacheEventType`).
+/// Cache event operation kind applied to [`CoordinatorKeyDirectory`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheEventOpKind {
     /// Inserts or updates a placement for the key.
@@ -18,8 +19,7 @@ pub enum CacheEventOpKind {
     Access,
 }
 
-/// Live placement of a cached key in the fleet directory
-/// (inspired by LMCache `lmcache/v1/mp_coordinator/views/key_directory.py` `Placement`).
+/// Live placement of a cached key in the fleet directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlacementRecord {
     /// Reporting worker instance identifier.
@@ -53,8 +53,7 @@ pub(super) struct KeyDirectoryRecord {
 }
 
 /// Fleet-wide key directory with incremental tier byte accounting and `O(|l1_keys(instance)|)`
-/// reverse-indexed L1 instance fencing
-/// (inspired by LMCache `lmcache/v1/mp_coordinator/views/key_directory.py` `KeyDirectory`).
+/// reverse-indexed L1 instance fencing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CoordinatorKeyDirectory {
     directory: IndexMap<u64, KeyDirectoryRecord>,

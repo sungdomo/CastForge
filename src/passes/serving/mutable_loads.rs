@@ -1,7 +1,5 @@
 //! ARC eviction, FP8 codecs, mutable load fusion, and binary trace stream codecs.
 
-#[allow(unused_imports)]
-use super::*;
 use crate::ir::{
     Attribute, BlockId, DType, Module, OpId, OpName, Operation, Type, Value, ValueDef, ValueId,
 };
@@ -10,8 +8,7 @@ use smallvec::SmallVec;
 
 // ============================================================================
 // Polynomial Rolling-Hash Window Matcher & Coordinator Blend Content Index
-// (inspired by LMCache `lmcache/v1/mp_coordinator/blend_index.py` and
-//  `lmcache/v1/multiprocess/token_hasher.py`)
+//
 // ============================================================================
 
 /// Fleet-constant 64-bit odd polynomial base for CacheBlend rolling-hash content indexing.
@@ -352,7 +349,7 @@ impl BlendContentFingerprintIndex {
 }
 
 // ============================================================================
-// Batch 17 Step 2: FP8 E4M3FN Quantization Codec & Multi-Output Serde Group Planner
+// FP8 E4M3FN Quantization Codec & Multi-Output Serde Group Planner
 // ============================================================================
 
 /// Maximum finite positive value representable in `float8_e4m3fn` (`(1 + 6/8) * 2^8 = 448.0`).
@@ -555,7 +552,7 @@ impl MultiSerdeGroupSchema {
 }
 
 // ============================================================================
-// Batch 17 Step 3: Mutable Load Parallelizer & Exclusive-Chain Kernel Fuser
+// Mutable Load Parallelizer & Exclusive-Chain Kernel Fuser
 // ============================================================================
 
 /// Returns `true` if `op_name` is a kernel eligible to fuse an `mo.mutable.load` buffer directly.
@@ -935,7 +932,7 @@ pub fn fuse_mutable_loads_into_kernels(module: &mut Module) -> usize {
 }
 
 // ============================================================================
-// Batch 17 Step 4: Bidirectional Tensor Layout Inference & Conflict Detector
+// Bidirectional Tensor Layout Inference & Conflict Detector
 // ============================================================================
 
 /// Returns the tensor rank of `ty` if it is a ranked `Type::Tensor`.
@@ -1101,7 +1098,7 @@ pub fn infer_and_propagate_tensor_layouts(
 }
 
 // ============================================================================
-// Batch 17 Step 5: Bottom-Up Call-Graph Slot-Index Globalizer
+// Bottom-Up Call-Graph Slot-Index Globalizer
 // ============================================================================
 
 /// Extracts a non-negative integer attribute (handling both `Attribute::Int` and typed integer
@@ -1305,7 +1302,7 @@ pub fn globalize_call_graph_slot_indices(
 }
 
 // ============================================================================
-// Batch 18 Step 1: L1/L2 Store Policy Planner & Binary Trace Stream Codec
+// L1/L2 Store Policy Planner & Binary Trace Stream Codec
 // ============================================================================
 
 /// Magic bytes at the start of every binary observability trace stream.
