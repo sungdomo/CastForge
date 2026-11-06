@@ -7,26 +7,34 @@
 //! (`OrchestratorReplyWindow`), pre-prefetch KV load policy (`KvLoadPolicy`), and multi-field
 //! object group framing (`ObjectGroupFrame`).
 
+use std::collections::BTreeMap;
+
 use castforge::ir::{
     Attribute, Block, BlockId, DType, Dim, Location, Module, OpId, OpName, Operation, Region,
     TensorType, Type, Value, ValueDef, ValueId,
 };
 use castforge::passes::serving::{
     AdapterLifecycleController, AdapterLifecycleState, AsyncDataflowAnalysis,
-    AsyncEngineDrivenStoreCoordinator, AsyncLaunchDispatch, CacheControlObjectService,
-    CacheDeleteTier, DebugAllocPoisonTracker, ExtentSpec, KvLoadContext, L1ManagerTargetSpec,
-    L1WritePolicy, ObjectFieldSpec, ObjectGroupFrame, OrchestratorReplyWindow, PhysicalMemoryRange,
+    AsyncEngineDrivenStoreCoordinator, AsyncLaunchDispatch, BinaryTraceRecorder,
+    CacheControlObjectService, CacheDeleteTier, DebugAllocPoisonTracker, DynamicPageStorageAgent,
+    ExtentSpec, KvLoadContext, L1ManagerTargetSpec, L1WritePolicy, NonBlockingXferReport,
+    ObjectFieldSpec, ObjectGroupFrame, OrchestratorReplyWindow, PageXferState, PhysicalMemoryRange,
     RDMA_GET_MISS, REGION_CONTRACT_VERSION, RdmaArenaWindowPool, RegionContract,
     RelocatablePipelineKeyOptions, ReplyWindowOutcome, RowwiseReductionMonoid,
-    SelectionFileVersion, SharedRegionState, StagingBufferSignature, WriteReserveStatus,
-    ZERO_FILL_PATTERN, classify_view_foreach, collect_sorted_graph_devices,
-    compute_relocatable_module_cache_key, evaluate_kv_load_policy, fill_poison_buffer,
-    finalize_device_graphs, form_graph_blobs, fuse_view_producers, get_poison_pattern_for_dtype,
+    SelectionFileVersion, SharedRegionState, StagingBufferSignature, StorageObjectKey, TraceValue,
+    TransferPhaseTimingSampler, WarmPrefetchOnceStatus, WarmPrefetchService,
+    WarmPrefetchSubmitResult, WriteReserveStatus, ZERO_FILL_PATTERN,
+    canonicalize_kernel_stubs_for_merge, classify_view_foreach, collect_sorted_graph_devices,
+    compute_relocatable_module_cache_key, deduplicate_kernel_stubs_bottom_up,
+    evaluate_kv_load_policy, fill_poison_buffer, finalize_device_graphs, fixup_overhang_chains,
+    form_graph_blobs, fuse_view_producers, get_poison_pattern_for_dtype, inline_mgp_calls,
     is_compatible_shape, legalize_rmo_ops, lower_graph_to_mgp_model, lower_map_kernels_to_routines,
     lower_primitives_to_async_routines, lower_tensor_ops_to_map_kernels,
     normalize_call_operands_to_callee, optimize_async_dataflow_dependencies,
-    optimize_symbolic_dims, promote_rmo_dtypes, remove_dead_param_declares,
+    optimize_symbolic_dims, outline_models_to_mef_callables, promote_rmo_dtypes,
+    propagate_bidirectional_tensor_layouts, remove_dead_param_declares,
     resolve_token_chunk_object_keys, select_l1_write_targets, staticize_shape_and_tensor_ops,
+    storage_object_key_to_sharded_relpath, validate_module_target_arch_dtypes,
 };
 use indexmap::IndexMap;
 use smallvec::{SmallVec, smallvec};
@@ -1714,4 +1722,307 @@ fn test_rdma_window_async_store_and_cache_control_lifecycle() {
     assert_eq!(summary.deleted_l1, 1);
     assert_eq!(summary.deleted_l2, 2);
     assert_eq!(summary.skipped_locked, vec![keys[0].clone()]);
+}
+
+#[test]
+fn test_model_inlining_outlining_and_overhang_chain_fixup_pipeline() {
+    let mut module = Module::new(Some("model_inlining_outlining_pipeline".to_string()));
+    let root = module.body_block();
+    let ch_ty = Type::Opaque("!grt.chain".to_string());
+    let ctx_ty = Type::Opaque("!mgp.context".to_string());
+    let buf_ty = Type::Opaque("!mgp.buffer".to_string());
+
+    let sub_init = module.create_block(None);
+    let c_sub = module.add_block_argument(sub_init, None, ch_ty.clone());
+    let sub_ctx_attrs = IndexMap::from([("num_slots".to_string(), Attribute::Int(1))]);
+    push_op(
+        &mut module,
+        sub_init,
+        "mgp",
+        "context.create",
+        &[],
+        std::slice::from_ref(&ctx_ty),
+        sub_ctx_attrs,
+    );
+    let cache_attrs = IndexMap::from([("buffer_slot".to_string(), Attribute::Int(0))]);
+    push_op(
+        &mut module,
+        sub_init,
+        "mgp",
+        "buffer.cache",
+        &[c_sub],
+        std::slice::from_ref(&ch_ty),
+        cache_attrs,
+    );
+    push_op(
+        &mut module,
+        sub_init,
+        "mgp",
+        "yield",
+        &[c_sub],
+        &[],
+        IndexMap::new(),
+    );
+
+    let sub_exec = module.create_block(None);
+    let x_sub = module.add_block_argument(sub_exec, None, buf_ty.clone());
+    let ch_sub = module.add_block_argument(sub_exec, None, ch_ty.clone());
+    let exec_gen_attrs = IndexMap::from([("runtime_slot".to_string(), Attribute::Int(0))]);
+    let (_, k_res) = push_op(
+        &mut module,
+        sub_exec,
+        "mgp",
+        "execute_generic",
+        &[x_sub, ch_sub],
+        &[buf_ty.clone(), ch_ty.clone()],
+        exec_gen_attrs,
+    );
+    push_op(
+        &mut module,
+        sub_exec,
+        "mgp",
+        "yield",
+        &[k_res[0], ch_sub],
+        &[],
+        IndexMap::new(),
+    );
+
+    let main_init = module.create_block(None);
+    let c_main = module.add_block_argument(main_init, None, ch_ty.clone());
+    let main_ctx_attrs = IndexMap::from([("num_slots".to_string(), Attribute::Int(2))]);
+    let (main_ctx_op, _) = push_op(
+        &mut module,
+        main_init,
+        "mgp",
+        "context.create",
+        &[],
+        &[ctx_ty],
+        main_ctx_attrs,
+    );
+    push_op(
+        &mut module,
+        main_init,
+        "mgp",
+        "yield",
+        &[c_main],
+        &[],
+        IndexMap::new(),
+    );
+
+    let main_exec = module.create_block(None);
+    let x_main = module.add_block_argument(main_exec, None, buf_ty.clone());
+    let ch_main = module.add_block_argument(main_exec, None, ch_ty.clone());
+    let call_attrs = IndexMap::from([
+        ("callee".to_string(), Attribute::String("sub".to_string())),
+        (
+            "prefix".to_string(),
+            Attribute::String("layer0.".to_string()),
+        ),
+    ]);
+    let (_, call_res) = push_op(
+        &mut module,
+        main_exec,
+        "mgp",
+        "call",
+        &[x_main, ch_main],
+        &[buf_ty, ch_ty],
+        call_attrs,
+    );
+    push_op(
+        &mut module,
+        main_exec,
+        "mgp",
+        "yield",
+        &[call_res[0], call_res[1]],
+        &[],
+        IndexMap::new(),
+    );
+
+    for (name, is_sub, b_init, b_exec) in [
+        ("sub", true, sub_init, sub_exec),
+        ("main", false, main_init, main_exec),
+    ] {
+        let r_i = module.create_region(vec![b_init]);
+        let r_e = module.create_region(vec![b_exec]);
+        let attrs = IndexMap::from([
+            ("sym_name".to_string(), Attribute::String(name.to_string())),
+            ("is_subgraph".to_string(), Attribute::Bool(is_sub)),
+        ]);
+        module.add_operation(
+            root,
+            OpName::new("mgp", "model"),
+            smallvec![],
+            vec![],
+            attrs,
+            vec![r_i, r_e],
+            false,
+            Location::Unknown,
+        );
+    }
+
+    assert_eq!(inline_mgp_calls(&mut module).expect("inline mgp.call"), 1);
+    assert_eq!(
+        module.ops[main_ctx_op].attributes.get("num_slots"),
+        Some(&Attribute::Int(3))
+    );
+    assert!(fixup_overhang_chains(&mut module) >= 1);
+    let outlined = outline_models_to_mef_callables(&mut module).expect("outline to mef");
+    assert_eq!(outlined.len(), 1);
+    assert_eq!(outlined[0].init_callable_name, "main$init");
+    assert_eq!(outlined[0].exec_callable_name, "main$exec");
+}
+
+#[test]
+fn test_stub_merge_compiled_routine_lowering_and_layout_inference() {
+    let mut module = Module::new(Some("stub_merge_and_layout_pipeline".to_string()));
+    let root = module.body_block();
+
+    for (sym, ordinal, dim_name) in [("kern_b", 2, "batch_b"), ("kern_a", 1, "batch_a")] {
+        let b = module.create_block(None);
+        let d_attrs = IndexMap::from([
+            (
+                "device_ref".to_string(),
+                Attribute::String(format!("gpu:{ordinal}")),
+            ),
+            (
+                "shape_attr".to_string(),
+                Attribute::Array(vec![Attribute::String(dim_name.to_string())]),
+            ),
+        ]);
+        push_op(&mut module, b, "mogg", "op", &[], &[], d_attrs);
+        let reg = module.create_region(vec![b]);
+        let f_attrs =
+            IndexMap::from([("sym_name".to_string(), Attribute::String(sym.to_string()))]);
+        module.add_operation(
+            root,
+            OpName::new("mogg", "func"),
+            smallvec![],
+            vec![],
+            f_attrs,
+            vec![reg],
+            false,
+            Location::Unknown,
+        );
+    }
+
+    assert_eq!(canonicalize_kernel_stubs_for_merge(&mut module), 2);
+    assert_eq!(deduplicate_kernel_stubs_bottom_up(&mut module), 1);
+
+    let b_layout = module.create_block(None);
+    let t4 = tensor_ty(DType::BF16, &[1, 64, 28, 28]);
+    let x = module.add_block_argument(b_layout, None, t4.clone());
+    let w = module.add_block_argument(b_layout, None, t4.clone());
+    let conv_attrs = IndexMap::from([(
+        "device_ref".to_string(),
+        Attribute::String("gpu:0".to_string()),
+    )]);
+    push_op(
+        &mut module,
+        b_layout,
+        "mo",
+        "conv",
+        &[x, w],
+        &[t4],
+        conv_attrs,
+    );
+    let r_layout = module.create_region(vec![b_layout]);
+    module.add_operation(
+        root,
+        OpName::new("mo", "graph"),
+        smallvec![],
+        vec![],
+        IndexMap::new(),
+        vec![r_layout],
+        false,
+        Location::Unknown,
+    );
+
+    assert_eq!(
+        propagate_bidirectional_tensor_layouts(&mut module).expect("infer layouts"),
+        2
+    );
+    validate_module_target_arch_dtypes(&module, "x86_64-unknown-linux-gnu")
+        .expect("validate dtypes");
+}
+
+#[test]
+fn test_dynamic_page_agent_warm_prefetch_and_binary_trace_pipeline() {
+    let key = StorageObjectKey {
+        model_name: "meta/qwen-72b".to_string(),
+        kv_rank: 3,
+        object_group_id: 1,
+        chunk_hash_hex: "123456789abcdef0".to_string(),
+        cache_salt: "tenant_x".to_string(),
+    };
+    assert_eq!(
+        storage_object_key_to_sharded_relpath(&key).expect("sharded relpath"),
+        "12/34/meta--qwen-72b_3_1_123456789abcdef0@tenant_x.bin"
+    );
+
+    let mut agent =
+        DynamicPageStorageAgent::new("cuda:0", "GDS", 0x1000, 0x4000, 0x1000).expect("agent init");
+    assert_eq!(agent.mem_type(), "VRAM");
+    agent
+        .dynamic_store(&key, vec![vec![0xAB; 16]])
+        .expect("dynamic store");
+    assert_eq!(agent.get_stored_size(&key), Some(16));
+    let xfer = agent
+        .post_non_blocking(
+            PageXferState::InProgress,
+            &[PageXferState::InProgress, PageXferState::Done],
+        )
+        .expect("spin completion");
+    assert_eq!(
+        xfer,
+        NonBlockingXferReport {
+            spin_checks: 2,
+            backoff_sleeps: 0
+        }
+    );
+
+    let mut prefetch = WarmPrefetchService::new();
+    prefetch.register_model_layout("qwen-72b", 4, 2, 1);
+    let WarmPrefetchSubmitResult::Submitted { request_id, chunks } = prefetch
+        .submit("qwen-72b", 4, &[10, 20, 30, 40], "l2", "l1")
+        .expect("submit prefetch")
+    else {
+        panic!("expected Submitted");
+    };
+    assert_eq!(chunks, 2);
+    assert_eq!(
+        prefetch.status(&request_id).expect("pending status"),
+        WarmPrefetchOnceStatus::Pending
+    );
+    assert!(prefetch.complete_job(&request_id, vec![3, 4]));
+    assert_eq!(
+        prefetch.status(&request_id).expect("first completed poll"),
+        WarmPrefetchOnceStatus::Completed {
+            found_keys: 7,
+            total_keys: 8
+        }
+    );
+    // Second poll after completion is Unknown (Err).
+    assert!(prefetch.status(&request_id).is_err());
+
+    let mut recorder = BinaryTraceRecorder::new("FULL", true, 1_000_000);
+    let mut cfg = BTreeMap::new();
+    cfg.insert("backend".to_string(), "GDS".to_string());
+    recorder.attach_storage_config(&cfg);
+    let mut args = BTreeMap::new();
+    args.insert(
+        "shape".to_string(),
+        TraceValue::Tuple(vec![TraceValue::Int(8), TraceValue::Int(128)]),
+    );
+    recorder.write_record("serving.mp.store", &args, 1_005_000);
+    recorder.close();
+    let frames = recorder.read_frames();
+    assert_eq!(frames.len(), 2);
+    assert!(frames[0].starts_with("HDR|magic=CFTR|level=FULL|"));
+    assert!(frames[1].contains("fn=serving.mp.store"));
+
+    let mut sampler = TransferPhaseTimingSampler::new(true);
+    sampler.record_native_sample("gpu_gather", 120);
+    sampler.on_transfer_end("req_99");
+    assert_eq!(sampler.published_events().len(), 1);
+    assert_eq!(sampler.published_events()[0].samples.len(), 1);
 }
