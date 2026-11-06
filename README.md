@@ -98,7 +98,7 @@ CastForge/
 ├── config/             # Pass catalog (`passes.toml`) & hardware profiles (`targets.toml`)
 ├── docs/               # Architecture (`DESIGN.md`) and pass reference (`PASSES.md`)
 ├── examples/           # Sample `.mlir` workloads and pipeline configs
-├── tests/              # 13 integration, property, fuzz, negative, and scaling test suites
+├── tests/              # 14 integration, property, fuzz, negative, and scaling test suites
 └── benches/            # Compiler micro-benchmark suite (`compiler_bench.rs`)
 ```
 
