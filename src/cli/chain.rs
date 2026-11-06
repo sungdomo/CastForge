@@ -631,4 +631,84 @@ mod tests {
         assert_eq!(tcat.arch_profile.len(), 11);
         assert_eq!(tcat.translator.len(), 21);
     }
+
+    #[test]
+    fn test_phase4_ffi_safetensors_inliner_and_pass_options() {
+        use crate::ffi::{castforge_free_string, castforge_optimize_mlir};
+        use crate::ir::TensorStore;
+        use crate::passes::PassManager;
+        use std::ffi::CString;
+
+        let reg = PassRegistry::with_builtin_passes();
+        // 1. Unrecognized option on a pass with documented options must return Err
+        assert!(PassManager::from_pipeline_str(&reg, "quantize(unknown_opt_xyz=1)").is_err());
+
+        // 2. SafeTensors duplicate key and unaligned F32/F16 byte length rejection
+        let make_st = |hdr: &str, body_len: usize| -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&(hdr.len() as u64).to_le_bytes());
+            out.extend_from_slice(hdr.as_bytes());
+            out.resize(8 + hdr.len() + body_len, 0u8);
+            out
+        };
+        let dup_hdr = concat!(
+            r#"{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"#,
+            r#""w":{"dtype":"F32","shape":[1],"data_offsets":[4,8]}}"#,
+        );
+        assert!(TensorStore::from_safetensors_bytes(&make_st(dup_hdr, 8)).is_err());
+
+        let overlap_hdr = concat!(
+            r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"#,
+            r#""b":{"dtype":"F32","shape":[1],"data_offsets":[2,6]}}"#,
+        );
+        assert!(TensorStore::from_safetensors_bytes(&make_st(overlap_hdr, 8)).is_err());
+
+        let unaligned_f32_hdr = r#"{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,5]}}"#;
+        assert!(TensorStore::from_safetensors_bytes(&make_st(unaligned_f32_hdr, 8)).is_err());
+
+        let unaligned_f16_hdr = r#"{"w":{"dtype":"F16","shape":[1],"data_offsets":[0,3]}}"#;
+        assert!(TensorStore::from_safetensors_bytes(&make_st(unaligned_f16_hdr, 4)).is_err());
+
+        // 3. Mutual recursion cycle is safely skipped by inline-calls
+        let mut_rec_src = concat!(
+            "module @mut_rec {\n",
+            "  func.func @a(%x: tensor<2xf32>) -> tensor<2xf32> {\n",
+            "    %y = func.call @b(%x) : (tensor<2xf32>) -> tensor<2xf32>\n",
+            "    func.return %y : tensor<2xf32>\n",
+            "  }\n",
+            "  func.func @b(%x: tensor<2xf32>) -> tensor<2xf32> {\n",
+            "    %y = func.call @a(%x) : (tensor<2xf32>) -> tensor<2xf32>\n",
+            "    func.return %y : tensor<2xf32>\n",
+            "  }\n",
+            "}\n",
+        );
+        let mut rec_mod = crate::ir::parse_mlir(mut_rec_src).unwrap();
+        let mut pm = PassManager::from_pipeline_str(&reg, "inline-calls").unwrap();
+        pm.max_iterations = 8;
+        let res = pm.run(&mut rec_mod).unwrap();
+        assert!(!res[0].changed);
+
+        // 4. FFI zero-initializes output pointers even on error
+        let bad_cstr = CString::new("invalid mlir").unwrap();
+        let spec_cstr = CString::new("cse").unwrap();
+        let mut out_mlir: *mut std::ffi::c_char = std::ptr::dangling_mut();
+        let mut out_tel: *mut std::ffi::c_char = std::ptr::dangling_mut();
+        let mut out_err: *mut std::ffi::c_char = std::ptr::null_mut();
+        let rc = unsafe {
+            castforge_optimize_mlir(
+                bad_cstr.as_ptr(),
+                spec_cstr.as_ptr(),
+                &mut out_mlir,
+                &mut out_tel,
+                &mut out_err,
+            )
+        };
+        assert_ne!(rc, 0);
+        assert!(out_mlir.is_null());
+        assert!(out_tel.is_null());
+        assert!(!out_err.is_null());
+        unsafe {
+            castforge_free_string(out_err);
+        }
+    }
 }

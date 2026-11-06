@@ -520,15 +520,16 @@ impl PassRegistry {
                     bad.join(", ")
                 ));
             }
-            for k in opts.keys() {
+            let accepts_dim_bindings = matches!(name, "specialize-shapes" | "O3");
+            for (k, v) in opts {
                 let in_catalog = cat.options.iter().any(|o| o.name == *k);
-                if !in_catalog && !is_known_pass_option_alias(k) {
+                let is_dim_binding = accepts_dim_bindings && v.parse::<i64>().is_ok();
+                if !in_catalog && !is_known_pass_option_alias(k) && !is_dim_binding {
                     let valid: Vec<&str> = cat.options.iter().map(|o| o.name.as_str()).collect();
-                    eprintln!(
-                        "[castforge:warn] pass `{name}`: unrecognized option `{k}` \
-                         (documented options: {})",
+                    return Err(anyhow!(
+                        "Pass `{name}`: unrecognized option `{k}` (documented options: {})",
                         valid.join(", ")
-                    );
+                    ));
                 }
             }
         }
@@ -584,8 +585,92 @@ fn is_known_pass_option_alias(key: &str) -> bool {
             | "num_devices"
             | "devices"
             | "num_streams"
+            | "streams"
+            | "ring_size"
+            | "stages"
+            | "microbatches"
+            | "lr"
             | "opt"
             | "wd"
+            | "min_distance"
+            | "min_span"
+            | "l2_size"
+            | "reg_tile"
+            | "tensor_cores"
+            | "arch"
+            | "args"
+            | "outline"
+            | "rename_op"
+            | "symbols"
+            | "gvn"
+            | "layout"
+            | "method"
+            | "kv_lora_rank"
+            | "kv_format"
+            | "page_block_size"
+            | "window_size"
+            | "max_seq_len"
+            | "max_steps"
+            | "split_kv"
+            | "state_dim"
+            | "chunk_size"
+            | "capacity_factor"
+            | "top_k"
+            | "share_every"
+            | "drop_rate"
+            | "sparsity"
+            | "salient_ratio"
+            | "awq_salient"
+            | "clamp_max"
+            | "alpha"
+            | "lambda"
+            | "eps"
+            | "bits"
+            | "group_size"
+            | "filter"
+            | "prefix"
+            | "value"
+            | "buckets"
+            | "token_prune_ratio"
+            | "stride"
+            | "all"
+            | "annotate_op"
+            | "attributes"
+            | "batch"
+            | "coalesce"
+            | "conditional"
+            | "debuginfo"
+            | "decompose"
+            | "dedup"
+            | "egraph"
+            | "equiv"
+            | "fold_constants"
+            | "fuse_fma"
+            | "hadamard"
+            | "hash"
+            | "hoist_constants"
+            | "instrument"
+            | "isa"
+            | "licm"
+            | "lower_conv"
+            | "min_memory"
+            | "optimizer"
+            | "order"
+            | "profile"
+            | "propagate"
+            | "ratio"
+            | "reg_m"
+            | "reg_n"
+            | "sanitize"
+            | "scheme"
+            | "shapes"
+            | "shared_expert"
+            | "ssa"
+            | "t"
+            | "tol"
+            | "toposort"
+            | "unfreeze"
+            | "weight_decay"
             | "tile_size"
             | "tile"
             | "tile_m"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import ctypes
+import ctypes.util
 import json
 import os
 import platform
@@ -18,6 +19,28 @@ def _default_lib_name() -> str:
     return "libcastforge.so"
 
 
+def _resolve_lib_path(lib_path: str | os.PathLike[str] | None) -> str:
+    if lib_path is not None:
+        return str(lib_path)
+    env_path = os.environ.get("CASTFORGE_LIB_PATH")
+    if env_path:
+        return env_path
+    lib_name = _default_lib_name()
+    pkg_dir = Path(__file__).resolve().parent
+    bundled = pkg_dir / lib_name
+    if bundled.exists():
+        return str(bundled)
+    repo_root = pkg_dir.parents[1]
+    rel_candidate = repo_root / "target" / "release" / lib_name
+    if rel_candidate.exists():
+        return str(rel_candidate)
+    dbg_candidate = repo_root / "target" / "debug" / lib_name
+    if dbg_candidate.exists():
+        return str(dbg_candidate)
+    found = ctypes.util.find_library("castforge")
+    return found if found else lib_name
+
+
 class CastForgeError(RuntimeError):
     """Raised when a CastForge compilation or optimization call fails."""
 
@@ -26,12 +49,7 @@ class CastForge:
     """High-level Python SDK wrapper around the CastForge C ABI (`libcastforge`)."""
 
     def __init__(self, lib_path: str | os.PathLike[str] | None = None) -> None:
-        if lib_path is None:
-            repo_root = Path(__file__).resolve().parents[2]
-            rel_candidate = repo_root / "target" / "release" / _default_lib_name()
-            dbg_candidate = repo_root / "target" / "debug" / _default_lib_name()
-            lib_path = rel_candidate if rel_candidate.exists() else dbg_candidate
-        self._lib = ctypes.CDLL(str(lib_path))
+        self._lib = ctypes.CDLL(_resolve_lib_path(lib_path))
 
         self._lib.castforge_version.argtypes = []
         self._lib.castforge_version.restype = ctypes.c_char_p
@@ -85,10 +103,13 @@ class CastForge:
             ctypes.byref(out_err),
         )
         if rc != 0:
+            self._take_string(out_mlir)
+            self._take_string(out_tel)
             err_msg = self._take_string(out_err)
             raise CastForgeError(err_msg or f"castforge_optimize_mlir failed (rc={rc})")
         opt_text = self._take_string(out_mlir)
         tel_text = self._take_string(out_tel)
+        self._take_string(out_err)
         return opt_text, json.loads(tel_text) if tel_text else []
 
     def compile(
@@ -105,6 +126,8 @@ class CastForge:
             ctypes.byref(out_err),
         )
         if rc != 0:
+            self._take_string(out_code)
             err_msg = self._take_string(out_err)
             raise CastForgeError(err_msg or f"castforge_compile_mlir failed (rc={rc})")
+        self._take_string(out_err)
         return self._take_string(out_code)

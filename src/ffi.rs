@@ -50,6 +50,11 @@ pub unsafe extern "C" fn castforge_optimize_mlir(
     out_telemetry_json: *mut *mut c_char,
     out_error: *mut *mut c_char,
 ) -> i32 {
+    unsafe {
+        init_out_ptr(out_mlir);
+        init_out_ptr(out_telemetry_json);
+        init_out_ptr(out_error);
+    }
     let result = catch_unwind(AssertUnwindSafe(|| unsafe {
         optimize_mlir_inner(input_mlir, pipeline_spec, out_mlir, out_telemetry_json)
     }));
@@ -85,6 +90,10 @@ pub unsafe extern "C" fn castforge_compile_mlir(
     out_code: *mut *mut c_char,
     out_error: *mut *mut c_char,
 ) -> i32 {
+    unsafe {
+        init_out_ptr(out_code);
+        init_out_ptr(out_error);
+    }
     let result = catch_unwind(AssertUnwindSafe(|| unsafe {
         compile_mlir_inner(input_mlir, pipeline_spec, target_name, out_code)
     }));
@@ -183,6 +192,14 @@ fn build_pass_manager(spec: &str) -> Result<PassManager, String> {
         return Ok(PassManager::new());
     }
     PassManager::from_pipeline_str(&reg, spec).map_err(|e| e.to_string())
+}
+
+unsafe fn init_out_ptr(dst: *mut *mut c_char) {
+    if !dst.is_null() {
+        unsafe {
+            *dst = std::ptr::null_mut();
+        }
+    }
 }
 
 unsafe fn write_c_string(dst: *mut *mut c_char, text: &str) {

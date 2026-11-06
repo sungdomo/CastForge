@@ -161,18 +161,39 @@ impl Pass for InlineCallsPass {
         let mut created = 0usize;
 
         let mut func_map: HashMap<String, OpId> = HashMap::new();
+        let mut block_to_fn_name: HashMap<BlockId, String> = HashMap::new();
+        let mut call_edges: HashMap<String, HashSet<String>> = HashMap::new();
         for fn_op_id in module.functions() {
             if let Some(name) = module.ops[fn_op_id]
                 .attributes
                 .get("sym_name")
                 .and_then(|a| a.as_str())
+                .map(str::to_string)
             {
-                func_map.insert(name.to_string(), fn_op_id);
+                func_map.insert(name.clone(), fn_op_id);
+                let mut callees = HashSet::new();
+                for &reg_id in &module.ops[fn_op_id].regions {
+                    for &blk_id in &module.regions[reg_id].blocks {
+                        block_to_fn_name.insert(blk_id, name.clone());
+                        for &op_id in &module.blocks[blk_id].ops {
+                            if module.ops[op_id].is_op("func", "call")
+                                && let Some(c) = module.ops[op_id]
+                                    .attributes
+                                    .get("callee")
+                                    .and_then(|a| a.as_str())
+                            {
+                                callees.insert(c.to_string());
+                            }
+                        }
+                    }
+                }
+                call_edges.insert(name, callees);
             }
         }
 
         let blocks: Vec<BlockId> = module.blocks.keys().collect();
         for block_id in blocks {
+            let caller_fn_name = block_to_fn_name.get(&block_id).cloned();
             let ops = module.block_ops(block_id);
             for call_op_id in ops {
                 let Some(call_op) = module.ops.get(call_op_id).cloned() else {
@@ -191,6 +212,13 @@ impl Pass for InlineCallsPass {
                 let callee_reg = module.ops[callee_fn_id].regions[0];
                 let callee_block = module.regions[callee_reg].blocks[0];
                 if callee_block == block_id {
+                    continue;
+                }
+                if callee_reaches_caller_or_exceeds_depth(
+                    &call_edges,
+                    callee_name,
+                    caller_fn_name.as_deref(),
+                ) {
                     continue;
                 }
 
@@ -284,6 +312,38 @@ impl Pass for InlineCallsPass {
             ops_created: created,
         })
     }
+}
+
+const MAX_INLINE_DEPTH: usize = 32;
+
+fn callee_reaches_caller_or_exceeds_depth(
+    call_edges: &HashMap<String, HashSet<String>>,
+    callee: &str,
+    caller: Option<&str>,
+) -> bool {
+    let mut visited = HashSet::new();
+    let mut stack = vec![(callee, 1usize)];
+    while let Some((curr, depth)) = stack.pop() {
+        if depth > MAX_INLINE_DEPTH {
+            return true;
+        }
+        if let Some(target) = caller
+            && curr == target
+        {
+            return true;
+        }
+        if let Some(next_set) = call_edges.get(curr) {
+            for next in next_set {
+                if next == callee || caller.is_some_and(|t| next == t) {
+                    return true;
+                }
+                if visited.insert(next.as_str()) {
+                    stack.push((next.as_str(), depth + 1));
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Unified Subgraph Extractor & Delta IR Reducer Pass (`extract-subgraph`).

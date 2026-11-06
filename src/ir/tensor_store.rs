@@ -599,10 +599,10 @@ impl TensorStore {
         let header_slice = &bytes[8..data_start];
         let body_slice = &bytes[data_start..];
 
-        let raw_map: IndexMap<String, serde_json::Value> = serde_json::from_slice(header_slice)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let raw_map = parse_safetensors_header_map(header_slice)?;
 
         let mut loaded = 0usize;
+        let mut seen_ranges: Vec<(usize, usize)> = Vec::new();
         for (name, val) in raw_map {
             if name == "__metadata__" {
                 continue;
@@ -615,6 +615,15 @@ impl TensorStore {
                     io::ErrorKind::UnexpectedEof,
                     format!("Invalid data_offsets [{start}, {end}] for tensor `{name}`"),
                 ));
+            }
+            if start < end && seen_ranges.iter().any(|&(s, e)| start < e && s < end) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Overlapping data_offsets [{start}, {end}] for tensor `{name}`"),
+                ));
+            }
+            if start < end {
+                seen_ranges.push((start, end));
             }
             let mut shape = Vec::with_capacity(hdr.shape.len());
             let mut elem_prod = 1i64;
@@ -643,6 +652,15 @@ impl TensorStore {
 
             match hdr.dtype.as_str() {
                 "F32" => {
+                    if !slice.len().is_multiple_of(4) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "F32 tensor `{name}` byte length {} is not a multiple of 4",
+                                slice.len()
+                            ),
+                        ));
+                    }
                     let vals: Vec<f32> = slice
                         .as_chunks::<4>()
                         .0
@@ -654,6 +672,15 @@ impl TensorStore {
                     loaded += 1;
                 }
                 "F16" => {
+                    if !slice.len().is_multiple_of(2) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "F16 tensor `{name}` byte length {} is not a multiple of 2",
+                                slice.len()
+                            ),
+                        ));
+                    }
                     let vals: Vec<f32> = slice
                         .as_chunks::<2>()
                         .0
@@ -665,6 +692,15 @@ impl TensorStore {
                     loaded += 1;
                 }
                 "BF16" => {
+                    if !slice.len().is_multiple_of(2) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "BF16 tensor `{name}` byte length {} is not a multiple of 2",
+                                slice.len()
+                            ),
+                        ));
+                    }
                     let vals: Vec<f32> = slice
                         .as_chunks::<2>()
                         .0
@@ -763,11 +799,16 @@ impl TensorStore {
         }
         let mut header_bytes = vec![0u8; header_len as usize];
         file.read_exact(&mut header_bytes)?;
-        let data_base = 8u64 + header_len;
-        let raw_map: IndexMap<String, serde_json::Value> = serde_json::from_slice(&header_bytes)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let data_base = 8u64.checked_add(header_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Safetensors header offset overflow",
+            )
+        })?;
+        let raw_map = parse_safetensors_header_map(&header_bytes)?;
 
         let mut count = 0usize;
+        let mut seen_ranges: Vec<(usize, usize)> = Vec::new();
         for (name, val) in raw_map {
             if name == "__metadata__" {
                 continue;
@@ -775,13 +816,32 @@ impl TensorStore {
             let hdr: SafeTensorEntryHeader = serde_json::from_value(val)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             let [start, end] = hdr.data_offsets;
-            let abs_start = data_base.saturating_add(start as u64);
-            let abs_end = data_base.saturating_add(end as u64);
+            let abs_start = data_base.checked_add(start as u64).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Offset overflow for tensor `{name}`"),
+                )
+            })?;
+            let abs_end = data_base.checked_add(end as u64).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Offset overflow for tensor `{name}`"),
+                )
+            })?;
             if start > end || abs_end > file_len {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     format!("Out-of-bounds data_offsets for tensor `{name}`"),
                 ));
+            }
+            if start < end && seen_ranges.iter().any(|&(s, e)| start < e && s < end) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Overlapping data_offsets [{start}, {end}] for tensor `{name}`"),
+                ));
+            }
+            if start < end {
+                seen_ranges.push((start, end));
             }
             let dtype = match hdr.dtype.as_str() {
                 "F16" => DType::F16,
@@ -790,7 +850,29 @@ impl TensorStore {
                 "U8" => DType::U8,
                 _ => DType::F32,
             };
-            let shape: Vec<Dim> = hdr.shape.iter().map(|&d| Dim::Static(d as i64)).collect();
+            let mut shape = Vec::with_capacity(hdr.shape.len());
+            let mut elem_prod = 1i64;
+            for &d in &hdr.shape {
+                let di = i64::try_from(d).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Dimension {d} overflows i64 for tensor `{name}`"),
+                    )
+                })?;
+                elem_prod = elem_prod.checked_mul(di.max(1)).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Dimension product overflow for tensor `{name}`"),
+                    )
+                })?;
+                if elem_prod > TensorType::MAX_TENSOR_ELEMENTS {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Tensor `{name}` exceeds max element limit"),
+                    ));
+                }
+                shape.push(Dim::Static(di));
+            }
             self.insert(TensorEntry {
                 name,
                 ty: TensorType::new(shape, dtype),
@@ -804,4 +886,40 @@ impl TensorStore {
         }
         Ok(count)
     }
+}
+
+fn parse_safetensors_header_map(
+    header_slice: &[u8],
+) -> Result<IndexMap<String, serde_json::Value>, std::io::Error> {
+    use serde::de::{Deserializer, Error as DeError, MapAccess, Visitor};
+    use std::{fmt, io};
+
+    struct UniqueMapVisitor;
+
+    impl<'de> Visitor<'de> for UniqueMapVisitor {
+        type Value = IndexMap<String, serde_json::Value>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a JSON object with unique tensor keys")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut out = IndexMap::new();
+            while let Some((k, v)) = map.next_entry::<String, serde_json::Value>()? {
+                if out.insert(k.clone(), v).is_some() {
+                    return Err(A::Error::custom(format!(
+                        "Duplicate tensor key `{k}` in Safetensors header"
+                    )));
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    let mut de = serde_json::Deserializer::from_slice(header_slice);
+    de.deserialize_map(UniqueMapVisitor)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
