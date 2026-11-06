@@ -269,6 +269,52 @@ fn is_commutative_binary_op(op: &Operation) -> bool {
         )
 }
 
+fn format_attr_for_gvn(attr: &crate::ir::Attribute) -> String {
+    use crate::ir::Attribute;
+    use sha2::{Digest, Sha256};
+
+    match attr {
+        Attribute::DenseElements { ty, raw_literal } if raw_literal.len() > 128 => {
+            let mut hasher = Sha256::new();
+            hasher.update(raw_literal.as_bytes());
+            let digest = hasher.finalize();
+            let lo = u64::from_le_bytes(digest[0..8].try_into().unwrap_or([0; 8]));
+            let hi = u64::from_le_bytes(digest[8..16].try_into().unwrap_or([0; 8]));
+            format!(
+                "DenseElements({ty},len={},sha256={lo:016x}{hi:016x})",
+                raw_literal.len()
+            )
+        }
+        Attribute::DenseIntArray(vals) if vals.len() > 16 => {
+            let mut hasher = Sha256::new();
+            for &v in vals {
+                hasher.update(v.to_le_bytes());
+            }
+            let digest = hasher.finalize();
+            let lo = u64::from_le_bytes(digest[0..8].try_into().unwrap_or([0; 8]));
+            let hi = u64::from_le_bytes(digest[8..16].try_into().unwrap_or([0; 8]));
+            format!(
+                "DenseIntArray(len={},sha256={lo:016x}{hi:016x})",
+                vals.len()
+            )
+        }
+        Attribute::DenseF64Array(vals) if vals.len() > 16 => {
+            let mut hasher = Sha256::new();
+            for &v in vals {
+                hasher.update(v.to_bits().to_le_bytes());
+            }
+            let digest = hasher.finalize();
+            let lo = u64::from_le_bytes(digest[0..8].try_into().unwrap_or([0; 8]));
+            let hi = u64::from_le_bytes(digest[8..16].try_into().unwrap_or([0; 8]));
+            format!(
+                "DenseF64Array(len={},sha256={lo:016x}{hi:016x})",
+                vals.len()
+            )
+        }
+        other => format!("{other:?}"),
+    }
+}
+
 fn gvn_signature(
     op: &Operation,
     res_ty: &Type,
@@ -289,7 +335,7 @@ fn gvn_signature(
         .attributes
         .iter()
         .filter(|(k, _)| !k.starts_with("castforge.") && *k != "inplace_operand")
-        .map(|(k, v)| (k, format!("{v:?}")))
+        .map(|(k, v)| (k, format_attr_for_gvn(v)))
         .collect();
     attrs.sort_by(|a, b| a.0.cmp(b.0));
     format!(

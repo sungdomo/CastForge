@@ -39,7 +39,7 @@ int32_t castforge_optimize_mlir(
 
 /**
  * Compiles an MLIR text string through `pipeline_spec` and emits target code for `target_name`
- * ("rust", "c", "wgsl", "cuda", "metal", "ptx") into `*out_code`.
+ * ("rust", "c", "wgsl", "cuda", "msl", "hip", "opencl") into `*out_code`.
  *
  * Returns 0 on success or non-zero on error (writing the error message to `*out_error`).
  */

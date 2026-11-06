@@ -11,7 +11,6 @@ pub mod gemm;
 pub mod layernorm_softmax;
 pub mod loops;
 pub mod norm;
-pub use crate::passes::serving;
 
 pub use activations::*;
 pub use attention::*;
@@ -21,4 +20,3 @@ pub use gemm::*;
 pub use layernorm_softmax::*;
 pub use loops::*;
 pub use norm::*;
-pub use serving::*;

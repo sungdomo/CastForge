@@ -6,6 +6,7 @@ use crate::ir::{Attribute, DType, Dim, TensorType};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Backing storage for a weight/constant tensor in the Weight Plane (`TensorStore`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -211,7 +212,7 @@ pub fn format_dense_i8_literal(values: &[i8], shape: &[Dim]) -> String {
 /// Holds weight buffers or lazy external file references alongside the SSA Compute Graph.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TensorStore {
-    pub(crate) entries: IndexMap<String, TensorEntry>,
+    pub(crate) entries: Arc<IndexMap<String, TensorEntry>>,
 }
 
 impl TensorStore {
@@ -220,7 +221,7 @@ impl TensorStore {
     }
 
     pub fn insert(&mut self, entry: TensorEntry) {
-        self.entries.insert(entry.name.clone(), entry);
+        Arc::make_mut(&mut self.entries).insert(entry.name.clone(), entry);
     }
 
     pub fn get(&self, name: &str) -> Option<&TensorEntry> {
@@ -228,20 +229,21 @@ impl TensorStore {
     }
 
     pub fn get_mut(&mut self, name: &str) -> Option<&mut TensorEntry> {
-        self.entries.get_mut(name)
+        Arc::make_mut(&mut self.entries).get_mut(name)
     }
 
     pub fn remove(&mut self, name: &str) -> Option<TensorEntry> {
-        self.entries.shift_remove(name)
+        Arc::make_mut(&mut self.entries).shift_remove(name)
     }
 
     pub fn rename_key(&mut self, old_name: &str, new_name: String) {
         if old_name == new_name {
             return;
         }
-        if let Some(mut entry) = self.entries.shift_remove(old_name) {
+        let entries = Arc::make_mut(&mut self.entries);
+        if let Some(mut entry) = entries.shift_remove(old_name) {
             entry.name = new_name.clone();
-            self.entries.insert(new_name, entry);
+            entries.insert(new_name, entry);
         }
     }
 
@@ -257,7 +259,7 @@ impl TensorStore {
     ) -> Attribute {
         match old_attr {
             Attribute::TensorRef { key, .. } => {
-                if let Some(entry) = self.entries.get_mut(key) {
+                if let Some(entry) = Arc::make_mut(&mut self.entries).get_mut(key) {
                     entry.ty = new_ty.clone();
                     entry.backing = TensorBacking::F32Data(new_vals);
                 }
@@ -269,7 +271,7 @@ impl TensorStore {
             _ => {
                 let raw_literal = format_dense_f32_literal(&new_vals, &new_ty.shape);
                 if let Some(name) = ssa_name
-                    && let Some(entry) = self.entries.get_mut(name)
+                    && let Some(entry) = Arc::make_mut(&mut self.entries).get_mut(name)
                 {
                     entry.ty = new_ty.clone();
                     entry.backing = TensorBacking::F32Data(new_vals);
@@ -427,7 +429,7 @@ impl TensorStore {
         let mut headers: IndexMap<String, SafeTensorEntryHeader> = IndexMap::new();
         let mut data_buf: Vec<u8> = Vec::new();
 
-        for (name, entry) in &self.entries {
+        for (name, entry) in self.entries.as_ref() {
             let shape: Vec<usize> = entry
                 .ty
                 .shape

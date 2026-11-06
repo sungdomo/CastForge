@@ -1291,9 +1291,17 @@ fn read_input_text(input: Option<&PathBuf>) -> Result<String> {
         Some(path) if path.as_os_str() != "-" => {
             fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))
         }
-        _ => {
+        other => {
+            let stdin = std::io::stdin();
+            if other.is_none() && stdin.is_terminal() {
+                anyhow::bail!(
+                    "No input file specified and stdin is an interactive terminal \
+                     (pass a file path or `-` to read from stdin)"
+                );
+            }
             let mut buf = String::new();
-            std::io::stdin()
+            stdin
+                .lock()
                 .read_to_string(&mut buf)
                 .context("Failed to read from stdin")?;
             Ok(buf)
@@ -1306,7 +1314,12 @@ fn write_text_output(output: Option<&PathBuf>, content: &str) -> Result<()> {
         fs::write(out_path, content)
             .with_context(|| format!("Failed to write {}", out_path.display()))?;
     } else {
-        print!("{content}");
+        let mut stdout = std::io::stdout().lock();
+        if let Err(err) = stdout.write_all(content.as_bytes())
+            && err.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            return Err(err).context("Failed to write to stdout");
+        }
     }
     Ok(())
 }

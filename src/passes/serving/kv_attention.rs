@@ -1247,7 +1247,7 @@ pub fn compress_splat_constants(module: &mut Module, min_elements: usize) -> usi
                 module.blocks[block_id].ops.insert(pos + 1, bcast_op_id);
             }
             if let Some(k) = evicted_key {
-                module.tensor_store.entries.shift_remove(&k);
+                module.tensor_store.remove(&k);
             }
             compressed += 1;
         }

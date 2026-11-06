@@ -13,9 +13,9 @@ pipelines, inspect transformations visually, and generate dependency-free CPU an
 - **Zero C++ / LLVM Build Tax**: Pure Rust implementation (`cargo build --release` in seconds).
 - **Dual-Plane IR**: Separates symbolic graph topology (`Module`) from binary weights
   (`TensorStore`) with lazy `.safetensors` file indexing.
-- **115 Composable Passes**: 9 domain packages covering algebraic simplification, shape
+- **115 Composable Passes**: 11 domain packages covering algebraic simplification, shape
   specialization, weight merging/pruning, quantization, operator fusion, arena memory planning,
-  distributed sharding, polyhedral loop scheduling, and IR verification.
+  distributed sharding, polyhedral loop scheduling, IR verification, and LLM serving/KV-cache.
 - **Multi-Format Importers & Exporters**: Symmetric support for **MLIR / StableHLO**, **ONNX-JSON**,
   **GGUF v2/v3**, **SafeTensors**, and **HuggingFace `config.json`**.
 - **7 Codegen Backends**: Emits standalone **Rust**, **C99**, **WebGPU (WGSL)**, **NVIDIA CUDA**,
@@ -57,7 +57,7 @@ cargo run --bin castforge -- list-passes --tree
 
 ## Optimization Domains & Presets
 
-CastForge organizes its 115 passes into 9 domain packages plus 3 optimization presets (`O1`, `O2`,
+CastForge organizes its 115 passes into 11 domain packages plus 3 optimization presets (`O1`, `O2`,
 `O3`). See [**`docs/PASSES.md`**](docs/PASSES.md) for the complete pass catalog and CLI options.
 
 | Domain | Key Passes | Purpose |
@@ -65,12 +65,13 @@ CastForge organizes its 115 passes into 9 domain packages plus 3 optimization pr
 | **`canonicalize`** | `dce`, `cse`, `simplify-algebraic` | Algebraic folding, GVN/CSE, topo-sort |
 | **`shapes`** | `fold-views`, `specialize-shapes` | View folding & dynamic shape binding |
 | **`weights`** | `merge-weights`, `fold-weights`, `prune-weights` | LoRA, SLERP/TIES, 2:4 pruning |
-| **`quantize`** | `quantize`, `recast-mixed-precision` | INT8/INT4/FP8/NF4/AWQ/GPTQ PTQ |
+| **`quantize`** | `quantize`, `lower-mixed-precision` | INT8/INT4/FP8/NF4/AWQ/GPTQ PTQ |
 | **`fuse`** | `fuse-norm`, `fuse-attention`, `fuse-gemm` | RMSNorm, RoPE, SDPA, SwiGLU, epilogues |
 | **`memory`** | `optimize-memory`, `rematerialize` | In-place buffers & checkpointing |
 | **`distributed`** | `shard-distributed`, `autodiff` | SPMD sharding, ring attn, VJP autodiff |
 | **`loops`** | `schedule-loops`, `lower-conv-to-gemm` | Tiling, interchange, unroll, SIMD |
 | **`normalize`** | `verify-ir`, `reduce-ir`, `inline-calls` | Verification, bisection, IR reducer |
+| **`serving`** | KV-cache, prefix routing, device graphs | LLM serving & tiered KV storage |
 | **`registry`** | `O1`, `O2`, `O3` | Turnkey optimization pipelines |
 
 ## Supported Formats & Codegen Targets

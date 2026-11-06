@@ -72,7 +72,8 @@ pub unsafe extern "C" fn castforge_optimize_mlir(
 }
 
 /// Compiles an MLIR text string through `pipeline_spec` (or empty string for no passes) and emits
-/// source code for `target_name` (`"rust"`, `"c"`, `"wgsl"`, `"cuda"`, `"metal"`, `"ptx"`).
+/// source code for `target_name` (`"rust"`, `"c"`, `"wgsl"`, `"cuda"`, `"msl"`, `"hip"`,
+/// `"opencl"`).
 ///
 /// Returns `0` on success or a non-zero status code on failure (populating `*out_error` when
 /// non-null).

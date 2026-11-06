@@ -115,7 +115,7 @@ class CastForge:
     def compile(
         self, mlir_source: str, target: str = "rust", pipeline: str = "O2"
     ) -> str:
-        """Optimize `mlir_source` and generate code for `target` (rust/c/wgsl/cuda/metal/ptx)."""
+        """Optimize `mlir_source` and emit code for `target` (rust/c/wgsl/cuda/msl/hip/opencl)."""
         out_code = ctypes.c_void_p()
         out_err = ctypes.c_void_p()
         rc = self._lib.castforge_compile_mlir(

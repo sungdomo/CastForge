@@ -193,6 +193,7 @@ impl<P: Pass> Translator for PassTranslator<P> {
 
 /// Declarative configuration file format (`pipeline.toml` or `.json`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
     #[serde(default)]
     pub settings: PipelineSettings,
@@ -201,6 +202,7 @@ pub struct PipelineConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PipelineSettings {
     #[serde(default = "default_true")]
     pub verify_after_each_pass: bool,
@@ -225,6 +227,7 @@ impl Default for PipelineSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PassStepConfig {
     pub pass: String,
     #[serde(default)]

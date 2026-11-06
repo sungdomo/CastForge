@@ -87,9 +87,9 @@ optimizer, and multi-target code generator written in pure Rust.
   (`tensor_store.rs`), `LoopModule` (`loops.rs`), visualizers (`viz.rs`), and
   ONNX/GGUF/SafeTensors/HF formats (`formats/`).
 - **Passes ([`src/passes/`](../src/passes))**: `PassRegistry`, `PassManager`, structured
-  `PassTelemetry`, `O1`/`O2`/`O3` presets (`registry/`), and 9 domain pass packages
+  `PassTelemetry`, `O1`/`O2`/`O3` presets (`registry/`), and 10 domain pass packages
   (`canonicalize`, `shapes`, `weights`, `quantize`, `fuse`, `memory`, `distributed`, `loops`,
-  `normalize`).
+  `normalize`, `serving`).
 - **Codegen ([`src/codegen/`](../src/codegen))**: Liveness & interval-coloring arena planner
   (`memory_plan.rs`), Roofline cost model (`cost_model.rs`), reference interpreter (`eval.rs`),
   schedule autotuner (`autotune.rs`), and 7 target backends (`targets/`).

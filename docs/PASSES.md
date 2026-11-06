@@ -1,9 +1,10 @@
 # CastForge — Pass Reference (115 Graph Passes + Loop IR Optimizer)
 
 CastForge provides **115 built-in optimization, fusion, quantization, and surgery passes** across
-9 domain packages in [`src/passes/`](../src/passes) (`38` top-level/composite passes and presets +
+11 domain packages in [`src/passes/`](../src/passes) (`38` top-level/composite passes and presets +
 `77` single-optimization leaf passes), plus [`OptimizeLoopIrPass`](../src/passes/loops/opt.rs)
-(`optimize-loop-ir`) on lowered loop nests.
+(`optimize-loop-ir`) on lowered loop nests and the [`serving/`](../src/passes/serving) LLM
+inference/KV-cache/device-graph optimization suite.
 
 - **Composite Passes** (`Pass::is_composite() == true`): Orchestrate an ordered sequence of
   lower-level passes (`Pass::child_passes()`).
@@ -25,7 +26,8 @@ CastForge provides **115 built-in optimization, fusion, quantization, and surger
 | 7 | **`distributed/`** | `shard-distributed`, `autodiff`, `coalesce-all-reduce` | 6 |
 | 8 | **`loops/`** | `schedule-loops`, `lower-conv-to-gemm`, `split-large-gemm` | 6 |
 | 9 | **`normalize/`** | `normalize-ir`, `inline-calls`, `outline-subgraphs`, `verify-ir` | 15 |
-| 10 | **`registry/`** | `O1`, `O2`, `O3` (Optimization Presets) | — |
+| 10 | **`serving/`** | KV-cache codecs, prefix caching, device-graph & storage passes | — |
+| 11 | **`registry/`** | `O1`, `O2`, `O3` (Optimization Presets) | — |
 
 ---
 
@@ -115,8 +117,8 @@ CastForge provides **115 built-in optimization, fusion, quantization, and surger
     QuaRot/SpinQuant Hadamard rotations, and QAT Straight-Through Estimator nodes.
 
 ### Leaf Passes
-`quantize-weights`, `quantize-groupwise`, `quantize-fp8`, `quantize-nvfp4`,
-`convert-mixed-precision`, `calibrate-quantization`, `quantize-dynamic`, `smoothquant`,
+`quantize-weights`, `quantize-groupwise`, `quantize-fp8`, `quantize-fp4`,
+`lower-mixed-precision`, `calibrate-quantize`, `quantize-dynamic`, `smooth-quantize`,
 `rotate-hadamard`, `insert-qat-ste`.
 
 ---
@@ -158,8 +160,8 @@ CastForge provides **115 built-in optimization, fusion, quantization, and surger
 `fuse-add-max`, `fuse-activations`, `fuse-swiglu`, `fuse-gelu`, `fuse-gated-mlp`, `fuse-moe`,
 `fuse-map-reduce`, `fuse-megakernel`, `fuse-horizontal-dot`, `fuse-dequant-matmul`,
 `fuse-matmul-epilogue`, `fuse-rmsnorm`, `fuse-residual-norm`, `fuse-layernorm`, `fuse-softmax`,
-`fuse-cross-entropy`, `fuse-rope`, `fuse-sdpa`, `fuse-mla`, `fuse-ssm`, `inject-kv-cache`,
-`rewrite-paged-attention`, `rewrite-flash-decoding`, `fuse-speculative-tree`,
+`fuse-linear-cross-entropy`, `fuse-rope`, `fuse-sdpa`, `fuse-mla`, `fuse-ssm`, `inject-kv-cache`,
+`lower-paged-attention`, `lower-flash-decoding`, `lower-tree-attention`,
 `fuse-sliding-window`, `share-kv-cache`.
 
 ---
@@ -202,8 +204,8 @@ CastForge provides **115 built-in optimization, fusion, quantization, and surger
   - *Effect*: Fuses adjacent `all_reduce` collectives and schedules compute-communication overlap.
 
 ### Leaf Passes
-`shard-spmd`, `shard-ring-attention`, `shard-pipeline`, `shard-fsdp`, `shard-experts`,
-`assign-streams`.
+`shard-spmd`, `shard-ring-attention`, `shard-pipeline-parallel`, `shard-fsdp`, `shard-experts`,
+`schedule-streams`.
 
 ---
 
@@ -228,7 +230,7 @@ CastForge provides **115 built-in optimization, fusion, quantization, and surger
 
 ### Leaf Passes
 `pad-for-tiling`, `tile-loops`, `permute-loops`, `unroll-loops`, `vectorize-loops`,
-`lower-to-tensor-cores`.
+`lower-tensor-cores`.
 
 ---
 
@@ -265,9 +267,10 @@ CastForge provides **115 built-in optimization, fusion, quantization, and surger
   - *Effect*: Wraps target operations in `castforge.profile_region` timing markers.
 
 ### Leaf Passes
-`rename-ops`, `annotate-ops`, `freeze-inputs`, `unfreeze-constants`, `tap-intermediates`,
-`normalize-ssa`, `strip-metadata`, `outline-kernels`, `dedup-functions`, `unroll-calls`,
-`verify-shapes`, `verify-equiv`, `bisect-passes`, `hash-ir`, `profile-roofline`.
+`rename-ops`, `annotate-ops`, `freeze-inputs`, `parameterize-constants`, `tap-intermediates`,
+`normalize-ssa`, `strip-debuginfo`, `strip-attributes`, `outline-kernels`, `dedup-functions`,
+`compose-functions`, `unroll-calls`, `verify-shapes`, `verify-equiv`, `bisect-passes`, `hash-ir`,
+`print-op-stats`, `profile-roofline`.
 
 ---
 

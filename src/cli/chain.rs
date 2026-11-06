@@ -606,12 +606,17 @@ mod tests {
         assert_eq!(rep.op_histogram.get("stablehlo.add"), Some(&1));
 
         let pcat = crate::ir::pass_catalog();
+        let passes_doc = include_str!("../../docs/PASSES.md");
         assert_eq!(pcat.pass.len(), reg.list().count());
         for (name, desc) in reg.list() {
             let entry = reg
                 .catalog_entry(name)
                 .unwrap_or_else(|| panic!("missing pass `{name}` in config/passes.toml"));
             assert_eq!(entry.description, desc);
+            assert!(
+                passes_doc.contains(&format!("`{name}`")),
+                "pass `{name}` is missing from docs/PASSES.md"
+            );
             let instance = reg
                 .create_pass(name, &Default::default())
                 .unwrap_or_else(|e| panic!("failed to instantiate `{name}`: {e}"));
@@ -625,6 +630,19 @@ mod tests {
                 "child_passes mismatch for `{name}` in config/passes.toml"
             );
         }
+
+        // PipelineConfig with deny_unknown_fields must reject unknown TOML keys
+        assert!(
+            crate::passes::PassManager::from_toml_str(&reg, "[settings]\nunknown_setting = true\n")
+                .is_err()
+        );
+        assert!(
+            crate::passes::PassManager::from_toml_str(
+                &reg,
+                "[[pipeline]]\npass = \"cse\"\ntypo_key = 1\n"
+            )
+            .is_err()
+        );
 
         let tcat = crate::cli::target_catalog();
         assert_eq!(tcat.target.len(), 10);

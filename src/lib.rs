@@ -1,6 +1,7 @@
 //! CastForge: Zero-C++ MLIR & StableHLO compiler in pure Rust with 115+ graph optimization,
 //! fusion, quantization, and weight-surgery passes and standalone CPU/GPU codegen.
 
+#[cfg(feature = "cli")]
 pub mod cli;
 pub mod codegen;
 pub mod ffi;
