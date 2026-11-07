@@ -499,3 +499,59 @@ fn test_kv_group_edits_mamba_subpaged_attention_and_token_drop_compaction() {
         Ok(3)
     );
 }
+
+#[test]
+fn test_optimize_serving_pass_registry_pipeline() {
+    use castforge::passes::{PassManager, PassRegistry};
+
+    let reg = PassRegistry::with_builtin_passes();
+    let mut pm = PassManager::from_pipeline_str(
+        &reg,
+        "optimize-serving(mode=topology),optimize-serving(mode=all)",
+    )
+    .expect("build optimize-serving pipeline");
+
+    let mut module = Module::new(Some("serving_pipeline_test".to_string()));
+    let blk = module.body_block();
+    let t_ty = Type::Tensor(TensorType {
+        shape: vec![Dim::Static(4)],
+        dtype: DType::F32,
+        encoding: None,
+    });
+
+    let mut use_attrs = IndexMap::new();
+    use_attrs.insert(
+        "param_uses".to_string(),
+        Attribute::Array(vec![Attribute::String("SEQ_LEN".to_string())]),
+    );
+    let op_use = module.add_operation(
+        blk,
+        OpName::new("mo", "broadcast_to"),
+        SmallVec::new(),
+        vec![(None, t_ty.clone())],
+        use_attrs,
+        Vec::new(),
+        false,
+        Location::Unknown,
+    );
+
+    let mut decl_attrs = IndexMap::new();
+    decl_attrs.insert(
+        "param_decls".to_string(),
+        Attribute::Array(vec![Attribute::String("SEQ_LEN".to_string())]),
+    );
+    let op_decl = module.add_operation(
+        blk,
+        OpName::new("mo", "rebind"),
+        SmallVec::new(),
+        vec![(None, t_ty)],
+        decl_attrs,
+        Vec::new(),
+        false,
+        Location::Unknown,
+    );
+
+    let results = pm.run(&mut module).expect("run optimize-serving pipeline");
+    assert!(results.iter().any(|r| r.changed));
+    assert_eq!(module.blocks[blk].ops, vec![op_decl, op_use]);
+}

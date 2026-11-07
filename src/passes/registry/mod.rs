@@ -12,4 +12,4 @@ pub use manager::{
     PassTranslator, PipelineConfig, PipelineSettings, parse_pass_spec_item, pass_catalog,
     split_pipeline_spec,
 };
-pub use presets::{OptO1Pass, OptO2Pass, OptO3Pass};
+pub use presets::{OptO1Pass, OptO2Pass, OptO3Pass, OptimizeServingPass};

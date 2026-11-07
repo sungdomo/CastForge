@@ -1189,3 +1189,12 @@ child_passes = []
 options = [
   { name = "ridge", default = "10.0", desc = "Roofline ridge point in FLOPs/Byte" },
 ]
+
+[[pass]]
+name = "optimize-serving"
+family = "serving"
+description = "Unified serving pass (mode=all|topology|device_graph|routines|memory|stubs)"
+child_passes = []
+options = [
+  { name = "mode", default = "all", desc = "Serving pass stage (all, topology, device_graph, routines, memory, stubs)" },
+]

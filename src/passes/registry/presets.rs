@@ -218,3 +218,110 @@ impl Pass for OptO3Pass {
         Ok(PassResult::aggregate(self.name(), &steps))
     }
 }
+
+/// Unified serving IR optimization pass (`optimize-serving`):
+/// Orchestrates parametric dependency topological sorting, hanging chain overhang joins,
+/// non-aliasing mutable chain relaxation, MGP device-graph staging and collective partitioning,
+/// routine lowering, mutable buffer elision/parallelization, kernel stub deduplication,
+/// single-caller index-constant raising, and call-graph slot globalization.
+pub struct OptimizeServingPass {
+    /// Execution mode (`"all"`, `"topology"`, `"device_graph"`, `"routines"`, `"memory"`, or
+    /// `"stubs"`).
+    pub mode: String,
+}
+
+impl Default for OptimizeServingPass {
+    fn default() -> Self {
+        Self {
+            mode: "all".to_string(),
+        }
+    }
+}
+
+impl Pass for OptimizeServingPass {
+    fn name(&self) -> &'static str {
+        "optimize-serving"
+    }
+
+    fn description(&self) -> &'static str {
+        "Unified serving pass (mode=all|topology|device_graph|routines|memory|stubs)"
+    }
+
+    fn run(&mut self, module: &mut Module) -> Result<PassResult> {
+        #[cfg(not(feature = "serving"))]
+        {
+            let _ = module;
+            Ok(PassResult::unchanged(self.name()))
+        }
+        #[cfg(feature = "serving")]
+        {
+            use crate::passes::serving::{
+                AsyncLaunchDispatch, canonicalize_kernel_stubs_for_merge,
+                deduplicate_kernel_stubs_bottom_up, elide_redundant_mutable_buffer_ops,
+                fixup_hanging_chain_overhangs, fuse_mutable_loads_into_kernels,
+                globalize_mgp_call_slot_indices, lower_buffer_concat_in_place,
+                lower_compiled_routines_with_init_guards, lower_guards_to_async_routines,
+                lower_map_kernels_to_routines, lower_primitives_to_async_routines,
+                parallelize_multi_use_mutable_loads, partition_device_graph_collective,
+                raise_back_single_caller_index_constants,
+                relax_non_aliasing_mutable_chain_sequences, stage_device_graph_regions,
+                topologically_sort_block_with_parameters, verify_device_graph_kernel_registrations,
+            };
+
+            let mode = self.mode.as_str();
+            let run_all = mode.is_empty() || mode == "all";
+            let mut modified = 0usize;
+
+            if run_all || mode == "topology" {
+                let block_ids: Vec<_> = module.blocks.keys().collect();
+                for blk_id in block_ids {
+                    modified += topologically_sort_block_with_parameters(module, blk_id)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                }
+                modified += fixup_hanging_chain_overhangs(module);
+                modified += relax_non_aliasing_mutable_chain_sequences(module);
+            }
+
+            if run_all || mode == "device_graph" {
+                let _ = verify_device_graph_kernel_registrations(module)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                modified += stage_device_graph_regions(module);
+                modified +=
+                    partition_device_graph_collective(module).map_err(|e| anyhow::anyhow!(e))?;
+            }
+
+            if run_all || mode == "routines" {
+                modified += lower_guards_to_async_routines(module);
+                modified += lower_map_kernels_to_routines(module);
+                let (c, w) =
+                    lower_primitives_to_async_routines(module, AsyncLaunchDispatch::Immediate);
+                modified += c + w;
+                modified += lower_compiled_routines_with_init_guards(module)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+            }
+
+            if run_all || mode == "memory" {
+                modified += elide_redundant_mutable_buffer_ops(module);
+                modified += parallelize_multi_use_mutable_loads(module);
+                modified += fuse_mutable_loads_into_kernels(module);
+                modified += lower_buffer_concat_in_place(module, 64);
+            }
+
+            if run_all || mode == "stubs" {
+                modified += canonicalize_kernel_stubs_for_merge(module);
+                modified += deduplicate_kernel_stubs_bottom_up(module);
+                modified += raise_back_single_caller_index_constants(module);
+                modified +=
+                    globalize_mgp_call_slot_indices(module).map_err(|e| anyhow::anyhow!(e))?;
+            }
+
+            Ok(PassResult {
+                pass_name: self.name().to_string(),
+                changed: modified > 0,
+                ops_removed: 0,
+                ops_modified: modified,
+                ops_created: 0,
+            })
+        }
+    }
+}

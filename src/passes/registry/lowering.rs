@@ -678,6 +678,17 @@ pub(super) fn register_lowering_passes(reg: &mut PassRegistry) {
         "Preset O3: Shape specialization + O2 + MoE/FMA/zero-copy + weight packing + arena",
         |opts| Ok(Box::new(build_o3_preset("O3", opts))),
     );
+    reg.register(
+        "optimize-serving",
+        "Unified serving pass (mode=all|topology|device_graph|routines|memory|stubs)",
+        |opts| {
+            let mode = opts
+                .get("mode")
+                .cloned()
+                .unwrap_or_else(|| "all".to_string());
+            Ok(Box::new(OptimizeServingPass { mode }))
+        },
+    );
 }
 
 fn build_o3_preset(preset_name: &'static str, opts: &PassOptions) -> OptO3Pass {

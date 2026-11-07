@@ -26,7 +26,7 @@ inference/KV-cache/device-graph optimization suite.
 | 7 | **`distributed/`** | `shard-distributed`, `autodiff`, `coalesce-all-reduce` | 6 |
 | 8 | **`loops/`** | `schedule-loops`, `lower-conv-to-gemm`, `split-large-gemm` | 6 |
 | 9 | **`normalize/`** | `normalize-ir`, `inline-calls`, `outline-subgraphs`, `verify-ir` | 15 |
-| 10 | **`serving/`** | KV-cache codecs, prefix caching, device-graph & storage passes | — |
+| 10 | **`serving/`** | `optimize-serving` (KV-cache codecs, device-graph & storage passes) | — |
 | 11 | **`registry/`** | `O1`, `O2`, `O3` (Optimization Presets) | — |
 
 ---

@@ -568,12 +568,12 @@ mod tests {
             Cli::try_parse_from(["castforge", "diff", "a.mlir", "b.mlir"]).expect("diff parses");
         assert!(matches!(cli_diff.command, Commands::Diff { .. }));
 
-        let cli_inspect =
-            Cli::try_parse_from(["castforge", "inspect", "model.mlir", "--json"]).unwrap();
+        let cli_inspect = Cli::try_parse_from(["castforge", "inspect", "model.mlir", "--json"])
+            .expect("inspect parses");
         assert!(matches!(cli_inspect.command, Commands::Inspect { .. }));
 
-        let cli_targets =
-            Cli::try_parse_from(["castforge", "targets", "hopper", "--json"]).unwrap();
+        let cli_targets = Cli::try_parse_from(["castforge", "targets", "hopper", "--json"])
+            .expect("targets parses");
         assert!(matches!(cli_targets.command, Commands::ListTargets { .. }));
 
         let cli_passes = Cli::try_parse_from([
@@ -585,7 +585,7 @@ mod tests {
             "-o",
             "passes.txt",
         ])
-        .unwrap();
+        .expect("list-passes parses");
         assert!(matches!(cli_passes.command, Commands::ListPasses { .. }));
 
         let mod_ir = crate::ir::parse_mlir(
@@ -598,7 +598,7 @@ mod tests {
             }
             "#,
         )
-        .unwrap();
+        .expect("parse demo mlir");
         let rep = crate::cli::inspect_module(&mod_ir);
         assert_eq!(rep.name, "demo");
         assert_eq!(rep.functions.len(), 1);
@@ -700,15 +700,15 @@ mod tests {
             "  }\n",
             "}\n",
         );
-        let mut rec_mod = crate::ir::parse_mlir(mut_rec_src).unwrap();
-        let mut pm = PassManager::from_pipeline_str(&reg, "inline-calls").unwrap();
+        let mut rec_mod = crate::ir::parse_mlir(mut_rec_src).expect("parse mut_rec");
+        let mut pm = PassManager::from_pipeline_str(&reg, "inline-calls").expect("pipeline");
         pm.max_iterations = 8;
-        let res = pm.run(&mut rec_mod).unwrap();
+        let res = pm.run(&mut rec_mod).expect("run inline-calls");
         assert!(!res[0].changed);
 
         // 4. FFI zero-initializes output pointers even on error
-        let bad_cstr = CString::new("invalid mlir").unwrap();
-        let spec_cstr = CString::new("cse").unwrap();
+        let bad_cstr = CString::new("invalid mlir").expect("bad_cstr");
+        let spec_cstr = CString::new("cse").expect("spec_cstr");
         let mut out_mlir: *mut std::ffi::c_char = std::ptr::dangling_mut();
         let mut out_tel: *mut std::ffi::c_char = std::ptr::dangling_mut();
         let mut out_err: *mut std::ffi::c_char = std::ptr::null_mut();

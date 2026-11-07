@@ -350,7 +350,7 @@ mod tests {
             "  }\n",
             "}\n",
         );
-        let mut module = parse_mlir(src).unwrap();
+        let mut module = parse_mlir(src).expect("parse mlir");
         let fn_op = module.functions()[0];
         let reg_id = module.ops[fn_op].regions[0];
         let blk_id = module.regions[reg_id].blocks[0];
@@ -370,7 +370,7 @@ mod tests {
             "  }\n",
             "}\n",
         );
-        let chain_mod = parse_mlir(chain_src).unwrap();
+        let chain_mod = parse_mlir(chain_src).expect("parse chain_src");
         let mut loop_mod = lower_to_loop_ir(&chain_mod, &TargetConfig::default());
         let mut opt = OptimizeLoopIrPass::default();
         assert!(opt.run(&mut loop_mod) > 0);
@@ -393,14 +393,14 @@ mod tests {
             "  }\n",
             "}\n",
         );
-        let red_mod = parse_mlir(red_src).unwrap();
-        let out = evaluate_module(&red_mod, &[vec![1.0, 5.0, -3.0, 2.0]]).unwrap();
+        let red_mod = parse_mlir(red_src).expect("parse red_src");
+        let out = evaluate_module(&red_mod, &[vec![1.0, 5.0, -3.0, 2.0]]).expect("eval red_mod");
         assert_eq!(out, vec![vec![5.0, 2.0]]);
-        let r_code = emit_rust_module(&red_mod).unwrap();
+        let r_code = emit_rust_module(&red_mod).expect("emit rust");
         assert!(r_code.contains("acc = acc.max("));
-        let c_code = emit_c_module(&red_mod).unwrap();
+        let c_code = emit_c_module(&red_mod).expect("emit c");
         assert!(c_code.contains("fmaxf(acc,"));
-        let w_code = emit_wgsl_module(&red_mod).unwrap();
+        let w_code = emit_wgsl_module(&red_mod).expect("emit wgsl");
         assert!(w_code.contains("max(acc,"));
 
         // 4. WGSL fused_log_softmax and register-tiled GEMM tail cleanup
@@ -415,19 +415,19 @@ mod tests {
             "  }\n",
             "}\n",
         );
-        let lsm_mod = parse_mlir(lsm_src).unwrap();
-        let wgsl_lsm = emit_wgsl_module(&lsm_mod).unwrap();
+        let lsm_mod = parse_mlir(lsm_src).expect("parse lsm_src");
+        let wgsl_lsm = emit_wgsl_module(&lsm_mod).expect("emit wgsl lsm");
         assert!(wgsl_lsm.contains("let lse: f32 = max_v + log(sum_exp);"));
         let reg_cfg = TargetConfig::default().with_register_tile(2, 2);
-        let rust_tiled = emit_rust_module_with_config(&lsm_mod, &reg_cfg).unwrap();
+        let rust_tiled = emit_rust_module_with_config(&lsm_mod, &reg_cfg).expect("emit rust tiled");
         assert!(rust_tiled.contains("for n in 2..3"));
-        let c_tiled = emit_c_module_with_config(&lsm_mod, &reg_cfg).unwrap();
+        let c_tiled = emit_c_module_with_config(&lsm_mod, &reg_cfg).expect("emit c tiled");
         assert!(c_tiled.contains("for (int n = 2; n < 3; ++n)"));
 
         // 5. Loop-IR to Rust and WGSL targets
-        let loop_rust = emit_rust_from_loop_ir(&loop_mod).unwrap();
+        let loop_rust = emit_rust_from_loop_ir(&loop_mod).expect("emit loop rust");
         assert!(loop_rust.contains("pub fn forward("));
-        let loop_wgsl = emit_wgsl_from_loop_ir(&loop_mod).unwrap();
+        let loop_wgsl = emit_wgsl_from_loop_ir(&loop_mod).expect("emit loop wgsl");
         assert!(loop_wgsl.contains("@compute @workgroup_size(64)"));
 
         // 6. WGSL composite math (Layernorm, Residual RMSNorm, FlashAttention)
@@ -448,8 +448,8 @@ mod tests {
             "  }\n",
             "}\n",
         );
-        let comp_mod = parse_mlir(comp_src).unwrap();
-        let wgsl_comp = emit_wgsl_module(&comp_mod).unwrap();
+        let comp_mod = parse_mlir(comp_src).expect("parse comp_src");
+        let wgsl_comp = emit_wgsl_module(&comp_mod).expect("emit wgsl comp");
         assert!(wgsl_comp.contains("+ input_1[r * 4u + c]"));
         assert!(wgsl_comp.contains("let mean = sum / f32(4u);"));
         assert!(wgsl_comp.contains("o_acc[d] / l_prev"));
@@ -473,7 +473,7 @@ mod tests {
             "  }\n",
             "}\n",
         );
-        let cmp_mod = parse_mlir(cmp_src).unwrap();
+        let cmp_mod = parse_mlir(cmp_src).expect("parse cmp_src");
         let cmp_plan = build_memory_plan(&cmp_mod);
         assert!(cmp_plan.arena_f32_len() >= 8);
 
@@ -494,14 +494,14 @@ mod tests {
             "  }\n",
             "}\n",
         );
-        let nd_mod = parse_mlir(nd_src).unwrap();
+        let nd_mod = parse_mlir(nd_src).expect("parse nd_src");
         let x_val: Vec<f32> = (1..=12).map(|v| v as f32).collect();
         let b_val: Vec<f32> = vec![1.0, 2.0, 3.0, 0.5, 1.5, 2.5];
-        let eval_out = evaluate_module(&nd_mod, &[x_val, b_val]).unwrap();
+        let eval_out = evaluate_module(&nd_mod, &[x_val, b_val]).expect("eval nd_mod");
         assert_eq!(eval_out[0].len(), 8);
-        let rust_nd = emit_rust_module(&nd_mod).unwrap();
+        let rust_nd = emit_rust_module(&nd_mod).expect("emit rust nd");
         assert!(rust_nd.contains("for batch in 0..2"));
-        let c_nd = emit_c_module(&nd_mod).unwrap();
+        let c_nd = emit_c_module(&nd_mod).expect("emit c nd");
         assert!(c_nd.contains("for (int batch = 0; batch < 2; ++batch)"));
 
         // 3. Autodiff inserts stablehlo.reduce for broadcast operands
@@ -516,8 +516,10 @@ mod tests {
             "  }\n",
             "}\n",
         );
-        let mut ad_mod = parse_mlir(ad_src).unwrap();
-        let res = AutodiffPass::default().run(&mut ad_mod).unwrap();
+        let mut ad_mod = parse_mlir(ad_src).expect("parse ad_src");
+        let res = AutodiffPass::default()
+            .run(&mut ad_mod)
+            .expect("run autodiff");
         assert!(res.changed);
         let printed_ad = crate::ir::print_mlir(&ad_mod);
         assert!(printed_ad.contains("stablehlo.reduce"));
@@ -538,8 +540,8 @@ mod tests {
             "  }\n",
             "}\n",
         );
-        let kw_mod = parse_mlir(kw_src).unwrap();
-        let kw_c = emit_c_module(&kw_mod).unwrap();
+        let kw_mod = parse_mlir(kw_src).expect("parse kw_src");
+        let kw_c = emit_c_module(&kw_mod).expect("emit kw_c");
         assert!(kw_c.contains("v_for"));
         assert!(kw_c.contains("a_1_"));
     }
