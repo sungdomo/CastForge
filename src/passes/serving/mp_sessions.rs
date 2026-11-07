@@ -1,6 +1,7 @@
-//! Multiprocess request sessions, stream-ordered host completion dispatch, and transport auth.
+//! Multiprocess request sessions, rolling token chunk hashing, transport API-key auth, and IPC
+//! policy.
 //!
-//! Implements three multiprocess KV-serving runtime subsystems:
+//! Implements two multiprocess KV-serving subsystems:
 //! 1. **Per-Request Token & Rolling-Hash Session Manager (`MpRequestSession`,
 //!    `MpSessionManager`)**:
 //!    - Holds packed 4-byte token sequences (`MP_TOKEN_STRIDE_BYTES = 4`) and computes incremental
@@ -8,18 +9,13 @@
 //!    - Tracks per-lookup prefetch hit counts, locked GIDs, and retained L1 read-lock owners
 //!      (`begin_lookup`, `record_prefetch_result`, `get_prefetch_owners`), and expires idle
 //!      sessions by TTL (`cleanup_expired`) while invoking registered destroy callbacks.
-//! 2. **Stream-Ordered Host Callback Dispatcher (`DeviceHostFuncDispatcher`)**:
-//!    - Decouples device-stream host callbacks from runtime locks by recording `(stream_ptr, kind,
-//!      payload)` completions on a lock-free queue (`record_completion_on_stream`) and draining
-//!      them on a dispatcher worker (`drain_once`) with per-kind dispatch and exception counters.
-//! 3. **Transport API-Key Rotation Verifier & Runtime IPC Policy (`ApiKeyVerifier`, `IpcPolicy`)**:
+//! 2. **Transport API-Key Rotation Verifier & Runtime IPC Policy (`ApiKeyVerifier`, `IpcPolicy`)**:
 //!    - Loads multi-key service rotation credentials from CLI files and environment sources,
 //!      performs constant-time token verification (`verify_token`) with secret-redacted `Debug`
 //!      and `Display` formatting, builds outbound `Authorization: Bearer` headers, and manages
 //!      container-isolation (`isolated_ipc`) and VMM (`use_vmm_api`) IPC policy flags.
 
 use indexmap::IndexMap;
-use std::collections::VecDeque;
 use std::fmt;
 
 /// Byte width of a single packed token ID (`4` bytes / `u32`).
@@ -339,163 +335,6 @@ impl MpSessionManager {
     }
 }
 
-// ============================================================================
-// Stream-Ordered Host Callback Dispatcher (`native_completion.py`)
-// ============================================================================
-
-/// A single stream-ordered completion callback item recorded on a device stream.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingStreamCompletion {
-    /// Device stream handle on which the callback was ordered.
-    pub stream_ptr: u64,
-    /// Registered completion kind (e.g. `"finish_write"`, `"finish_read_prefetched"`).
-    pub kind: String,
-    /// Encoded payload bytes delivered to the handler.
-    pub payload: Vec<u8>,
-}
-
-type HostCompletionHandler = Box<dyn FnMut(&[u8]) -> Result<(), String> + Send>;
-
-/// Drains buffered device-stream completions and dispatches each payload to the handler registered
-/// for its `kind` without holding runtime locks on the device driver thread.
-pub struct DeviceHostFuncDispatcher {
-    handlers: IndexMap<String, HostCompletionHandler>,
-    pending_queue: VecDeque<PendingStreamCompletion>,
-    dispatched_count: usize,
-    dropped_unregistered_count: usize,
-    exception_counts: IndexMap<String, usize>,
-    running: bool,
-}
-
-impl fmt::Debug for DeviceHostFuncDispatcher {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DeviceHostFuncDispatcher")
-            .field(
-                "registered_kinds",
-                &self.handlers.keys().collect::<Vec<_>>(),
-            )
-            .field("pending_count", &self.pending_queue.len())
-            .field("dispatched_count", &self.dispatched_count)
-            .field(
-                "dropped_unregistered_count",
-                &self.dropped_unregistered_count,
-            )
-            .field("exception_counts", &self.exception_counts)
-            .field("running", &self.running)
-            .finish()
-    }
-}
-
-impl Default for DeviceHostFuncDispatcher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl DeviceHostFuncDispatcher {
-    /// Creates a new [`DeviceHostFuncDispatcher`].
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            handlers: IndexMap::new(),
-            pending_queue: VecDeque::new(),
-            dispatched_count: 0,
-            dropped_unregistered_count: 0,
-            exception_counts: IndexMap::new(),
-            running: true,
-        }
-    }
-
-    /// Registers a completion handler for `kind`.
-    pub fn register<F>(&mut self, kind: impl Into<String>, handler: F)
-    where
-        F: FnMut(&[u8]) -> Result<(), String> + Send + 'static,
-    {
-        self.handlers.insert(kind.into(), Box::new(handler));
-    }
-
-    /// Schedules a stream-ordered host completion for `kind` with `payload` on `stream_ptr`.
-    pub fn record_completion_on_stream(
-        &mut self,
-        stream_ptr: u64,
-        kind: impl Into<String>,
-        payload: Vec<u8>,
-    ) {
-        self.pending_queue.push_back(PendingStreamCompletion {
-            stream_ptr,
-            kind: kind.into(),
-            payload,
-        });
-    }
-
-    /// Drains all currently queued completions and dispatches each to its registered handler.
-    ///
-    /// Handler errors are caught and counted in `handler_exception_counts` so the drain loop stays
-    /// alive across individual handler failures. Returns the number of successfully dispatched
-    /// callbacks in this drain cycle.
-    pub fn drain_once(&mut self) -> usize {
-        let before = self.dispatched_count;
-        let completions: Vec<PendingStreamCompletion> = self.pending_queue.drain(..).collect();
-        for item in completions {
-            let Some(handler) = self.handlers.get_mut(&item.kind) else {
-                self.dropped_unregistered_count += 1;
-                continue;
-            };
-            match handler(&item.payload) {
-                Ok(()) => {
-                    self.dispatched_count += 1;
-                }
-                Err(_) => {
-                    *self.exception_counts.entry(item.kind).or_insert(0) += 1;
-                }
-            }
-        }
-        self.dispatched_count - before
-    }
-
-    /// Stops the dispatcher and executes one final drain of any remaining completions.
-    pub fn stop(&mut self) -> usize {
-        self.running = false;
-        self.drain_once()
-    }
-
-    /// Returns the total number of successfully dispatched completions.
-    #[must_use]
-    pub const fn dispatched_count(&self) -> usize {
-        self.dispatched_count
-    }
-
-    /// Returns the number of completions dropped because no handler was registered for their
-    /// `kind`.
-    #[must_use]
-    pub const fn dropped_unregistered_count(&self) -> usize {
-        self.dropped_unregistered_count
-    }
-
-    /// Returns the per-kind handler exception counts.
-    #[must_use]
-    pub fn handler_exception_counts(&self) -> IndexMap<String, usize> {
-        self.exception_counts.clone()
-    }
-
-    /// Returns the number of buffered completions awaiting drain.
-    #[must_use]
-    pub fn pending_count(&self) -> usize {
-        self.pending_queue.len()
-    }
-
-    /// Returns whether the dispatcher is currently marked running.
-    #[must_use]
-    pub const fn is_running(&self) -> bool {
-        self.running
-    }
-}
-
-// ============================================================================
-// Transport API-Key Rotation Verifier & Runtime IPC Policy
-// (`security/api_key.py`, `multiprocess/transport/auth.py`, `platform/ipc_policy.py`)
-// ============================================================================
-
 /// Validates and extracts a single-line API key from file contents.
 pub fn parse_single_line_api_key(contents: &str, source_label: &str) -> Result<String, String> {
     let trimmed = contents.trim();
@@ -585,7 +424,6 @@ pub fn request_client_auth_headers(
     Ok(headers)
 }
 
-/// Constant-time byte slice equality comparison.
 #[must_use]
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -737,7 +575,6 @@ mod tests {
         });
 
         let sess = mgr.get_or_create("req-1", 100.0);
-        // Pack 5 tokens (20 bytes); chunk_size = 2 -> 2 full chunks (4 tokens).
         let packed: Vec<u8> = (0..5u32).flat_map(u32::to_be_bytes).collect();
         sess.set_tokens(packed).expect("set_tokens");
         assert_eq!(sess.num_held_tokens(), 5);
@@ -746,47 +583,14 @@ mod tests {
         assert_eq!(hashes_all.len(), 2);
         assert_eq!(sess.num_chunks_processed, 2);
 
-        // Requesting second chunk only reuses cached hashes without recomputing.
         let second_only = sess.get_hashes(2, Some(4)).expect("second chunk");
         assert_eq!(second_only, vec![hashes_all[1]]);
-
-        // Explicit `end > held` must error.
         assert!(sess.get_hashes(0, Some(6)).is_err());
 
-        // Expire at t = 161.0 (age 61.0 > TTL 60.0).
         let removed = mgr.cleanup_expired(161.0);
         assert_eq!(removed, 1);
         assert_eq!(mgr.active_count(), 0);
         assert_eq!(*destroyed_log.lock().expect("lock"), vec!["req-1"]);
-    }
-
-    #[test]
-    fn test_device_host_func_dispatcher_drains_and_counts_exceptions() {
-        let mut disp = DeviceHostFuncDispatcher::new();
-        let seen: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let seen_clone = Arc::clone(&seen);
-
-        disp.register("finish_write", move |payload| {
-            if payload.is_empty() {
-                return Err("empty payload".to_string());
-            }
-            seen_clone.lock().expect("lock").extend_from_slice(payload);
-            Ok(())
-        });
-
-        disp.record_completion_on_stream(0x10, "finish_write", vec![1, 2, 3]);
-        disp.record_completion_on_stream(0x10, "finish_write", Vec::new());
-        disp.record_completion_on_stream(0x10, "unknown_kind", vec![9]);
-
-        let ok_count = disp.drain_once();
-        assert_eq!(ok_count, 1);
-        assert_eq!(disp.dispatched_count(), 1);
-        assert_eq!(disp.dropped_unregistered_count(), 1);
-        assert_eq!(
-            disp.handler_exception_counts().get("finish_write"),
-            Some(&1)
-        );
-        assert_eq!(*seen.lock().expect("lock"), vec![1, 2, 3]);
     }
 
     #[test]

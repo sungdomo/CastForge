@@ -1,36 +1,9 @@
-//! RDMA L1 arena window resolution with revoked-region retry, three-phase
-//! asynchronous engine-driven KV store coordination, and runtime L2 adapter
-//! lifecycle, reconfiguration, and cache-control services.
-//!
-//! Covers:
-//! 1. **RDMA L1 Arena Window Resolver & Revoked-Region Retry Pool (`RdmaArenaWindowPool`)**:
-//!    Validates L1 arena base/size and fabric provider (`"efa-direct"` or
-//!    `"tcp"`), resolves writable in-arena buffer sub-windows, rejects 0-byte
-//!    RDMA writes, returns `RDMA_GET_MISS = -1` on missing keys or mismatched
-//!    byte counts, and retries once after re-registering the L1 arena if the
-//!    fabric error indicates a `"revoked"` memory registration.
-//! 2. **Three-Phase Async Engine-Driven Store Coordinator & Pinned Staging Pool
-//!    (`PinnedStagingBufferPool`, `AsyncEngineDrivenStoreCoordinator`)**:
-//!    Pools reusable `(shape, dtype)` pinned CPU staging buffers and tracks
-//!    `pending_stores` (submitted stores whose device gather event has not yet
-//!    been recorded) separately from `inflight_gather_events` so
-//!    `flush_inflight_stores` closes the preemption race window between
-//!    submission and worker gather launch.
-//! 3. **Runtime L2 Adapter Lifecycle, Reconfiguration & Cache-Control Services
-//!    (`AdapterLifecycleController`, `select_l1_write_targets`,
-//!    `resolve_token_chunk_object_keys`, `CacheControlObjectService`)**:
-//!    Supports online `AddAdapter` and graceful-drain `RemoveAdapter`,
-//!    non-overlapping physical range reconfiguration, multi-L1 write target
-//!    routing, bounded token-chunk key resolution, and lock-aware tiered
-//!    object deletion (`L1`, `L2`, `All`).
+//! RDMA L1 arena window resolution with revoked-region retry, three-phase asynchronous
+//! engine-driven KV store coordination, and runtime L2 adapter lifecycle management.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use crate::ir::mlir::DType;
-
-// ---------------------------------------------------------------------------
-// 1. RDMA L1 Arena Window Resolver & Revoked-Region Retry Pool
-// ---------------------------------------------------------------------------
 
 /// Sentinel return code when an RDMA `get_into` misses or returns a partial read.
 pub const RDMA_GET_MISS: i64 = -1;
@@ -46,7 +19,6 @@ pub struct RdmaWindowSpec {
     pub registration_epoch: u64,
 }
 
-/// Stored RDMA payload entry with optional expiration timestamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RdmaStoredEntry {
     payload: Vec<u8>,
@@ -70,11 +42,6 @@ impl RdmaArenaWindowPool {
     /// Creates a new RDMA L1 arena window pool after validating the arena base,
     /// size, fabric provider (`"efa-direct"` or `"tcp"`), and optional network
     /// interface name.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if `l1_base == 0`, `l1_size == 0`, `rdma_provider` is not
-    /// `"efa-direct"` or `"tcp"`, or `rdma_interface` is `Some("")`.
     pub fn new(
         l1_base: u64,
         l1_size: usize,
@@ -134,11 +101,6 @@ impl RdmaArenaWindowPool {
 
     /// Resolves a buffer `[buf_addr, buf_addr + buf_len)` into an
     /// [`RdmaWindowSpec`] inside `[l1_base, l1_base + l1_size)`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if `readonly` is `true`, `buf_len == 0`, or the buffer lies
-    /// outside `[l1_base, l1_base + l1_size)`.
     pub fn resolve_window(
         &self,
         buf_addr: u64,
@@ -172,8 +134,6 @@ impl RdmaArenaWindowPool {
         })
     }
 
-    /// Executes an RDMA operation with single-retry recovery if the transport
-    /// fails with an error containing `"revoked"`.
     fn run_with_revoked_retry<T, F>(&mut self, mut op: F) -> Result<T, String>
     where
         F: FnMut(&mut Self) -> Result<T, String>,
@@ -181,7 +141,6 @@ impl RdmaArenaWindowPool {
         match op(self) {
             Ok(val) => Ok(val),
             Err(first_err) if first_err.contains("revoked") => {
-                // Re-register the L1 memory region and retry exactly once.
                 self.registration_epoch += 1;
                 op(self)
             }
@@ -191,11 +150,6 @@ impl RdmaArenaWindowPool {
 
     /// Stores `payload` under `key` via the RDMA worker pool, rejecting empty
     /// 0-byte values and applying an optional `ttl_seconds` relative to `now_sec`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if `payload` is empty or if a transport fault persists
-    /// after re-registering a revoked memory region.
     pub fn rdma_set(
         &mut self,
         key: &str,
@@ -227,15 +181,6 @@ impl RdmaArenaWindowPool {
 
     /// Fetches `key` directly into a resolved L1 arena window
     /// `[buf_addr, buf_addr + expected_size)`.
-    ///
-    /// Returns `Ok(expected_size as i64)` on an exact-size hit, or
-    /// `Ok(RDMA_GET_MISS)` (`-1`) if the key is missing, expired at `now_sec`,
-    /// or its stored byte length does not equal `expected_size`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if the target buffer lies outside the L1 arena, is
-    /// read-only, or if a revoked-registration fault persists after retry.
     pub fn rdma_get_into(
         &mut self,
         key: &str,
@@ -271,10 +216,6 @@ impl RdmaArenaWindowPool {
         })
     }
 }
-
-// ---------------------------------------------------------------------------
-// 2. Three-Phase Async Engine-Driven Store Coordinator & Pinned Staging Pool
-// ---------------------------------------------------------------------------
 
 /// Key identifying a homogeneous pool of pinned CPU staging buffers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -408,10 +349,6 @@ impl AsyncEngineDrivenStoreCoordinator {
     /// Phase 1 (`submit_store`): Allocates a pinned staging buffer and registers
     /// `store_id` in `pending_stores` BEFORE the worker thread launches the GPU
     /// gather kernel.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if the coordinator is closed or `store_id` already exists.
     pub fn submit_store(
         &mut self,
         store_id: u64,
@@ -438,10 +375,6 @@ impl AsyncEngineDrivenStoreCoordinator {
     /// Phase 2 (`record_gather_launched`): Records that the worker has launched
     /// the device gather kernel with `gather_event_id`, atomically moving
     /// `store_id` from `pending_stores` into `inflight_gather_events`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if `store_id` is not in `PendingGatherLaunch`.
     pub fn record_gather_launched(
         &mut self,
         store_id: u64,
@@ -471,10 +404,6 @@ impl AsyncEngineDrivenStoreCoordinator {
 
     /// Phase 3 (`complete_commit`): Synchronizes the gather event, commits the
     /// staged KV chunks, and releases the pinned staging buffer back to the pool.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if `store_id` is not in `GatherInflight`.
     pub fn complete_commit(&mut self, store_id: u64) -> Result<(), String> {
         let Some(phase) = self.store_phases.remove(&store_id) else {
             return Err(format!("unknown store_id {store_id}"));
@@ -498,29 +427,17 @@ impl AsyncEngineDrivenStoreCoordinator {
     }
 
     /// Flushes all in-flight stores before a scheduler preemption or KV page
-    /// eviction can overwrite source GPU pages:
-    /// 1. Waits for every store in `pending_stores` to launch its gather event
-    ///    (assigning synthetic gather events starting at `next_synthetic_event`
-    ///    for any pending store not yet advanced by a background worker).
-    /// 2. Synchronizes all `inflight_gather_events` in deterministic order and
-    ///    completes their commits, returning the list of synchronized event IDs.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if any phase transition fails.
+    /// eviction can overwrite source GPU pages.
     pub fn flush_inflight_stores(
         &mut self,
         mut next_synthetic_event: u64,
     ) -> Result<Vec<u64>, String> {
-        // Step 1: Drain `pending_stores` first so no submitted store can slip
-        // through the window between submission and gather-event recording.
         let pending_ids: Vec<u64> = self.pending_stores.iter().copied().collect();
         for store_id in pending_ids {
             self.record_gather_launched(store_id, next_synthetic_event)?;
             next_synthetic_event += 1;
         }
 
-        // Step 2: Synchronize all `inflight_gather_events`.
         let inflight_ids: Vec<(u64, u64)> = self
             .inflight_gather_events
             .iter()
@@ -536,10 +453,6 @@ impl AsyncEngineDrivenStoreCoordinator {
 
     /// Closes the coordinator, flushing any remaining stores and clearing the
     /// pinned staging buffer pool.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if flushing remaining stores fails.
     pub fn close(&mut self) -> Result<(), String> {
         let _ = self.flush_inflight_stores(1_000_000)?;
         self.staging_pool.clear();
@@ -553,10 +466,6 @@ impl AsyncEngineDrivenStoreCoordinator {
         &self.staging_pool
     }
 }
-
-// ---------------------------------------------------------------------------
-// 3. Runtime L2 Adapter Lifecycle, Reconfiguration & Cache-Control Services
-// ---------------------------------------------------------------------------
 
 /// Physical memory range owned by an L1/L2 adapter registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -639,11 +548,6 @@ impl AdapterLifecycleController {
     /// Registers a new online L2 adapter (`AddAdapter`), validating that its
     /// physical memory range has non-zero length and does not overlap any
     /// existing non-removed adapter.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if `adapter_id` is already active/draining, `byte_len == 0`,
-    /// or `owned_range` overlaps another adapter.
     pub fn add_adapter(
         &mut self,
         adapter_id: &str,
@@ -676,11 +580,6 @@ impl AdapterLifecycleController {
 
     /// Reconfigures an existing active adapter's `owned_range` online, verifying
     /// that the new range does not overlap any other registered adapter.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if `adapter_id` is not `Active`, `new_range.byte_len == 0`,
-    /// or `new_range` overlaps another adapter.
     pub fn reconfigure_adapter(
         &mut self,
         adapter_id: &str,
@@ -708,10 +607,6 @@ impl AdapterLifecycleController {
     }
 
     /// Starts a new task on `adapter_id` if and only if it is `Active`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if the adapter is unknown, `Draining`, or `Removed`.
     pub fn acquire_task(&mut self, adapter_id: &str) -> Result<(), String> {
         let Some(desc) = self.adapters.get_mut(adapter_id) else {
             return Err(format!("unknown adapter '{adapter_id}'"));
@@ -728,10 +623,6 @@ impl AdapterLifecycleController {
 
     /// Completes one in-flight task on `adapter_id`; if the adapter is
     /// `Draining` and `inflight_tasks` reaches `0`, transitions it to `Removed`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if `adapter_id` is unknown or has `0` in-flight tasks.
     pub fn release_task(&mut self, adapter_id: &str) -> Result<AdapterLifecycleState, String> {
         let Some(desc) = self.adapters.get_mut(adapter_id) else {
             return Err(format!("unknown adapter '{adapter_id}'"));
@@ -749,10 +640,6 @@ impl AdapterLifecycleController {
     /// Initiates graceful removal (`RemoveAdapter`): transitions `adapter_id` to
     /// `Draining` so no new tasks are routed to it, or immediately to `Removed`
     /// if `inflight_tasks == 0`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if `adapter_id` is unknown.
     pub fn remove_adapter(&mut self, adapter_id: &str) -> Result<AdapterLifecycleState, String> {
         let Some(desc) = self.adapters.get_mut(adapter_id) else {
             return Err(format!("unknown adapter '{adapter_id}'"));
@@ -769,262 +656,6 @@ impl AdapterLifecycleController {
     #[must_use]
     pub fn get_adapter(&self, adapter_id: &str) -> Option<&ManagedAdapterDescriptor> {
         self.adapters.get(adapter_id)
-    }
-}
-
-/// Write-target selection policy across multiple L1 manager instances.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum L1WritePolicy {
-    /// Routes all writes to the first healthy L1 manager target.
-    DefaultFirst,
-    /// Routes writes to the L1 manager matching the preferred tag (falling back
-    /// to the first healthy target).
-    TagAffinity(String),
-    /// Routes writes to the healthy L1 manager with the lowest utilization ratio.
-    LeastUtilized,
-}
-
-/// Target descriptor for an L1 cache manager instance.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct L1ManagerTargetSpec {
-    /// Unique manager identifier.
-    pub manager_id: String,
-    /// Affinity tags associated with this L1 manager (e.g. `"numa0"`, `"nvlink"`).
-    pub tags: Vec<String>,
-    /// Used bytes in this L1 manager.
-    pub used_bytes: u64,
-    /// Total capacity bytes in this L1 manager.
-    pub capacity_bytes: u64,
-    /// Whether the L1 manager is healthy and accepting writes.
-    pub healthy: bool,
-}
-
-/// Selects the target `manager_id` for a batch of write keys under `policy`.
-///
-/// # Errors
-///
-/// Returns `Err` if no healthy L1 manager target with non-zero capacity exists.
-pub fn select_l1_write_targets(
-    targets: &[L1ManagerTargetSpec],
-    policy: &L1WritePolicy,
-) -> Result<String, String> {
-    let healthy: Vec<&L1ManagerTargetSpec> = targets
-        .iter()
-        .filter(|t| t.healthy && t.capacity_bytes > 0 && t.used_bytes < t.capacity_bytes)
-        .collect();
-    if healthy.is_empty() {
-        return Err("no healthy L1 manager target with available capacity".to_string());
-    }
-    match policy {
-        L1WritePolicy::DefaultFirst => Ok(healthy[0].manager_id.clone()),
-        L1WritePolicy::TagAffinity(tag) => {
-            if let Some(matched) = healthy.iter().find(|t| t.tags.iter().any(|tg| tg == tag)) {
-                Ok(matched.manager_id.clone())
-            } else {
-                Ok(healthy[0].manager_id.clone())
-            }
-        }
-        L1WritePolicy::LeastUtilized => {
-            let best = healthy
-                .iter()
-                .min_by_key(|t| (t.used_bytes as u128 * 1_000_000) / (t.capacity_bytes as u128))
-                .copied()
-                .ok_or_else(|| "no healthy L1 manager target".to_string())?;
-            Ok(best.manager_id.clone())
-        }
-    }
-}
-
-/// Maximum number of token IDs accepted in a single cache-control resolution call.
-pub const MAX_CACHE_CONTROL_TOKEN_IDS: usize = 1_000_000;
-
-/// Maximum number of object keys accepted in a single cache-control delete call.
-pub const MAX_CACHE_CONTROL_DELETE_BATCH: usize = 10_000;
-
-/// Deterministic rolling FNV-1a 64-bit hash used to chain token chunks.
-fn hash_token_chunk_with_prefix(prefix_hash: u64, chunk: &[u32]) -> u64 {
-    let mut hash = prefix_hash ^ 0xcbf2_9ce4_8422_2325;
-    for &tok in chunk {
-        for b in tok.to_le_bytes() {
-            hash ^= u64::from(b);
-            hash = hash.wrapping_mul(0x0100_0000_01b3);
-        }
-    }
-    hash
-}
-
-/// Resolves a sequence of `token_ids` into cumulative prefix-hashed chunk object
-/// keys (`"{model_name}@{world_size}:{rank}:chunk_{idx}:{hash:016x}"`).
-///
-/// Trailing partial chunks smaller than `chunk_size` are omitted (only full
-/// `chunk_size` blocks produce cache-control object keys).
-///
-/// # Errors
-///
-/// Returns `Err` if `chunk_size == 0` or `token_ids.len() > MAX_CACHE_CONTROL_TOKEN_IDS`.
-pub fn resolve_token_chunk_object_keys(
-    model_name: &str,
-    world_size: u32,
-    rank: u32,
-    token_ids: &[u32],
-    chunk_size: usize,
-) -> Result<Vec<String>, String> {
-    if chunk_size == 0 {
-        return Err("chunk_size must be greater than zero".to_string());
-    }
-    if token_ids.len() > MAX_CACHE_CONTROL_TOKEN_IDS {
-        return Err(format!(
-            "token_ids length {} exceeds maximum {}",
-            token_ids.len(),
-            MAX_CACHE_CONTROL_TOKEN_IDS
-        ));
-    }
-    let num_full_chunks = token_ids.len() / chunk_size;
-    let mut keys = Vec::with_capacity(num_full_chunks);
-    let mut running_hash = 0u64;
-    for chunk_idx in 0..num_full_chunks {
-        let slice = &token_ids[chunk_idx * chunk_size..(chunk_idx + 1) * chunk_size];
-        running_hash = hash_token_chunk_with_prefix(running_hash, slice);
-        keys.push(format!(
-            "{model_name}@{world_size}:{rank}:chunk_{chunk_idx}:{running_hash:016x}"
-        ));
-    }
-    Ok(keys)
-}
-
-/// Target storage tier for [`CacheControlObjectService::delete_objects`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CacheDeleteTier {
-    /// Delete only from L1 memory.
-    L1Only,
-    /// Delete only from L2 storage adapters.
-    L2Only,
-    /// Delete from both L1 and L2 tiers.
-    AllTiers,
-}
-
-/// Summary of a batch [`CacheControlObjectService::delete_objects`] operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CacheDeleteSummary {
-    /// Number of object keys deleted from L1.
-    pub deleted_l1: usize,
-    /// Number of object keys deleted from L2.
-    pub deleted_l2: usize,
-    /// Keys skipped because they had active read/write locks and `force == false`.
-    pub skipped_locked: Vec<String>,
-}
-
-/// Multi-tier cache-control object management service supporting lock-aware
-/// tiered deletion (`L1Only`, `L2Only`, `AllTiers`) and paginated L2 key listing.
-#[derive(Debug, Default)]
-pub struct CacheControlObjectService {
-    l1_objects: BTreeSet<String>,
-    l1_locked_keys: HashSet<String>,
-    l2_objects: BTreeSet<String>,
-}
-
-impl CacheControlObjectService {
-    /// Creates a new empty cache-control object service.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Inserts an object key into L1 (with optional active lock) and/or L2.
-    pub fn insert_object(&mut self, key: &str, in_l1: bool, l1_locked: bool, in_l2: bool) {
-        if in_l1 {
-            self.l1_objects.insert(key.to_string());
-            if l1_locked {
-                self.l1_locked_keys.insert(key.to_string());
-            }
-        }
-        if in_l2 {
-            self.l2_objects.insert(key.to_string());
-        }
-    }
-
-    /// Lists L2 keys matching `prefix` using cursor-based pagination (`after_cursor`,
-    /// `limit`). Returns `(matching_page, next_cursor)`.
-    #[must_use]
-    pub fn list_l2_keys_paginated(
-        &self,
-        prefix: &str,
-        after_cursor: Option<&str>,
-        limit: usize,
-    ) -> (Vec<String>, Option<String>) {
-        if limit == 0 {
-            return (Vec::new(), None);
-        }
-        let iter = self
-            .l2_objects
-            .iter()
-            .filter(|k| k.starts_with(prefix))
-            .filter(|k| after_cursor.is_none_or(|cur| k.as_str() > cur));
-
-        let mut page = Vec::with_capacity(limit);
-        let mut has_more = false;
-        for key in iter {
-            if page.len() < limit {
-                page.push(key.clone());
-            } else {
-                has_more = true;
-                break;
-            }
-        }
-        let next_cursor = if has_more { page.last().cloned() } else { None };
-        (page, next_cursor)
-    }
-
-    /// Deletes a batch of `keys` from `tier`.
-    ///
-    /// When `force == false`, keys currently locked in L1 are not deleted from L1
-    /// and are reported in `skipped_locked`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if `keys.len() > MAX_CACHE_CONTROL_DELETE_BATCH`.
-    pub fn delete_objects(
-        &mut self,
-        keys: &[String],
-        tier: CacheDeleteTier,
-        force: bool,
-    ) -> Result<CacheDeleteSummary, String> {
-        if keys.len() > MAX_CACHE_CONTROL_DELETE_BATCH {
-            return Err(format!(
-                "delete batch size {} exceeds maximum {}",
-                keys.len(),
-                MAX_CACHE_CONTROL_DELETE_BATCH
-            ));
-        }
-
-        let mut deleted_l1 = 0usize;
-        let mut deleted_l2 = 0usize;
-        let mut skipped_locked = Vec::new();
-
-        for key in keys {
-            if matches!(tier, CacheDeleteTier::L1Only | CacheDeleteTier::AllTiers)
-                && self.l1_objects.contains(key)
-            {
-                if self.l1_locked_keys.contains(key) && !force {
-                    skipped_locked.push(key.clone());
-                } else {
-                    self.l1_objects.remove(key);
-                    self.l1_locked_keys.remove(key);
-                    deleted_l1 += 1;
-                }
-            }
-            if matches!(tier, CacheDeleteTier::L2Only | CacheDeleteTier::AllTiers)
-                && self.l2_objects.remove(key)
-            {
-                deleted_l2 += 1;
-            }
-        }
-
-        Ok(CacheDeleteSummary {
-            deleted_l1,
-            deleted_l2,
-            skipped_locked,
-        })
     }
 }
 
@@ -1054,7 +685,6 @@ mod tests {
         assert_eq!(n, 4);
         assert_eq!(out, [1, 2, 3, 4]);
 
-        // Mismatched expected size returns RDMA_GET_MISS (-1).
         let mut out8 = [0u8; 8];
         let miss = pool
             .rdma_get_into("chunk_0", 0x1000_0100, 8, false, 20, &mut out8)
@@ -1073,8 +703,6 @@ mod tests {
         let _b2 = coord.submit_store(2, sig.clone()).expect("submit 2");
         coord.record_gather_launched(1, 501).expect("gather 1");
 
-        // Store 2 is still in pending_stores; flush must drain pending_stores
-        // first and synchronize both events.
         let flushed = coord.flush_inflight_stores(900).expect("flush");
         assert_eq!(flushed, vec![501, 900]);
         assert_eq!(coord.staging_pool().pooled_count(&sig), 2);
