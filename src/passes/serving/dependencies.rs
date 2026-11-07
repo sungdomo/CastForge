@@ -346,14 +346,15 @@ pub fn lower_buffer_concat_in_place(module: &mut Module, preferred_alignment: u6
             ) && out_pos > first_in_pos
             {
                 module.blocks[blk_id].ops.remove(out_pos);
-                let new_first_pos = module.blocks[blk_id]
+                if let Some(new_first_pos) = module.blocks[blk_id]
                     .ops
                     .iter()
                     .position(|&id| id == in_alloc_ops[0])
-                    .unwrap();
-                module.blocks[blk_id]
-                    .ops
-                    .insert(new_first_pos, out_alloc_op);
+                {
+                    module.blocks[blk_id]
+                        .ops
+                        .insert(new_first_pos, out_alloc_op);
+                }
             }
 
             // Replace each input allocation with `index.constant` + `mgp.buffer.slice`.
@@ -461,10 +462,9 @@ pub fn fixup_hanging_chain_overhangs(module: &mut Module) -> usize {
 
     for blk_id in block_ids {
         let ops = &module.blocks[blk_id].ops;
-        if ops.is_empty() {
+        let Some(&term_op) = ops.last() else {
             continue;
-        }
-        let term_op = *ops.last().unwrap();
+        };
         if module.ops[term_op].name.full_name() != "func.return" {
             continue;
         }
@@ -589,8 +589,9 @@ pub fn outline_structured_kernel_bodies(module: &mut Module) -> usize {
                 let blk = module.regions[reg].blocks[0];
                 // Rotate trailing `index` block argument (`[inputs..., outputs..., index]`) to
                 // position 0 (`[index, captures...]`).
-                if module.blocks[blk].arguments.len() >= 2 {
-                    let idx_arg = module.blocks[blk].arguments.pop().unwrap();
+                if module.blocks[blk].arguments.len() >= 2
+                    && let Some(idx_arg) = module.blocks[blk].arguments.pop()
+                {
                     module.blocks[blk].arguments.insert(0, idx_arg);
                 }
                 (reg, blk)
@@ -908,7 +909,9 @@ pub fn topologically_sort_parametric_block(
     if orig_ops.len() <= 1 {
         return Ok(0);
     }
-    let has_terminator = module.ops[*orig_ops.last().unwrap()].name.full_name() == "func.return";
+    let has_terminator = orig_ops
+        .last()
+        .is_some_and(|&op_id| module.ops[op_id].name.full_name() == "func.return");
     let body_len = if has_terminator {
         orig_ops.len() - 1
     } else {

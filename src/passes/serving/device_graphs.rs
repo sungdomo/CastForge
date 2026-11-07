@@ -121,7 +121,10 @@ pub fn stage_device_graph_regions(module: &mut Module) -> usize {
             }
         }
 
-        let loc = module.ops[*staged_ops.first().unwrap()].location.clone();
+        let Some(&first_staged_op) = staged_ops.first() else {
+            continue;
+        };
+        let loc = module.ops[first_staged_op].location.clone();
         let staging_blk = module.blocks.insert_with_key(|id| crate::ir::Block {
             id,
             label: None,
@@ -280,10 +283,9 @@ pub fn partition_device_graph_collective(module: &mut Module) -> Result<usize, S
             }
             let staging_blk = module.regions[staging_reg].blocks[0];
             let body_ops = module.blocks[staging_blk].ops.clone();
-            if body_ops.is_empty() {
+            let Some(&yield_op) = body_ops.last() else {
                 continue;
-            }
-            let yield_op = *body_ops.last().unwrap();
+            };
             let non_term_ops = &body_ops[..body_ops.len() - 1];
 
             // Collect `stable.create` slot indices and sorted accelerator devices.

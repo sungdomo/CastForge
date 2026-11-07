@@ -216,7 +216,9 @@ impl BlendContentFingerprintIndex {
             }
         }
 
-        let entry = self.fingerprint_table.get_mut(&poly).unwrap();
+        let Some(entry) = self.fingerprint_table.get_mut(&poly) else {
+            return;
+        };
         if let Some(occ) = entry.occupants.get_mut(&chunk_hash) {
             occ.token_offset = token_offset;
             if occ.namespaces.insert(namespace.to_string()) {
@@ -1408,11 +1410,33 @@ pub(super) fn push_len_prefixed_str(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(bytes);
 }
 
+pub(super) fn read_be_u32(slice: &[u8], offset: usize) -> u32 {
+    u32::from_be_bytes([
+        slice[offset],
+        slice[offset + 1],
+        slice[offset + 2],
+        slice[offset + 3],
+    ])
+}
+
+pub(super) fn read_be_u64(slice: &[u8], offset: usize) -> u64 {
+    u64::from_be_bytes([
+        slice[offset],
+        slice[offset + 1],
+        slice[offset + 2],
+        slice[offset + 3],
+        slice[offset + 4],
+        slice[offset + 5],
+        slice[offset + 6],
+        slice[offset + 7],
+    ])
+}
+
 pub(super) fn read_len_prefixed_str(frame: &[u8], cursor: &mut usize) -> Result<String, String> {
     if *cursor + 4 > frame.len() {
         return Err("truncated string length in trace frame".to_string());
     }
-    let len = u32::from_be_bytes(frame[*cursor..*cursor + 4].try_into().unwrap()) as usize;
+    let len = read_be_u32(frame, *cursor) as usize;
     *cursor += 4;
     if *cursor + len > frame.len() {
         return Err("truncated string payload in trace frame".to_string());
@@ -1462,7 +1486,7 @@ pub fn decode_trace_stream(stream: &[u8]) -> Result<(TraceHeader, Vec<TraceRecor
     if stream.len() < 4 {
         return Err("trace stream is empty or has truncated header length prefix".to_string());
     }
-    let hdr_len = u32::from_be_bytes(stream[0..4].try_into().unwrap()) as usize;
+    let hdr_len = read_be_u32(stream, 0) as usize;
     if stream.len() < 4 + hdr_len {
         return Err("trace stream has truncated header frame body".to_string());
     }
@@ -1470,11 +1494,11 @@ pub fn decode_trace_stream(stream: &[u8]) -> Result<(TraceHeader, Vec<TraceRecor
     if hdr_frame.len() < 8 {
         return Err("trace header frame too short".to_string());
     }
-    let magic: [u8; 4] = hdr_frame[0..4].try_into().unwrap();
+    let magic: [u8; 4] = [hdr_frame[0], hdr_frame[1], hdr_frame[2], hdr_frame[3]];
     if magic != TRACE_MAGIC {
         return Err(format!("trace header bad magic: {magic:?}"));
     }
-    let format_version = u32::from_be_bytes(hdr_frame[4..8].try_into().unwrap());
+    let format_version = read_be_u32(hdr_frame, 4);
     if format_version != TRACE_FORMAT_VERSION {
         return Err(format!(
             "unsupported trace format_version {format_version} (expected {TRACE_FORMAT_VERSION})"
@@ -1485,16 +1509,16 @@ pub fn decode_trace_stream(stream: &[u8]) -> Result<(TraceHeader, Vec<TraceRecor
     if hc + 20 > hdr_frame.len() {
         return Err("trace header truncated numeric fields".to_string());
     }
-    let trace_schema_version = u32::from_be_bytes(hdr_frame[hc..hc + 4].try_into().unwrap());
+    let trace_schema_version = read_be_u32(hdr_frame, hc);
     hc += 4;
     if level == "storage" && trace_schema_version != TRACE_SCHEMA_VERSION {
         return Err(format!(
             "unsupported storage trace_schema_version {trace_schema_version}"
         ));
     }
-    let t_mono_start_ns = u64::from_be_bytes(hdr_frame[hc..hc + 8].try_into().unwrap());
+    let t_mono_start_ns = read_be_u64(hdr_frame, hc);
     hc += 8;
-    let t_wall_start_ns = u64::from_be_bytes(hdr_frame[hc..hc + 8].try_into().unwrap());
+    let t_wall_start_ns = read_be_u64(hdr_frame, hc);
     hc += 8;
     let sm_config_digest = read_len_prefixed_str(hdr_frame, &mut hc)?;
 
@@ -1517,7 +1541,7 @@ pub fn decode_trace_stream(stream: &[u8]) -> Result<(TraceHeader, Vec<TraceRecor
             had_truncated_tail = true;
             break;
         }
-        let rec_len = u32::from_be_bytes(stream[pos..pos + 4].try_into().unwrap()) as usize;
+        let rec_len = read_be_u32(stream, pos) as usize;
         pos += 4;
         if pos + rec_len > stream.len() {
             had_truncated_tail = true;
@@ -1528,8 +1552,8 @@ pub fn decode_trace_stream(stream: &[u8]) -> Result<(TraceHeader, Vec<TraceRecor
         if rec_frame.len() < 16 {
             continue;
         }
-        let t_mono_ns = u64::from_be_bytes(rec_frame[0..8].try_into().unwrap());
-        let t_wall_ns = u64::from_be_bytes(rec_frame[8..16].try_into().unwrap());
+        let t_mono_ns = read_be_u64(rec_frame, 0);
+        let t_wall_ns = read_be_u64(rec_frame, 8);
         let mut rc = 16usize;
         let Ok(qualname) = read_len_prefixed_str(rec_frame, &mut rc) else {
             continue;

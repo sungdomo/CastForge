@@ -941,7 +941,7 @@ pub fn legalize_rowwise_kernels(
             );
         }
         let capture_args = &rw_args[..rw_args.len() - 1];
-        let row_arg = *rw_args.last().unwrap();
+        let row_arg = rw_args[rw_args.len() - 1];
 
         let fold_ops: Vec<OpId> = module.blocks[rw_blk]
             .ops
@@ -1467,7 +1467,7 @@ pub fn add_try_except_blocks(module: &mut Module) -> usize {
             continue;
         }
 
-        let term_id = *block_ops.last().unwrap();
+        let term_id = block_ops[block_ops.len() - 1];
         let term_operands: SmallVec<[ValueId; 4]> = module.ops[term_id].operands.clone();
         let term_types: Vec<Type> = term_operands
             .iter()

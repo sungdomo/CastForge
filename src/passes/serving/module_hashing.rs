@@ -908,7 +908,7 @@ pub fn wrap_funcs_with_trace(module: &mut Module) -> usize {
             continue;
         }
 
-        let term_id = *block_ops.last().unwrap();
+        let term_id = block_ops[block_ops.len() - 1];
         let mut setup_ops: Vec<OpId> = Vec::new();
         let mut traced_ops: Vec<OpId> = Vec::new();
         let mut seen_call = false;

@@ -154,8 +154,9 @@ impl CoordinatorKeyDirectory {
                         record.placements.push(new_p);
                         self.adjust_stats(tier, 1, entry.size_bytes as i64);
                     }
-                    let rec = self.directory.get_mut(&entry.key).unwrap();
-                    rec.last_access_ts = rec.last_access_ts.max(ts);
+                    if let Some(rec) = self.directory.get_mut(&entry.key) {
+                        rec.last_access_ts = rec.last_access_ts.max(ts);
+                    }
                     if tier == CacheEventTier::L1 {
                         let l1_list = self
                             .l1_keys_by_instance

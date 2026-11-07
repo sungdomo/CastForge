@@ -1421,6 +1421,32 @@ pub(super) fn validate_and_write_frames(
     Ok(())
 }
 
+pub(super) fn read_be_u16_at(payload: &[u8], off: usize) -> usize {
+    u16::from_be_bytes([payload[off], payload[off + 1]]) as usize
+}
+
+pub(super) fn read_be_u32_at(payload: &[u8], off: usize) -> usize {
+    u32::from_be_bytes([
+        payload[off],
+        payload[off + 1],
+        payload[off + 2],
+        payload[off + 3],
+    ]) as usize
+}
+
+pub(super) fn read_be_u64_at(payload: &[u8], off: usize) -> usize {
+    u64::from_be_bytes([
+        payload[off],
+        payload[off + 1],
+        payload[off + 2],
+        payload[off + 3],
+        payload[off + 4],
+        payload[off + 5],
+        payload[off + 6],
+        payload[off + 7],
+    ]) as usize
+}
+
 pub(super) fn read_and_validate_frames(
     payload: &[u8],
     cursor: &mut usize,
@@ -1432,7 +1458,7 @@ pub(super) fn read_and_validate_frames(
     if *cursor + 4 > payload.len() {
         return Err("Unexpected EOF reading inline tensor frame count".to_string());
     }
-    let count = u32::from_be_bytes(payload[*cursor..*cursor + 4].try_into().unwrap()) as usize;
+    let count = read_be_u32_at(payload, *cursor);
     *cursor += 4;
     if count > MAX_INLINE_TENSOR_COUNT {
         return Err("Inline tensor count exceeds 65536".to_string());
@@ -1462,7 +1488,7 @@ pub(super) fn read_and_validate_frames(
         if *cursor + 2 > payload.len() {
             return Err("Unexpected EOF reading inline tensor dtype length".to_string());
         }
-        let dt_len = u16::from_be_bytes(payload[*cursor..*cursor + 2].try_into().unwrap()) as usize;
+        let dt_len = read_be_u16_at(payload, *cursor);
         *cursor += 2;
         if *cursor + dt_len > payload.len() {
             return Err("Unexpected EOF reading inline tensor dtype".to_string());
@@ -1494,7 +1520,7 @@ pub(super) fn read_and_validate_frames(
         }
         let mut shape = Vec::with_capacity(rank);
         for _ in 0..rank {
-            let d = u64::from_be_bytes(payload[*cursor..*cursor + 8].try_into().unwrap()) as usize;
+            let d = read_be_u64_at(payload, *cursor);
             *cursor += 8;
             shape.push(d);
         }
@@ -1507,8 +1533,7 @@ pub(super) fn read_and_validate_frames(
         if *cursor + 8 > payload.len() {
             return Err("Unexpected EOF reading inline tensor data length".to_string());
         }
-        let data_len =
-            u64::from_be_bytes(payload[*cursor..*cursor + 8].try_into().unwrap()) as usize;
+        let data_len = read_be_u64_at(payload, *cursor);
         *cursor += 8;
         if data_len != expected_tensor_bytes {
             return Err(format!(
@@ -1630,7 +1655,7 @@ pub fn decode_grouped_tensor_envelope(
     if payload.len() < 4 || payload[0] != 0x47 || payload[1] != 1 {
         return Err("Invalid or mismatched GroupedTensorEnvelope header".to_string());
     }
-    let group_count = u16::from_be_bytes(payload[2..4].try_into().unwrap()) as usize;
+    let group_count = read_be_u16_at(payload, 2);
     if group_count != expected.len() {
         return Err(format!(
             "Inline tensor group count mismatch: expected {}, got {group_count}",
@@ -1644,14 +1669,14 @@ pub fn decode_grouped_tensor_envelope(
         if cursor + 4 > payload.len() {
             return Err("Unexpected EOF reading group chunk index count".to_string());
         }
-        let idx_len = u32::from_be_bytes(payload[cursor..cursor + 4].try_into().unwrap()) as usize;
+        let idx_len = read_be_u32_at(payload, cursor);
         cursor += 4;
         if cursor + idx_len * 8 > payload.len() {
             return Err("Unexpected EOF reading group chunk indices".to_string());
         }
         let mut chunk_indices = Vec::with_capacity(idx_len);
         for _ in 0..idx_len {
-            let cidx = u64::from_be_bytes(payload[cursor..cursor + 8].try_into().unwrap()) as usize;
+            let cidx = read_be_u64_at(payload, cursor);
             cursor += 8;
             chunk_indices.push(cidx);
         }

@@ -1439,12 +1439,15 @@ impl AsymK16V8MultiSerde {
             2 => KvScaleScope::PerPageHead,
             other => return Err(format!("AsymK16V8MultiSerde: unknown scope tag {other}")),
         };
-        let num_pages = u32::from_le_bytes(blob[8..12].try_into().unwrap()) as usize;
-        let page_tokens = u32::from_le_bytes(blob[12..16].try_into().unwrap()) as usize;
-        let num_kv_heads = u32::from_le_bytes(blob[16..20].try_into().unwrap()) as usize;
-        let head_dim = u32::from_le_bytes(blob[20..24].try_into().unwrap()) as usize;
-        let k_payload_len = u32::from_le_bytes(blob[24..28].try_into().unwrap()) as usize;
-        let v_payload_len = u32::from_le_bytes(blob[28..32].try_into().unwrap()) as usize;
+        let read_le_u32 = |off: usize| -> usize {
+            u32::from_le_bytes([blob[off], blob[off + 1], blob[off + 2], blob[off + 3]]) as usize
+        };
+        let num_pages = read_le_u32(8);
+        let page_tokens = read_le_u32(12);
+        let num_kv_heads = read_le_u32(16);
+        let head_dim = read_le_u32(20);
+        let k_payload_len = read_le_u32(24);
+        let v_payload_len = read_le_u32(28);
 
         if self.mode == AsymK16V8SerdeMode::SplitTierVOnly && k_payload_len != 0 {
             return Err(format!(

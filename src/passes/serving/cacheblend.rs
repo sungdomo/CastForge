@@ -1420,11 +1420,13 @@ pub fn coalesce_exhaustive_gathers_to_split(module: &mut Module) -> usize {
                 continue;
             }
 
-            let dominant_op_id = matched
+            let Some(dominant_op_id) = matched
                 .iter()
                 .min_by_key(|&&(pos, _)| pos)
                 .map(|&(_, id)| id)
-                .unwrap();
+            else {
+                continue;
+            };
 
             let mut split_results = Vec::with_capacity(axis0_len);
             let mut locs = Vec::with_capacity(axis0_len);

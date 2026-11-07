@@ -315,8 +315,7 @@ pub fn fixup_isolated_from_above_regions(module: &mut Module) -> usize {
                     "mef.output" | "mo.output" | "grt.yield" | "scf.yield"
                 ) {
                     let before_last = num_regions == 2 && reg_idx == 0;
-                    if before_last && !module.ops[term_op].operands.is_empty() {
-                        let last_opd = module.ops[term_op].operands.pop().unwrap();
+                    if before_last && let Some(last_opd) = module.ops[term_op].operands.pop() {
                         for &barg in &new_bargs {
                             module.ops[term_op].operands.push(barg);
                         }
@@ -541,7 +540,7 @@ pub fn fuse_rowwise_reductions(module: &mut Module) -> (usize, usize) {
                         if src_bargs.len() < src_inputs.len() + 2 {
                             break;
                         }
-                        let src_loop_idx_barg = *src_bargs.last().unwrap();
+                        let src_loop_idx_barg = src_bargs[src_bargs.len() - 1];
 
                         // Map `src`'s first input into `inp_idx` and deduplicate/append any
                         // additional `src` inputs:
@@ -567,8 +566,9 @@ pub fn fuse_rowwise_reductions(module: &mut Module) -> (usize, usize) {
                                     let ty = module.values[extra_in].ty.clone();
                                     let new_barg = module.add_block_argument(dst_blk, None, ty);
                                     // Move `new_barg` to `new_pos` (before output & row args):
-                                    let popped = module.blocks[dst_blk].arguments.pop().unwrap();
-                                    module.blocks[dst_blk].arguments.insert(new_pos, popped);
+                                    if let Some(popped) = module.blocks[dst_blk].arguments.pop() {
+                                        module.blocks[dst_blk].arguments.insert(new_pos, popped);
+                                    }
                                     for (pos, &b) in
                                         module.blocks[dst_blk].arguments.iter().enumerate()
                                     {
@@ -659,14 +659,15 @@ pub fn fuse_rowwise_reductions(module: &mut Module) -> (usize, usize) {
                                         }
                                     }
                                 }
-                                let load_pos = module.blocks[dst_blk]
+                                if let Some(load_pos) = module.blocks[dst_blk]
                                     .ops
                                     .iter()
                                     .position(|&x| x == load_id)
-                                    .unwrap();
-                                module.blocks[dst_blk]
-                                    .ops
-                                    .splice(load_pos..=load_pos, cloned_ops);
+                                {
+                                    module.blocks[dst_blk]
+                                        .ops
+                                        .splice(load_pos..=load_pos, cloned_ops);
+                                }
                             }
                         }
 
@@ -700,7 +701,8 @@ pub fn fuse_rowwise_reductions(module: &mut Module) -> (usize, usize) {
                             break;
                         }
                         let dst_out_barg = module.blocks[dst_blk].arguments[num_dst_inputs];
-                        let dst_row_barg = *module.blocks[dst_blk].arguments.last().unwrap();
+                        let dst_bargs_len = module.blocks[dst_blk].arguments.len();
+                        let dst_row_barg = module.blocks[dst_blk].arguments[dst_bargs_len - 1];
 
                         // Verify `dst_out_barg` has a single `map.store(val, dst_out_barg,
                         // dst_row_barg)` in `dst_blk`:
@@ -751,7 +753,7 @@ pub fn fuse_rowwise_reductions(module: &mut Module) -> (usize, usize) {
                             break;
                         }
                         let cons_out_barg = cons_bargs[cons_inputs.len()];
-                        let cons_loop_barg = *cons_bargs.last().unwrap();
+                        let cons_loop_barg = cons_bargs[cons_bargs.len() - 1];
 
                         // Every use of the consumer's input block arg for `dst_res` must be a
                         // `map.load` at `cons_loop_barg`:
@@ -793,8 +795,9 @@ pub fn fuse_rowwise_reductions(module: &mut Module) -> (usize, usize) {
                                 module.ops[dst_id].operands.push(cin);
                                 let ty = module.values[cin].ty.clone();
                                 let new_barg = module.add_block_argument(dst_blk, None, ty);
-                                let popped = module.blocks[dst_blk].arguments.pop().unwrap();
-                                module.blocks[dst_blk].arguments.insert(insert_pos, popped);
+                                if let Some(popped) = module.blocks[dst_blk].arguments.pop() {
+                                    module.blocks[dst_blk].arguments.insert(insert_pos, popped);
+                                }
                                 for (pos, &b) in module.blocks[dst_blk].arguments.iter().enumerate()
                                 {
                                     module.values[b].def =
