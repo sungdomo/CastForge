@@ -1196,5 +1196,5 @@ family = "serving"
 description = "Unified serving pass (mode=all|topology|device_graph|routines|memory|stubs)"
 child_passes = []
 options = [
-  { name = "mode", default = "all", desc = "Serving pass stage (all, topology, device_graph, routines, memory, stubs)" },
+  { name = "mode", default = "all", desc = "Serving pass stage" },
 ]
